@@ -68,7 +68,9 @@ jobs:
       - run: npm run test:repo
 
   package-tests:
-    runs-on: ubuntu-latest
+    # macOS, the platform OpenRig runs on: several daemon and cli tests read macOS ps columns,
+    # file-inode behaviour and release tags.
+    runs-on: macos-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -76,11 +78,13 @@ jobs:
         package: [daemon, cli, tui, ui]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-      - run: sudo apt-get install -y --no-install-recommends tmux
+      - run: brew install tmux
       - run: npm ci
       - name: Build the packages the tests import
         run: npm run build
