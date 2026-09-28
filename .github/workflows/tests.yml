@@ -1,0 +1,87 @@
+name: Tests
+
+# Builds, type-checks and runs every test suite on a clean GitHub runner, and records the file
+# list each published package would contain. Each suite is its own job so one failure does not
+# hide the others. Runners have no agent CLIs, logins or shared configuration, so tests cannot
+# reach a real account or a running rig.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Record the published file list of each package
+        run: |
+          mkdir -p pack-lists
+          for p in cli daemon tui; do
+            (cd packages/$p && npm pack --dry-run --json --ignore-scripts) \
+              | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const f of JSON.parse(s)[0].files)console.log(f.path)})' \
+              | sort > pack-lists/$p.txt
+            echo "$p: $(wc -l < pack-lists/$p.txt) files"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pack-lists
+          path: pack-lists/
+
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  repo-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:repo
+
+  package-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [daemon, cli, tui, ui]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: sudo apt-get install -y --no-install-recommends tmux
+      - run: npm ci
+      - name: Build the packages the tests import
+        run: npm run build
+      - run: npm run test -w packages/${{ matrix.package }}
