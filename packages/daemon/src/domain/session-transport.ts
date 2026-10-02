@@ -1246,17 +1246,45 @@ export class SessionTransport {
       }
     }
 
-    // 2. OPR.0.4.1.10 — robust prompt/permission + mid-work guard on the DEFAULT path.
-    // Runs the same detector previously reachable only via --wait-for-idle: fresh runtime-hook primary
-    // (within the send-readiness window) + hardened capture-pane fallback. This closes the rig-send
-    // prompt-injection footgun — a message can never select/submit/approve another agent's prompt by
-    // default. OPR.0.4.3.28 correction + fast-follow: only POSITIVE picker/approval evidence
-    // (needs_input) FAILS CLOSED (refuse, or an audited --dangerously-interact override). Every other
-    // state now PROCEEDS with a non-blocking advisory: UNKNOWN (absent/stale/failed telemetry) and
-    // RUNNING (mid-work, busy) both send-and-advise — busy/uncertain is not authority to block
-    // communication. --force is a no-op on this path now (kept for back-compat) and never bypasses
-    // the positive-picker guard (FR-4 — the footgun separation). The advisory is carried on the
-    // success result via `warning` so the honest telemetry is surfaced.
+    // Only positive picker/permission evidence refuses delivery. Unknown and busy remain
+    // advisory. Reuse this rule at readiness and the two input boundaries; audit an
+    // explicit override once, before it first permits input onto an observed prompt.
+    let promptOverrideAudited = false;
+    const promptFailure = (readiness: AgentActivity, sent = false): SendResult | null => {
+      if (readiness.state !== "needs_input") return null;
+      const effect = sent
+        ? "Text has already been pasted but was not submitted; Enter was not sent. Inspect the pane before trying again."
+        : "No text was sent.";
+      const refused = (reason: string, error: string): SendResult => ({
+        ok: false, sessionName, reason, error: `${error} ${effect}`,
+        ...waitEvidence, activity: readiness, sent, outcome: "failed",
+      });
+      if (!opts?.dangerouslyInteract) {
+        return refused("target_needs_input", `Refused: '${sessionName}' is at an interactive prompt (${readiness.reason}). A message must not select or approve it. To deliberately drive the prompt: rig send ${sessionName} "<text>" --dangerously-interact --reason "<why>".`);
+      }
+      if (!opts.reason || opts.reason.trim().length === 0) {
+        return refused("dangerously_interact_requires_reason", "--dangerously-interact requires --reason explaining why the prompt is being driven.");
+      }
+      if (!promptOverrideAudited) {
+        const audit = this.recordPromptOverride({
+          sessionName, readiness, actorSession: opts.actorSession ?? null, overrideReason: opts.reason,
+        });
+        if (!audit.ok) {
+          return refused("prompt_override_audit_unavailable", `Refused: --dangerously-interact requires an auditable override record, which could not be persisted (${audit.reason}).`);
+        }
+        promptOverrideAudited = true;
+      }
+      return null;
+    };
+    const checkPromptBoundary = async (sent: boolean): Promise<SendResult | null> => {
+      const pane = await probeSessionActivity({
+        sessionName, runtime, attachmentType: sessionMeta.attachmentType as "tmux" | "external_cli" | null,
+        tmuxAdapter: this.tmuxAdapter, now: this.now(),
+        captureObserver: this.captureObserver, binding: observed?.binding,
+      });
+      return promptFailure(pane, sent);
+    };
+
     let sendAdvisory: string | undefined;
     if (waitForIdleMs === undefined) {
       const readiness = await this.classifySendReadiness({
@@ -1269,46 +1297,9 @@ export class SessionTransport {
       // Single state dispatch (B1 code-review fix): flattened so `unknown` ALWAYS attaches the advisory
       // regardless of whether --dangerously-interact was passed — the deliberate-override branch no
       // longer bypasses unknown handling.
-      if (readiness.state === "needs_input") {
-        // The POSITIVE picker/approval footgun. --dangerously-interact is the deliberate audited
-        // override (reason required + an auditable record persisted BEFORE the send; fail closed if it
-        // cannot be audited so an unauditable override never sends). Otherwise refuse with the
-        // proceed-path. This is the ONLY state --dangerously-interact bypasses.
-        if (opts?.dangerouslyInteract) {
-          if (!opts.reason || opts.reason.trim().length === 0) {
-            return {
-              ok: false,
-              sessionName,
-              reason: "dangerously_interact_requires_reason",
-              error: "--dangerously-interact requires --reason explaining why the prompt is being driven. No text was sent.",
-            };
-          }
-          const audit = this.recordPromptOverride({
-            sessionName,
-            readiness,
-            actorSession: opts.actorSession ?? null,
-            overrideReason: opts.reason,
-          });
-          if (!audit.ok) {
-            return {
-              ok: false,
-              sessionName,
-              reason: "prompt_override_audit_unavailable",
-              activity: readiness,
-              error: `Refused: --dangerously-interact requires an auditable override record, which could not be persisted (${audit.reason}). No text was sent.`,
-            };
-          }
-          // audited → proceed to the send.
-        } else {
-          return {
-            ok: false,
-            sessionName,
-            reason: "target_needs_input",
-            activity: readiness,
-            error: `Refused: '${sessionName}' is at an interactive prompt (${readiness.reason}). A message must not select or approve it. To deliberately drive the prompt: rig send ${sessionName} "<text>" --dangerously-interact --reason "<why>". No text was sent.`,
-          };
-        }
-      } else if (readiness.state === "unknown") {
+      const readinessFailure = promptFailure(readiness);
+      if (readinessFailure) return observe(readinessFailure);
+      if (readiness.state === "unknown") {
         // OPR.0.4.3.28 correction — INVERT the fail-closed-on-unknown default. Absent/stale/failed
         // telemetry is NOT positive picker evidence, so the send PROCEEDS. Diagnose the producer link
         // and carry it as a NON-blocking advisory (`warning` on the success result) — ALWAYS, whether
@@ -1356,6 +1347,12 @@ export class SessionTransport {
     const targetFailure = await checkClaudeTarget();
     if (targetFailure) return observe(targetFailure);
 
+    // A fresh hook is advisory about the CURRENT pane. Check the existing positive
+    // prompt detector immediately before paste, after all other readiness awaits.
+    const beforePaste = await checkPromptBoundary(false);
+    if (beforePaste) return observe(beforePaste);
+    if (runtime === "claude-code" && bindingChanged()) return observe(changedRecipient());
+
     // 3. Send text (paste)
     if (observed) observed.sentHash = hashSentText(text);
     const textResult = await this.runStage(
@@ -1377,6 +1374,13 @@ export class SessionTransport {
     // 4. Wait 200ms (spike-proven delay)
     await this.sleep(200);
 
+    if (runtime === "claude-code" && bindingChanged()) return observe(changedRecipient(true));
+
+    // A choice can appear during paste settling. Refuse Enter, honestly preserving
+    // the already-pasted effect. Capture and input are not atomic: this narrows the
+    // race, it cannot guarantee detection of a prompt appearing after this capture.
+    const beforeSubmit = await checkPromptBoundary(true);
+    if (beforeSubmit) return observe(beforeSubmit);
     if (runtime === "claude-code" && bindingChanged()) return observe(changedRecipient(true));
 
     // 5. Submit (C-m)
@@ -1556,7 +1560,7 @@ export class SessionTransport {
       hookActivity.evidenceSource === "runtime_hook" &&
       hookActivity.stale !== true
     ) {
-      // Fresh hook (within the 15s send window): authoritative for any state.
+      // Fresh hook supplies readiness; positive pane vetoes still run at input boundaries.
       if (this.hookFreshForSend(hookActivity, now)) {
         return hookActivity;
       }

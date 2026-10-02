@@ -623,7 +623,7 @@ describe("SessionTransport", () => {
     expect(result.attempts).toBe(2);
     expect(result.activity?.state).toBe("idle");
     expect(sendTextSpy).toHaveBeenCalledWith("dev-impl@my-rig", "hello");
-    expect(callOrder).toEqual(["capture", "capture", "sendText", "sendKeys"]);
+    expect(callOrder).toEqual(["capture", "capture", "capture", "sendText", "capture", "sendKeys"]);
   });
 
   it("send with wait-for-idle waits through current Claude thinking evidence and sends after idle", async () => {
@@ -677,7 +677,7 @@ describe("SessionTransport", () => {
     expect(result.attempts).toBe(2);
     expect(result.activity?.state).toBe("idle");
     expect(sendTextSpy).toHaveBeenCalledWith("dev-impl@my-rig", "hello");
-    expect(callOrder).toEqual(["capture", "capture", "sendText", "sendKeys"]);
+    expect(callOrder).toEqual(["capture", "capture", "capture", "sendText", "capture", "sendKeys"]);
   });
 
   it("send with wait-for-idle times out on running activity without sending text", async () => {

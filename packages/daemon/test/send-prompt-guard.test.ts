@@ -1,6 +1,6 @@
 // OPR.0.4.1.10 — rig send interactive-prompt / permission-block guard: KEYSTONE regression.
 // Reproduces the 2026-06-20 footgun (a peer rig-send submitted an open AskUserQuestion default and
-// shipped a release) and proves it is impossible by default. K-1..K-6 from the impl-prd plus the
+// shipped a release) and checks refusal of a positively observed prompt. K-1..K-6 from the impl-prd plus the
 // guard-required amendment tests (audit all-or-nothing, danger+wait rejection, send-readiness
 // freshness fallback). Detector covered on BOTH the fresh-runtime-hook path and the capture-pane
 // fallback (Codex's sole prompt guard — exact render from qa-codex-approval-render-research-20260627).
@@ -104,9 +104,11 @@ describe("OPR.0.4.1.10 rig send prompt/permission guard (keystone)", () => {
     withBus?: boolean;
     now?: () => Date;
     activityEndpointFile?: () => { baseUrl: string; token: string } | null;
+    sleep?: (ms: number) => Promise<void>;
   }) {
     return new SessionTransport({
       db, rigRepo, sessionRegistry, tmuxAdapter: tmux, agentActivityStore,
+      ...(opts?.sleep ? { sleep: opts.sleep } : {}),
       ...(opts?.withBus === false ? {} : { eventBus }),
       ...(opts?.now ? { now: opts.now } : {}),
       ...(opts?.activityEndpointFile ? { activityEndpointFile: opts.activityEndpointFile } : {}),
@@ -607,7 +609,7 @@ describe("OPR.0.4.1.10 rig send prompt/permission guard (keystone)", () => {
     expect(sendText).toHaveBeenCalled();
   });
 
-  it("AMEND: a hook fresh within the send window (idle) is authoritative and the send proceeds", async () => {
+  it("a fresh idle hook is vetoed by a positive current-pane prompt", async () => {
     const fixedNow = new Date("2026-06-27T12:00:00.000Z");
     agentActivityStore.recordHookEvent({
       runtime: "claude-code", sessionName: "dev-impl@my-rig", hookEvent: "Stop",
@@ -616,9 +618,9 @@ describe("OPR.0.4.1.10 rig send prompt/permission guard (keystone)", () => {
     const { sendText } = spies();
     const t = makeTransport(mockTmux({ capturePaneContent: async () => SHIP_PROMPT, sendText }), { now: () => fixedNow });
     const r = await t.send("dev-impl@my-rig", "hi");
-    expect(r.ok).toBe(true);
-    expect(r.activity === undefined || r.activity?.evidenceSource === "runtime_hook").toBe(true);
-    expect(sendText).toHaveBeenCalled();
+    expect(r).toMatchObject({ ok: false, reason: "target_needs_input", sent: false });
+    expect(r.activity?.evidenceSource).toBe("pane_heuristic");
+    expect(sendText).not.toHaveBeenCalled();
   });
 
   // FR-1c: a permission question with no visible selector is still detected (Codex/Claude robustness).
@@ -700,4 +702,68 @@ describe("OPR.0.4.1.10 rig send prompt/permission guard (keystone)", () => {
     expect(forced.warning).toContain("busy is advisory");
     expect(runSpy).toHaveBeenCalled();
   });
+  describe("input-boundary rechecks (#498)", () => {
+    const choice = "Choose a color\n❯ 1. RED\n  2. BLUE";
+    const idle = "❯ ";
+
+    it.each(["Stop", "UserPromptSubmit"])("fresh %s hook cannot hide a visible choice", async (hookEvent) => {
+      agentActivityStore.recordHookEvent({ runtime: "claude-code", sessionName: "dev-impl@my-rig", hookEvent });
+      const { sendText, sendKeys } = spies();
+      const result = await makeTransport(mockTmux({ capturePaneContent: async () => choice, sendText, sendKeys }))
+        .send("dev-impl@my-rig", "note");
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input", sent: false });
+      expect(sendText).not.toHaveBeenCalled();
+      expect(sendKeys).not.toHaveBeenCalled();
+    });
+
+    it.each([false, true])("catches a choice after the readiness read (verify=%s)", async (verify) => {
+      let captures = 0;
+      const { sendText, sendKeys } = spies();
+      const result = await makeTransport(mockTmux({
+        capturePaneContent: async () => ++captures === 1 ? idle : choice, sendText, sendKeys,
+      })).send("dev-impl@my-rig", "note", { verify });
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input", sent: false });
+      expect(sendText).not.toHaveBeenCalled();
+      expect(sendKeys).not.toHaveBeenCalled();
+    });
+
+    it.each([undefined, 1000])("catches a choice during paste settling, truthfully (wait=%s)", async (waitForIdleMs) => {
+      let pane = idle;
+      const { sendText, sendKeys } = spies();
+      const result = await makeTransport(mockTmux({ capturePaneContent: async () => pane, sendText, sendKeys }), {
+        sleep: async () => { pane = choice; },
+      }).send("dev-impl@my-rig", "note", { waitForIdleMs, verify: true });
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input", sent: true, outcome: "failed" });
+      expect(result.error).toContain("already been pasted");
+      expect(result.error).toContain("not submitted");
+      expect(sendText).toHaveBeenCalledTimes(1);
+      expect(sendKeys).not.toHaveBeenCalled();
+    });
+
+    it.each(["unknown", "busy", "capture-error"])("keeps %s advisory through both boundaries", async (state) => {
+      const { sendText, sendKeys } = spies();
+      const result = await makeTransport(mockTmux({ capturePaneContent: async () => {
+        if (state === "capture-error") throw new Error("fixture unavailable");
+        return state === "busy" ? "Working… esc to interrupt" : "unrecognized view";
+      }, sendText, sendKeys }), { sleep: async () => {} }).send("dev-impl@my-rig", "note");
+      expect(result.ok).toBe(true);
+      expect(result.warning).toBeTruthy();
+      expect(sendText).toHaveBeenCalledTimes(1);
+      expect(sendKeys).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([false, true])("requires a durable override at a late choice (audit available=%s)", async (withBus) => {
+      let pane = idle;
+      const { sendText, sendKeys } = spies();
+      const result = await makeTransport(mockTmux({ capturePaneContent: async () => pane, sendText, sendKeys }), {
+        withBus, sleep: async () => { pane = choice; },
+      }).send("dev-impl@my-rig", "note", { dangerouslyInteract: true, reason: "deliberate color fixture" });
+      expect(result.ok).toBe(withBus);
+      expect(sendText).toHaveBeenCalledTimes(1);
+      expect(sendKeys).toHaveBeenCalledTimes(withBus ? 1 : 0);
+      expect(overrideEvents()).toHaveLength(withBus ? 1 : 0);
+      if (!withBus) expect(result).toMatchObject({ reason: "prompt_override_audit_unavailable", sent: true });
+    });
+  });
+
 });
