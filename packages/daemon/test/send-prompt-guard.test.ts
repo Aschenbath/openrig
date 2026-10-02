@@ -706,6 +706,83 @@ describe("OPR.0.4.1.10 rig send prompt/permission guard (keystone)", () => {
     const choice = "Choose a color\n❯ 1. RED\n  2. BLUE";
     const idle = "❯ ";
 
+    it.each(["codex", "claude", "plain"])("submits own echoed text and subsequent sends (%s)", async (layout) => {
+      let draft = "";
+      const history: string[] = [];
+      const pane = () => [
+        ...history.map((text) => `> ${text}`),
+        layout === "claude" ? "────────────────────" : "",
+        `❯ ${draft}`,
+        layout === "claude" ? "────────────────────" : "",
+        layout === "codex" ? "gpt-5.1 high · Context [42% used]" : layout === "claude" ? "⏵⏵ accept edits on" : "",
+      ].join("\n");
+      const sendText = vi.fn(async (_target: string, text: string) => { draft = text; return { ok: true as const }; });
+      const sendKeys = vi.fn(async () => { history.push(draft); draft = ""; return { ok: true as const }; });
+      const transport = makeTransport(mockTmux({ capturePaneContent: async () => pane(), sendText, sendKeys }), { sleep: async () => {} });
+      for (const text of ["hello", "Please check: Do you want to run the tests?", "A note\nDo you want to run the tests?\nEnd of note", "1. RED\n2. BLUE", "second send"]) {
+        const first = await transport.send("dev-impl@my-rig", text);
+        expect(first.ok).toBe(true);
+        const second = await transport.send("dev-impl@my-rig", "follow up", { waitForIdleMs: 1000 });
+        expect(second.ok).toBe(true);
+      }
+      expect(sendText).toHaveBeenCalledTimes(10);
+      expect(sendKeys).toHaveBeenCalledTimes(10);
+    });
+
+    it.each(["choice", "permission", "foreign draft", "changed draft"])("does not erase %s beside its own echo", async (kind) => {
+      let pane = idle;
+      const text = "Please check: Do you want to run the tests?";
+      const sendText = vi.fn(async () => { pane = `❯ ${text}\n` + (
+        kind === "choice" ? choice : kind === "permission" ? "Do you want to allow this operation?" :
+        kind === "foreign draft" ? "❯ someone's input\n⏵⏵ accept edits on" : "❯ Please check: Do you want to run different tests?\n⏵⏵ accept edits on"
+      ); return { ok: true as const }; });
+      const sendKeys = vi.fn(async () => ({ ok: true as const }));
+      const result = await makeTransport(mockTmux({ capturePaneContent: async () => pane, sendText, sendKeys }), { sleep: async () => {} })
+        .send("dev-impl@my-rig", text);
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input", sent: true, outcome: "failed" });
+      expect(sendKeys).not.toHaveBeenCalled();
+    });
+
+    it.each(["wrapped", "placeholder"])("recognizes its own %s composer rendering", async (style) => {
+      let pane = idle;
+      const text = "Please check: Do you want to run the tests?\nA second line";
+      const sendText = vi.fn(async () => { pane = style === "wrapped"
+        ? "❯ Please check: Do you want to\n  run the tests?\nA second line\n⏵⏵ accept edits on"
+        : "❯ [Pasted text #1 +2 lines]\n⏵⏵ accept edits on";
+        return { ok: true as const }; });
+      const sendKeys = vi.fn(async () => ({ ok: true as const }));
+      const result = await makeTransport(mockTmux({ capturePaneContent: async () => pane, sendText, sendKeys }), { sleep: async () => {} })
+        .send("dev-impl@my-rig", text);
+      expect(result.ok).toBe(true);
+      expect(sendKeys).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["first read", "failed paste", "replacement binding"])("does not exempt text without a matching successful paste (%s)", async (condition) => {
+      const text = "Do you want to run the tests?";
+      let pane = idle;
+      const sendText = vi.fn(async () => ({ ok: condition !== "failed paste", message: "fixture failure" }));
+      const sendKeys = vi.fn(async () => ({ ok: true as const }));
+      const transport = makeTransport(mockTmux({ capturePaneContent: async () => pane, sendText, sendKeys }), { sleep: async () => {} });
+      if (condition !== "first read") await transport.send("dev-impl@my-rig", text);
+      if (condition === "replacement binding") db.prepare("UPDATE sessions SET resume_token = 'replacement' WHERE session_name = ?").run("dev-impl@my-rig");
+      pane = `❯ ${text}\n⏵⏵ accept edits on`;
+      sendText.mockClear(); sendKeys.mockClear();
+      const result = await transport.send("dev-impl@my-rig", text);
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input", sent: false });
+      expect(sendText).not.toHaveBeenCalled();
+      expect(sendKeys).not.toHaveBeenCalled();
+    });
+
+    it.each(["", "\n"])("does not erase a selector that repeats the sent text (gap=%j)", async (gap) => {
+      let pane = idle;
+      const sendText = vi.fn(async () => { pane = `Choose a color\n❯ 1. RED\n${gap}  2. BLUE`; return { ok: true as const }; });
+      const sendKeys = vi.fn(async () => ({ ok: true as const }));
+      const result = await makeTransport(mockTmux({ capturePaneContent: async () => pane, sendText, sendKeys }), { sleep: async () => {} })
+        .send("dev-impl@my-rig", "1. RED");
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input", sent: true });
+      expect(sendKeys).not.toHaveBeenCalled();
+    });
+
     it.each(["Stop", "UserPromptSubmit"])("fresh %s hook cannot hide a visible choice", async (hookEvent) => {
       agentActivityStore.recordHookEvent({ runtime: "claude-code", sessionName: "dev-impl@my-rig", hookEvent });
       const { sendText, sendKeys } = spies();

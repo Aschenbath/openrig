@@ -143,6 +143,40 @@ function findPromptDraftBeforeFooter(paneContent: string): string | null {
   return truncateEvidence(priorTrimmed);
 }
 
+// Ignore only complete echoes of text this transport actually pasted to this recipient.
+// Keep nonmatching lines (including adjacent choices) and the scan-window geometry. This
+// is classification-only: observers still receive the original capture, never these markers.
+function withoutSentEchoes(pane: string, sentTexts: readonly string[], pastedText?: string): string {
+  const lines = pane.split("\n");
+  const compact = (text: string) => text.replace(/\s+/g, "");
+  const expected = sentTexts.map(compact).filter(Boolean);
+  for (let start = 0; start < lines.length; start++) {
+    const marker = /^\s*([❯›>])\s*(.*)$/.exec(lines[start]!);
+    if (!marker) continue;
+    let content = compact(marker[2]!);
+    const placeholder = /^\[Pasted text #\d+ \+(\d+) lines\]$/.exec(marker[2]!);
+    const ownPlaceholder = pastedText !== undefined && placeholder !== null &&
+      Number(placeholder[1]) === pastedText.split("\n").length;
+    for (let end = start; end < lines.length; end++) {
+      if ((end === start && ownPlaceholder) || expected.includes(content)) {
+        // Matching one option is not matching a whole menu. Leave that selector
+        // intact when another option remains outside the echoed block.
+        const next = lines.slice(end + 1).find((line) => line.trim());
+        if (/^\d+\.\s/.test(marker[2]!) && /^\s*(?:[❯›]\s*)?\d+\.\s/.test(next ?? "")) break;
+        lines[start] = marker[1] === ">" ? "[sent text]" : marker[1]!;
+        for (let i = start + 1; i <= end; i++) {
+          if (lines[i]!.trim()) lines[i] = "[sent text]";
+        }
+        start = end;
+        break;
+      }
+      if (!expected.some((text) => text.startsWith(content))) break;
+      if (end + 1 < lines.length) content += compact(lines[end + 1]!);
+    }
+  }
+  return lines.join("\n");
+}
+
 export function classifyPaneActivity(paneContent: string): PaneActivityClassification {
   const lastNonBlank = trimPaneLines(paneContent);
   if (lastNonBlank.length === 0) {
@@ -255,10 +289,12 @@ export async function probeSessionActivity(input: {
   /** S01/S02 P2: optional read-only observer of the capture this probe already takes. */
   captureObserver?: CaptureObserverSink;
   binding?: Omit<ObservedBinding, "sessionName">;
+  sentTexts?: readonly string[];
+  pastedText?: string;
 }): Promise<AgentActivity> {
   // Capture routing and observation labels must share the entry context. The
   // caller may reuse/mutate its input while hasSession is pending.
-  const { sessionName, runtime, attachmentType, tmuxAdapter, now, captureObserver, binding } = input;
+  const { sessionName, runtime, attachmentType, tmuxAdapter, now, captureObserver, binding, sentTexts, pastedText } = input;
   const sampledAt = (now ?? new Date()).toISOString();
   // P2: attempt identity frozen at entry, before any await. Early returns below
   // take no capture and are not observed.
@@ -367,7 +403,7 @@ export async function probeSessionActivity(input: {
   try {
     const paneContent = await tmuxAdapter.capturePaneContent(sessionName, 20);
     const capturedAt = new Date().toISOString();
-    const classification = classifyPaneActivity(paneContent ?? "");
+    const classification = classifyPaneActivity(withoutSentEchoes(paneContent ?? "", sentTexts ?? [], pastedText));
     return observeProbe(captureSlot(paneContent, capturedAt, captureSeq), {
       state: mapPaneState(classification.state),
       reason: classification.reason,
@@ -596,6 +632,9 @@ export class SessionTransport {
   private activityEndpointFile: () => { baseUrl: string; token: string } | null;
   private captureObserver?: CaptureObserverSink;
   private listProcesses?: NativeProcessLister;
+  // Bounded recent echoes for the next send's readiness read. Replacement binding
+  // invalidates them; no durable state or change to hook authority.
+  private sentEchoes = new Map<string, { binding: string; texts: string[] }>();
 
   constructor(deps: SessionTransportDeps) {
     this.db = deps.db;
@@ -984,6 +1023,10 @@ export class SessionTransport {
     let preVerifyContent: string | null = null;
     const sessionMeta = this.getSessionMeta(sessionName);
     const runtime = sessionMeta.runtime;
+    const echoBinding = JSON.stringify(sessionMeta);
+    const previousEchoes = this.sentEchoes.get(sessionName);
+    const sentTexts = previousEchoes?.binding === echoBinding ? previousEchoes.texts : [];
+    if (previousEchoes?.binding !== echoBinding) this.sentEchoes.delete(sessionName);
     let runtimeAdvisory: string | undefined;
     const bindingChanged = () => JSON.stringify(this.getSessionMeta(sessionName)) !== JSON.stringify(sessionMeta);
     const changedRecipient = (sent = false): SendResult => ({ ok: false, sessionName, sent, reason: "target_runtime_conflict",
@@ -1227,6 +1270,7 @@ export class SessionTransport {
         runtime,
         attachmentType: sessionMeta.attachmentType,
         timeoutMs: waitForIdleMs,
+        sentTexts,
         binding: observed?.binding,
       });
       waitEvidence = {
@@ -1281,6 +1325,8 @@ export class SessionTransport {
         sessionName, runtime, attachmentType: sessionMeta.attachmentType as "tmux" | "external_cli" | null,
         tmuxAdapter: this.tmuxAdapter, now: this.now(),
         captureObserver: this.captureObserver, binding: observed?.binding,
+        sentTexts: sent ? [...sentTexts, text] : sentTexts,
+        pastedText: sent ? text : undefined,
       });
       return promptFailure(pane, sent);
     };
@@ -1288,6 +1334,7 @@ export class SessionTransport {
     let sendAdvisory: string | undefined;
     if (waitForIdleMs === undefined) {
       const readiness = await this.classifySendReadiness({
+        sentTexts,
         sessionName,
         runtime,
         attachmentType: sessionMeta.attachmentType,
@@ -1371,6 +1418,10 @@ export class SessionTransport {
       });
     }
 
+    this.sentEchoes.delete(sessionName);
+    this.sentEchoes.set(sessionName, { binding: echoBinding, texts: [text, ...sentTexts].slice(0, 20) });
+    if (this.sentEchoes.size > 256) this.sentEchoes.delete(this.sentEchoes.keys().next().value!);
+
     // 4. Wait 200ms (spike-proven delay)
     await this.sleep(200);
 
@@ -1444,6 +1495,7 @@ export class SessionTransport {
     runtime: string | null;
     attachmentType: string | null;
     timeoutMs: number;
+    sentTexts?: readonly string[];
     binding?: ObservedBinding;
   }): Promise<
     | { ok: true; activity: AgentActivity; waitedMs: number; attempts: number }
@@ -1546,6 +1598,7 @@ export class SessionTransport {
     runtime: string | null;
     attachmentType: string | null;
     binding?: ObservedBinding;
+    sentTexts?: readonly string[];
   }): Promise<AgentActivity> {
     const now = this.now();
     const hookActivity = this.agentActivityStore?.getLatestForNode({
@@ -1586,6 +1639,7 @@ export class SessionTransport {
           now,
           captureObserver: this.captureObserver,
           binding: input.binding,
+          sentTexts: input.sentTexts,
         });
         if (paneVeto.state === "needs_input") {
           return paneVeto;
@@ -1602,6 +1656,7 @@ export class SessionTransport {
       now,
       captureObserver: this.captureObserver,
       binding: input.binding,
+      sentTexts: input.sentTexts,
     });
     // A Codex empty-composer placeholder is also on screen while Codex streams with its status
     // row hidden, so a placeholder-only idle verdict must not override a display-fresh (<5min)
