@@ -1212,7 +1212,7 @@ export class SessionTransport {
       if (targetFailure) return targetFailure;
       const submitResult = await this.runStage(
         "session_transport.submit",
-        () => this.tmuxAdapter.sendKeys(sessionName, ["C-m"]),
+        () => this.tmuxAdapter.sendKeys(sessionName, ["Enter"]),
         (result) => result.ok ? "ok" : "failed",
       );
       if (!submitResult.ok) {
@@ -1383,10 +1383,10 @@ export class SessionTransport {
     if (beforeSubmit) return observe(beforeSubmit);
     if (runtime === "claude-code" && bindingChanged()) return observe(changedRecipient(true));
 
-    // 5. Submit (C-m)
+    // 5. Submit the named Enter key (Ctrl+M differs in tmux extended-keys mode 2).
     const submitResult = await this.runStage(
       "session_transport.submit",
-      () => this.tmuxAdapter.sendKeys(sessionName, ["C-m"]),
+      () => this.tmuxAdapter.sendKeys(sessionName, ["Enter"]),
       (result) => result.ok ? "ok" : "failed",
     );
     if (!submitResult.ok) {
