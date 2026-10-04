@@ -1,4 +1,4 @@
-import { selectCatalogProject, ProjectReadError } from "@openrig/daemon/project-catalog";
+import { readProjectCatalog, selectCatalogProject, ProjectReadError } from "@openrig/daemon/project-catalog";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
@@ -18,6 +18,10 @@ const SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 export type WorkInstallSource = "explicit" | "manifest" | "default";
 export type WorkInstallAltitude = "project" | "mission" | "slice";
+/** How the project was chosen: --project, the only catalog entry, the calling
+ *  rig's catalog association, the deepest catalog root containing the working
+ *  directory, the only entry no rig claims, or the uncatalogued workspace itself. */
+export type WorkInstallSelectedBy = "explicit" | "single" | "rig" | "cwd" | "unclaimed" | "workspace";
 
 export interface WorkInstallPiece {
   altitude: WorkInstallAltitude;
@@ -32,6 +36,7 @@ export interface WorkInstallPlan {
     workspaceRoot: string;
     projectId: string | null;
     projectRoot: string;
+    selectedBy: WorkInstallSelectedBy;
     missionRoot: string | null;
     sliceRoot: string | null;
     mission: string | null;
@@ -136,6 +141,92 @@ function manifestProjectId(manifest: Record<string, unknown> | null): string | n
   return isRecord(metadata) && typeof metadata["id"] === "string" ? metadata["id"] : null;
 }
 
+/** The rig of a canonical seat session (`member@rig`). Pod and member ids can't
+ *  contain `@`, so the rig is everything after the first one. */
+function rigFromSession(sessionName: string | undefined): string | null {
+  const at = sessionName?.indexOf("@") ?? -1;
+  return at > 0 && at < sessionName!.length - 1 ? sessionName!.slice(at + 1) : null;
+}
+
+function selectInferred(
+  catalogPath: string,
+  id: string,
+  selectedBy: "rig" | "cwd" | "unclaimed",
+): { id: string; root: string; selectedBy: "rig" | "cwd" | "unclaimed" } | WorkInstallFailure {
+  try {
+    const selected = selectCatalogProject(catalogPath, id);
+    return selected ? { ...selected, selectedBy } : failure("project_not_found", `project '${id}' is not declared in ${catalogPath}`);
+  } catch (err) {
+    if (err instanceof ProjectReadError) return failure(err.code, err.message, err.candidates);
+    throw err;
+  }
+}
+
+/** Steps 3-5 of project selection, used only where the catalog alone would stop
+ *  with project_required: the calling rig's association (workspace.yaml
+ *  `projects[].rigs`), then the unique deepest project root containing the
+ *  working directory, then the only entry that no rig claims. The last keeps a
+ *  user's own rigs on their project after a claimed project (a contributor
+ *  bundle) is added beside it. None adds a refusal: an unusable signal is a
+ *  warning, and no unique answer keeps project_required. */
+function inferCatalogProject(
+  catalogPath: string,
+  required: ProjectReadError,
+  opts: { cwd?: string; sessionName?: string },
+  warnings: string[],
+): { id: string; root: string; selectedBy: "rig" | "cwd" | "unclaimed" } | WorkInstallFailure {
+  const raw = readYaml(catalogPath).value?.["projects"];
+  const claims = new Map<string, string[]>();
+  const malformed = new Set<string>();
+  for (const entry of Array.isArray(raw) ? raw : []) {
+    if (!isRecord(entry) || typeof entry["id"] !== "string" || entry["rigs"] === undefined) continue;
+    const rigs = entry["rigs"];
+    if (!Array.isArray(rigs) || !rigs.every((name) => typeof name === "string")) {
+      warnings.push(`${catalogPath}: project '${entry["id"]}' rigs must be a list of rig names; ignored it`);
+      malformed.add(entry["id"]);
+      continue;
+    }
+    claims.set(entry["id"], rigs as string[]);
+  }
+
+  const rig = rigFromSession(opts.sessionName);
+  if (rig) {
+    const claimants = [...claims].filter(([, rigs]) => rigs.includes(rig)).map(([id]) => id);
+    if (claimants.length > 1) {
+      return failure("project_required", `rig '${rig}' is listed under several projects in ${catalogPath}; select one with --project`, claimants);
+    }
+    if (claimants.length === 1) return selectInferred(catalogPath, claimants[0]!, "rig");
+  }
+
+  const cwd = opts.cwd === undefined ? null : canonicalExisting(opts.cwd);
+  if (cwd) {
+    const containing: Array<{ id: string; root: string; depth: number }> = [];
+    for (const entry of readProjectCatalog(catalogPath) ?? []) {
+      const root = canonicalExisting(resolve(dirname(catalogPath), entry.root));
+      if (!root) {
+        warnings.push(`project '${entry.id}' root does not exist; skipped it for working-directory selection`);
+        continue;
+      }
+      if (inside(root, cwd)) containing.push({ id: entry.id, root, depth: root.split(sep).length });
+    }
+    const depth = Math.max(...containing.map((entry) => entry.depth));
+    const deepest = containing.filter((entry) => entry.depth === depth);
+    if (deepest.length === 1) return { id: deepest[0]!.id, root: deepest[0]!.root, selectedBy: "cwd" };
+    if (deepest.length > 1) {
+      return failure(
+        "project_required",
+        `the working directory is inside several projects with the same root; select one with --project`,
+        deepest.map((entry) => entry.id),
+      );
+    }
+  }
+
+  const unclaimed = (readProjectCatalog(catalogPath) ?? [])
+    .filter((entry) => !malformed.has(entry.id) && (claims.get(entry.id) ?? []).length === 0);
+  if (unclaimed.length === 1) return selectInferred(catalogPath, unclaimed[0]!.id, "unclaimed");
+  return failure(required.code, required.message, required.candidates);
+}
+
 function resolveExplicitSlice(
   missionRoot: string,
   selection: string,
@@ -189,6 +280,10 @@ export function resolveWorkPosition(opts: {
   project?: string;
   mission?: string;
   slice?: string;
+  /** Working directory for selection step 4 (the CLI passes --cwd or the process cwd). */
+  cwd?: string;
+  /** Calling seat's canonical session, for selection step 3; absent in a plain shell. */
+  sessionName?: string;
 }): WorkInstallResult {
   if (opts.project !== undefined && !SEGMENT.test(opts.project)) {
     return failure("invalid_project", "project must be a single bounded segment");
@@ -218,12 +313,20 @@ export function resolveWorkPosition(opts: {
   const catalogPath = resolve(opts.catalogPath ?? join(workspaceRoot, "workspace.yaml"));
   let projectId: string | null = null;
   let projectRoot = workspaceRoot;
+  let selectedBy: WorkInstallSelectedBy = opts.project !== undefined ? "explicit" : "workspace";
   try {
     const selected = selectCatalogProject(catalogPath, opts.project);
-    if (selected) { projectId = selected.id; projectRoot = selected.root; }
+    if (selected) {
+      projectId = selected.id;
+      projectRoot = selected.root;
+      if (opts.project === undefined) selectedBy = "single";
+    }
   } catch (err) {
-    if (err instanceof ProjectReadError) return failure(err.code, err.message, err.candidates);
-    throw err;
+    if (!(err instanceof ProjectReadError)) throw err;
+    if (err.code !== "project_required") return failure(err.code, err.message, err.candidates);
+    const inferred = inferCatalogProject(catalogPath, err, opts, warnings);
+    if ("error" in inferred) return inferred;
+    ({ id: projectId, root: projectRoot, selectedBy } = inferred);
   }
 
   const projectManifestPath = join(projectRoot, "project.yaml");
@@ -387,6 +490,7 @@ export function resolveWorkPosition(opts: {
       workspaceRoot,
       projectId,
       projectRoot,
+      selectedBy,
       missionRoot,
       sliceRoot,
       mission: opts.mission ?? null,
