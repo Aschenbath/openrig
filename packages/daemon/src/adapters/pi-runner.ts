@@ -23,7 +23,7 @@ import nodePath from "node:path";
 import readline from "node:readline";
 import { PassThrough } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { formatDaemonHostForUrl } from "./daemon-url.js";
@@ -749,6 +749,24 @@ export function resolveRuntimeExecutable(
   }
 }
 
+/** Enrich an actual CLI rejection, without guessing compatibility from a version
+ * or from help (older Pi prints help before validating unknown long flags). */
+export function piLaunchCapabilityError(
+  command: string,
+  trust: "approve" | "no-approve",
+  line: string,
+  readVersion: () => string,
+): string | undefined {
+  const diagnostic = stripVTControlCharacters(line);
+  if (!/unknown options?:/i.test(diagnostic) || !/--(?:name|approve|no-approve)(?=[\s,.:]|$)/.test(diagnostic)) return;
+  let version = "unknown version";
+  try {
+    const value = stripVTControlCharacters(readVersion()).trim();
+    if (/^[0-9][A-Za-z0-9.+_-]{0,63}$/.test(value)) version = `version ${value}`;
+  } catch { /* diagnostics only; never changes the child's outcome */ }
+  return `Pi invoked as ${command} (${version}; exact executable path unknown) rejects the managed --name/--${trust} flags. Install the current @earendil-works/pi-coding-agent (npm install -g @earendil-works/pi-coding-agent) and check 'command -v pi' in this pane; an older Pi installation may be shadowing it.`;
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   let args: RunnerArgs;
   try {
@@ -828,6 +846,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     stdio: ["pipe", "pipe", "pipe"],
   });
 
+  // The child may close its pipe before the first RPC write completes.
+  child.stdin.on("error", () => { /* spawn/exit handlers own the diagnosis */ });
+
   const io: RunnerIo = {
     sendRpc: (cmd) => {
       try { child.stdin.write(`${JSON.stringify(cmd)}\n`); } catch { /* exit handler reports */ }
@@ -890,20 +911,35 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // The last few stderr lines, so an OMP that exits during startup is
   // reported with its own words in the error, not only above it.
   const stderrTail: string[] = [];
+  let reportedPiCapability = false;
   readline.createInterface({ input: child.stderr }).on("line", (line) => {
     if (!line.trim()) return;
     process.stdout.write(`[${runtime}:err] ${line}\n`);
     stderrTail.push(line.length > OMP_STDERR_TAIL_CHARS ? `${line.slice(0, OMP_STDERR_TAIL_CHARS)}...` : line);
     if (stderrTail.length > OMP_STDERR_TAIL_LINES) stderrTail.shift();
+    if (runtime === "pi" && !core.isReady() && !reportedPiCapability) {
+      const detail = piLaunchCapabilityError(command, args.trust, line, () => {
+        const version = spawnSync(command, ["--version"], { cwd: args.cwd, env: childEnv, encoding: "utf8",
+          timeout: 3000, killSignal: "SIGKILL", maxBuffer: 4096, stdio: ["ignore", "pipe", "pipe"] });
+        if (version.error || version.status !== 0) return "";
+        // Older Pi redirects even --version to stderr when stdout is a pipe.
+        return version.stdout.trim() || version.stderr.trim();
+      });
+      if (detail) {
+        reportedPiCapability = true;
+        process.stdout.write(`[pi-runner] ${detail}\n`);
+      }
+    }
   });
   const input = createRunnerInput(process.stdin, process.stdout, (block) => core.handleUserBlock(block));
 
   if (runtime === "pi") {
     child.on("error", (err) => {
       console.error(`${PI_RUNNER_ERROR_MARKER} failed to spawn pi: ${err.message}`);
-      core.handlePiExit(null);
+      const code = (err as NodeJS.ErrnoException).code === "ENOENT" ? 127 : 1;
+      core.handlePiExit(code);
       input.close();
-      process.exitCode = 1;
+      process.exitCode = code;
     });
     child.on("exit", (code) => {
       core.handlePiExit(code);
