@@ -314,20 +314,38 @@ describe("agent pane activity classifier", () => {
 
 describe("shared composer matchers", () => {
   it("hasExpectedStagedText matches Claude `❯` staged text", () => {
-    expect(hasExpectedStagedText("prior\n❯ deploy the release\n────────────\nhint", "deploy the release")).toBe(true);
+    expect(hasExpectedStagedText("prior\n❯ deploy the release\n────────────\nhint", "deploy the release", "claude-code")).toBe(true);
   });
 
   it("hasExpectedStagedText matches Codex `›` staged text", () => {
-    expect(hasExpectedStagedText("prior\n› deploy the release\n", "deploy the release")).toBe(true);
+    expect(hasExpectedStagedText("prior\n› deploy the release\n", "deploy the release", "codex")).toBe(true);
   });
 
   it("hasExpectedStagedText matches Codex 0.153 `»` staged text", () => {
-    expect(hasExpectedStagedText("prior\n» deploy the release\n", "deploy the release")).toBe(true);
+    expect(hasExpectedStagedText("prior\n» deploy the release\n", "deploy the release", "codex")).toBe(true);
+  });
+
+  it("hasExpectedStagedText reads a Claude draft whose continuation starts with a Codex glyph", () => {
+    const pane = [
+      "prior output",
+      "❯ please check this:",
+      "› run the tests",
+      "────────────",
+      "hint bar",
+    ].join("\n");
+    // Runtime-scoped markers: the `›` continuation is part of the Claude draft,
+    // not a second composer. The union-only read would take the `›` line as the
+    // input marker and lose the drafted head.
+    expect(hasExpectedStagedText(pane, "please check this:\n› run the tests", "claude-code")).toBe(true);
   });
 
   it("hasExpectedStagedText never treats a numbered selection as staged input", () => {
-    expect(hasExpectedStagedText("prior\n❯ 1. Yes\n", "Yes")).toBe(false);
-    expect(hasExpectedStagedText("prior\n» 1. Yes\n", "Yes")).toBe(false);
+    expect(hasExpectedStagedText("prior\n❯ 1. Yes\n", "Yes", "claude-code")).toBe(false);
+    expect(hasExpectedStagedText("prior\n» 1. Yes\n", "Yes", "codex")).toBe(false);
+    // The broad prefix exclusion also catches compact options (`1.Yes`), which
+    // the draft/selection classifier's spaced pattern deliberately does not.
+    expect(hasExpectedStagedText("prior\n❯ 1.Yes\n", "Yes", "claude-code")).toBe(false);
+    expect(hasExpectedStagedText("prior\n› 2.No\n", "2.No", "codex")).toBe(false);
   });
 
   it("inspectStartupStagedText reads a `»` composer body", () => {
@@ -338,8 +356,14 @@ describe("shared composer matchers", () => {
       "shift+tab to cycle",
     ].join("\n");
 
-    expect(inspectStartupStagedText(pane, "hello world")).toBe("staged");
-    expect(inspectStartupStagedText(pane, "something else")).toBe("unverified");
+    expect(inspectStartupStagedText(pane, "hello world", "codex")).toBe("staged");
+    expect(inspectStartupStagedText(pane, "something else", "codex")).toBe("unverified");
+  });
+
+  it("inspectStartupStagedText excludes a compact numbered option", () => {
+    const pane = ["Previous turn", "❯ 1.Yes", "────────────", "shift+tab to cycle"].join("\n");
+
+    expect(inspectStartupStagedText(pane, "1.Yes", "claude-code")).toBe("unverified");
   });
 });
 

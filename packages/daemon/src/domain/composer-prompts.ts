@@ -17,32 +17,61 @@ export const COMPOSER_PROMPT_CLASS = COMPOSER_PROMPT_CHARS.join("");
 
 const promptChar = `[${COMPOSER_PROMPT_CLASS}]`;
 
+/**
+ * The glyph set for one runtime. A Claude pane uses `❯`; a Codex pane uses `›`
+ * (and `»` on 0.153 variants). Only an unknown runtime takes the union, because
+ * a multi-line draft's continuation can itself start with another harness's
+ * glyph (a quoted Codex line inside a Claude draft, say), and taking the last
+ * such line as the composer would misread the staged text.
+ */
+export function composerPromptClassForRuntime(runtime: string | null | undefined): string {
+  if (runtime === "claude-code") return "❯";
+  if (runtime === "codex") return "›»";
+  return COMPOSER_PROMPT_CLASS;
+}
+
+/** Build a line-anchored pattern for one prompt-glyph set. */
+function promptPattern(promptClass: string, suffix: string, flags = ""): RegExp {
+  return new RegExp(`^[${promptClass}]${suffix}`, flags);
+}
+
 /** A numbered option line (`❯ 1. Yes`, `› 2. No`): a prompt selection, never staged input. */
-export const COMPOSER_SELECTION_PATTERN = new RegExp(`^${promptChar}\\s*\\d+\\.\\s`);
+export const COMPOSER_SELECTION_PATTERN = promptPattern(COMPOSER_PROMPT_CLASS, "\\s*\\d+\\.\\s");
 /** Same selection shape, matched line-wise across a multi-line scan window. */
-export const COMPOSER_SELECTION_SCAN_PATTERN = new RegExp(`^${promptChar}\\s*\\d+\\.\\s`, "m");
+export const COMPOSER_SELECTION_SCAN_PATTERN = promptPattern(COMPOSER_PROMPT_CLASS, "\\s*\\d+\\.\\s", "m");
+/**
+ * The broader numbered-option exclusion the staged-input checks always had:
+ * number plus dot, with or without a space (`❯ 1.Yes` is still a selector). A
+ * compact option must never be confirmed or healed as staged text.
+ */
+export function composerSelectionPrefixPattern(promptClass: string = COMPOSER_PROMPT_CLASS): RegExp {
+  return promptPattern(promptClass, "\\s*\\d+\\.");
+}
 /** Empty composer: prompt glyph, optional whitespace, end of line. */
-export const COMPOSER_EMPTY_PATTERN = new RegExp(`^${promptChar}\\s*$`);
+export const COMPOSER_EMPTY_PATTERN = promptPattern(COMPOSER_PROMPT_CLASS, "\\s*$");
 /** Codex renders a fixed placeholder in its empty composer. */
 export const COMPOSER_EMPTY_CODEX_PLACEHOLDER_PATTERN = /^›\s+Ask Codex to do anything\s*$/;
 /** Draft present: prompt glyph followed by non-whitespace text. */
-export const COMPOSER_DRAFT_PATTERN = new RegExp(`^${promptChar}\\s+\\S`);
-/** True when a line begins with a composer prompt glyph. */
-export const COMPOSER_PROMPT_LINE_PATTERN = new RegExp(`^${promptChar}`);
+export const COMPOSER_DRAFT_PATTERN = promptPattern(COMPOSER_PROMPT_CLASS, "\\s+\\S");
+/** True when a line begins with any composer prompt glyph (union default). */
+export const COMPOSER_PROMPT_LINE_PATTERN = promptPattern(COMPOSER_PROMPT_CLASS, "");
 
 /**
  * Index of the last composer prompt line in a capture, or -1 when the capture
  * carries none. Only the last one can be the current input; everything above it
  * is transcript history and a bare Enter there could drive an old prompt.
+ * `promptClass` scopes the glyphs to a known runtime; the union is the default
+ * for callers that have no runtime (the advisory classifier and CLI detector).
  */
-export function findComposerInputLineIndex(lines: string[]): number {
+export function findComposerInputLineIndex(lines: string[], promptClass: string = COMPOSER_PROMPT_CLASS): number {
+  const pattern = promptPattern(promptClass, "");
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (COMPOSER_PROMPT_LINE_PATTERN.test(lines[i]!.trimStart())) return i;
+    if (pattern.test(lines[i]!.trimStart())) return i;
   }
   return -1;
 }
 
 /** Strip a leading prompt glyph from a composer line. */
-export function stripComposerPromptGlyph(line: string): string {
-  return line.replace(COMPOSER_PROMPT_LINE_PATTERN, "");
+export function stripComposerPromptGlyph(line: string, promptClass: string = COMPOSER_PROMPT_CLASS): string {
+  return line.replace(promptPattern(promptClass, ""), "");
 }

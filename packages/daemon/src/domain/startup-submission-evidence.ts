@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
-import { COMPOSER_SELECTION_PATTERN, findComposerInputLineIndex } from "./composer-prompts.js";
+import {
+  composerPromptClassForRuntime,
+  composerSelectionPrefixPattern,
+  findComposerInputLineIndex,
+} from "./composer-prompts.js";
 
 const normalize = (text: string): string => text.replace(/\s+/g, "");
 // Claude 2.1.289 briefly replaces its mode bar after a bracketed paste.
@@ -10,9 +14,10 @@ const isComposerFooter = (line: string): boolean => /(?:shift\+tab to cycle|\? f
 const QUEUED_PLACEHOLDER = normalize("Press up to edit queued messages");
 
 /** The same composer region used by the startup Enter guard. No transcript fallback. */
-function composerRegion(pane: string | null) {
+function composerRegion(pane: string | null, runtime: string | null = null) {
+  const promptClass = composerPromptClassForRuntime(runtime);
   const lines = (pane ?? "").split("\n");
-  const inputAt = findComposerInputLineIndex(lines);
+  const inputAt = findComposerInputLineIndex(lines, promptClass);
   let end = -1;
   if (inputAt >= 0) {
     // Prompt text can itself contain rules (the startup challenge does).
@@ -24,15 +29,15 @@ function composerRegion(pane: string | null) {
       }
     }
   }
-  const body = inputAt < 0 || end < 0 || COMPOSER_SELECTION_PATTERN.test(lines[inputAt]!.trimStart())
+  const body = inputAt < 0 || end < 0 || composerSelectionPrefixPattern(promptClass).test(lines[inputAt]!.trimStart())
     ? null : normalize(lines.slice(inputAt, end).join("\n").trimStart().slice(1));
   return { body, markerLine: inputAt < 0 ? null : inputAt + 1,
     closingRuleLine: end < 0 ? null : end + 1, capturedLines: pane === null ? 0 : lines.length };
 }
 
 /** An echoed turn or a partial/opaque composer stays unverified. */
-export function inspectStartupStagedText(pane: string | null, expected: string): "staged" | "clear" | "unverified" {
-  const { body } = composerRegion(pane);
+export function inspectStartupStagedText(pane: string | null, expected: string, runtime: string | null = null): "staged" | "clear" | "unverified" {
+  const { body } = composerRegion(pane, runtime);
   if (body === null) return "unverified";
   if (!body) return "clear";
   if (body === normalize(expected)) return "staged";
@@ -82,9 +87,9 @@ export interface StartupSubmissionDiagnostic {
 /** No excerpts: every startup source accepts arbitrary, potentially credential-bearing text.
  * Fixed-size metadata per capture (at most three per send), never a pane/prompt dump.
  * Diagnostics must not turn a delivery decision into a failure. */
-export function startupSubmissionEvidence(pane: string | null, expected: string, captureScrollbackLines: number): StartupSubmissionEvidence | undefined {
+export function startupSubmissionEvidence(pane: string | null, expected: string, captureScrollbackLines: number, runtime: string | null = null): StartupSubmissionEvidence | undefined {
   try {
-    const { body, ...positions } = composerRegion(pane);
+    const { body, ...positions } = composerRegion(pane, runtime);
     const expectedBytes = Buffer.from(normalize(expected));
     const observedBytes = body === null ? null : Buffer.from(body);
     const digest = (bytes: Buffer) => ({ bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") });

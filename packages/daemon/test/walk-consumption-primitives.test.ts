@@ -110,6 +110,27 @@ describe("SessionTransport submitOnly — the guarded bare-Enter retry", () => {
     expect(sendKeys).not.toHaveBeenCalled();                       // the Enter never lands
   });
 
+  // Review round (mvschwarz on #635): the shared selection pattern requires a space after the
+  // dot, but the staged-input checks always excluded the broad prefix. A compact option like
+  // `1.Yes` must still refuse in both modes — zero Enter calls either way.
+  it("REFUSES a compact numbered option in both modes — the space after the dot is not required", async () => {
+    for (const requireFullStagedText of [false, true]) {
+      const sendKeys = vi.fn(async () => ({ ok: true as const }));
+      const transport = makeTransport(mockTmux({
+        sendKeys,
+        capturePaneContent: async () => "Choose an option\n❯ 1.Yes\n────────────\nshift+tab to cycle\n",
+      }));
+      const res = await transport.send("dev-impl@my-rig", "", {
+        submitOnly: true,
+        expectedStagedText: "1.Yes",
+        requireFullStagedText,
+      });
+      expect(res.ok).toBe(false);
+      expect(res.reason).toBe("staged_mismatch");
+      expect(sendKeys).not.toHaveBeenCalled();
+    }
+  });
+
   it("a bare placeholder with a matching size but NO literal residual REFUSES — size similarity is not identity (round-4 contract; supersedes the R1/R2 acceptance)", async () => {
     const sendKeys = vi.fn(async () => ({ ok: true as const }));
     const transport = makeTransport(mockTmux({
