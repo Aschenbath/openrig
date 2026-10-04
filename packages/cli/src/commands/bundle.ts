@@ -14,7 +14,7 @@ import { readDeclaredConfigurations, authoredMapping, resolveConfiguration, list
  * Function-level read on purpose: module-level constants would mask test
  * isolation per the audit-every-layer discipline.
  */
-function getCliVersion(): string {
+export function getCliVersion(): string {
   try {
     const here = fileURLToPath(import.meta.url);
     const pkgPath = nodePath.join(nodePath.dirname(here), "..", "..", "package.json");
