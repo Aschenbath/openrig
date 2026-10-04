@@ -82,13 +82,13 @@ type StartupDeliveryInput = StartupInput & {
   lastSubmissionConfirmed?: boolean;
 };
 
-export type StartupResult =
+export type StartupResult = { warnings?: string[] } & (
   | { ok: true; startupStatus: "ready"; continuityOutcome: "resumed" | "fresh" | "forked" | "rebuilt"; submission?: { status: "unverified" | "staged"; reasons: string[]; warning?: string; diagnostics?: StartupSubmissionDiagnostic[] } }
   // `evidence` carries the last-N pane lines for `attention_required`
   // outcomes so restore-orchestrator's per-node mapping can populate
   // `attentionEvidence` on the RestoreNodeResult. Internal type only;
   // not persisted on the failure event.
-  | { ok: false; startupStatus: "attention_required" | "failed"; errors: string[]; evidence?: string };
+  | { ok: false; startupStatus: "attention_required" | "failed"; errors: string[]; evidence?: string });
 
 interface StartupOrchestratorDeps {
   db: Database.Database;
@@ -155,9 +155,15 @@ export class StartupOrchestrator {
   private readFile: (path: string) => string;
 
   async startNode(input: StartupInput): Promise<StartupResult> {
+    const warnings: string[] = [];
+    const result = await this.startNodeWithWarnings(input, warnings);
+    return { ...result, ...(warnings.length ? { warnings: [...new Set(warnings)] } : {}) };
+  }
+
+  private async startNodeWithWarnings(input: StartupInput, warnings: string[]): Promise<StartupResult> {
     const guard = this.tmuxAdapter.deliveryGuard;
     if (guard && !guard.ownsLifecycle(input.nodeId)) {
-      return guard.lifecycle([input.nodeId], () => this.startNode(input));
+      return guard.lifecycle([input.nodeId], () => this.startNodeWithWarnings(input, warnings));
     }
     try {
       input = { ...input, binding: new NativePermissionStore(this.db).apply(input.binding, input.adapter.runtime) };
@@ -197,6 +203,7 @@ export class StartupOrchestrator {
     let projectionResult: ProjectionResult;
     try {
       projectionResult = await input.adapter.project(input.plan, input.binding);
+      warnings.push(...(projectionResult.warnings ?? []));
       if (projectionResult.failed.length > 0) {
         for (const f of projectionResult.failed) {
           errors.push(`Projection failed for ${f.effectiveId}: ${f.error}`);
@@ -237,6 +244,7 @@ export class StartupOrchestrator {
     // Always call even with empty list so adapters can provision runtime-specific config (e.g. context collectors)
     try {
       const deliveryResult = await input.adapter.deliverStartup(preLaunchFiles, input.binding);
+      warnings.push(...(deliveryResult.warnings ?? []));
       if (deliveryResult.failed.length > 0) {
         for (const f of deliveryResult.failed) {
           errors.push(`Pre-launch file delivery failed: ${f.path}: ${f.error}`);
@@ -435,6 +443,7 @@ export class StartupOrchestrator {
     if (postLaunchFiles.length > 0) {
       try {
         const deliveryResult = await input.adapter.deliverStartup(postLaunchFiles, input.binding);
+        warnings.push(...(deliveryResult.warnings ?? []));
         if (deliveryResult.failed.length > 0) {
           for (const f of deliveryResult.failed) {
             errors.push(`Post-launch file delivery failed: ${f.path}: ${f.error}`);
