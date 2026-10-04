@@ -11,7 +11,7 @@ interface TmuxShellCommandOptions {
   stageIfLong?: boolean;
   /** A staged single-executable runner must replace the staging shell. */
   execInScript?: boolean;
-  /** Preserve rc aliases/functions in a POSIX pane shell; other shells use /bin/sh. */
+  /** Preserve rc aliases/functions in POSIX or fish panes; other shells use /bin/sh. */
   sourceInPane?: boolean;
 }
 
@@ -655,12 +655,24 @@ export class TmuxAdapter {
 
   private async sendShellCommandUnchecked(target: string, command: string, beforeInput: (() => void) | undefined, options: TmuxShellCommandOptions): Promise<TmuxResult> {
     const commandBytes = Buffer.byteLength(command, "utf8");
-    // The subshell/source syntax is not valid in fish or nu. Unknown/unreadable
-    // panes retain the portable /bin/sh invocation used by ordinary staging.
+    // POSIX shells retain subshell isolation; unknown/unreadable panes use sh.
     const paneShell = options.sourceInPane ? (await this.getPaneCommand(target) ?? "").replace(/^-/, "") : "";
     const sourceInPane = ["bash", "zsh", "sh", "dash", "ksh"].includes(paneShell);
     let path = options.stageIfLong && commandBytes <= 512 ? undefined : this.fileOps.tmpName();
     let invocation = path ? sourceInPane ? `( . ${shellQuote(path)} )` : `/bin/sh ${shellQuote(path)}` : command;
+    if (path && paneShell === "fish") {
+      const quotedPath = shellQuote(path);
+      invocation = `/bin/sh ${quotedPath}`;
+      // Fish single quotes reinterpret POSIX backslashes. Keep those payloads
+      // (and paths) on sh, preserving existing executable launches byte-for-byte.
+      if (!command.includes("\\") && !path.includes("\\")) {
+        // Probe fixed syntax in the pane before sourcing, not the launch's exit
+        // status: even failed cleanup must not turn a later exit into a retry.
+        const sourced = `if eval 'OPENRIG_FISH_ASSIGNMENT_PROBE=1 /bin/sh -c :'; source ${quotedPath}; else; /bin/sh ${quotedPath}; end`;
+        // Repeating the path must not add a refusal for previously valid TMPDIRs.
+        if (Buffer.byteLength(sourced, "utf8") <= 512) invocation = sourced;
+      }
+    }
     if (Buffer.byteLength(invocation, "utf8") > 512) {
       // Pi commands below the canonical tty limit still fit when staging cannot.
       if (options.stageIfLong && commandBytes < 1024) {
