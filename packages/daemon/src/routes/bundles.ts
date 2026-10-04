@@ -31,6 +31,7 @@ import { vendorProjectDir } from "../domain/bundle-carried-project.js";
 import { getDaemonVersion } from "../domain/daemon-version.js";
 import { inspectBundleBehaviour } from "../domain/bundle-behaviour-inspect.js";
 import type { BundleBehaviour } from "../domain/bundle-behaviour.js";
+import { normalizePreconditionsBlock, type BundlePrecondition } from "../domain/bundle-types.js";
 import { assertShippableSubstance } from "../domain/agent-resolver.js";
 
 /**
@@ -476,6 +477,8 @@ function writeInstallAudit(opts: {
  * for the install side to route from.
  */
 interface AuthorBundleCrossPrimitives {
+  warnings?: string[];
+  preconditions?: BundlePrecondition[];
   skills?: string[];
   plugins?: BundlePluginReference[];
   workflowSpecs?: string[];
@@ -555,6 +558,14 @@ function consumeAuthorBundleYaml(sourceRoot: string, staging: string): AuthorBun
   const authorYaml = fs.readFileSync(authorBundlePath, "utf-8");
   const authorParsed = parsePodBundleManifest(authorYaml) as Record<string, unknown>;
   const result: AuthorBundleCrossPrimitives = {};
+  result.preconditions = normalizePreconditionsBlock(authorParsed["preconditions"], reason => {
+    (result.warnings ??= []).push(`Ignored author bundle preconditions: ${reason}; the whole block was omitted.`);
+  });
+  for (const [index, precondition] of (result.preconditions ?? []).entries()) {
+    if (precondition.commands?.some(command => /[;|`<>]|&&|\$\(/.test(command))) {
+      (result.warnings ??= []).push(`preconditions[${index}].commands contains shell operators; retained as data, but a site may omit setup commands that fail its plain-command rule.`);
+    }
+  }
 
   const vendorFile = (declared: string, kindLabel: string): void => {
     if (!isRelativeSafePath(declared)) throw new Error(`author bundle ${kindLabel} path '${declared}' is not safe`);
@@ -806,6 +817,7 @@ bundleRoutes.post("/create", async (c) => {
         // cross-primitive content into staging + carry the fields onto
         // the manifest. computeIntegrity below covers the vendored content.
         const authorPrimitives = consumeAuthorBundleYaml(effectiveRigRoot, tmpStaging);
+        if (authorPrimitives.preconditions) result.manifest.preconditions = authorPrimitives.preconditions;
         if (authorPrimitives.skills) result.manifest.skills = authorPrimitives.skills;
         if (authorPrimitives.plugins) result.manifest.plugins = authorPrimitives.plugins;
         if (authorPrimitives.workflowSpecs) result.manifest.workflowSpecs = authorPrimitives.workflowSpecs;
@@ -830,7 +842,7 @@ bundleRoutes.post("/create", async (c) => {
         assertShippableStagingTree(tmpStaging);
         const archiveHash = await pack(tmpStaging, nodePath.resolve(outputPath));
         eventBus.emit({ type: "bundle.created", bundleName, bundleVersion, archiveHash });
-        const warning = [driftWarning, ...(result.warnings ?? [])].filter(Boolean).join("; ");
+        const warning = [driftWarning, ...(result.warnings ?? []), ...(authorPrimitives.warnings ?? [])].filter(Boolean).join("; ");
         return c.json({ ...bundleBuildIdentity(result.manifest, archiveHash), bundleName, bundleVersion, archiveHash, schemaVersion: 2, agents: result.manifest.agents.length, ...(warning ? { warning } : {}) }, 201);
       } finally {
         fs.rmSync(tmpStaging, { recursive: true, force: true });
@@ -895,8 +907,9 @@ bundleRoutes.post("/create", async (c) => {
       // since the assembler already wrote one without these fields.
       const legacyAuthorPrimitives = consumeAuthorBundleYaml(specDir, tmpStaging);
       const hasLegacyPrimitives = legacyAuthorPrimitives.skills || legacyAuthorPrimitives.plugins ||
-        legacyAuthorPrimitives.workflowSpecs || legacyAuthorPrimitives.contextPacks || legacyAuthorPrimitives.agentImages;
+        legacyAuthorPrimitives.workflowSpecs || legacyAuthorPrimitives.contextPacks || legacyAuthorPrimitives.agentImages || legacyAuthorPrimitives.preconditions;
       if (hasLegacyPrimitives || manifest.assembler) {
+        if (legacyAuthorPrimitives.preconditions) manifest.preconditions = legacyAuthorPrimitives.preconditions;
         if (legacyAuthorPrimitives.skills) manifest.skills = legacyAuthorPrimitives.skills;
         if (legacyAuthorPrimitives.plugins) manifest.plugins = legacyAuthorPrimitives.plugins;
         if (legacyAuthorPrimitives.workflowSpecs) manifest.workflowSpecs = legacyAuthorPrimitives.workflowSpecs;
@@ -913,7 +926,8 @@ bundleRoutes.post("/create", async (c) => {
       assertShippableStagingTree(tmpStaging);
       const archiveHash = await pack(tmpStaging, nodePath.resolve(outputPath));
       eventBus.emit({ type: "bundle.created", bundleName, bundleVersion, archiveHash });
-      return c.json({ ...bundleBuildIdentity(manifest, archiveHash), bundleName, bundleVersion, archiveHash, packages: manifest.packages.length, ...(driftWarning ? { warning: driftWarning } : {}) }, 201);
+      const warning = [driftWarning, ...(legacyAuthorPrimitives.warnings ?? [])].filter(Boolean).join("; ");
+      return c.json({ ...bundleBuildIdentity(manifest, archiveHash), bundleName, bundleVersion, archiveHash, packages: manifest.packages.length, ...(warning ? { warning } : {}) }, 201);
     } finally {
       fs.rmSync(tmpStaging, { recursive: true, force: true });
     }
@@ -1020,6 +1034,7 @@ bundleRoutes.post("/inspect", async (c) => {
         // (same single-contract reason as provenance above). v1 already
         // surfaces via the normalizer at the end of this handler.
         compatibility: normalizeCompatibilityBlock(rawParsed["compatibility"]),
+        preconditions: normalizePreconditionsBlock(rawParsed["preconditions"]),
         // Item 6 / Checkpoint 7.5 / QA-20260601 C1 repair: surface the 5
         // cross-primitive blocks normalized to camelCase so /inspect's
         // contract carries the same shape v1's normalizer already

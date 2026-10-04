@@ -49,16 +49,32 @@ describe("before-action bundle view", () => {
     }
     const validate = ajv.getSchema("https://openrig.dev/schemas/bundle-behaviour.v1.json")!;
     const files = new Map([["rig.yaml", "name: demo\nversion: '1'\npods:\n- id: team\n  members:\n  - {id: shell, agent_ref: 'builtin:terminal', profile: none, runtime: terminal, cwd: .}\n"]]);
-    const generated = describeBundleBehaviour({ files, manifest: { schema_version: 2, rig_spec: "rig.yaml" }, generator: { openrigVersion: "0.6.6" }, digestValid: false, filesVerified: false });
+    const generated = describeBundleBehaviour({ files, manifest: { schema_version: 2, rig_spec: "rig.yaml", preconditions: [{ name: "Prepare the source clone", commands: ["cd openrig", "npm ci", "npm run build"] }] }, generator: { openrigVersion: "0.6.6" }, digestValid: false, filesVerified: false });
     expect(generated.state).toBe("generated");
     for (const record of [generated, view]) {
       expect(validate(record), JSON.stringify(validate.errors)).toBe(true);
     }
     if (generated.state !== "generated") throw new Error(generated.reason);
+    expect(generated.needs).toContainEqual({ kind: "precondition", name: "Prepare the source clone", commands: ["cd openrig", "npm ci", "npm run build"], status: "not_checked", sourceRefs: [{ path: "bundle.yaml", field: "preconditions[0]" }] });
+    const rendered = formatBundleBehaviour(generated).join("\n");
+    expect(rendered).toContain("Prepare the source clone");
+    expect(rendered).toContain("Author setup commands (not run; one shell, in order):\n      cd openrig\n      npm ci\n      npm run build");
     const oldGenerator = structuredClone(generated);
     delete oldGenerator.posture[0]!.permissionPrompts;
     expect(validate(oldGenerator), JSON.stringify(validate.errors)).toBe(true);
     expect(validate({ ...generated, posture: [{ ...generated.posture[0], permissionPrompts: "not-stated" }] })).toBe(false);
+  });
+
+  it("renders a large setup command list without losing the whole view to the argument limit", () => {
+    const files = new Map([["rig.yaml", "name: demo\nversion: '1'\npods:\n- id: team\n  members:\n  - {id: shell, agent_ref: 'builtin:terminal', profile: none, runtime: terminal, cwd: .}\n"]]);
+    const commands = Array.from({ length: 200_000 }, (_, index) => `echo ${index}`);
+    const generated = describeBundleBehaviour({ files, manifest: { schema_version: 2, rig_spec: "rig.yaml", preconditions: [{ name: "Author setup", commands }] }, generator: { openrigVersion: "test" }, digestValid: true, filesVerified: true });
+    expect(generated.state).toBe("generated");
+    const lines = formatBundleBehaviour(generated);
+    const start = lines.indexOf("    Author setup commands (not run; one shell, in order):") + 1;
+    expect(start).toBeGreaterThan(0);
+    expect(lines.slice(start, start + commands.length)).toEqual(commands.map(command => `      ${command}`));
+    expect(lines[start + commands.length]).toBe("Unknown before launch:");
   });
 
   it.each(["rig", "member"])("states declared %s-level yolo plainly for Claude, Codex and Pi", location => {
