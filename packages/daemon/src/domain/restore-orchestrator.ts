@@ -1,3 +1,4 @@
+import { nonInterruptiveNotice, nonInterruptiveSummary } from "../adapters/non-interruptive.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
@@ -219,6 +220,8 @@ export class RestoreOrchestrator {
      * resume-policy seats STOP as `awaiting-decision` instead.
      */
     freshLogicalIds?: string[];
+    /** Explicit rig launch choice; persisted only after restore preconditions pass. */
+    nonInterruptive?: boolean;
     /** Selection evidence from an automatic caller. Direct restore defaults
      * to explicit because its public door names the snapshot id. */
     snapshotSelection?: RestoreSnapshotSelection;
@@ -296,6 +299,8 @@ export class RestoreOrchestrator {
       // DB still reflects original session state (running for stale sessions)
       const preRestoreSnapshot = this.snapshotCapture.captureSnapshot(rigId, "pre_restore");
 
+      if (opts?.nonInterruptive !== undefined) this.rigRepo.setRigNonInterruptive(rigId, opts.nonInterruptive);
+
       // 2b. NOW mark stale sessions as detached (safe: we've captured the
       // pre-restore snapshot and confirmed no live/unknown sessions remain)
       for (const sessionId of classification.stale) {
@@ -352,6 +357,8 @@ export class RestoreOrchestrator {
       // 5. Execute restore with compensating pattern per node
       const nodeResults: RestoreNodeResult[] = [];
       const restoreWarnings: string[] = [...validation.warnings];
+      if (this.rigRepo.getRigNonInterruptive(rigId)) restoreWarnings.push(nonInterruptiveSummary(true));
+      else if (opts?.nonInterruptive === false) restoreWarnings.push(nonInterruptiveSummary(false));
       for (const entry of plan) {
         const result = await this.restoreNodeWithCompensation(entry, rigId, snapshotId, snapshot.data, opts, restoreWarnings);
         nodeResults.push(result);
@@ -1018,7 +1025,7 @@ export class RestoreOrchestrator {
         await this.rollbackToZeroSession(node.id, sessionName, launchResult?.session.id, priorState);
         return { nodeId: node.id, logicalId: node.logicalId, status: "awaiting-decision", error: `Original session unresumable: resume requested but no token available. No session is running. Re-run with --fresh ${node.logicalId} for a deliberate fresh-primed seat, or restore the original session manually.` };
       } else {
-        const resumeOutcome = await this.attemptResume(node.id, sessionName, resumeType, resumeToken, node.cwd ?? "/", node.codexConfigProfile, node.model, this.resolveRestorePosture(node.id, rigId), node.effort);
+        const resumeOutcome = await this.attemptResume(node.id, sessionName, resumeType, resumeToken, node.cwd ?? "/", node.codexConfigProfile, node.model, this.resolveRestorePosture(node.id, rigId), node.effort, warnings);
         if (resumeOutcome.kind === "resumed") {
           baseStatus = "resumed";
         } else if (resumeOutcome.kind === "attention_required") {
@@ -1462,6 +1469,7 @@ export class RestoreOrchestrator {
     // custom policies re-validated when readable). Absent = env decision.
     resolvedPosture?: "floor" | "full_bypass" | "auto",
     effort?: string | null,
+    warnings?: string[],
   ): Promise<
     | { kind: "resumed" }
     | { kind: "retry_fresh" }
@@ -1469,6 +1477,9 @@ export class RestoreOrchestrator {
     | { kind: "attention_required"; message: string; evidence?: string }
   > {
     const launchGeneration = this.sessionRegistry.currentOccupantTenure(nodeId)?.generationUuid;
+    const node = this.db.prepare("SELECT rig_id FROM nodes WHERE id = ?").get(nodeId) as { rig_id: string } | undefined;
+    const nonInterruptive = node ? this.rigRepo.getRigNonInterruptive(node.rig_id) : false;
+    const launchTail: [effort?: string | null, nonInterruptive?: boolean] = nonInterruptive ? [effort, true] : effort !== undefined ? [effort] : [];
     let permissionMode: string | undefined;
     try {
       const runtime = this.claudeResume.canResume(resumeType, resumeToken) ? "claude-code"
@@ -1480,8 +1491,10 @@ export class RestoreOrchestrator {
       permissionMode = override.permissionMode ?? (resolvedPosture === "auto" && runtime === "claude-code" ? "auto" : undefined);
     } catch (error) { return { kind: "failed", message: `Permission selection: ${(error as Error).message}` }; }
     if (this.claudeResume.canResume(resumeType, resumeToken)) {
-      const result = await this.claudeResume.resume(sessionName, resumeType, resumeToken, cwd, resolvedPosture, model, permissionMode, nodeId, ...(effort !== undefined ? [effort] : []));
+      const result = await this.claudeResume.resume(sessionName, resumeType, resumeToken, cwd, resolvedPosture, model, permissionMode, nodeId, ...launchTail);
       if (result.ok) {
+        const notice = nonInterruptiveNotice("claude-code", { nonInterruptive, launchPosture: resolvedPosture, permissionMode });
+        if (notice) warnings?.push(`${sessionName}: ${notice}`);
         if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
         return { kind: "resumed" };
       }
@@ -1498,8 +1511,10 @@ export class RestoreOrchestrator {
     }
 
     if (this.codexResume.canResume(resumeType, resumeToken)) {
-      const result = await this.codexResume.resume(sessionName, resumeType, resumeToken, cwd, codexConfigProfile, resolvedPosture, model, ...(effort !== undefined ? [effort] : []));
+      const result = await this.codexResume.resume(sessionName, resumeType, resumeToken, cwd, codexConfigProfile, resolvedPosture, model, ...launchTail);
       if (result.ok) {
+        const notice = nonInterruptiveNotice("codex", { nonInterruptive, launchPosture: resolvedPosture, permissionMode });
+        if (notice) warnings?.push(`${sessionName}: ${notice}`);
         if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
         return { kind: "resumed" };
       }
