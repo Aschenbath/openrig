@@ -59,12 +59,13 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
     .option("--bundle-version <ver>", "Bundle version", "0.1.0")
     .option("--include-packages <refs...>", "Package refs to include (default: all from spec)")
     .option("--rig-root <root>", "Root directory for pod-aware resolution")
+    .option("--context-pack <dir>", "Carry the context pack in <dir> (its manifest.yaml and declared files), which may sit outside the rig folder; repeatable", (dir: string, dirs: string[]) => [...dirs, dir], [] as string[])
     .option("--notes <text>", "Operator notes captured in bundle provenance metadata")
     .option("--min-daemon-version <ver>", "Minimum daemon version required to install this bundle (Item 2 compatibility)")
     .option("--min-cli-version <ver>", "Minimum CLI version required to install this bundle (Item 2 compatibility)")
     .option("--allow-drift", "Bundle a spec that disagrees with the running rig of the same name; the divergence is stamped into bundle provenance")
     .option("--json", "JSON output")
-    .action(async (spec: string, opts: { output: string; name: string; bundleVersion: string; includePackages?: string[]; rigRoot?: string; notes?: string; minDaemonVersion?: string; minCliVersion?: string; allowDrift?: boolean; json?: boolean }) => {
+    .action(async (spec: string, opts: { output: string; name: string; bundleVersion: string; includePackages?: string[]; rigRoot?: string; contextPack?: string[]; notes?: string; minDaemonVersion?: string; minCliVersion?: string; allowDrift?: boolean; json?: boolean }) => {
       const deps = getDepsF();
       const client = await getClient(deps);
       if (!client) { process.exitCode = 1; return; }
@@ -91,6 +92,7 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
         specPath: nodePath.resolve(spec), bundleName: opts.name, bundleVersion: opts.bundleVersion, outputPath: nodePath.resolve(opts.output),
         includePackages: opts.includePackages,
         rigRoot: opts.rigRoot ? nodePath.resolve(opts.rigRoot) : undefined,
+        ...(opts.contextPack?.length ? { contextPackDirs: opts.contextPack.map((dir) => nodePath.resolve(dir)) } : {}),
         provenance: buildClientProvenance(opts.notes),
         ...(hasCompatibility ? { compatibility } : {}),
         ...(opts.allowDrift ? { allowDrift: true } : {}),
@@ -258,11 +260,13 @@ const ROUTING_LABELS: Array<[string, string]> = [
 export function bundleRoutingSummary(data: Record<string, unknown>): string[] {
   const lines: string[] = [];
   for (const [key, label] of ROUTING_LABELS) {
-    const routing = data[key] as { routedCount?: number; records?: Array<{ declaredPath?: string; id?: string; status?: string }> } | undefined;
+    const routing = data[key] as { routedCount?: number; records?: Array<{ declaredPath?: string; id?: string; status?: string; detail?: string }> } | undefined;
     if (!routing || typeof routing.routedCount !== "number") continue;
     const rejected = (routing.records ?? []).filter((r) => r.status !== "routed");
     const detail = rejected.length > 0 ? `; not routed: ${rejected.map((r) => `${r.declaredPath ?? r.id ?? "?"} (${r.status ?? "?"})`).join(", ")}` : "";
     lines.push(`${label}: ${routing.routedCount} routed${detail}`);
+    // Each entry's own explanation, which can carry the command that resolves it
+    for (const r of rejected) if (r.detail) lines.push(`  ${r.declaredPath ?? r.id ?? "?"}: ${r.detail}`);
   }
   return lines;
 }
