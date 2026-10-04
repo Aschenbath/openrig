@@ -764,6 +764,54 @@ describe("Bundle types", () => {
     const normalized = normalizeBundleManifest(parsed);
     expect(normalized.agentImages).toBeUndefined();
   });
+
+  // -- project block tests (v1 must enforce the same containment as the pod-aware validator) --
+  // A bundle's project.id is joined onto workspace.projects_root and its project.path onto the
+  // extracted bundle root, so an escaping value is an arbitrary-directory write/read. The
+  // pod-aware (v2) validator already rejects these; the legacy (v1) validator must too.
+
+  it("missing project block passes validation (backward compat)", () => {
+    const raw = { ...VALID_RAW };
+    const result = validateBundleManifest(raw);
+    expect(result.valid).toBe(true);
+  });
+
+  it("project block with a simple id and a safe relative path passes validation", () => {
+    const raw = { ...VALID_RAW, project: { id: "openrig", path: "project" } };
+    const result = validateBundleManifest(raw);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toHaveLength(0);
+  });
+
+  it("project present but not an object rejected", () => {
+    const raw = { ...VALID_RAW, project: "project" };
+    const result = validateBundleManifest(raw);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("project must be an object"))).toBe(true);
+  });
+
+  it("project.id that escapes the projects root rejected", () => {
+    const raw = { ...VALID_RAW, project: { id: "../../../tmp/pwned", path: "project" } };
+    const result = validateBundleManifest(raw);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("project.id"))).toBe(true);
+  });
+
+  it("project.path that escapes the bundle root rejected", () => {
+    const raw = { ...VALID_RAW, project: { id: "openrig", path: "../../outside" } };
+    const result = validateBundleManifest(raw);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("project.path"))).toBe(true);
+  });
+
+  it("project.path that is absolute or backslash-separated rejected", () => {
+    const absolute = validateBundleManifest({ ...VALID_RAW, project: { id: "openrig", path: "/etc" } });
+    expect(absolute.valid).toBe(false);
+    expect(absolute.errors.some((e) => e.includes("project.path"))).toBe(true);
+    const backslash = validateBundleManifest({ ...VALID_RAW, project: { id: "openrig", path: "a\\b" } });
+    expect(backslash.valid).toBe(false);
+    expect(backslash.errors.some((e) => e.includes("project.path"))).toBe(true);
+  });
 });
 
 describe("isRelativeSafePath", () => {

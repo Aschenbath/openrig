@@ -658,6 +658,11 @@ export function validateLegacyBundleManifest(
   validateWorkflowSpecsBlock(m["workflow_specs"], errors);
   validateContextPacksBlock(m["context_packs"], errors);
   validateAgentImagesBlock(m["agent_images"], errors);
+  // A bundle's project block is read on install by routeBundleContents, which joins project.id
+  // onto workspace.projects_root and project.path onto the extracted bundle root. The pod-aware
+  // (v2) validator already enforces containment here; the legacy (v1) validator must too, or a v1
+  // bundle can escape the projects root (write) or the bundle root (read).
+  validateProjectBlock(m["project"], errors);
 
   return { valid: errors.length === 0, errors };
 }
