@@ -8,7 +8,7 @@ this through their terminal or through the Mission Control UI.
 Use the identity from your first orientation turn. If it has not been
 verified yet, recover it before introducing yourself. In Claude Code, if
 this is a new turn, invoke the native Skill tool again with
-`skill: "openrig-core:openrig-skills"` before `rig whoami --json` in that
+`skill: "openrig-skills"` before `rig whoami --json` in that
 same turn. Respect the permission boundary described in your role; the
 previous turn's invocation does not carry forward. Other runtimes use
 their ordinary identity flow.

@@ -9,7 +9,7 @@ hand off.
 ## First orientation
 
 In Claude Code, invoke the native Skill tool with
-`skill: "openrig-core:openrig-skills"` before running `rig whoami --json`
+`skill: "openrig-skills"` before running `rig whoami --json`
 in the same turn. This loads the installed OpenRig index for orientation;
 reading its file or mentioning its name is not a Skill invocation.
 

@@ -745,8 +745,8 @@ describe("StartupOrchestrator", () => {
     const firstPrompt = vi.mocked(tmux.sendText).mock.calls[0][1];
     expect(firstPrompt).toContain(makeIdentityAction().value);
     expect(firstPrompt).toContain("In Claude Code, invoke the native Skill tool");
-    expect(firstPrompt).toContain('skill: "openrig-core:openrig-skills"');
-    expect(firstPrompt.indexOf('skill: "openrig-core:openrig-skills"')).toBeLessThan(firstPrompt.indexOf("rig whoami --json"));
+    expect(firstPrompt).toContain('skill: "openrig-skills"');
+    expect(firstPrompt.indexOf('skill: "openrig-skills"')).toBeLessThan(firstPrompt.indexOf("rig whoami --json"));
     expect(firstPrompt).toContain("in the same turn");
     expect(firstPrompt).toContain("explicit ask/deny rules and managed restrictions");
     // Context is a later message. It must retain the same-turn invocation rule,
@@ -755,6 +755,7 @@ describe("StartupOrchestrator", () => {
     expect(later.map(f => f.path)).toEqual(["startup/context.md"]);
     const context = readFile(later[0].absolutePath);
     expect(context).toContain("invoke the native Skill tool again");
+    expect(context).toContain('skill: "openrig-skills"');
     expect(context.indexOf("invoke the native Skill tool again")).toBeLessThan(context.indexOf("rig whoami --json"));
     // This checks delivered instructions, not native Skill execution or permission effects.
   });
