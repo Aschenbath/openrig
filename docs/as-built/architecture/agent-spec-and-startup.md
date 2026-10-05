@@ -126,7 +126,8 @@ select the startup proof (`:210`) → project resources (`:224`) → deliver
 pre-launch files (`:266`) → persist startup context (`:282`) → launch harness,
 recording any resume token (`:301`, `:313`) → wait for ready (`:384`) → deliver
 the session identity prompt and interactive files (`:420`, `:473`) → execute
-`after_files` then `after_ready` actions (`:495`, `:502`) → check readiness
+`after_files` then the remaining `after_ready` actions (`:495`, `:502`; see
+the resume preload below) → check readiness
 again and, for a Claude resume, that the launched session agrees with the
 requested token (`:507`–`535`) → mark ready (`:538`). The class doc comment
 (`startup-orchestrator.ts:120`–`139`) lists ten steps; the code persists the
@@ -183,8 +184,10 @@ after the startup prompt was confirmed submitted (`sendProofInstruction`,
 hook route (`routes/activity.ts:239`); `verifyStartupProof`
 (`startup-proof.ts:133`) records `node.startup_proof_verified` or
 `node.startup_proof_rejected`. Orientation status is derived from those events
-(`startup-proof.ts:239`), never from `startup_status`. Other launches record
-`node.startup_proof_skipped`.
+(`startup-proof.ts:239`), never from `startup_status`. Other fresh launches (no
+proof selected, or a terminal runtime) record `node.startup_proof_skipped`
+(`startup-orchestrator.ts:374`); resume, fork and rebuild keep the existing proof
+history.
 
 **Fresh context pending and `rig seat continue`.** When a fresh launch stops at
 a native prompt before its context is delivered, `fail()` (`:592`) marks the
