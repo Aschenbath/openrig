@@ -751,7 +751,10 @@ describe("StartupOrchestrator", () => {
     expect(firstPrompt).toContain("explicit ask/deny rules and managed restrictions");
     // Context is a later message. It must retain the same-turn invocation rule,
     // rather than relying on the previous turn's skill grant.
-    const later = deliverStartup.mock.calls[0][0];
+    // The adapter first provisions pre-launch files, even when that list is empty.
+    expect(deliverStartup).toHaveBeenCalledTimes(2);
+    expect(deliverStartup.mock.calls[0][0]).toEqual([]);
+    const later = deliverStartup.mock.calls[1][0];
     expect(later.map(f => f.path)).toEqual(["startup/context.md"]);
     const context = readFile(later[0].absolutePath);
     expect(context).toContain("invoke the native Skill tool again");
