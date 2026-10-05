@@ -41,7 +41,7 @@ import { codexDaemonSupportProbe } from "./domain/codex-daemon-support.js";
 import { codexNetworkDefaultReader } from "./domain/codex-network-default.js";
 import { PiResumeAdapter } from "./adapters/pi-resume.js";
 import { OmpResumeAdapter } from "./adapters/omp-resume.js";
-import { OMP_PROVIDER_ENV_VARS } from "./adapters/pi-runner-protocol.js";
+import { OMP_PROVIDER_ENV_VARS, OMP_PROVIDER_EXTRA_ENV_VARS } from "./adapters/pi-runner-protocol.js";
 import { RigSpecExporter } from "./domain/rigspec-exporter.js";
 import { PodRepository } from "./domain/pod-repository.js";
 import { RigSpecPreflight } from "./domain/rigspec-preflight.js";
@@ -250,8 +250,15 @@ const KNOWN_PROVIDER_AUTH_ENV = new Set([
 // every other runtime keeps KNOWN_PROVIDER_AUTH_ENV above. Double opt-in is
 // unchanged: the operator names each var, and the runner forwards only the
 // declared provider's var.
+// A provider whose key is scoped to one endpoint (a self-hosted LiteLLM proxy)
+// contributes its base-URL variable too: admitting the key alone would hand the
+// seat an unusable credential, so the pair travels together — the same pairing
+// KNOWN_PROVIDER_AUTH_ENV makes for ANTHROPIC_BASE_URL / OPENAI_BASE_URL.
 const OMP_PROVIDER_AUTH_ENV: Record<string, true> = Object.fromEntries(
-  Object.values(OMP_PROVIDER_ENV_VARS).map((name) => [name, true as const]),
+  [
+    ...Object.values(OMP_PROVIDER_ENV_VARS),
+    ...Object.values(OMP_PROVIDER_EXTRA_ENV_VARS).flat(),
+  ].map((name) => [name, true as const]),
 );
 
 export function collectAllowlistedProviderAuthEnv(
