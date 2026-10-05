@@ -292,7 +292,10 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       }
       const cmd = managed ? managed.command(["--permission-mode", binding.permissionMode!, ...nonInterruptiveArgs(this.runtime, binding), ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []),
         "--resume", parentId, "--fork-session", "--name", opts.name])
-        : `${rendererPrefix}claude ${permissionMode}${modelArg}${effortArg} --resume ${parentId} --fork-session --name ${opts.name}`;
+        // The non-managed command text is parsed by the pane shell, so the
+        // parent id needs the same quoting as --model/--effort above (and as
+        // the codex fork path) — a hostile id must not leave --resume.
+        : `${rendererPrefix}claude ${permissionMode}${modelArg}${effortArg} --resume ${shellQuote(parentId)} --fork-session --name ${opts.name}`;
       const textResult = managed ? await this.tmux.sendShellCommand(binding.tmuxSession, cmd, managed.assertCurrent)
         : this.seatLaunchEnvironment
           ? await this.tmux.sendShellCommand(binding.tmuxSession, await this.seatLaunchEnvironment.command(binding.tmuxSession, cmd, { nodeId: binding.nodeId, generation: binding.launchGeneration, runtime: this.runtime }), undefined, { sourceInPane: true })
