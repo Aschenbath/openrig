@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { inspectStartupStagedText, startupSubmissionEvidence, type StartupSubmissionEvidence } from "./startup-submission-evidence.js";
 import {
   composerPromptClassForRuntime,
+  composerPromptIsAmbiguous,
   composerSelectionPrefixPattern,
   COMPOSER_DRAFT_PATTERN,
   COMPOSER_EMPTY_CODEX_PLACEHOLDER_PATTERN as CODEX_EMPTY_COMPOSER_PATTERN,
@@ -600,6 +601,9 @@ export function hasExpectedStagedText(pane: string | null, expected: string, run
   const currentInputAt = findComposerInputLineIndex(paneLines, promptClass);
   let stagedEvidence = false;
   if (currentInputAt >= 0) {
+    // Unknown runtime: a composer block that mixes glyph kinds has no runtime to
+    // say which line is live, so fail closed exactly as the pre-union check did.
+    if (composerPromptIsAmbiguous(paneLines, currentInputAt, promptClass)) return false;
     const inputLine = paneLines[currentInputAt]!.trimStart();
     // The region is the last composer-marker line through the input box's closing separator
     // (a box-drawing line) or pane end — wrapped input continues below the marker; everything
@@ -1351,7 +1355,7 @@ export class SessionTransport {
       const recordMismatch = (pane: string | null): void => {
         if (!opts.requireFullStagedText || !opts.onStartupMismatch) return;
         try {
-          const evidence = startupSubmissionEvidence(pane, expected, opts.submitOnlyCaptureLines ?? 50);
+          const evidence = startupSubmissionEvidence(pane, expected, opts.submitOnlyCaptureLines ?? 50, runtime);
           if (evidence) opts.onStartupMismatch(evidence);
         } catch { /* Observation has no delivery authority. */ }
       };

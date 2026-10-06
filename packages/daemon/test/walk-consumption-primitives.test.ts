@@ -131,6 +131,32 @@ describe("SessionTransport submitOnly — the guarded bare-Enter retry", () => {
     }
   });
 
+  // Review round 2 (mvschwarz on #635): with no runtime there is no way to say
+  // which mixed-glyph line is the live composer. The union read must fail
+  // closed exactly as the pre-shared-matcher check did, in both modes.
+  it("unknown-runtime full-match refuses a mixed-glyph block with zero Enter calls", async () => {
+    const rig = rigRepo.createRig("unknown-runtime-rig");
+    const node = rigRepo.addNode(rig.id, "dev.impl", { role: "worker" });
+    const session = sessionRegistry.registerSession(node.id, "dev-impl@unknown-runtime-rig");
+    sessionRegistry.updateStatus(session.id, "running");
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "dev-impl@unknown-runtime-rig" });
+    const sendKeys = vi.fn(async () => ({ ok: true as const }));
+    const transport = makeTransport(mockTmux({
+      sendKeys,
+      capturePaneContent: async () => "❯ unrelated first line\n› expected text\n────────────\nshift+tab to cycle\n",
+    }));
+    for (const requireFullStagedText of [false, true]) {
+      const res = await transport.send("dev-impl@unknown-runtime-rig", "", {
+        submitOnly: true,
+        expectedStagedText: "expected text",
+        requireFullStagedText,
+      });
+      expect(res.ok).toBe(false);
+      expect(res.reason).toBe("staged_mismatch");
+    }
+    expect(sendKeys).not.toHaveBeenCalled();
+  });
+
   it("a bare placeholder with a matching size but NO literal residual REFUSES — size similarity is not identity (round-4 contract; supersedes the R1/R2 acceptance)", async () => {
     const sendKeys = vi.fn(async () => ({ ok: true as const }));
     const transport = makeTransport(mockTmux({

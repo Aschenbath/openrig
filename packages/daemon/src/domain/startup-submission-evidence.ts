@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   composerPromptClassForRuntime,
+  composerPromptIsAmbiguous,
   composerSelectionPrefixPattern,
   findComposerInputLineIndex,
 } from "./composer-prompts.js";
@@ -29,7 +30,8 @@ function composerRegion(pane: string | null, runtime: string | null = null) {
       }
     }
   }
-  const body = inputAt < 0 || end < 0 || composerSelectionPrefixPattern(promptClass).test(lines[inputAt]!.trimStart())
+  const body = inputAt < 0 || end < 0 || composerPromptIsAmbiguous(lines, inputAt, promptClass)
+    || composerSelectionPrefixPattern(promptClass).test(lines[inputAt]!.trimStart())
     ? null : normalize(lines.slice(inputAt, end).join("\n").trimStart().slice(1));
   return { body, markerLine: inputAt < 0 ? null : inputAt + 1,
     closingRuleLine: end < 0 ? null : end + 1, capturedLines: pane === null ? 0 : lines.length };

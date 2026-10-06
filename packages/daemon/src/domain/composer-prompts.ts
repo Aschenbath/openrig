@@ -75,3 +75,33 @@ export function findComposerInputLineIndex(lines: string[], promptClass: string 
 export function stripComposerPromptGlyph(line: string, promptClass: string = COMPOSER_PROMPT_CLASS): string {
   return line.replace(promptPattern(promptClass, ""), "");
 }
+
+/**
+ * Distinct prompt glyphs in the contiguous draft block that ends at
+ * `inputIndex`: walk upward until a blank line or a box rule. Only the glyph
+ * kinds matter; output text is traversed harmlessly.
+ */
+export function composerGlyphKindsInBlock(lines: string[], inputIndex: number): Set<string> {
+  const kinds = new Set<string>();
+  for (let i = inputIndex; i >= 0; i--) {
+    const raw = lines[i]!;
+    if (i < inputIndex) {
+      const trimmed = raw.trim();
+      if (trimmed === "" || /^[─═-]{10,}$/.test(trimmed)) break;
+    }
+    const first = raw.trimStart()[0];
+    if (first !== undefined && (COMPOSER_PROMPT_CHARS as readonly string[]).includes(first)) kinds.add(first);
+  }
+  return kinds;
+}
+
+/**
+ * True when an unknown-runtime read of this composer block is ambiguous: the
+ * block holds more than one prompt glyph kind, so there is no runtime to say
+ * which line is the live input. A caller must keep the union for unknown
+ * runtimes but fail closed here, exactly as the pre-shared-matcher check did.
+ */
+export function composerPromptIsAmbiguous(lines: string[], inputIndex: number, promptClass: string = COMPOSER_PROMPT_CLASS): boolean {
+  if (promptClass !== COMPOSER_PROMPT_CLASS) return false;
+  return composerGlyphKindsInBlock(lines, inputIndex).size > 1;
+}

@@ -365,6 +365,21 @@ describe("shared composer matchers", () => {
 
     expect(inspectStartupStagedText(pane, "1.Yes", "claude-code")).toBe("unverified");
   });
+
+  // Review round 2 (mvschwarz on #635): with no runtime there is no way to say
+  // which mixed-glyph line is the live composer, so the union read must fail
+  // closed exactly as the pre-shared-matcher check did.
+  it("unknown runtime refuses a mixed-glyph composer block", () => {
+    const pane = [
+      "❯ unrelated first line",
+      "› expected text",
+      "────────────",
+      "shift+tab to cycle",
+    ].join("\n");
+
+    expect(hasExpectedStagedText(pane, "expected text")).toBe(false);
+    expect(inspectStartupStagedText(pane, "expected text")).toBe("unverified");
+  });
 });
 
 function setupDb(): Database.Database {
