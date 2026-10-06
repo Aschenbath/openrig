@@ -102,8 +102,10 @@ question through the human channel instead.
      directory.
 6. **Plan, then ask.** Run `rig up <team, copy path or link> --cwd <folder>
    --plan` (for workshop, with its `--target ~/rigs/workshop`) and tell them
-   what will start: how many agents, which providers, in which folder. Launch
-   the same command without `--plan` only after they say yes.
+   what will start: how many agents, which providers, in which folder.
+   Use `applying-a-permission-policy`; if they are unsure, recommend its scoped
+   middle option. Launch the same command without `--plan` after they approve
+   the team launch; permission changes are a separate choice.
 7. **Report readiness honestly.** Read each seat's `startupStatus` in
    `rig ps --nodes --rig <team> --json`: `pending` means still starting, not
    ready; only `ready` is ready; `attention_required` and `failed` need the
