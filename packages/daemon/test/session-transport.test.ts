@@ -82,6 +82,18 @@ describe("agent pane activity classifier", () => {
     expect(result.reason).toBe("idle_prompt");
   });
 
+  it("classifies an idle Codex 0.153 `»` composer placeholder as agent_idle", () => {
+    const result = classifyPaneActivity([
+      "  Tip: You can resume a previous conversation by running codex resume",
+      "» Ask Codex to do anything",
+      "  GPT-5.5 medium · ~/code/projects/openrig · Verify assigned outcome",
+      "  ← for agents · ? for shortcuts                       ⚠ 1 warning · f2 to view",
+    ].join("\n"));
+
+    expect(result.state).toBe("agent_idle");
+    expect(result.reason).toBe("idle_prompt");
+  });
+
   it("keeps a working Codex 0.157 pane with the same placeholder and footer as agent_active", () => {
     const result = classifyPaneActivity([
       "◦ Working (11s • esc to interrupt) · 1 background terminal running · /ps to view",
@@ -370,15 +382,21 @@ describe("shared composer matchers", () => {
   // which mixed-glyph line is the live composer, so the union read must fail
   // closed exactly as the pre-shared-matcher check did.
   it("unknown runtime refuses a mixed-glyph composer block", () => {
-    const pane = [
-      "❯ unrelated first line",
-      "› expected text",
-      "────────────",
-      "shift+tab to cycle",
-    ].join("\n");
+    const separators: string[][] = [[], [""], ["────────────"]];
+    for (const separator of separators) {
+      for (const glyph of ["›", "»"]) {
+        const pane = [
+          "❯ unrelated first line",
+          ...separator,
+          `${glyph} expected text`,
+          "────────────",
+          "shift+tab to cycle",
+        ].join("\n");
 
-    expect(hasExpectedStagedText(pane, "expected text")).toBe(false);
-    expect(inspectStartupStagedText(pane, "expected text")).toBe("unverified");
+        expect(hasExpectedStagedText(pane, "expected text")).toBe(false);
+        expect(inspectStartupStagedText(pane, "expected text")).toBe("unverified");
+      }
+    }
   });
 });
 

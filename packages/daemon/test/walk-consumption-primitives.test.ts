@@ -140,21 +140,33 @@ describe("SessionTransport submitOnly — the guarded bare-Enter retry", () => {
     const session = sessionRegistry.registerSession(node.id, "dev-impl@unknown-runtime-rig");
     sessionRegistry.updateStatus(session.id, "running");
     sessionRegistry.updateBinding(node.id, { tmuxSession: "dev-impl@unknown-runtime-rig" });
-    const sendKeys = vi.fn(async () => ({ ok: true as const }));
-    const transport = makeTransport(mockTmux({
-      sendKeys,
-      capturePaneContent: async () => "❯ unrelated first line\n› expected text\n────────────\nshift+tab to cycle\n",
-    }));
-    for (const requireFullStagedText of [false, true]) {
-      const res = await transport.send("dev-impl@unknown-runtime-rig", "", {
-        submitOnly: true,
-        expectedStagedText: "expected text",
-        requireFullStagedText,
-      });
-      expect(res.ok).toBe(false);
-      expect(res.reason).toBe("staged_mismatch");
+    const separators: string[][] = [[], [""], ["────────────"]];
+    for (const separator of separators) {
+      for (const glyph of ["›", "»"]) {
+        for (const requireFullStagedText of [false, true]) {
+          const sendKeys = vi.fn(async () => ({ ok: true as const }));
+          const transport = makeTransport(mockTmux({
+            sendKeys,
+            capturePaneContent: async () => [
+              "❯ unrelated first line",
+              ...separator,
+              `${glyph} expected text`,
+              "────────────",
+              "shift+tab to cycle",
+              "",
+            ].join("\n"),
+          }));
+          const res = await transport.send("dev-impl@unknown-runtime-rig", "", {
+            submitOnly: true,
+            expectedStagedText: "expected text",
+            requireFullStagedText,
+          });
+          expect(res.ok).toBe(false);
+          expect(res.reason).toBe("staged_mismatch");
+          expect(sendKeys).not.toHaveBeenCalled();
+        }
+      }
     }
-    expect(sendKeys).not.toHaveBeenCalled();
   });
 
   it("a bare placeholder with a matching size but NO literal residual REFUSES — size similarity is not identity (round-4 contract; supersedes the R1/R2 acceptance)", async () => {

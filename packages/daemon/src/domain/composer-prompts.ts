@@ -49,8 +49,8 @@ export function composerSelectionPrefixPattern(promptClass: string = COMPOSER_PR
 }
 /** Empty composer: prompt glyph, optional whitespace, end of line. */
 export const COMPOSER_EMPTY_PATTERN = promptPattern(COMPOSER_PROMPT_CLASS, "\\s*$");
-/** Codex renders a fixed placeholder in its empty composer. */
-export const COMPOSER_EMPTY_CODEX_PLACEHOLDER_PATTERN = /^›\s+Ask Codex to do anything\s*$/;
+/** Codex renders a fixed placeholder in its empty composer (`›` or 0.153's `»`). */
+export const COMPOSER_EMPTY_CODEX_PLACEHOLDER_PATTERN = /^[›»]\s+Ask Codex to do anything\s*$/;
 /** Draft present: prompt glyph followed by non-whitespace text. */
 export const COMPOSER_DRAFT_PATTERN = promptPattern(COMPOSER_PROMPT_CLASS, "\\s+\\S");
 /** True when a line begins with any composer prompt glyph (union default). */
@@ -77,19 +77,15 @@ export function stripComposerPromptGlyph(line: string, promptClass: string = COM
 }
 
 /**
- * Distinct prompt glyphs in the contiguous draft block that ends at
- * `inputIndex`: walk upward until a blank line or a box rule. Only the glyph
- * kinds matter; output text is traversed harmlessly.
+ * Distinct prompt glyphs in the capture up to and including `inputIndex`.
+ * The walk does not stop at a blank line or a rule: a multi-line draft can
+ * hold either, and the ambiguous unknown-runtime read has to see the
+ * unrelated first line that precedes them.
  */
 export function composerGlyphKindsInBlock(lines: string[], inputIndex: number): Set<string> {
   const kinds = new Set<string>();
   for (let i = inputIndex; i >= 0; i--) {
-    const raw = lines[i]!;
-    if (i < inputIndex) {
-      const trimmed = raw.trim();
-      if (trimmed === "" || /^[─═-]{10,}$/.test(trimmed)) break;
-    }
-    const first = raw.trimStart()[0];
+    const first = lines[i]!.trimStart()[0];
     if (first !== undefined && (COMPOSER_PROMPT_CHARS as readonly string[]).includes(first)) kinds.add(first);
   }
   return kinds;
