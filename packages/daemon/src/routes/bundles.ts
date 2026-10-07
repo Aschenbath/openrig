@@ -1136,29 +1136,25 @@ bundleRoutes.post("/install", async (c) => {
   }
 
   try {
-  // Item 2 / slice-05 Checkpoint 3.3: install-time compatibility check
-  // Runs AFTER the lock + BEFORE bootstrap delegation. Mismatch returns a
-  // 3-part error and exits the lifecycle (lock releases via the outer
-  // finally). Operator override via --skip-version-check (request body
-  // skipVersionCheck=true).
   // Item 2 + Item 3 / slice-05: single safe extract pass yields both the
   // bundle manifest (for compat check) and the rig name (for conflict check).
-  // Caller can skip the compat check via skipVersionCheck; the conflict check
-  // also runs from this same extract pass unless --force bypasses it.
-  let installMeta: { bundleManifest: Record<string, unknown>; rigName: string | undefined } | null = null;
-  if (!skipVersionCheck || !force) {
-    try {
-      installMeta = await extractInstallTimeMetadata(bundlePath);
-    } catch (err) {
-      return c.json({
-        error: "Bundle install pre-check could not run (extraction failed)",
-        detail: (err as Error).message,
-        resolutions: [
-          "confirm the bundle path is correct and the archive is readable",
-          "pass --skip-version-check and --force to bypass both pre-checks (NOT recommended unless intentional)",
-        ],
-      }, 400);
-    }
+  // This pass also runs the manifest SAFETY validation — the first place
+  // rig_spec/project fields are validated on the install path; the bundle
+  // source resolver validates them again later — so it runs unconditionally:
+  // --skip-version-check and --force override the Item-2 compat check and
+  // the Item-3 conflict check, not the safety validation.
+  let installMeta: { bundleManifest: Record<string, unknown>; rigName: string | undefined };
+  try {
+    installMeta = await extractInstallTimeMetadata(bundlePath);
+  } catch (err) {
+    return c.json({
+      error: "Bundle install pre-check could not run (extraction failed)",
+      detail: (err as Error).message,
+      resolutions: [
+        "confirm the bundle path is correct and the archive is readable",
+        "--skip-version-check and --force skip the compatibility and conflict checks; the manifest safety check always runs",
+      ],
+    }, 400);
   }
 
   if (!skipVersionCheck && installMeta) {
