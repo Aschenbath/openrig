@@ -78,9 +78,12 @@ export function ingestDecision(ev: SlackEvent): { ingest: true } | { ingest: fal
   const hasFiles = Array.isArray(ev.files) && ev.files.length > 0;
   if (!ev.type || !ADMITTED_EVENT_TYPES.includes(ev.type)) return { ingest: false, reason: "type" };
   if (ev.bot_id) return { ingest: false, reason: "bot_id" }; // never ingest our own / any bot post
-  // OPR.0.5.6.2: `file_share` WITH files is the human-upload shape and is admitted;
-  // every other subtype (edits, joins, …) stays rejected exactly as before.
-  if (ev.subtype && !(ev.subtype === "file_share" && hasFiles)) return { ingest: false, reason: "subtype" };
+  // OPR.0.5.6.2: `file_share` WITH files is the human-upload shape and is admitted.
+  // #899: a thread reply sent with "Also send to #channel" arrives as `thread_broadcast`
+  // and still carries its thread_ts, so it is admitted and routes like any thread reply.
+  // Every other subtype (edits, joins, …) stays rejected exactly as before.
+  const isThreadBroadcast = ev.subtype === "thread_broadcast" && !!ev.thread_ts && ev.thread_ts !== ev.ts;
+  if (ev.subtype && !(ev.subtype === "file_share" && hasFiles) && !isThreadBroadcast) return { ingest: false, reason: "subtype" };
   if (!ev.user) return { ingest: false, reason: "no-user" };
   // A pure file drop has no caption: empty text is admissible iff files ride along.
   if ((!ev.text || !ev.text.trim()) && !hasFiles) return { ingest: false, reason: "empty-text" };
