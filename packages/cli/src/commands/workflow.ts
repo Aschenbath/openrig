@@ -133,7 +133,7 @@ export function workflowCommand(depsOverride?: WorkflowDeps): Command {
     .option("--json", "JSON output for agents")
     .addHelpText("after", `
 Examples:
-  $ rig workflow validate workflows/conveyor-starter.workflow.md
+  $ rig workflow validate workflows/release.workflow.md
   $ rig workflow validate ./my-spec.workflow.md --json | jq .ok
 `)
     .action(async (specPath: string, opts: { json?: boolean }) => {
@@ -257,14 +257,14 @@ Examples:
     .option("--json", "JSON output for agents")
     .addHelpText("after", `
 Examples:
-  $ rig workflow instantiate workflows/conveyor.workflow.md \\
+  $ rig workflow instantiate workflows/release.workflow.md \\
       --root-objective "Ship release-0.3.2" \\
-      --created-by orch-lead@openrig-velocity
+      --created-by orch-lead@my-rig
 
   $ rig workflow instantiate ./my-spec.workflow.md \\
       --root-objective "Run dogfood" \\
-      --created-by velocity-driver@openrig-velocity \\
-      --entry-owner velocity-qa@openrig-velocity --json
+      --created-by driver@my-rig \\
+      --entry-owner qa@my-rig --json
 `)
     .action(async (specPath: string, opts: {
       rootObjective: string;
@@ -329,21 +329,21 @@ Examples:
       --instance WF01ABC \\
       --current-packet QITEM-123 \\
       --exit handoff \\
-      --actor-session velocity-driver@openrig-velocity \\
+      --actor-session driver@my-rig \\
       --result-note "implementation green; ready for review"
 
   # close the run cleanly
   $ rig workflow project --instance WF01ABC --current-packet QITEM-9 \\
-      --exit done --actor-session orch-lead@openrig-velocity
+      --exit done --actor-session orch-lead@my-rig
 
   # block on an external gate
   $ rig workflow project --instance WF01ABC --current-packet QITEM-4 \\
-      --exit waiting --actor-session velocity-qa@openrig-velocity \\
+      --exit waiting --actor-session qa@my-rig \\
       --blocked-on "founder-gate-2"
 
   # also wait for the current outcome of a slice (no copied readiness)
   $ rig workflow project --instance WF01ABC --current-packet QITEM-4 \\
-      --exit waiting --actor-session velocity-qa@openrig-velocity \\
+      --exit waiting --actor-session qa@my-rig \\
       --blocked-on QITEM-3 --wait-for-proof release-example/slices/01-build
 `)
     .action(async (opts: {
@@ -685,7 +685,7 @@ command reconnects, then degrades to polling — announced, never a
 silent freeze.
 
 Examples:
-  $ rig workflow run workflows/conveyor.workflow.md \\
+  $ rig workflow run workflows/release.workflow.md \\
       --root-objective "Ship it" --created-by orch-lead@my-rig
   $ rig workflow run ./spec.yaml --root-objective x --created-by a@b --json
 `)
