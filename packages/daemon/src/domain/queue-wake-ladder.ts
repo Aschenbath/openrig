@@ -508,6 +508,8 @@ function appendMarker(repo: QueueRepository, row: QueueItem, note: string): void
     state: row.state,
     actorSession: LADDER_ACTOR,
     transitionNote: note,
+    // A scheduler receipt does not clear the claim's original gate. State writes do.
+    closureTarget: row.state === "in-progress" ? repo.retainedClaimBlocker(row.qitemId) : undefined,
   });
 }
 
@@ -1138,7 +1140,8 @@ async function refreshEscalationRowIfExists(
   deps.db.transaction(() => {
     deps.db.prepare("UPDATE queue_items SET tags = ? WHERE qitem_id = ?").run(JSON.stringify([...tags, ...added]), existing.qitem_id);
     deps.queueRepo.transitionLog.append({ qitemId: existing.qitem_id, state: row.state, actorSession: LADDER_ACTOR,
-      transitionNote: `wake-escalation members added: ${added.join(", ")}` });
+      transitionNote: `wake-escalation members added: ${added.join(", ")}`,
+      closureTarget: row.state === "in-progress" ? deps.queueRepo.retainedClaimBlocker(existing.qitem_id) : undefined });
   })();
 }
 
