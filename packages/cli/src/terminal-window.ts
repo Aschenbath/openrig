@@ -12,7 +12,7 @@ interface Pane { seat: string; label: string; paneCommand: string }
 interface Preview {
   planId: string;
   status: { launch?: { socketPath: string; session?: string } };
-  composed: { opened: Pane[]; pages: Pane[][]; columns?: number; absent: OpenViewResult["absent"]; degraded: OpenViewResult["degraded"] };
+  composed: { id: string; opened: Pane[]; pages: Pane[][]; columns?: number; absent: OpenViewResult["absent"]; degraded: OpenViewResult["degraded"] };
 }
 
 export interface WindowDeps {
@@ -176,6 +176,53 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
         await deps.sleep(250);
       }
       if (!alive) throw new Error("The terminal was requested, but herdr's control socket did not become ready. Inspect the new terminal before retrying.");
+      // Inventory is read-only: a failed read must not prevent the first open.
+      // Scope each tab list to its workspace, on the daemon's exact endpoint.
+      const herdrArgs = ["-u", "TMUX", "-u", "HERDR_SESSION", "-u", "HERDR_SOCKET_PATH", `HERDR_SOCKET_PATH=${endpoint.socketPath}`, herdr];
+      let tabs: Array<{ workspace_id: string; tab_id: string; label: string }> = [];
+      try {
+        const listed = JSON.parse(await deps.exec("/usr/bin/env", [...herdrArgs, "workspace", "list"]));
+        const workspaces = listed?.result?.workspaces as Array<{ workspace_id: string }> | undefined;
+        if (!Array.isArray(workspaces) || !workspaces.every(ws => ws && typeof ws.workspace_id === "string" && ws.workspace_id)) {
+          throw new Error("Herdr returned no usable workspace inventory.");
+        }
+        for (const workspace of workspaces) {
+          const listedTabs = JSON.parse(await deps.exec("/usr/bin/env", [...herdrArgs, "tab", "list", "--workspace", workspace.workspace_id]));
+          const scoped = listedTabs?.result?.tabs as typeof tabs | undefined;
+          if (!Array.isArray(scoped) || !scoped.every(tab => tab && typeof tab.label === "string" && typeof tab.tab_id === "string" && tab.tab_id && tab.workspace_id === workspace.workspace_id)) {
+            throw new Error(`Herdr returned no usable tab inventory for workspace ${workspace.workspace_id}.`);
+          }
+          tabs.push(...scoped);
+        }
+      } catch (err) {
+        tabs = [];
+        windowNotes.push(`Could not check existing Herdr workspaces: ${(err as Error).message} Creating a fresh workspace; existing workspaces are kept.`);
+      }
+      const viewMarker = `openrig:${composed.id}`;
+      const planMarker = `${viewMarker}#${planId.slice(0, 16)}`;
+      const marker = (label: string) => label.includes("#") ? label.slice(0, label.lastIndexOf("#")) : "";
+      const existing = tabs.find(tab => marker(tab.label) === planMarker);
+      const stale = tabs.filter(tab => {
+        const value = marker(tab.label);
+        return value !== planMarker && (value === viewMarker ||
+          (value.startsWith(`${viewMarker}#`) && /^[a-f0-9]{16}$/.test(value.slice(viewMarker.length + 1))));
+      });
+      for (const id of new Set(stale.map(tab => tab.workspace_id))) {
+        windowNotes.push(`Workspace ${id} has an older or different plan for this view and was kept. After inspecting it, close it if no longer needed: herdr workspace close ${shellQuote(id)}`);
+      }
+      if (existing) {
+        const focused = JSON.parse(await deps.exec("/usr/bin/env", [...herdrArgs, "tab", "focus", existing.tab_id])) as {
+          result?: { tab?: { tab_id?: string; workspace_id?: string } };
+        };
+        if (focused?.result?.tab?.tab_id !== existing.tab_id || focused.result.tab.workspace_id !== existing.workspace_id) {
+          throw new Error("Herdr did not confirm the existing view selection; no replacement space was created.");
+        }
+        return {
+          provider, ok: true, opened: [], absent: composed.absent, degraded: composed.degraded, pages: 0, window,
+          reusedWorkspace: { id: existing.workspace_id, tabId: existing.tab_id, view: composed.id },
+          notes: [...windowNotes, "Existing workspace contents were kept; no layout refresh or new tiles were requested. Check the new terminal shows the intended view."],
+        };
+      }
       const result = await client.post<OpenViewResult>("/api/terminal/open", { view, provider: "herdr", expectedPlan: planId }, { timeoutMs: 45_000 });
       if (result.status >= 400) return { ...failed(result.data.error ?? `The daemon refused the view (HTTP ${result.status}).`), window, notes: windowNotes, absent: composed.absent, degraded: composed.degraded };
       if (!Array.isArray(result.data?.opened)) throw new Error("The terminal opened, but the daemon returned no view result. Inspect it before retrying.");

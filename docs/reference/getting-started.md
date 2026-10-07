@@ -218,6 +218,15 @@ latter with `--provider tmux --window`. Neither route types into or replaces the
 installing agent's terminal. Existing conversations continue in their original
 sessions.
 
+Opening the same Herdr view with the same current plan selects its existing
+OpenRig workspace in the new window, preserving its tabs and contents. The receipt
+reports reuse and any currently absent or degraded seats; it does not claim to
+refresh the layout or create new tiles. Changed membership or attachment targets
+create a fresh workspace. A note identifies older workspaces and gives the command
+to close them after inspection; nothing is closed automatically. If the workspace
+inventory cannot be read, the command creates a fresh workspace and reports the
+inventory problem.
+
 ### Confirm the view
 
 The default `saved:kernel` composition is **TUI | advisor | operator**, in three
