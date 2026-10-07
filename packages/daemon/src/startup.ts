@@ -236,10 +236,12 @@ const KNOWN_PROVIDER_AUTH_ENV = new Set([
   // pi-runner's own deny-by-default allowlist then has nothing to pass
   // through). Double opt-in preserved: the operator must still name each var
   // in recovery.provider_auth_env_allowlist. OpenRouter is the founder-ruled
-  // preferred path (2026-07-06); zai/kimi-coding are the secondary natives.
+  // preferred path (2026-07-06); zai/kimi-coding are the secondary natives;
+  // minimax follows the same per-family pattern (one key var per native slug).
   "OPENROUTER_API_KEY",
   "ZAI_API_KEY",
   "KIMI_API_KEY",
+  "MINIMAX_API_KEY",
   // Issue #194: the bearer token of a Codex Amazon Bedrock provider
   // (`env_key = "AWS_BEARER_TOKEN_BEDROCK"`). Still forwarded only when the
   // operator names it in recovery.provider_auth_env_allowlist.
