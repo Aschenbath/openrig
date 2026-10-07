@@ -134,16 +134,16 @@ function failure(provider: string, error: string): OpenViewResult {
 }
 
 /** Render the daemon's existing composition; never rediscover/relaunch kernel seats here. */
-export async function openTerminalWindow(client: DaemonClient, view: string, requestedProvider?: string, deps = defaultWindowDeps()): Promise<OpenViewResult> {
+export async function openTerminalWindow(client: DaemonClient, view: string, requestedProvider?: string, deps = defaultWindowDeps(), expectedPlan?: string): Promise<OpenViewResult> {
   let provider = requestedProvider ?? "herdr";
   let window: { app: string; surface: string } | undefined;
   let viewer: string | undefined;
   let windowAttempted = false;
   const recovery = `rig terminal open ${shellQuote(view)} --window${requestedProvider && ["herdr", "tmux"].includes(requestedProvider) ? ` --provider ${shellQuote(requestedProvider)}` : ""}`;
-  const failed = (reason: string): OpenViewResult => failure(provider,
+  const failed = (reason: string): OpenViewResult => ({ ...failure(provider,
     window ? `A terminal window was requested, but the view outcome could not be confirmed. ${reason} Inspect the terminal before retrying: ${recovery}`
       : windowAttempted ? `Terminal window status is unknown. ${reason} Inspect the desktop before retrying: ${recovery}`
-        : `No terminal window was opened. ${reason} On the daemon's desktop, run: ${recovery}`);
+        : `No terminal window was opened. ${reason} On the daemon's desktop, run: ${recovery}`), windowAttempted });
   const windowNotes: string[] = [];
   try {
     if (!localDaemon(client.baseUrl)) throw new Error("The window launcher must run on the daemon's own desktop; the configured daemon is remote.");
@@ -158,6 +158,9 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
       return failed((preview.data as OpenViewResult).error ?? "Could not compose the requested view.");
     }
     const { composed, planId } = preview.data;
+    if (expectedPlan !== undefined && expectedPlan !== planId) {
+      return failure(provider, "The terminal view changed since preview. Refresh the preview before opening.");
+    }
     if (!composed.opened.length) return { ...failed("No conversations are attachable."), absent: composed.absent, degraded: composed.degraded };
 
     if (herdr) {

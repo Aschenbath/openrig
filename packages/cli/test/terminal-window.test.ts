@@ -28,6 +28,20 @@ function fixture(options: { herdr?: boolean; ghostty?: string; refusal?: number;
 }
 
 describe("desktop terminal view", () => {
+  it.each([true, false])("rejects a changed preview before opening a window (Herdr installed: %s)", async herdr => {
+    const f = fixture({ herdr });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps, "prior-plan");
+    expect(result).toMatchObject({ ok: false, opened: [], error: expect.stringContaining("changed since preview") });
+    expect(f.exec.mock.calls.some(([file, args]) => file === "/usr/bin/osascript" || args.includes("new-session"))).toBe(false);
+    expect(f.post).not.toHaveBeenCalled();
+  });
+
+  it("opens the previewed tmux layout when the expected plan still matches", async () => {
+    const f = fixture({ herdr: false });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps, "bound-plan");
+    expect(result).toMatchObject({ ok: true, provider: "tmux", opened: ["tui", "advisor", "operator"] });
+  });
+
   it("opens a new Ghostty tab and applies the same daemon plan and Herdr endpoint", async () => {
     const f = fixture({ ghostty: "1.3.0" });
     const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
@@ -99,6 +113,7 @@ describe("desktop terminal view", () => {
     if (reason === "headless") Object.assign(f.deps, { platform: "linux", env: {} });
     const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
     expect(result.ok).toBe(false);
+    expect(result).toMatchObject({ code: "terminal_window_failed", windowAttempted: false });
     expect(f.exec.mock.calls.some(([file]) => file === "/usr/bin/osascript" || file === "/fixture/bin/tmux")).toBe(false);
     expect(f.post).not.toHaveBeenCalled();
   });
@@ -110,7 +125,7 @@ describe("desktop terminal view", () => {
       if (file === "/usr/bin/osascript") throw new Error("Automation denied");
       return original(file, args);
     });
-    expect(await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps)).toMatchObject({ ok: false, error: expect.stringContaining("Terminal window status is unknown. Automation denied"), opened: [] });
+    expect(await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps)).toMatchObject({ ok: false, windowAttempted: true, error: expect.stringContaining("Terminal window status is unknown. Automation denied"), opened: [] });
     expect(vi.mocked(f.deps.exec).mock.calls.filter(([file]) => file === "/usr/bin/osascript")).toHaveLength(1);
     expect(f.post).not.toHaveBeenCalled();
   });
