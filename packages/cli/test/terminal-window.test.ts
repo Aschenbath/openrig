@@ -59,6 +59,72 @@ describe("desktop terminal view", () => {
     expect(f.post).toHaveBeenCalledExactlyOnceWith("/api/terminal/open", { view: "saved:kernel", provider: "herdr", expectedPlan: "bound-plan" }, { timeoutMs: 45_000 });
   });
 
+  it.each(["/Applications/Ghostty.app", "/fixture/Applications/Ghostty.app"])("opens %s before scripting and explains the prompts", async app => {
+    const f = fixture({ ghostty: "1.3.0" });
+    const events: string[] = [];
+    const progress = vi.fn((_message: string) => { events.push("notice"); });
+    Object.assign(f.deps, { exists: (file: string) => file === app, progress });
+    const original = f.deps.exec;
+    f.deps.exec = vi.fn(async (file, args) => {
+      if (file === "/usr/bin/open") {
+        events.push("open");
+        await Promise.resolve();
+        events.push("opened");
+      }
+      if (file === "/usr/bin/osascript") events.push("script");
+      return original(file, args);
+    });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(events).toEqual(["notice", "open", "opened", "script"]);
+    expect(vi.mocked(f.deps.exec).mock.calls.filter(([file]) => file === "/usr/bin/open")).toEqual([["/usr/bin/open", ["-a", app]]]);
+    expect(progress).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/macOS.*Ghostty.*open.*control Ghostty/));
+    expect(result.notes).toContain(progress.mock.calls[0]![0]);
+    expect(result).toMatchObject({ ok: true, window: { app: "Ghostty", surface: "tab" } });
+    expect(f.post).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["/usr/bin/open", "/usr/bin/osascript"])("preserves an uncertain Ghostty %s failure without another attempt", async failedStep => {
+    const f = fixture({ ghostty: "1.3.0" });
+    const progress = vi.fn();
+    Object.assign(f.deps, { progress });
+    const original = f.deps.exec;
+    f.deps.exec = vi.fn(async (file, args) => {
+      if (file === failedStep) throw new Error("launch timed out or approval was denied");
+      return original(file, args);
+    });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: false, windowAttempted: true, opened: [], error: expect.stringContaining("Terminal window status is unknown.") });
+    expect(result.error).toContain("Inspect the desktop before retrying");
+    expect(progress).toHaveBeenCalledTimes(1);
+    expect(result.notes).toContain(progress.mock.calls[0]![0]);
+    const launches = vi.mocked(f.deps.exec).mock.calls.filter(([file]) => file === "/usr/bin/open" || file === "/usr/bin/osascript");
+    expect(launches.map(([file]) => file)).toEqual(failedStep === "/usr/bin/open" ? [failedStep] : ["/usr/bin/open", failedStep]);
+    expect(f.post).not.toHaveBeenCalled();
+    expect(f.deps.launch).not.toHaveBeenCalled();
+  });
+
+  it.each(["empty", "changed", "remote"])("does not prelaunch Ghostty for a %s view", async reason => {
+    const f = fixture({ ghostty: "1.3.0", empty: reason === "empty" });
+    const progress = vi.fn();
+    Object.assign(f.deps, { progress });
+    if (reason === "remote") Object.assign(f.client, { baseUrl: "http://192.0.2.2:7433" });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps, reason === "changed" ? "prior-plan" : undefined);
+    expect(result.ok).toBe(false);
+    expect(progress).not.toHaveBeenCalled();
+    expect(f.exec.mock.calls.some(([file]) => file === "/usr/bin/open" || file === "/usr/bin/osascript")).toBe(false);
+    expect(f.post).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "1.2.0"])("does not prelaunch absent or older Ghostty (%s)", async ghostty => {
+    const f = fixture({ ghostty });
+    const progress = vi.fn();
+    Object.assign(f.deps, { progress });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result.window?.app).toBe("Terminal");
+    expect(progress).not.toHaveBeenCalled();
+    expect(f.exec.mock.calls.some(([file]) => file === "/usr/bin/open")).toBe(false);
+  });
+
   it("uses a new system Terminal window without requiring an existing terminal", async () => {
     const f = fixture();
     const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
