@@ -106,8 +106,8 @@ end run`;
         const prompt = "Opening Ghostty. If macOS asks, allow Ghostty to open and allow the app running this command to control Ghostty. Inspect the desktop before retrying if this request times out.";
         notes.push(prompt);
         deps.progress?.(prompt);
-        // Use Launch Services before AppleScript so first-launch prompts can appear.
-        await deps.exec("/usr/bin/open", ["-a", app!]);
+        // First-launch prompts need the same time for a person to respond as Automation.
+        await deps.exec("/usr/bin/open", ["-a", app!], 120_000);
       }
       const surface = (await deps.exec("/usr/bin/osascript", ["-e", script, command], 120_000)).trim();
       notes.push(ghostty

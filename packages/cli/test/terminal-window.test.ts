@@ -76,7 +76,8 @@ describe("desktop terminal view", () => {
     });
     const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
     expect(events).toEqual(["notice", "open", "opened", "script"]);
-    expect(vi.mocked(f.deps.exec).mock.calls.filter(([file]) => file === "/usr/bin/open")).toEqual([["/usr/bin/open", ["-a", app]]]);
+    expect(vi.mocked(f.deps.exec).mock.calls.filter(([file]) => file === "/usr/bin/open")).toEqual([["/usr/bin/open", ["-a", app], 120_000]]);
+    expect(f.deps.exec).toHaveBeenCalledWith("/usr/bin/osascript", expect.any(Array), 120_000);
     expect(progress).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/macOS.*Ghostty.*open.*control Ghostty/));
     expect(result.notes).toContain(progress.mock.calls[0]![0]);
     expect(result).toMatchObject({ ok: true, window: { app: "Ghostty", surface: "tab" } });
