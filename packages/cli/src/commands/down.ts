@@ -139,6 +139,10 @@ rig up <rig> --existing brings it back, resuming each seat's conversation where 
           console.error(`Error on host ${opts.host}: ${result.error}`);
           process.exitCode = 1;
         }
+        if (result.ok) {
+          const teardown = result.data as Partial<TeardownResult> | undefined;
+          if (teardown?.errors && teardown.errors.length > 0) process.exitCode = 2;
+        }
         return;
       }
 
