@@ -23,6 +23,7 @@ export interface WindowDeps {
   launch(file: string, args: string[]): Promise<void>;
   sleep(ms: number): Promise<void>;
   id(): string;
+  progress?(message: string): void;
 }
 
 export function defaultWindowDeps(): WindowDeps {
@@ -39,6 +40,7 @@ export function defaultWindowDeps(): WindowDeps {
     }),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     id: () => randomUUID().slice(0, 12),
+    progress: message => { process.stderr.write(`${message}\n`); },
   };
 }
 
@@ -100,6 +102,13 @@ return "window"
 end run`;
     // A denied/uncertain Automation request is returned once, never replayed in another app.
     return async command => {
+      if (ghostty) {
+        const prompt = "Opening Ghostty. If macOS asks, allow Ghostty to open and allow the app running this command to control Ghostty. Inspect the desktop before retrying if this request times out.";
+        notes.push(prompt);
+        deps.progress?.(prompt);
+        // Use Launch Services before AppleScript so first-launch prompts can appear.
+        await deps.exec("/usr/bin/open", ["-a", app!]);
+      }
       const surface = (await deps.exec("/usr/bin/osascript", ["-e", script, command], 120_000)).trim();
       notes.push(ghostty
         ? "Ghostty's macOS scripting interface does not expose window size. Enlarge the new view manually if its columns are cramped; existing window settings were kept."
