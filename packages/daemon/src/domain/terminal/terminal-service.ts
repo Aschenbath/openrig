@@ -62,6 +62,8 @@ export interface OpenViewRequest {
   view: string;
   /** Preview fingerprint. A changed membership/layout must be previewed again. */
   expectedPlan?: string;
+  /** Measured width of the viewing terminal; unknown widths keep the narrow default. */
+  viewportColumns?: number;
 }
 
 export interface TerminalPreview {
@@ -174,7 +176,7 @@ export class TerminalService {
       );
     }
 
-    const composed = await this.resolveComposed(req.view, provider.panesPerPage);
+    const composed = await this.resolveComposed(req.view, provider.panesPerPage, req.viewportColumns);
     if ("code" in composed) return errorResult(providerName, composed.code, composed.error);
     const planId = this.planId(providerName, composed);
     if (req.expectedPlan !== undefined && req.expectedPlan !== planId) {
@@ -199,12 +201,19 @@ export class TerminalService {
     return notes.length ? { ...result, notes: [...notes, ...(result.notes ?? [])] } : result;
   }
 
-  private async resolveComposed(viewArg: string, panesPerPage?: number): Promise<ComposedTerminalView | { code: string; error: string }> {
+  private async resolveComposed(viewArg: string, panesPerPage?: number, viewportColumns?: number): Promise<ComposedTerminalView | { code: string; error: string }> {
     const view = (viewArg ?? "").trim();
     if (!view) return { code: "view_required", error: "a view argument is required" };
     const resolved = await this.resolveView(view);
     if ("code" in resolved) return resolved;
     const composed = composeView(resolved.id, await this.refineLiveness(resolved.members), { resolveHost: (id) => this.deps.resolveHost(id), panesPerPage: resolved.panesPerPage ?? panesPerPage, localTmux: await this.resolveLocalTmux() });
+    if (resolved.kernelLayout && Number.isSafeInteger(viewportColumns) && viewportColumns! >= 120) {
+      // The default's members are operator, dashboard, advisor. Keep the advisor separate
+      // even when one of the other roles is unavailable; chunking two at a time would not.
+      const page = (indexes: number[]) => indexes.flatMap(index => composed.opened.filter(pane => pane.seat === resolved.members[index]?.seat));
+      const pages = [page([1, 0]), page([2])].filter(panes => panes.length > 0);
+      return { ...composed, opened: pages.flat(), pages, kernelLayout: resolved.kernelLayout, columns: 2 };
+    }
     return resolved.kernelLayout ? { ...composed, kernelLayout: resolved.kernelLayout, columns: resolved.columns } : composed;
   }
 
@@ -217,7 +226,7 @@ export class TerminalService {
     const providerName = (req.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
     const provider = this.deps.resolveProvider(providerName);
     if (!provider) return errorResult(providerName, "unknown_provider", `unknown provider '${providerName}'`);
-    const composed = await this.resolveComposed(req.view, provider.panesPerPage);
+    const composed = await this.resolveComposed(req.view, provider.panesPerPage, req.viewportColumns);
     if ("code" in composed) return errorResult(providerName, composed.code, composed.error);
     return { provider: providerName, view: req.view, composed, grids: composed.pages.map(page => buildGridRoot(page, composed.columns)), planId: this.planId(providerName, composed), status: await provider.status() };
   }

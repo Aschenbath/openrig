@@ -6,7 +6,7 @@ function fixture(options: { herdr?: boolean; ghostty?: string; refusal?: number;
   const panes = ["tui", "advisor", "operator"].map(seat => ({ seat, label: seat, paneCommand: `tmux attach-session -t '=fixture-${seat}'` }));
   const composed = { id: "kernel", opened: options.empty ? [] : panes, pages: options.empty ? [] : [panes], columns: 3, absent: [], degraded: [] };
   const preview = { planId: "bound-plan", composed, status: { launch: { socketPath: "/daemon home/herdr.sock", session: "daemon-session" } } };
-  const get = vi.fn(async (url: string) => ({ status: 200, data: url.includes("preview") ? preview : { providers: [{ liveness: { alive: options.alive !== false } }] } }));
+  const get = vi.fn(async (url: string): Promise<{ status: number; data: unknown }> => ({ status: 200, data: url.includes("preview") ? preview : { providers: [{ liveness: { alive: options.alive !== false } }] } }));
   const post = vi.fn(async () => options.refusal ? { status: options.refusal, data: { error: "view changed" } } : { status: 200, data: { provider: "herdr", ok: true, opened: panes.map(p => p.seat), absent: [], degraded: [], pages: 1 } });
   const client = { baseUrl: "http://localhost:7433", get, post } as unknown as DaemonClient;
   let pane = 0;
@@ -72,7 +72,7 @@ describe("desktop terminal view", () => {
     expect(f.deps.herdrConfig).toHaveBeenCalledExactlyOnceWith("/daemon home/herdr.sock");
     expect(result.notes).toEqual([
       "After the person starts Herdr, have the agent place this view by running: rig terminal open 'saved:kernel' --provider herdr",
-      "Herdr starts with the sidebar collapsed unless this endpoint has a saved choice; later toggles are kept.",
+      "Your Herdr config is kept when present; otherwise the sidebar starts open at 160 columns and collapsed below.",
     ]);
     expect(result.error).not.toContain("\n");
     expect(f.exec.mock.calls.some(([file]) => file === "/usr/bin/osascript" || file === "/usr/bin/open")).toBe(false);
@@ -244,10 +244,11 @@ describe("desktop terminal view", () => {
     expect(launch[1][1]).toContain("new tab in front window");
     expect(launch[1][1]).toContain("new window with configuration");
     expect(launch[1][1]).not.toMatch(/set (bounds|number of columns|number of rows)/);
-    expect(result.notes).toContain("Ghostty's macOS scripting interface does not expose window size. Enlarge the new view manually if its columns are cramped; existing window settings were kept.");
+    expect(result.notes).toContain("Ghostty keeps the person's window size; layout uses the hosting terminal's measured width when available.");
     expect(launch[1][2]).toContain("HERDR_SOCKET_PATH='/daemon home/herdr.sock'");
     expect(launch[1][2]).toContain("HERDR_CONFIG_PATH='/fixture/private herdr.toml'");
-    expect(f.deps.herdrConfig).toHaveBeenCalledExactlyOnceWith("/daemon home/herdr.sock");
+    expect(f.deps.herdrConfig).toHaveBeenNthCalledWith(1, "/daemon home/herdr.sock");
+    expect(f.deps.herdrConfig).toHaveBeenNthCalledWith(2, "/daemon home/herdr.sock", 160);
     expect(launch[1][2]).not.toContain("--session");
     expect(launch[1][2]).toContain("-u HERDR_SESSION");
     expect(launch[1][2]).not.toContain("wrong-session");
@@ -262,16 +263,21 @@ describe("desktop terminal view", () => {
     expect(script).toContain('tell application "Terminal"');
     expect(script).toContain("do script (item 1 of argv)");
     expect(script).not.toContain("in front window");
-    expect(script).not.toMatch(/number of (columns|rows)|bounds|position|size|tabs of|repeat with/);
+    expect(script).toContain("set personBounds to bounds of front window");
+    expect(script).toContain("set bounds of viewWindow to personBounds");
+    expect(script.indexOf("set personBounds")).toBeLessThan(script.indexOf('do script ""'));
+    expect(script.indexOf("set bounds")).toBeLessThan(script.indexOf("do script (item 1 of argv) in viewTab"));
+    expect(script).toContain("number of columns of viewTab");
+    expect(script).not.toMatch(/set number of (columns|rows)|set position/);
     expect(script).not.toMatch(/settings set|default settings|System Events/);
-    expect(result.notes).toContain("Terminal opened with its own window sizing. Resize or move the new view manually if needed; OpenRig did not request a size or position change.");
+    expect(result.notes).toContain("The new Terminal view copies the person's front-window bounds when available; existing window settings were kept.");
   });
 
-  it("keeps the Terminal view and reports manual sizing without reopening", async () => {
+  it("copies the existing Terminal bounds without reopening", async () => {
     const f = fixture();
     const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
     expect(result).toMatchObject({ ok: true, window: { app: "Terminal", surface: "window" } });
-    expect(result.notes?.join(" ")).toContain("Resize or move the new view manually");
+    expect(result.notes?.join(" ")).toContain("copies the person's front-window bounds");
     expect(result.notes?.join(" ")).not.toContain("tab reports 140");
     expect(f.exec.mock.calls.filter(([file]) => file === "/usr/bin/osascript")).toHaveLength(1);
     expect(f.post).toHaveBeenCalledTimes(1);
@@ -399,5 +405,73 @@ describe("desktop terminal view", () => {
     expect(calls[0]![1].at(-1)).toBe("env -u TMUX -u HERDR_SESSION -u HERDR_SOCKET_PATH HERDR_SOCKET_PATH='/daemon home/herdr.sock' HERDR_CONFIG_PATH='/fixture/private herdr.toml' '/fixture/bin/herdr'");
     expect(result).toMatchObject({ ok: true, window: { app, surface: "window-requested" } });
     expect(result.notes?.join(" ")).toContain("Requested 140 columns by 40 rows");
+  });
+});
+
+// Synthetic desktop results test the CLI/daemon width binding; native window geometry is a separate check.
+describe("measured welcome layout", () => {
+  function kernelFixture(herdr = true) {
+    const f = fixture({ herdr });
+    Object.assign(f.preview.composed, { kernelLayout: "dual-runtime" });
+    f.get.mockImplementation(async url => {
+      if (!url.includes("preview")) return { status: 200, data: { providers: [{ liveness: { alive: true } }] } };
+      const columns = Number(new URL(url, "http://fixture").searchParams.get("viewportColumns"));
+      const [dashboard, advisor, operator] = f.preview.composed.opened;
+      const pages = columns >= 120 ? [[dashboard!, operator!], [advisor!]] : [[operator!], [dashboard!], [advisor!]];
+      return { status: 200, data: { ...f.preview, planId: columns >= 120 ? "wide" : "narrow", composed: { ...f.preview.composed, pages, opened: pages.flat(), columns: columns >= 120 ? 2 : 1 } } };
+    });
+    return f;
+  }
+
+  it.each([119, 120, 159, 160, 174])("binds the Terminal-reported width %i to preview and open", async columns => {
+    const f = kernelFixture();
+    const original = f.deps.exec;
+    f.deps.exec = vi.fn(async (file, args) => file === "/usr/bin/osascript" ? `window:${columns}` : original(file, args));
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result.ok).toBe(true);
+    expect(f.get).toHaveBeenCalledWith(`/api/terminal/preview?view=saved%3Akernel&provider=herdr&viewportColumns=${columns}`);
+    expect(f.post).toHaveBeenCalledExactlyOnceWith("/api/terminal/open", { view: "saved:kernel", provider: "herdr", viewportColumns: columns, expectedPlan: columns >= 120 ? "wide" : "narrow" }, { timeoutMs: 45_000 });
+    expect(vi.mocked(f.deps.exec).mock.calls.filter(([file]) => file === "/usr/bin/osascript")).toHaveLength(1);
+  });
+
+  it("uses a Ghostty shell tool's hosting-terminal measurement without requiring a stdin TTY", async () => {
+    const f = kernelFixture();
+    f.deps.env = { TERM_PROGRAM: "ghostty" };
+    f.deps.exists = () => true;
+    f.deps.columns = async () => 120;
+    const original = f.deps.exec;
+    f.deps.exec = async (file, args) => file === "/usr/libexec/PlistBuddy" ? "1.3.1" : file === "/usr/bin/osascript" ? "tab" : original(file, args);
+    expect((await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps)).ok).toBe(true);
+    expect(f.post).toHaveBeenCalledWith("/api/terminal/open", expect.objectContaining({ viewportColumns: 120, expectedPlan: "wide" }), expect.anything());
+  });
+
+  it("leaves an unknown width narrow and says so", async () => {
+    const f = kernelFixture();
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result.ok).toBe(true);
+    expect(result.notes?.join(" ")).toContain("width could not be measured");
+    expect(f.post).toHaveBeenCalledWith("/api/terminal/open", { view: "saved:kernel", provider: "herdr", expectedPlan: "narrow" }, expect.anything());
+  });
+
+  it("does not silently replace an explicit expected plan after measuring a different layout", async () => {
+    const f = kernelFixture();
+    const original = f.deps.exec;
+    f.deps.exec = async (file, args) => file === "/usr/bin/osascript" ? "window:174" : original(file, args);
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps, "narrow");
+    expect(result).toMatchObject({ ok: false, windowAttempted: true });
+    expect(result.error).toContain("differs from the expected preview");
+    expect(f.post).not.toHaveBeenCalled();
+  });
+
+  it("chooses generated sidebar settings in the new terminal, after its bounds are copied", async () => {
+    const f = kernelFixture();
+    f.deps.herdrConfig = (_socket, columns) => columns === 160 ? "/fixture/wide.toml" : "/fixture/narrow.toml";
+    await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    const launch = f.exec.mock.calls.find(([file]) => file === "/usr/bin/osascript")!;
+    expect(launch[1][2]).toContain("stty size");
+    expect(launch[1][2]).toContain('-ge 160');
+    expect(launch[1][2]).toContain("HERDR_CONFIG_PATH='/fixture/wide.toml'");
+    expect(launch[1][2]).toContain("HERDR_CONFIG_PATH='/fixture/narrow.toml'");
+    expect(launch[1][1]!.indexOf("set bounds")).toBeLessThan(launch[1][1]!.indexOf("do script (item 1 of argv) in viewTab"));
   });
 });

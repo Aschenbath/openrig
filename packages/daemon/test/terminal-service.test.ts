@@ -400,15 +400,65 @@ describe("default saved kernel conversations", () => {
     expect(planHerdrLayout(herdr.lastView!, "fixed").pages.map(page => page.root)).toEqual(preview.grids.map(grid => grid.root));
   });
 
+  it.each([
+    [119, "claude-code", "codex"], [120, "claude-code", "codex"], [174, "claude-code", "codex"],
+    [119, "claude-code", "claude-code"], [120, "claude-code", "claude-code"],
+    [119, "codex", "codex"], [160, "codex", "codex"],
+  ] as const)("uses the measured %i-column welcome layout for %s/%s", async (viewportColumns, advisor, operator) => {
+    const { deps, herdr } = makeKernel(kernel(operator, advisor));
+    const service = new TerminalService(deps);
+    const preview = await service.previewView({ view: "saved:kernel", viewportColumns });
+    if (!("composed" in preview)) throw new Error("expected preview");
+    const wide = viewportColumns >= 120;
+    expect(preview.composed.pages.map(page => page.map(pane => pane.seat))).toEqual(wide
+      ? [["tui-bound", "operator-bound"], ["advisor-bound"]]
+      : [["operator-bound"], ["tui-bound"], ["advisor-bound"]]);
+    if (wide) expect(preview.grids[0]!.root).toMatchObject({
+      type: "split", direction: "right", ratio: 0.5,
+      first: { type: "pane", label: "operator.human" }, second: { type: "pane", label: "operator.agent" },
+    });
+    expect(preview.grids.every(grid => grid.blanks === 0)).toBe(true);
+    expect((await service.openView({ view: "saved:kernel", viewportColumns, expectedPlan: preview.planId })).ok).toBe(true);
+    expect(planHerdrLayout(herdr.lastView!, "fixed").pages.map(page => page.root)).toEqual(preview.grids.map(grid => grid.root));
+  });
+
+  it.each(["operator.agent", "operator.human"])("keeps the advisor separate at 160 columns when %s is absent", async missing => {
+    const { deps } = makeKernel(kernel().filter(row => row.logicalId !== missing));
+    const preview = await new TerminalService(deps).previewView({ view: "saved:kernel", viewportColumns: 160 });
+    if (!("composed" in preview)) throw new Error("expected preview");
+    expect(preview.composed.pages.map(page => page.map(pane => pane.seat))).toEqual([
+      [missing === "operator.agent" ? "tui-bound" : "operator-bound"], ["advisor-bound"],
+    ]);
+    expect(preview.composed.absent.map(pane => pane.seat)).toContain(missing);
+    expect(preview.grids.every(grid => grid.blanks === 0)).toBe(true);
+  });
+
+  it("binds preview fingerprints to the width-selected composition", async () => {
+    const { deps, herdr } = makeKernel(kernel());
+    const service = new TerminalService(deps);
+    const preview = await service.previewView({ view: "saved:kernel", viewportColumns: 119 });
+    if (!("composed" in preview)) throw new Error("expected preview");
+    const result = await service.openView({ view: "saved:kernel", viewportColumns: 120, expectedPlan: preview.planId });
+    expect(result).toMatchObject({ ok: false, code: "preview_changed" });
+    expect(herdr.lastView).toBeNull();
+  });
+
+  it.each([undefined, 0, -1, NaN, Infinity, 120.5])("uses the narrow layout for an unknown or invalid width %s", async viewportColumns => {
+    const { deps } = makeKernel(kernel());
+    const preview = await new TerminalService(deps).previewView({ view: "saved:kernel", viewportColumns });
+    if (!("composed" in preview)) throw new Error("expected preview");
+    expect(preview.composed.pages.map(page => page.map(pane => pane.seat))).toEqual([["operator-bound"], ["tui-bound"], ["advisor-bound"]]);
+  });
+
   it.each(["saved:kernel", "saved:custom", "rig:kernel"])("kernel geometry preserves auto-grid for %s outside the default", async view => {
     const custom: SavedView = { id: view.slice(6), name: "Custom", members: ["a", "b", "c"].map(seat => ({ seat })) };
     const { deps, herdr } = makeKernel(kernel().filter(row => row.logicalId !== "queue.worker"), [custom]);
     const service = new TerminalService(deps);
-    const preview = await service.previewView({ view });
+    const preview = await service.previewView({ view, viewportColumns: 174 });
     if (!("composed" in preview)) throw new Error("expected preview");
     expect(preview.composed.columns).toBeUndefined();
     expect(preview.grids[0]).toMatchObject({ columns: 2, rows: 2, blanks: 1 });
-    expect((await service.openView({ view, expectedPlan: preview.planId })).ok).toBe(true);
+    expect((await service.openView({ view, viewportColumns: 174, expectedPlan: preview.planId })).ok).toBe(true);
     expect(planHerdrLayout(herdr.lastView!, "fixed").pages.map(page => page.root)).toEqual(preview.grids.map(grid => grid.root));
   });
 

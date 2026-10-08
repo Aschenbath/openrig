@@ -67,8 +67,9 @@ rig daemon start  # if stopped
 rig terminal open saved:kernel --window
 ```
 
-`--window` opens a new terminal tab or window itself, with the **operator** filling
-the first page. The dashboard and advisor each have their own tab or tmux window.
+`--window` opens a new terminal tab or window itself. Below 120 measured columns,
+the **operator** fills the first page; from 120, the dashboard and operator share
+it equally. The advisor has a separate tab or tmux window.
 An installing agent can run it from its shell on the daemon's
 desktop; the person copies nothing. It uses Herdr when installed, otherwise
 the same layout in plain tmux, and preserves existing conversations. `rig tui`

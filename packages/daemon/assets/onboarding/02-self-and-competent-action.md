@@ -54,8 +54,9 @@ For “show me my agents”, “show me the terminals”, “see my agents” or
 `rig terminal open saved:kernel --window --json` on the daemon's desktop. The request is already permission to
 open it; otherwise ask **“Open the OpenRig view now?”** first. The command opens a new terminal tab/window using
 installed herdr, otherwise plain tmux; it preserves your terminal and existing conversations. The default view
-needs no YAML edit. Show the operator in one full-width pane for Claude-only, Codex-only and mixed kernels.
-The dashboard and advisor each remain available in their own tab or tmux window.
+needs no YAML edit. Below 120 measured columns (or unknown width), show the operator alone first; from 120,
+show dashboard and operator equally side by side. The advisor always has a separate tab or tmux window.
+This applies to Claude-only, Codex-only and mixed kernels.
 Keep the queue worker off the first view and accessible through the TUI. Reuse existing conversations and accounts.
 Inspect the result and visible content using authorized desktop tools, or report that visibility is unconfirmed.
 Herdr is visible only inside a terminal the person can see. Creating a workspace or switching the shared TUI

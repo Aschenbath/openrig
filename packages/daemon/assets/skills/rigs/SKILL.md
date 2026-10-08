@@ -38,8 +38,9 @@ guidance in `AGENTS.md` or `CLAUDE.md` plus the team's skills and plugins. Say s
   Keep it.
 - **Open the welcome screen:** for “show me my agents”, “show me the terminals”, “see my agents” or “welcome screen”, run
   `rig terminal open saved:kernel --window` on the daemon's desktop. Otherwise ask “Open the OpenRig view now?”
-  first. It opens a new terminal tab/window itself with one full-width operator pane, using herdr when installed
-  or plain tmux otherwise. The dashboard and advisor each have their own tab or tmux window; select one to switch.
+  first. It opens a new terminal tab/window itself, using herdr when installed or plain tmux otherwise.
+  Below 120 measured columns (or unknown width), the operator fills the first page; from 120, dashboard and operator
+  share it equally. The advisor always has a separate tab or tmux window; select one to switch.
   Preserve the current terminal. Check the result and visible content, or report what cannot be
   verified. On a Mac the first open can raise two macOS prompts: “… is an app downloaded from the Internet”
   (Open) and “… wants access to control …” (Allow). Tell the person to expect them and accept both; if the open

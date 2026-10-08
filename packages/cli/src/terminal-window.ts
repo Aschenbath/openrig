@@ -13,7 +13,7 @@ interface Pane { seat: string; label: string; paneCommand: string }
 interface Preview {
   planId: string;
   status: { launch?: { socketPath: string; session?: string } };
-  composed: { id: string; opened: Pane[]; pages: Pane[][]; columns?: number; absent: OpenViewResult["absent"]; degraded: OpenViewResult["degraded"] };
+  composed: { id: string; opened: Pane[]; pages: Pane[][]; columns?: number; kernelLayout?: string; absent: OpenViewResult["absent"]; degraded: OpenViewResult["degraded"] };
 }
 
 export interface WindowDeps {
@@ -24,7 +24,9 @@ export interface WindowDeps {
   launch(file: string, args: string[]): Promise<void>;
   sleep(ms: number): Promise<void>;
   id(): string;
-  herdrConfig(socketPath: string): string;
+  herdrConfig(socketPath: string, columns?: number): string;
+  /** Hosting terminal measurement also works for an agent shell tool with piped stdio. */
+  columns?(): Promise<number | undefined>;
 }
 
 export function defaultWindowDeps(): WindowDeps {
@@ -41,7 +43,23 @@ export function defaultWindowDeps(): WindowDeps {
     }),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     id: () => randomUUID().slice(0, 12),
-    herdrConfig: socketPath => prepareHerdrLaunchConfig(env, socketPath),
+    herdrConfig: (socketPath, columns) => prepareHerdrLaunchConfig(env, socketPath, columns),
+    columns: async () => {
+      if (process.stdout.isTTY && process.stdout.columns > 0) return process.stdout.columns;
+      try {
+        const size = await run("/bin/sh", ["-c", "stty size < /dev/tty"], { encoding: "utf8", timeout: 1000 });
+        const width = Number(size.stdout.trim().split(/\s+/)[1]);
+        if (Number.isSafeInteger(width) && width > 0) return width;
+      } catch { /* A detached shell tool may still name its hosting tmux pane. */ }
+      if (process.env["TMUX"] && process.env["TMUX_PANE"]) {
+        try {
+          const size = await run("tmux", ["display-message", "-p", "-t", process.env["TMUX_PANE"], "#{window_width}"], { encoding: "utf8", timeout: 1000 });
+          const width = Number(size.stdout.trim());
+          if (Number.isSafeInteger(width) && width > 0) return width;
+        } catch { /* Unknown is a narrow layout, never an invented wide measurement. */ }
+      }
+      return undefined;
+    },
   };
 }
 
@@ -65,7 +83,7 @@ async function herdrBinary(deps: WindowDeps): Promise<string | null> {
 }
 
 /** New surfaces only. No System Events keystrokes or existing-terminal input. */
-async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((command: string) => Promise<{ app: string; surface: string }>) | string> {
+async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((command: string) => Promise<{ app: string; surface: string; columns?: number }>) | string> {
   // Shell tools can pipe stdio while still running inside the person's terminal.
   const program = deps.env["TERM_PROGRAM"];
   const linuxHost = deps.platform !== "linux" ? undefined
@@ -87,8 +105,7 @@ async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((comm
       } catch { /* No other app is a substitute for the hosting terminal. */ }
     }
     if (inGhostty && !ghostty) return "The hosting Ghostty does not provide a supported scripting interface.";
-    // Native macOS tab groups appear as separate one-tab Terminal windows.
-    // That is not evidence that resizing one would leave existing windows alone.
+    // A tab group shares bounds: copying its current bounds also leaves the original unchanged.
     const script = ghostty ? `on run argv
 tell application "Ghostty"
   set cfg to new surface configuration
@@ -107,18 +124,24 @@ tell application "Ghostty"
 end tell
 end run` : `on run argv
 tell application "Terminal"
-  do script (item 1 of argv)
+  set personBounds to missing value
+  if (count of windows) > 0 then set personBounds to bounds of front window
+  set viewTab to do script ""
+  set viewWindow to front window
+  if personBounds is not missing value then set bounds of viewWindow to personBounds
+  do script (item 1 of argv) in viewTab
   activate
+  return "window:" & (number of columns of viewTab)
 end tell
-return "window"
 end run`;
     // A denied/uncertain Automation request is returned once, never replayed in another app.
     return async command => {
-      const surface = (await deps.exec("/usr/bin/osascript", ["-e", script, command], 120_000)).trim();
+      const reported = (await deps.exec("/usr/bin/osascript", ["-e", script, command], 120_000)).trim();
+      const columns = Number(reported.split(":")[1]);
       notes.push(ghostty
-        ? "Ghostty's macOS scripting interface does not expose window size. Enlarge the new view manually if its columns are cramped; existing window settings were kept."
-        : "Terminal opened with its own window sizing. Resize or move the new view manually if needed; OpenRig did not request a size or position change.");
-      return { app: ghostty ? "Ghostty" : "Terminal", surface: ghostty ? surface : "window" };
+        ? "Ghostty keeps the person's window size; layout uses the hosting terminal's measured width when available."
+        : "The new Terminal view copies the person's front-window bounds when available; existing window settings were kept.");
+      return { app: ghostty ? "Ghostty" : "Terminal", surface: ghostty ? reported : "window", ...(Number.isSafeInteger(columns) && columns > 0 ? { columns } : {}) };
     };
   }
   if (deps.platform !== "linux") return `No supported desktop launcher on ${deps.platform}.`;
@@ -147,7 +170,7 @@ function failure(provider: string, error: string): OpenViewResult {
 /** Render the daemon's existing composition; never rediscover/relaunch kernel seats here. */
 export async function openTerminalWindow(client: DaemonClient, view: string, requestedProvider?: string, deps = defaultWindowDeps(), expectedPlan?: string): Promise<OpenViewResult> {
   let provider = requestedProvider ?? "herdr";
-  let window: { app: string; surface: string } | undefined;
+  let window: { app: string; surface: string; columns?: number } | undefined;
   let viewer: string | undefined;
   let windowAttempted = false;
   const recovery = `rig terminal open ${shellQuote(view)} --window${requestedProvider && ["herdr", "tmux"].includes(requestedProvider) ? ` --provider ${shellQuote(requestedProvider)}` : ""}`;
@@ -160,25 +183,45 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
     if (!localDaemon(client.baseUrl)) throw new Error("The window launcher must run on the daemon's own desktop; the configured daemon is remote.");
     if (requestedProvider && !["herdr", "tmux"].includes(requestedProvider)) throw new Error("--window supports herdr or tmux. Use cmux without --window.");
     const launchWindow = await windowLauncher(deps, windowNotes);
+    const measured = typeof launchWindow === "function" ? await deps.columns?.().catch(() => undefined) : undefined;
+    let viewportColumns = Number.isSafeInteger(measured) && measured! > 0 ? measured : undefined;
     const herdr = requestedProvider === "tmux" ? null : await herdrBinary(deps);
     if (!herdr && requestedProvider === "herdr") throw new Error("Herdr is not installed. Run rig setup, or use --provider tmux --window.");
     provider = herdr ? "herdr" : "tmux";
     // Preview is provider-neutral composition, including saved-view membership, absences and quoting.
-    const preview = await client.get<Preview | OpenViewResult>(`/api/terminal/preview?view=${encodeURIComponent(view)}&provider=herdr`);
+    const previewUrl = () => `/api/terminal/preview?view=${encodeURIComponent(view)}&provider=herdr${viewportColumns === undefined ? "" : `&viewportColumns=${viewportColumns}`}`;
+    const preview = await client.get<Preview | OpenViewResult>(previewUrl());
     if (preview.status >= 400 || !("composed" in preview.data)) {
       return failed((preview.data as OpenViewResult).error ?? "Could not compose the requested view.");
     }
-    const { composed, planId } = preview.data;
+    let { composed, planId } = preview.data;
     if (expectedPlan !== undefined && expectedPlan !== planId) {
       return failure(provider, "The terminal view changed since preview. Refresh the preview before opening.");
     }
     if (!composed.opened.length) return { ...failed("No conversations are attachable."), absent: composed.absent, degraded: composed.degraded };
+    const measureWindow = async () => {
+      if (window?.columns !== undefined && window.columns !== viewportColumns && composed.kernelLayout) {
+        viewportColumns = window.columns;
+        const next = await client.get<Preview | OpenViewResult>(previewUrl());
+        if (next.status >= 400 || !("composed" in next.data)) throw new Error("Could not compose the measured terminal view.");
+        if (expectedPlan !== undefined && expectedPlan !== next.data.planId) throw new Error("The measured terminal layout differs from the expected preview; refresh the preview before opening.");
+        ({ composed, planId } = next.data);
+        if (!composed.opened.length) throw new Error("No conversations are attachable after opening the terminal.");
+      }
+      if (composed.kernelLayout) windowNotes.push(viewportColumns === undefined
+        ? "Terminal width could not be measured; the welcome view uses the operator-only first page."
+        : `Welcome layout measured at ${viewportColumns} columns: ${viewportColumns >= 120 ? "dashboard and operator side by side; advisor on a separate page" : "operator first; dashboard and advisor on separate pages"}.`);
+    };
     const socket = preview.data.status.launch?.socketPath;
     let configEnv = "";
+    let configPrefix = "";
     if (herdr && socket) {
       try {
-        configEnv = ` HERDR_CONFIG_PATH=${shellQuote(deps.herdrConfig(socket))}`;
-        windowNotes.push("Herdr starts with the sidebar collapsed unless this endpoint has a saved choice; later toggles are kept.");
+        const narrow = deps.herdrConfig(socket);
+        const wide = typeof launchWindow === "function" ? deps.herdrConfig(socket, 160) : narrow;
+        if (narrow === wide) configEnv = ` HERDR_CONFIG_PATH=${shellQuote(narrow)}`;
+        else configPrefix = `set -- $(stty size 2>/dev/null); if [ "${'${2:-0}'}" -ge 160 ]; then export HERDR_CONFIG_PATH=${shellQuote(wide)}; else export HERDR_CONFIG_PATH=${shellQuote(narrow)}; fi; exec `;
+        windowNotes.push("Your Herdr config is kept when present; otherwise the sidebar starts open at 160 columns and collapsed below.");
       } catch (error) {
         windowNotes.push(`Could not prepare OpenRig's private Herdr settings (${error instanceof Error ? error.message : String(error)}); Herdr starts with its usual sidebar.`);
       }
@@ -200,7 +243,8 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
       if (!endpoint?.socketPath) throw new Error("The daemon does not report its herdr endpoint. Update the daemon, or use --provider tmux --window.");
       // A CLI session would override the daemon's resolved socket in Herdr.
       windowAttempted = true;
-      window = await launchWindow(`env -u TMUX -u HERDR_SESSION -u HERDR_SOCKET_PATH HERDR_SOCKET_PATH=${shellQuote(endpoint.socketPath)}${configEnv} ${shellQuote(herdr)}`);
+      window = await launchWindow(`${configPrefix}env -u TMUX -u HERDR_SESSION -u HERDR_SOCKET_PATH HERDR_SOCKET_PATH=${shellQuote(endpoint.socketPath)}${configEnv} ${shellQuote(herdr)}`);
+      await measureWindow();
       let alive = false;
       for (let attempt = 0; attempt < 20; attempt++) {
         const status = await client.get<{ providers: Array<{ liveness: { alive: boolean } }> }>("/api/terminal/status?provider=herdr");
@@ -255,7 +299,7 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
           notes: [...windowNotes, "Existing workspace contents were kept; no layout refresh or new tiles were requested. Check the new terminal shows the intended view."],
         };
       }
-      const result = await client.post<OpenViewResult>("/api/terminal/open", { view, provider: "herdr", expectedPlan: planId }, { timeoutMs: 45_000 });
+      const result = await client.post<OpenViewResult>("/api/terminal/open", { view, provider: "herdr", expectedPlan: planId, ...(viewportColumns !== undefined ? { viewportColumns } : {}) }, { timeoutMs: 45_000 });
       if (result.status >= 400) return { ...failed(result.data.error ?? `The daemon refused the view (HTTP ${result.status}).`), window, notes: windowNotes, absent: composed.absent, degraded: composed.degraded };
       if (!Array.isArray(result.data?.opened)) throw new Error("The terminal opened, but the daemon returned no view result. Inspect it before retrying.");
       return { ...result.data, window, notes: [...(result.data.notes ?? []), ...windowNotes, "Check the new terminal shows the intended view; window creation alone is not visual confirmation."] };
@@ -264,12 +308,25 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
     const tmux = (await deps.exec("/bin/sh", ["-c", "command -v tmux"]).catch(() => "")).trim();
     if (!tmux) throw new Error("tmux is unavailable; run rig setup first.");
     viewer = `openrig-view-${deps.id()}`;
+    let placeholder: string | undefined;
+    if (composed.kernelLayout) {
+      // This is our fresh, empty viewer, never a source seat. Attach it first so Terminal can
+      // report the real new window width before we select the welcome layout.
+      placeholder = (await deps.exec(tmux, ["new-session", "-d", "-s", viewer, "-n", "view-1", "-P", "-F", "#{pane_id}"])).trim();
+      windowAttempted = true;
+      window = await launchWindow(`env -u TMUX ${shellQuote(tmux)} attach-session -t ${shellQuote(`=${viewer}`)}`);
+      await measureWindow();
+    }
     for (const [pageIndex, page] of composed.pages.entries()) {
       if (!page.length) continue;
       const name = `view-${pageIndex + 1}`;
       const first = page[0]!;
       const args = pageIndex === 0 ? ["new-session", "-d", "-s", viewer, "-n", name] : ["new-window", "-d", "-t", `${viewer}:`, "-n", name];
-      let pane = (await deps.exec(tmux, [...args, "-P", "-F", "#{pane_id}", `env -u TMUX ${first.paneCommand}`])).trim();
+      let pane: string;
+      if (pageIndex === 0 && placeholder) {
+        await deps.exec(tmux, ["respawn-pane", "-k", "-t", placeholder, `env -u TMUX ${first.paneCommand}`]);
+        pane = placeholder;
+      } else pane = (await deps.exec(tmux, [...args, "-P", "-F", "#{pane_id}", `env -u TMUX ${first.paneCommand}`])).trim();
       // Nested source clients on this server can make a new window too narrow to split.
       // Use the viewer's configured detached size, then restore normal client resizing.
       const [width, height] = (await deps.exec(tmux, ["show-options", "-Av", "-t", viewer, "default-size"])).trim().split("x");
@@ -285,8 +342,10 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
       await deps.exec(tmux, ["set-option", "-w", "-t", `${viewer}:${name}`, "window-size", sizing]);
     }
     await deps.exec(tmux, ["select-window", "-t", `${viewer}:view-1`]);
-    windowAttempted = true;
-    window = await launchWindow(`env -u TMUX ${shellQuote(tmux)} attach-session -t ${shellQuote(`=${viewer}`)}`);
+    if (!window) {
+      windowAttempted = true;
+      window = await launchWindow(`env -u TMUX ${shellQuote(tmux)} attach-session -t ${shellQuote(`=${viewer}`)}`);
+    }
     return { provider, ok: true, opened: composed.opened.map(pane => pane.seat), absent: composed.absent, degraded: composed.degraded, pages: composed.pages.length, window, notes: [`Viewing session: ${viewer}. Existing conversations were preserved.`, ...windowNotes, "Check the new terminal shows the intended view; window creation alone is not visual confirmation."] };
   } catch (err) {
     return { ...failed((err as Error).message), ...(window ? { window } : {}), ...(windowNotes.length || viewer ? { notes: [...windowNotes, ...(viewer ? [`Viewing session ${viewer} may exist. Inspect it before retrying; no existing conversation was replaced.`] : [])] } : {}) };
