@@ -763,6 +763,14 @@ Root: `rig`; declared option: `-V, --version`.
 |---|---|---|
 | `rig grow <rig-id> <members...>` | — | `--pod <pod>`<br>`--new-pod <pod>`<br>`--runtime <runtime>`<br>`--cwd <path>`<br>`--json` |
 
+### edge
+
+| Invocation | Aliases | Declared options |
+|---|---|---|
+| `rig edge` | — | — |
+| `rig edge add <rig-id> <from> <to>` | — | `--kind <kind>` **required**<br>`--plan`<br>`--json` |
+| `rig edge remove <rig-id> <edge-id>` | — | `--plan`<br>`--json` |
+
 ### reconcile-session
 
 | Invocation | Aliases | Declared options |
