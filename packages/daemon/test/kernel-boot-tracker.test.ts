@@ -12,18 +12,42 @@ import type { EventBus } from "../src/domain/event-bus.js";
 import type { SessionRegistry } from "../src/domain/session-registry.js";
 import type { RigRepository } from "../src/domain/rig-repository.js";
 
-function makeRigRepo(rigs: Array<{ id: string; name: string }>): RigRepository {
+// A session row as the registry returns it. Each defaults to its own node (named after the session) unless
+// nodeId says otherwise; rows are created in array order.
+interface FakeSession {
+  sessionName: string;
+  runtime?: string;
+  startupStatus: string;
+  nodeId?: string;
+}
+
+const nodeOf = (s: FakeSession) => s.nodeId ?? s.sessionName;
+
+function makeRigRepo(
+  rigs: Array<{ id: string; name: string; archived?: boolean }>,
+  sessionsByRig: Record<string, FakeSession[]> = {},
+): RigRepository {
   return {
     listRigs: () => rigs,
     findRigsByName: (name: string) => rigs.filter((r) => r.name === name),
+    findUnarchivedRigsByName: (name: string) => rigs.filter((r) => r.name === name && !r.archived),
+    // The runtime lives on the node row: the first session row of each node supplies it here.
+    getRig: (rigId: string) => ({
+      rig: rigs.find((r) => r.id === rigId),
+      nodes: [...new Map((sessionsByRig[rigId] ?? []).map((s) => [nodeOf(s), { id: nodeOf(s), runtime: s.runtime ?? null }])).values()],
+      edges: [],
+    }),
   } as unknown as RigRepository;
 }
 
-function makeSessionRegistry(
-  sessionsByRig: Record<string, Array<{ sessionName: string; runtime?: string; startupStatus: string }>>,
-): SessionRegistry {
+function makeSessionRegistry(sessionsByRig: Record<string, FakeSession[]>): SessionRegistry {
   return {
-    getSessionsForRig: (rigId: string) => sessionsByRig[rigId] ?? [],
+    getSessionsForRig: (rigId: string) => (sessionsByRig[rigId] ?? []).map((s, i) => ({
+      ...s,
+      nodeId: nodeOf(s),
+      id: `session-${String(i).padStart(3, "0")}`,
+      createdAt: `2026-10-08T00:00:${String(i).padStart(2, "0")}Z`,
+    })),
   } as unknown as SessionRegistry;
 }
 
@@ -292,6 +316,110 @@ describe("KernelBootTracker — sessionRegistry error handling", () => {
     const status = tracker.getStatus();
     expect(status.agents).toEqual([]);
     expect(status.kernelState).toBe("skipped");
+    tracker.stop();
+  });
+});
+
+describe("KernelBootTracker — recovery after a boot failure (#1042)", () => {
+  const failedBoot = () => Promise.resolve({
+    runId: "t", status: "failed", stages: [], errors: ["startup gate timed out after 30s"], warnings: [],
+  } as never);
+
+  it("reports ready once every kernel seat is ready, keeping the failure as history", async () => {
+    const rigId = "rig-kernel-recovered";
+    const sessions: FakeSession[] = [
+      { sessionName: "operator-agent@kernel", runtime: "claude-code", startupStatus: "ready" },
+      { sessionName: "queue-worker@kernel", runtime: "codex", startupStatus: "attention_required" },
+    ];
+    const tracker = new KernelBootTracker({
+      eventBus: makeEventBus().bus,
+      sessionRegistry: makeSessionRegistry({ [rigId]: sessions }),
+      rigRepo: makeRigRepo([{ id: rigId, name: "kernel" }], { [rigId]: sessions }),
+      degradedTimeoutMs: 0,
+    });
+    tracker.startBooting("rig.yaml", failedBoot());
+    await flush();
+    expect(tracker.getStatus()).toMatchObject({ kernelState: "bootstrap_failed", lastBootFailure: null });
+
+    sessions[1]!.startupStatus = "ready"; // the gate was resolved, as with `rig seat continue`
+    const status = tracker.getStatus();
+    expect(status.kernelState).toBe("ready");
+    expect(status.detail).toBeNull();
+    expect(status.firstUnreadySince).toBeNull();
+    expect(status.lastBootFailure).toMatchObject({ state: "bootstrap_failed", detail: "startup gate timed out after 30s" });
+    expect(status.lastBootFailure?.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    tracker.stop();
+  });
+
+  it("keeps the failure current while any kernel seat is not ready", async () => {
+    const rigId = "rig-kernel-still-failed";
+    const sessions: FakeSession[] = [
+      { sessionName: "operator-agent@kernel", startupStatus: "ready" },
+      { sessionName: "queue-worker@kernel", startupStatus: "failed" },
+    ];
+    const tracker = new KernelBootTracker({
+      eventBus: makeEventBus().bus,
+      sessionRegistry: makeSessionRegistry({ [rigId]: sessions }),
+      rigRepo: makeRigRepo([{ id: rigId, name: "kernel" }], { [rigId]: sessions }),
+      degradedTimeoutMs: 0,
+    });
+    tracker.startBooting("rig.yaml", failedBoot());
+    await flush();
+    const status = tracker.getStatus();
+    expect(status.kernelState).toBe("bootstrap_failed");
+    expect(status.detail).toBe("startup gate timed out after 30s");
+    expect(status.lastBootFailure).toBeNull();
+    tracker.stop();
+  });
+
+  it("reports ready after a degraded boot once every seat is ready", async () => {
+    const rigId = "rig-kernel-degraded";
+    const sessions: FakeSession[] = [{ sessionName: "operator-agent@kernel", startupStatus: "pending" }];
+    let finish!: () => void;
+    const boot = new Promise((resolve) => { finish = () => resolve({ runId: "t", status: "ok", stages: [], errors: [], warnings: [] }); });
+    const tracker = new KernelBootTracker({
+      eventBus: makeEventBus().bus,
+      sessionRegistry: makeSessionRegistry({ [rigId]: sessions }),
+      rigRepo: makeRigRepo([{ id: rigId, name: "kernel" }], { [rigId]: sessions }),
+      degradedTimeoutMs: 10,
+    });
+    tracker.startBooting("rig.yaml", boot as never);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(tracker.getStatus().kernelState).toBe("degraded");
+
+    finish();
+    await flush();
+    sessions[0]!.startupStatus = "ready";
+    expect(tracker.getStatus()).toMatchObject({ kernelState: "ready", lastBootFailure: { state: "degraded" } });
+    tracker.stop();
+  });
+});
+
+describe("KernelBootTracker — one entry per kernel seat (#1042)", () => {
+  it("lists each seat once, from its newest session row, with the node's runtime, and skips archived kernels", async () => {
+    const rigId = "rig-kernel-current";
+    const sessions: FakeSession[] = [
+      { sessionName: "operator-agent@kernel", runtime: "claude-code", startupStatus: "attention_required", nodeId: "node-operator" },
+      { sessionName: "queue-worker@kernel", runtime: "codex", startupStatus: "ready", nodeId: "node-queue" },
+      // A relaunch or `rig seat continue` adds a newer session row for the same node.
+      { sessionName: "operator-agent@kernel", startupStatus: "ready", nodeId: "node-operator" },
+    ];
+    const archived: FakeSession[] = [{ sessionName: "operator-agent@kernel", startupStatus: "failed", nodeId: "node-old" }];
+    const byRig = { [rigId]: sessions, "rig-kernel-archived": archived };
+    const tracker = new KernelBootTracker({
+      eventBus: makeEventBus().bus,
+      sessionRegistry: makeSessionRegistry(byRig),
+      rigRepo: makeRigRepo([{ id: "rig-kernel-archived", name: "kernel", archived: true }, { id: rigId, name: "kernel" }], byRig),
+      degradedTimeoutMs: 0,
+    });
+    tracker.startBooting("rig.yaml", Promise.resolve({ runId: "t", status: "ok", stages: [], errors: [], warnings: [] } as never));
+    await flush();
+    const status = tracker.getStatus();
+    expect(status.agents).toEqual([
+      { sessionName: "operator-agent@kernel", runtime: "claude-code", startupStatus: "ready" },
+      { sessionName: "queue-worker@kernel", runtime: "codex", startupStatus: "ready" },
+    ]);
+    expect(status.kernelState).toBe("ready");
     tracker.stop();
   });
 });

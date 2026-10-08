@@ -30,6 +30,8 @@ function makeRigRepo(existingRigs: Array<{ id?: string; name: string }>): RigRep
   return {
     listRigs: () => existingRigs,
     findRigsByName: (name: string) => existingRigs.filter((r) => r.name === name),
+    findUnarchivedRigsByName: (name: string) => existingRigs.filter((r) => r.name === name),
+    getRig: () => null,
   } as unknown as RigRepository;
 }
 
