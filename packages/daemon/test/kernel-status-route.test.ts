@@ -24,10 +24,10 @@ function mountWithTracker(tracker: KernelBootTracker | undefined) {
 
 function makeTracker(opts: {
   rigs?: Array<{ id: string; name: string }>;
-  sessionsByRig?: Record<string, Array<{ sessionName: string; runtime: string; startupStatus: string }>>;
+  sessionsByRig?: Record<string, Array<{ sessionName: string; runtime: string; startupStatus: string; logicalId?: string }>>;
 } = {}) {
   const eventBus = { emit: () => undefined } as unknown as EventBus;
-  // One node per session name; the runtime lives on the node row.
+  // One node per session name; the runtime and the spec's `pod.member` (logicalId) live on the node row.
   const sessionRegistry = {
     getSessionsForRig: (rigId: string) => (opts.sessionsByRig?.[rigId] ?? []).map((s, i) => ({
       ...s, nodeId: s.sessionName, id: `session-${i}`, createdAt: `2026-10-08T00:00:0${i}Z`,
@@ -38,7 +38,7 @@ function makeTracker(opts: {
     findRigsByName: (name: string) => (opts.rigs ?? []).filter((r) => r.name === name),
     findUnarchivedRigsByName: (name: string) => (opts.rigs ?? []).filter((r) => r.name === name),
     getRig: (rigId: string) => ({
-      nodes: (opts.sessionsByRig?.[rigId] ?? []).map((s) => ({ id: s.sessionName, runtime: s.runtime })),
+      nodes: (opts.sessionsByRig?.[rigId] ?? []).map((s) => ({ id: s.sessionName, logicalId: s.logicalId ?? s.sessionName, runtime: s.runtime })),
     }),
   } as unknown as RigRepository;
   return new KernelBootTracker({ eventBus, sessionRegistry, rigRepo, degradedTimeoutMs: 0 });
@@ -107,16 +107,16 @@ describe("GET /api/kernel/status", () => {
     tracker.stop();
   });
 
-  it("reports ready with last_boot_failure once a failed boot's seats are all ready (#1042)", async () => {
+  it("reports ready with last_boot_failure once a failed boot's expected seats are all ready (#1042)", async () => {
     const rigId = "rig-kernel-route-recovered";
     const sessions = [
-      { sessionName: "operator-agent@kernel", runtime: "claude-code", startupStatus: "ready" },
-      { sessionName: "queue-worker@kernel", runtime: "codex", startupStatus: "ready" },
+      { sessionName: "operator-agent@kernel", runtime: "claude-code", startupStatus: "ready", logicalId: "operator.agent" },
+      { sessionName: "queue-worker@kernel", runtime: "codex", startupStatus: "ready", logicalId: "queue.worker" },
     ];
     const tracker = makeTracker({ rigs: [{ id: rigId, name: "kernel" }], sessionsByRig: { [rigId]: sessions } });
     tracker.startBooting("rig.yaml", Promise.resolve({
       runId: "t", status: "failed", stages: [], errors: ["startup gate timed out after 30s"], warnings: [],
-    } as never));
+    } as never), ["operator.agent", "queue.worker"]);
     await new Promise<void>((r) => setImmediate(r));
     const body = await (await mountWithTracker(tracker).request("/api/kernel/status")).json();
     expect(body.kernel_state).toBe("ready");

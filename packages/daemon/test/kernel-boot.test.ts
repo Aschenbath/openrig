@@ -11,8 +11,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import {
   bootKernelIfNeeded,
+  expectedKernelSeats,
   selectVariant,
   kernelAlreadyManaged,
   authBlockMessage,
@@ -330,5 +332,28 @@ describe("probeCodexReadiness — the kernel's Codex probe (#194)", () => {
     }, tmpSpecsDir));
     expect(tracker.getStatus().variant).toBe("rig-codex-only.yaml");
     tracker.stop();
+  });
+});
+
+describe("expectedKernelSeats — the roster a boot failure must recover (#1042)", () => {
+  it("reads each pod member of the shipped kernel variants as pod.member", () => {
+    const kernelDir = fileURLToPath(new URL("../specs/rigs/launch/kernel/", import.meta.url));
+    for (const variant of ["rig.yaml", "rig-claude-only.yaml", "rig-codex-only.yaml"]) {
+      expect(expectedKernelSeats(join(kernelDir, variant))).toEqual(["advisor.lead", "operator.human", "operator.agent", "queue.worker"]);
+    }
+  });
+
+  it("returns null when the roster can't be known, so a failure stays current", () => {
+    const cases: Record<string, string> = {
+      "no-pods.yaml": "name: kernel\n",
+      "empty-pods.yaml": "name: kernel\npods: []\n",
+      "member-without-id.yaml": "name: kernel\npods:\n  - id: queue\n    members:\n      - runtime: codex\n",
+      "malformed.yaml": "name: kernel\npods: [\n",
+    };
+    for (const [file, yaml] of Object.entries(cases)) {
+      writeFileSync(join(tmpSpecsDir, file), yaml);
+      expect(expectedKernelSeats(join(tmpSpecsDir, file))).toBeNull();
+    }
+    expect(expectedKernelSeats(join(tmpSpecsDir, "missing.yaml"))).toBeNull();
   });
 });

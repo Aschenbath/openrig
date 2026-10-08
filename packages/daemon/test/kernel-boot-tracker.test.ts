@@ -23,19 +23,25 @@ interface FakeSession {
 
 const nodeOf = (s: FakeSession) => s.nodeId ?? s.sessionName;
 
+// A node row as getRig returns it, independent of the session rows, so a node can have no session. logicalId
+// is the spec's `pod.member`; the runtime lives on the node row.
+interface FakeNode {
+  id: string;
+  logicalId: string;
+  runtime?: string;
+}
+
 function makeRigRepo(
   rigs: Array<{ id: string; name: string; archived?: boolean }>,
-  sessionsByRig: Record<string, FakeSession[]> = {},
+  nodesByRig: Record<string, FakeNode[]> = {},
 ): RigRepository {
   return {
     listRigs: () => rigs,
     findRigsByName: (name: string) => rigs.filter((r) => r.name === name),
     findUnarchivedRigsByName: (name: string) => rigs.filter((r) => r.name === name && !r.archived),
-    // The runtime lives on the node row: the first session row of each node supplies it here.
     getRig: (rigId: string) => ({
       rig: rigs.find((r) => r.id === rigId),
-      nodes: (sessionsByRig[rigId] ?? []).filter((s, i, all) => all.findIndex((t) => nodeOf(t) === nodeOf(s)) === i)
-        .map((s) => ({ id: nodeOf(s), runtime: s.runtime ?? null })),
+      nodes: (nodesByRig[rigId] ?? []).map((n) => ({ ...n, runtime: n.runtime ?? null })),
       edges: [],
     }),
   } as unknown as RigRepository;
@@ -325,20 +331,28 @@ describe("KernelBootTracker — recovery after a boot failure (#1042)", () => {
   const failedBoot = () => Promise.resolve({
     runId: "t", status: "failed", stages: [], errors: ["startup gate timed out after 30s"], warnings: [],
   } as never);
+  // The seats the kernel spec declares, and their nodes.
+  const expected = ["operator.agent", "queue.worker"];
+  const operatorNode: FakeNode = { id: "node-operator", logicalId: "operator.agent", runtime: "claude-code" };
+  const queueNode: FakeNode = { id: "node-queue", logicalId: "queue.worker", runtime: "codex" };
 
-  it("reports ready once every kernel seat is ready, keeping the failure as history", async () => {
-    const rigId = "rig-kernel-recovered";
-    const sessions: FakeSession[] = [
-      { sessionName: "operator-agent@kernel", runtime: "claude-code", startupStatus: "ready" },
-      { sessionName: "queue-worker@kernel", runtime: "codex", startupStatus: "attention_required" },
-    ];
+  function failedTracker(rigId: string, nodes: FakeNode[], sessions: FakeSession[], seats: readonly string[] | null | undefined) {
     const tracker = new KernelBootTracker({
       eventBus: makeEventBus().bus,
       sessionRegistry: makeSessionRegistry({ [rigId]: sessions }),
-      rigRepo: makeRigRepo([{ id: rigId, name: "kernel" }], { [rigId]: sessions }),
+      rigRepo: makeRigRepo([{ id: rigId, name: "kernel" }], { [rigId]: nodes }),
       degradedTimeoutMs: 0,
     });
-    tracker.startBooting("rig.yaml", failedBoot());
+    tracker.startBooting("rig.yaml", failedBoot(), seats);
+    return tracker;
+  }
+
+  it("reports ready once every expected seat is ready, keeping the failure as history", async () => {
+    const sessions: FakeSession[] = [
+      { sessionName: "operator-agent@kernel", startupStatus: "ready", nodeId: "node-operator" },
+      { sessionName: "queue-worker@kernel", startupStatus: "attention_required", nodeId: "node-queue" },
+    ];
+    const tracker = failedTracker("rig-kernel-recovered", [operatorNode, queueNode], sessions, expected);
     await flush();
     expect(tracker.getStatus()).toMatchObject({ kernelState: "bootstrap_failed", lastBootFailure: null });
 
@@ -352,19 +366,11 @@ describe("KernelBootTracker — recovery after a boot failure (#1042)", () => {
     tracker.stop();
   });
 
-  it("keeps the failure current while any kernel seat is not ready", async () => {
-    const rigId = "rig-kernel-still-failed";
-    const sessions: FakeSession[] = [
-      { sessionName: "operator-agent@kernel", startupStatus: "ready" },
-      { sessionName: "queue-worker@kernel", startupStatus: "failed" },
-    ];
-    const tracker = new KernelBootTracker({
-      eventBus: makeEventBus().bus,
-      sessionRegistry: makeSessionRegistry({ [rigId]: sessions }),
-      rigRepo: makeRigRepo([{ id: rigId, name: "kernel" }], { [rigId]: sessions }),
-      degradedTimeoutMs: 0,
-    });
-    tracker.startBooting("rig.yaml", failedBoot());
+  it("keeps the failure current while any expected seat is not ready", async () => {
+    const tracker = failedTracker("rig-kernel-still-failed", [operatorNode, queueNode], [
+      { sessionName: "operator-agent@kernel", startupStatus: "ready", nodeId: "node-operator" },
+      { sessionName: "queue-worker@kernel", startupStatus: "failed", nodeId: "node-queue" },
+    ], expected);
     await flush();
     const status = tracker.getStatus();
     expect(status.kernelState).toBe("bootstrap_failed");
@@ -373,26 +379,78 @@ describe("KernelBootTracker — recovery after a boot failure (#1042)", () => {
     tracker.stop();
   });
 
-  it("reports ready after a degraded boot once every seat is ready", async () => {
-    const rigId = "rig-kernel-degraded";
-    const sessions: FakeSession[] = [{ sessionName: "operator-agent@kernel", startupStatus: "pending" }];
-    let finish!: () => void;
-    const boot = new Promise((resolve) => { finish = () => resolve({ runId: "t", status: "ok", stages: [], errors: [], warnings: [] }); });
-    const tracker = new KernelBootTracker({
-      eventBus: makeEventBus().bus,
-      sessionRegistry: makeSessionRegistry({ [rigId]: sessions }),
-      rigRepo: makeRigRepo([{ id: rigId, name: "kernel" }], { [rigId]: sessions }),
-      degradedTimeoutMs: 10,
-    });
-    tracker.startBooting("rig.yaml", boot as never);
-    await new Promise((r) => setTimeout(r, 30));
-    expect(tracker.getStatus().kernelState).toBe("degraded");
-
-    finish();
+  it("keeps the failure current when a kernel node has no session row", async () => {
+    // Two kernel nodes, one ready session: the add-member path creates the node before the failure.
+    const tracker = failedTracker("rig-kernel-no-session", [operatorNode, queueNode], [
+      { sessionName: "operator-agent@kernel", startupStatus: "ready", nodeId: "node-operator" },
+    ], expected);
     await flush();
-    sessions[0]!.startupStatus = "ready";
-    expect(tracker.getStatus()).toMatchObject({ kernelState: "ready", lastBootFailure: { state: "degraded" } });
+    const status = tracker.getStatus();
+    expect(status.agents).toHaveLength(1);
+    expect(status.kernelState).toBe("bootstrap_failed");
+    expect(status.detail).toBe("startup gate timed out after 30s");
+    expect(status.lastBootFailure).toBeNull();
     tracker.stop();
+  });
+
+  it("keeps the failure current when an expected member has no node", async () => {
+    // The member failed before its node was created, so only the operator seat exists, and it is ready.
+    const tracker = failedTracker("rig-kernel-no-node", [operatorNode], [
+      { sessionName: "operator-agent@kernel", startupStatus: "ready", nodeId: "node-operator" },
+    ], expected);
+    await flush();
+    expect(tracker.getStatus()).toMatchObject({ kernelState: "bootstrap_failed", lastBootFailure: null });
+    tracker.stop();
+  });
+
+  it("keeps the failure current when the expected roster is unknown, even with every seat ready", async () => {
+    for (const seats of [undefined, null, []]) {
+      const tracker = failedTracker("rig-kernel-unknown-roster", [operatorNode, queueNode], [
+        { sessionName: "operator-agent@kernel", startupStatus: "ready", nodeId: "node-operator" },
+        { sessionName: "queue-worker@kernel", startupStatus: "ready", nodeId: "node-queue" },
+      ], seats);
+      await flush();
+      expect(tracker.getStatus()).toMatchObject({ kernelState: "bootstrap_failed", lastBootFailure: null });
+      tracker.stop();
+    }
+  });
+
+  describe("after a degraded boot", () => {
+    async function degradedTracker(rigId: string, nodes: FakeNode[], sessions: FakeSession[]) {
+      let finish!: () => void;
+      const boot = new Promise((resolve) => { finish = () => resolve({ runId: "t", status: "ok", stages: [], errors: [], warnings: [] }); });
+      const tracker = new KernelBootTracker({
+        eventBus: makeEventBus().bus,
+        sessionRegistry: makeSessionRegistry({ [rigId]: sessions }),
+        rigRepo: makeRigRepo([{ id: rigId, name: "kernel" }], { [rigId]: nodes }),
+        degradedTimeoutMs: 10,
+      });
+      tracker.startBooting("rig.yaml", boot as never, expected);
+      await new Promise((r) => setTimeout(r, 30));
+      expect(tracker.getStatus().kernelState).toBe("degraded");
+      finish();
+      await flush();
+      return tracker;
+    }
+
+    it("reports ready once every expected seat is ready", async () => {
+      const sessions: FakeSession[] = [
+        { sessionName: "operator-agent@kernel", startupStatus: "pending", nodeId: "node-operator" },
+        { sessionName: "queue-worker@kernel", startupStatus: "pending", nodeId: "node-queue" },
+      ];
+      const tracker = await degradedTracker("rig-kernel-degraded", [operatorNode, queueNode], sessions);
+      for (const s of sessions) s.startupStatus = "ready";
+      expect(tracker.getStatus()).toMatchObject({ kernelState: "ready", lastBootFailure: { state: "degraded" } });
+      tracker.stop();
+    });
+
+    it("stays degraded while a kernel node has no session row", async () => {
+      const sessions: FakeSession[] = [{ sessionName: "operator-agent@kernel", startupStatus: "pending", nodeId: "node-operator" }];
+      const tracker = await degradedTracker("rig-kernel-degraded-no-session", [operatorNode, queueNode], sessions);
+      sessions[0]!.startupStatus = "ready";
+      expect(tracker.getStatus()).toMatchObject({ kernelState: "degraded", lastBootFailure: null });
+      tracker.stop();
+    });
   });
 });
 
@@ -400,17 +458,22 @@ describe("KernelBootTracker — one entry per kernel seat (#1042)", () => {
   it("lists each seat once, from its newest session row, with the node's runtime, and skips archived kernels", async () => {
     const rigId = "rig-kernel-current";
     const sessions: FakeSession[] = [
-      { sessionName: "operator-agent@kernel", runtime: "claude-code", startupStatus: "attention_required", nodeId: "node-operator" },
-      { sessionName: "queue-worker@kernel", runtime: "codex", startupStatus: "ready", nodeId: "node-queue" },
+      { sessionName: "operator-agent@kernel", startupStatus: "attention_required", nodeId: "node-operator" },
+      { sessionName: "queue-worker@kernel", startupStatus: "ready", nodeId: "node-queue" },
       // A relaunch or `rig seat continue` adds a newer session row for the same node.
       { sessionName: "operator-agent@kernel", startupStatus: "ready", nodeId: "node-operator" },
     ];
     const archived: FakeSession[] = [{ sessionName: "operator-agent@kernel", startupStatus: "failed", nodeId: "node-old" }];
-    const byRig = { [rigId]: sessions, "rig-kernel-archived": archived };
     const tracker = new KernelBootTracker({
       eventBus: makeEventBus().bus,
-      sessionRegistry: makeSessionRegistry(byRig),
-      rigRepo: makeRigRepo([{ id: "rig-kernel-archived", name: "kernel", archived: true }, { id: rigId, name: "kernel" }], byRig),
+      sessionRegistry: makeSessionRegistry({ [rigId]: sessions, "rig-kernel-archived": archived }),
+      rigRepo: makeRigRepo([{ id: "rig-kernel-archived", name: "kernel", archived: true }, { id: rigId, name: "kernel" }], {
+        [rigId]: [
+          { id: "node-operator", logicalId: "operator.agent", runtime: "claude-code" },
+          { id: "node-queue", logicalId: "queue.worker", runtime: "codex" },
+        ],
+        "rig-kernel-archived": [{ id: "node-old", logicalId: "operator.agent", runtime: "claude-code" }],
+      }),
       degradedTimeoutMs: 0,
     });
     tracker.startBooting("rig.yaml", Promise.resolve({ runId: "t", status: "ok", stages: [], errors: [], warnings: [] } as never));
