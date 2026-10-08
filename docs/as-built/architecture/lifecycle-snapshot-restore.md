@@ -11,8 +11,8 @@ applies-when: |
   and the CLI restore-packet command work.
 siblings: [daemon-core.md, agent-spec-and-startup.md, transport-and-transcripts.md]
 prerequisite-reads: [../README.md, agent-spec-and-startup.md]
-last-verified-against-source: 2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7
-last-updated: 2026-10-05
+last-verified-against-source: e8f0ab340db773392ec8be75b072d1c0f3068a50
+last-updated: 2026-10-08
 ---
 
 # Lifecycle — Snapshot, Restore, Continuity
@@ -22,7 +22,7 @@ The durable-state half of the core product loop:
 captures serialized rig state; restore replays it honestly (no silent
 fresh-fallback); restore-check is a separate read-only readiness probe.
 
-> Verified against source at main `2caac7dd1bb16585138a6f7c1dd8b1f0752c49f7`. Each count below sits beside the
+> Verified against source at main `e8f0ab340db773392ec8be75b072d1c0f3068a50`. Each count below sits beside the
 > command that produces it; run the command from the repository root to refresh
 > it.
 
@@ -79,7 +79,7 @@ All in `packages/daemon/src/domain/types.ts`. The spec/projection types live in
   restore replay seam: persists only entry identity + source metadata, NOT
   stale `classification`, `conflicts`, or `noOps` (Architecture Rule 10).
   Restore rebuilds each entry as `safe_projection` with empty `conflicts` and
-  `noOps` (`restore-orchestrator.ts:1170`, `:1175`, `:1176`).
+  `noOps` (`restore-orchestrator.ts:1177`, `:1182`, `:1183`).
 
 ## 2. Snapshot, restore, continuity domain services
 
@@ -97,8 +97,8 @@ All under `packages/daemon/src/domain/`:
   accept only snapshots that pass `isRestoreUsableSnapshotData` (`:250`).
 - `restore-orchestrator.ts` — resume, checkpoint delivery, startup replay,
   live continuity consultation, topology ordering (`computeRestorePlan`,
-  `:669`, ordering only `delegates_to` and `spawned_by` edges, `:71`, among
-  the roster's intended nodes, `:670`), and service boot gating before agent
+  `:676`, ordering only `delegates_to` and `spawned_by` edges, `:71`, among
+  the roster's intended nodes, `:677`), and service boot gating before agent
   restore (`serviceOrchestrator.boot`, `:331`).
 - `restore-preconditions.ts` — `validatePreRestore` (`:7`), the one
   pre-restore validation shared by restore and restore-check (§3, §5.1).
@@ -132,7 +132,7 @@ Restore behavior, each point checked in `restore-orchestrator.ts`:
 - Resolves each node's occupant from the snapshot's recorded active-occupant
   maps, not by picking the newest session row
   (`resolveActiveSnapshotSession`, `active-occupant.ts:74`, called at
-  `restore-orchestrator.ts:767` and `:964`). An ambiguous occupant fails the
+  `restore-orchestrator.ts:774` and `:971`). An ambiguous occupant fails the
   node loudly (`activeOccupantAmbiguityError`, `active-occupant.ts:97`).
 - Consults live `continuity_state`; preserves state when a node is already
   `restoring` (`:777–791` — `SELECT status FROM continuity_state …` at
@@ -157,23 +157,23 @@ Restore behavior, each point checked in `restore-orchestrator.ts`:
   that outcome as HTTP 409 with `status: "not_attempted"`
   (`routes/up.ts:162`). A node that resumes its exact native session replays
   no startup files, actions, guidance or skills (`replayContained`,
-  `restore-orchestrator.ts:1107`); its saved Claude activity-hook selection
+  `restore-orchestrator.ts:1114`); its saved Claude activity-hook selection
   is reapplied before native resume. A skipped hook reapply adds a warning
   without changing the restore outcome.
 - Writes a **transcript boundary marker before re-launch**
-  (`writeBoundaryMarker`, `:893`, called before `launchNode` at `:904`) when
+  (`writeBoundaryMarker`, `:900`, called before `launchNode` at `:911`) when
   the transcript store is enabled.
 - Refuses to restore over live sessions (`:259–262` — `rig_not_stopped`: "Rig …
   has live sessions. Stop the rig with 'rig down' before restoring, or use the
   latest auto-pre-down snapshot."). A tmux probe that fails also blocks it
-  (`classifyRunningSessions`, `:605`).
+  (`classifyRunningSessions`, `:612`).
 - Checks that the harness actually resumed. The resume adapters judge the
   pane with `assessNativeResumeProbe` (`domain/native-resume-probe.ts:84`). A
   pod-aware resume counts as resumed only when startup reports `resumed`
   continuity or the launched session row carries the snapshot's resume type
   and token (`launchedSessionMatchesSnapshotResume`,
-  `restore-orchestrator.ts:1383`); a reported `fresh` continuity without that
-  proof rolls back to `awaiting-decision` (`:1221–1238`).
+  `restore-orchestrator.ts:1390`); a reported `fresh` continuity without that
+  proof rolls back to `awaiting-decision` (`:1228–1245`).
 - Saves a `rig up --non-interruptive` or `--no-non-interruptive` choice on
   the rig only after the live-session check and pre-restore validation pass
   (`:301`); see [adapters-and-runtimes.md](adapters-and-runtimes.md) for the
@@ -181,24 +181,24 @@ Restore behavior, each point checked in `restore-orchestrator.ts`:
 
 `launchNodeSubset` (`:392`) and `launchSingleNode` restore chosen seats rather
 than the whole rig; unlike a full restore, a failed tmux probe there proceeds
-with a `liveness_probe_unknown` warning (`:510`).
+with a `liveness_probe_unknown` warning (`:517`).
 
 **Restore-honesty rules** (texts in `architecture-rules-and-event-system.md`;
 cited here by number with the code that carries them):
 
 - Rule 7 — `RESTORE_POLICY_LEVEL`
   (`packages/daemon/src/domain/profile-resolver.ts:106`) orders the three
-  policies, and `resolveRestorePolicy` (`profile-resolver.ts:550`) rejects a
+  policies, and `resolveRestorePolicy` (`profile-resolver.ts:589`) rejects a
   profile or member value that broadens it.
 - Rule 14 — the outcome set is `RestoreNodeResult.status` (`types.ts:475`,
   §1); `rebuilt` is set only when a checkpoint is written
-  (`restore-orchestrator.ts:1090`).
+  (`restore-orchestrator.ts:1097`).
 - Rule 15 — in `restore-orchestrator.ts`, a `resume_if_possible` seat with a
   session but no token stops as `awaiting-decision` before launch unless
-  `--fresh` names it (`:805–824`); a failed resume kills the blank session
-  (`rollbackToZeroSession`, `:933`) and returns `awaiting-decision`
-  (`:1048`); pod-aware resume passes
-  `allowFreshFallback: !(isPodAware && resumeRequested)` (`:1217`). Fresh
+  `--fresh` names it (`:812–831`); a failed resume kills the blank session
+  (`rollbackToZeroSession`, `:940`) and returns `awaiting-decision`
+  (`:1055`); pod-aware resume passes
+  `allowFreshFallback: !(isPodAware && resumeRequested)` (`:1224`). Fresh
   launch is explicit: `rig up --existing <rig> --fresh <seats...>`
   (`packages/cli/src/commands/up.ts:99`). On a terminal, `rig up` asks
   yes or no for each `awaiting-decision` seat and re-posts with the accepted
@@ -262,7 +262,7 @@ cited here by number with the code that carries them):
   `continueFreshStartup` (`seat-lifecycle-service.ts:395`): it re-checks the
   binding, pane and runtime, then delivers the pending context to the same
   conversation without relaunching. In a restore, a pod-aware seat in this
-  state reports `attention_required` (`restore-orchestrator.ts:1258`). See
+  state reports `attention_required` (`restore-orchestrator.ts:1265`). See
   [agent-spec-and-startup.md](agent-spec-and-startup.md) for the startup side.
 - **Per-seat startup decision** — `POST /api/startup/:rigId/:logicalId`
   (`routes/startup.ts:142`) takes `resume`, `start`, `fresh` or `continue`
