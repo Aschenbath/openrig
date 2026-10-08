@@ -36,6 +36,7 @@ import type { Pod, ExpansionPodFragment } from "../domain/types.js";
 import type { RigExpansionService } from "../domain/rig-expansion-service.js";
 import type { PodRigInstantiator } from "../domain/rigspec-instantiator.js";
 import { convergeOp } from "../domain/topology-converge.js";
+import type { EdgeOpOutcome } from "../domain/rig-edge-ops.js";
 import type { RigLifecycleService } from "../domain/rig-lifecycle-service.js";
 import type { SelfAttachService } from "../domain/self-attach-service.js";
 
@@ -840,6 +841,42 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
   // 201 created. The node may still be failed/attention_required at launch; that
   // is carried in outcome.result.node.status (mirrors expand's per-node status).
   return c.json(outcome, 201);
+});
+
+function edgeOpStatus(outcome: EdgeOpOutcome): 200 | 201 | 400 | 404 | 500 {
+  if (outcome.ok) return outcome.outcome === "added" ? 201 : 200;
+  if (outcome.code === "rig_not_found" || outcome.code === "edge_not_found") return 404;
+  return outcome.code === "unavailable" ? 500 : 400;
+}
+
+// POST /api/rigs/:rigId/edges — add one typed edge between two seats, by logical id. `plan: true` writes nothing.
+rigsRoutes.post("/:rigId/edges", async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const { from, to, kind } = body;
+  if (typeof from !== "string" || typeof to !== "string" || typeof kind !== "string") {
+    return c.json({ ok: false, code: "validation_failed", message: "from, to and kind are required strings" }, 400);
+  }
+  const converged = await convergeOp(
+    { instantiator: c.get("podInstantiator" as never) as PodRigInstantiator, rigRepo: getRepo(c) },
+    rigId,
+    { kind: "add_edge", from, to, edgeKind: kind, plan: body["plan"] === true },
+    ".",
+  );
+  if (converged.kind !== "add_edge" || !converged.supported) return c.json({ error: "Unexpected converge result for add_edge" }, 500);
+  return c.json(converged.outcome, edgeOpStatus(converged.outcome));
+});
+
+// DELETE /api/rigs/:rigId/edges/:edgeId — remove exactly that edge. `?plan=1` writes nothing.
+rigsRoutes.delete("/:rigId/edges/:edgeId", async (c) => {
+  const converged = await convergeOp(
+    { instantiator: c.get("podInstantiator" as never) as PodRigInstantiator, rigRepo: getRepo(c) },
+    c.req.param("rigId")!,
+    { kind: "remove_edge", edgeId: c.req.param("edgeId")!, plan: c.req.query("plan") === "1" },
+    ".",
+  );
+  if (converged.kind !== "remove_edge" || !converged.supported) return c.json({ error: "Unexpected converge result for remove_edge" }, 500);
+  return c.json(converged.outcome, edgeOpStatus(converged.outcome));
 });
 
 // DELETE /api/rigs/:rigId/pods/:podRef
