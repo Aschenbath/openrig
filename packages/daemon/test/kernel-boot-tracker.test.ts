@@ -34,7 +34,8 @@ function makeRigRepo(
     // The runtime lives on the node row: the first session row of each node supplies it here.
     getRig: (rigId: string) => ({
       rig: rigs.find((r) => r.id === rigId),
-      nodes: [...new Map((sessionsByRig[rigId] ?? []).map((s) => [nodeOf(s), { id: nodeOf(s), runtime: s.runtime ?? null }])).values()],
+      nodes: (sessionsByRig[rigId] ?? []).filter((s, i, all) => all.findIndex((t) => nodeOf(t) === nodeOf(s)) === i)
+        .map((s) => ({ id: nodeOf(s), runtime: s.runtime ?? null })),
       edges: [],
     }),
   } as unknown as RigRepository;
