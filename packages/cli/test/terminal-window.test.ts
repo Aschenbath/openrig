@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { DaemonClient } from "../src/client.js";
 import { openTerminalWindow, type WindowDeps } from "../src/terminal-window.js";
+import { shellQuote } from "../src/cross-host-executor.js";
 
 function fixture(options: { herdr?: boolean; ghostty?: string; refusal?: number; empty?: boolean; alive?: boolean } = {}) {
   const panes = ["tui", "advisor", "operator"].map(seat => ({ seat, label: seat, paneCommand: `tmux attach-session -t '=fixture-${seat}'` }));
@@ -468,10 +469,9 @@ describe("measured welcome layout", () => {
     f.deps.herdrConfig = (_socket, columns) => columns === 160 ? "/fixture/wide.toml" : "/fixture/narrow.toml";
     await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
     const launch = f.exec.mock.calls.find(([file]) => file === "/usr/bin/osascript")!;
-    expect(launch[1][2]).toContain("stty size");
-    expect(launch[1][2]).toContain('-ge 160');
-    expect(launch[1][2]).toContain("HERDR_CONFIG_PATH='/fixture/wide.toml'");
-    expect(launch[1][2]).toContain("HERDR_CONFIG_PATH='/fixture/narrow.toml'");
+    // Terminal passes this line to the login shell, which need not understand POSIX conditionals.
+    const command = `set -- $(stty size 2>/dev/null); if [ "${'${2:-0}'}" -ge 160 ]; then export HERDR_CONFIG_PATH='/fixture/wide.toml'; else export HERDR_CONFIG_PATH='/fixture/narrow.toml'; fi; exec env -u TMUX -u HERDR_SESSION -u HERDR_SOCKET_PATH HERDR_SOCKET_PATH='/daemon home/herdr.sock' '/fixture/bin/herdr'`;
+    expect(launch[1][2]).toBe(`/bin/sh -c ${shellQuote(command)}`);
     expect(launch[1][1]!.indexOf("set bounds")).toBeLessThan(launch[1][1]!.indexOf("do script (item 1 of argv) in viewTab"));
   });
 });

@@ -243,7 +243,8 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
       if (!endpoint?.socketPath) throw new Error("The daemon does not report its herdr endpoint. Update the daemon, or use --provider tmux --window.");
       // A CLI session would override the daemon's resolved socket in Herdr.
       windowAttempted = true;
-      window = await launchWindow(`${configPrefix}env -u TMUX -u HERDR_SESSION -u HERDR_SOCKET_PATH HERDR_SOCKET_PATH=${shellQuote(endpoint.socketPath)}${configEnv} ${shellQuote(herdr)}`);
+      const command = `${configPrefix}env -u TMUX -u HERDR_SESSION -u HERDR_SOCKET_PATH HERDR_SOCKET_PATH=${shellQuote(endpoint.socketPath)}${configEnv} ${shellQuote(herdr)}`;
+      window = await launchWindow(configPrefix ? `/bin/sh -c ${shellQuote(command)}` : command);
       await measureWindow();
       let alive = false;
       for (let attempt = 0; attempt < 20; attempt++) {
