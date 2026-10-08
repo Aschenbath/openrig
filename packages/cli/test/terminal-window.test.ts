@@ -526,6 +526,39 @@ describe("welcome launcher for desktop apps and an existing Herdr client", () =>
     expect(result.notes?.join(" ")).toContain("control Ghostty");
   });
 
+  it.each(["1.2.0", "plist failure"])("uses Terminal before launch when a desktop caller cannot use Ghostty: %s", async version => {
+    const f = desktop({ TERM_PROGRAM: "vscode" }, "1.2.0");
+    const original = f.deps.exec;
+    f.deps.exec = vi.fn(async (file, args) => {
+      if (file === "/usr/libexec/PlistBuddy" && version === "plist failure") throw new Error("unreadable plist");
+      return original(file, args);
+    });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: true, window: { app: "Terminal" } });
+    expect(result.notes?.join(" ")).toContain("using Terminal for this desktop caller");
+    const calls = vi.mocked(f.deps.exec).mock.calls.filter(([file]) => file === "/usr/bin/osascript");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]![1][1]).toContain('tell application "Terminal"');
+    expect(calls[0]![1][1]).not.toContain('tell application "Ghostty"');
+  });
+
+  it.each(["message", "stderr"])("gives Automation settings and a manual command after denial in %s without replay", async where => {
+    const f = desktop({}, "1.3.0");
+    const original = f.deps.exec;
+    const denied = "Not authorized to send Apple events. (-1743)";
+    f.deps.exec = vi.fn(async (file, args) => {
+      if (file === "/usr/bin/osascript") throw where === "message" ? new Error(denied) : Object.assign(new Error("command failed"), { stderr: denied });
+      return original(file, args);
+    });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: false, windowAttempted: true });
+    expect(result.notes?.join(" ")).toContain("System Settings > Privacy & Security > Automation");
+    expect(result.notes?.join(" ")).toContain("run: env -u TMUX -u HERDR_SESSION -u HERDR_SOCKET_PATH HERDR_SOCKET_PATH='/daemon home/herdr.sock' HERDR_CONFIG_PATH='/fixture/private herdr.toml' '/fixture/bin/herdr'");
+    expect(result.notes?.join(" ")).toContain("rig terminal open 'saved:kernel' --provider herdr");
+    expect(vi.mocked(f.deps.exec).mock.calls.filter(([file]) => file === "/usr/bin/osascript")).toHaveLength(1);
+    expect(f.post).not.toHaveBeenCalled();
+  });
+
   it("does not borrow a VS Code pane width for a new Ghostty window of unknown width", async () => {
     const f = desktop({ TERM_PROGRAM: "vscode" }, "1.3.0");
     f.deps.columns = async () => 200;
@@ -570,7 +603,10 @@ describe("welcome launcher for desktop apps and an existing Herdr client", () =>
     expect(result).toMatchObject({ ok: true }); expect(result.window).toBeUndefined();
     expect(f.post).toHaveBeenCalledExactlyOnceWith("/api/terminal/open", { view: "saved:kernel", provider: "herdr", expectedPlan: "bound-plan", viewportColumns: 174 }, { timeoutMs: 45_000 });
     expect(f.deps.herdrConfig).not.toHaveBeenCalled(); expect(f.deps.launch).not.toHaveBeenCalled();
-    expect(f.exec.mock.calls.some(([file]) => file === "/usr/bin/osascript" || file === "/bin/launchctl" || file === "/usr/bin/env")).toBe(false);
+    expect(f.exec.mock.calls.some(([file]) => file === "/usr/bin/osascript" || file === "/bin/launchctl")).toBe(false);
+    expect(f.exec.mock.calls.filter(([file]) => file === "/usr/bin/env")).toEqual([
+      ["/usr/bin/env", ["-u", "TMUX", "-u", "HERDR_SESSION", "-u", "HERDR_SOCKET_PATH", `HERDR_SOCKET_PATH=${f.preview.status.launch.socketPath}`, "/fixture/bin/herdr", "workspace", "list"]],
+    ]);
   });
 
   it("does not place the current Herdr caller's view on a different daemon endpoint", async () => {
@@ -588,7 +624,7 @@ describe("welcome launcher for desktop apps and an existing Herdr client", () =>
     // A structured daemon refusal still has the ordinary result shape.
     f.post.mockResolvedValue({ status: 409, data: { provider: "herdr", ok: false, error: "preview changed", opened: [], absent: [], degraded: [], pages: 0 } });
     const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
-    expect(result).toMatchObject({ ok: false, error: "preview changed" });
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining("preview changed") });
     expect(result.notes?.join(" ")).not.toContain("Opened the view");
     expect(f.deps.launch).not.toHaveBeenCalled();
   });

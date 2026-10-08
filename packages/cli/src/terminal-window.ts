@@ -112,7 +112,8 @@ async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((comm
         ghostty = major! > 1 || (major === 1 && minor! >= 3);
       } catch { /* No other app is a substitute for the hosting terminal. */ }
     }
-    if ((inGhostty || app) && !ghostty) return "The installed Ghostty does not provide a supported scripting interface (1.3 or newer required).";
+    if (inGhostty && !ghostty) return "The installed Ghostty does not provide a supported scripting interface (1.3 or newer required).";
+    if (app && !ghostty) notes.push("The installed Ghostty could not be confirmed to support scripting (1.3 or newer required); using Terminal for this desktop caller.");
     const permissionNotice = `It is fine to click Allow if macOS asks to control ${ghostty ? "Ghostty" : "Terminal"}; this lets OpenRig open the requested welcome view.`;
     if (newApp) notes.push(`Tell the person: ${permissionNotice} The app uses its own new-window size because this caller has no scriptable terminal window to copy.`);
     // A tab group shares bounds: copying its current bounds also leaves the original unchanged.
@@ -186,9 +187,12 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
   let window: { app: string; surface: string; columns?: number } | undefined;
   let viewer: string | undefined;
   let windowAttempted = false;
+  let manualCommand: string | undefined;
+  let currentHerdr = false;
   const recovery = `rig terminal open ${shellQuote(view)} --window${requestedProvider && ["herdr", "tmux"].includes(requestedProvider) ? ` --provider ${shellQuote(requestedProvider)}` : ""}`;
   const failed = (reason: string): OpenViewResult => ({ ...failure(provider,
-    window ? `A terminal window was requested, but the view outcome could not be confirmed. ${reason} Inspect the terminal before retrying: ${recovery}`
+    currentHerdr ? `The current Herdr view outcome could not be confirmed. ${reason} Inspect the selected space before retrying: ${recovery}`
+      : window ? `A terminal window was requested, but the view outcome could not be confirmed. ${reason} Inspect the terminal before retrying: ${recovery}`
       : windowAttempted ? `Terminal window status is unknown. ${reason} Inspect the desktop before retrying: ${recovery}`
         : `No terminal window was opened. ${reason} On the daemon's desktop, run: ${recovery}`), windowAttempted });
   const windowNotes: string[] = [];
@@ -227,21 +231,19 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
     };
     const socket = preview.data.status.launch?.socketPath;
     if (typeof launchWindow === "object") {
+      currentHerdr = true;
       provider = "herdr";
       if (requestedProvider === "tmux") return failed("The current Herdr view requires provider herdr; no extra window was opened.");
       const base = path.join(deps.env["HOME"] ?? homedir(), ".config", "herdr");
       const callerSocket = deps.env["HERDR_SOCKET_PATH"] ?? (deps.env["HERDR_SESSION"]
         ? path.join(base, "sessions", deps.env["HERDR_SESSION"], "herdr.sock") : path.join(base, "herdr.sock"));
       if (!socket || path.resolve(socket) !== path.resolve(callerSocket)) return failed("The current Herdr endpoint differs from the daemon's endpoint; no space was opened in another session.");
-      const result = await client.post<OpenViewResult>("/api/terminal/open", { view, provider, expectedPlan: planId, ...(viewportColumns !== undefined ? { viewportColumns } : {}) }, { timeoutMs: 45_000 });
-      if (!Array.isArray(result.data?.opened)) return failed("The daemon returned no view result for the current Herdr session. Inspect it before retrying.");
-      return { ...result.data, notes: [...(result.data.notes ?? []), result.data.ok
-        ? "Opened the view in the current Herdr session; no terminal window or personal config was changed. Check the selected space is visible."
-        : "The current Herdr view was not confirmed; no terminal window or personal config was changed."] };
+      if (!herdr) return failed("The Herdr executable is unavailable; no space was opened.");
+      windowNotes.push("Using the current Herdr session; no terminal window or personal config was changed. Check the selected space is visible.");
     }
     let configEnv = "";
     let configPrefix = "";
-    if (herdr && socket) {
+    if (herdr && socket && !currentHerdr) {
       try {
         const narrow = deps.herdrConfig(socket);
         const wide = typeof launchWindow === "function" ? deps.herdrConfig(socket, 160) : narrow;
@@ -252,24 +254,27 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
         windowNotes.push(`Could not prepare OpenRig's private Herdr settings (${error instanceof Error ? error.message : String(error)}); Herdr starts with its usual sidebar.`);
       }
     }
+    const directCommand = herdr && socket
+      ? `${configPrefix}env -u TMUX -u HERDR_SESSION -u HERDR_SOCKET_PATH HERDR_SOCKET_PATH=${shellQuote(socket)}${configEnv} ${shellQuote(herdr)}`
+      : `env -u TMUX ${composed.opened[0]!.paneCommand.replace(/^ssh /, "ssh -t ")}`;
+    manualCommand = directCommand;
     if (typeof launchWindow === "string") {
-      const command = herdr && socket
-        ? `env -u TMUX -u HERDR_SESSION -u HERDR_SOCKET_PATH HERDR_SOCKET_PATH=${shellQuote(socket)}${configEnv} ${shellQuote(herdr)}`
-        : `env -u TMUX ${composed.opened[0]!.paneCommand.replace(/^ssh /, "ssh -t ")}`;
       const headless = deps.env["SSH_CONNECTION"] || deps.env["SSH_CLIENT"] || deps.env["SSH_TTY"]
         || (deps.platform === "linux" && !deps.env["DISPLAY"] && !deps.env["WAYLAND_DISPLAY"]);
       const where = headless ? "Open a new SSH session to the daemon's host" : "Open a new terminal window on the daemon's host";
       const notes = herdr && socket
         ? [`After the person starts Herdr, have the agent place this view by running: rig terminal open ${shellQuote(view)} --provider herdr`] : [];
-      return { ...failure(provider, `No terminal window was opened. ${launchWindow} ${where} and run: ${command}`), windowAttempted: false, absent: composed.absent, degraded: composed.degraded, notes: [...notes, ...windowNotes] };
+      return { ...failure(provider, `No terminal window was opened. ${launchWindow} ${where} and run: ${manualCommand}`), windowAttempted: false, absent: composed.absent, degraded: composed.degraded, notes: [...notes, ...windowNotes] };
     }
 
     if (herdr) {
       const endpoint = preview.data.status.launch;
       if (!endpoint?.socketPath) throw new Error("The daemon does not report its herdr endpoint. Update the daemon, or use --provider tmux --window.");
       // A CLI session would override the daemon's resolved socket in Herdr.
-      windowAttempted = true;
-      window = await launchWindow(`${configPrefix}env -u TMUX -u HERDR_SESSION -u HERDR_SOCKET_PATH HERDR_SOCKET_PATH=${shellQuote(endpoint.socketPath)}${configEnv} ${shellQuote(herdr)}`);
+      if (typeof launchWindow === "function") {
+        windowAttempted = true;
+        window = await launchWindow(manualCommand);
+      }
       await measureWindow();
       let alive = false;
       for (let attempt = 0; attempt < 20; attempt++) {
@@ -322,15 +327,16 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
         return {
           provider, ok: true, opened: [], absent: composed.absent, degraded: composed.degraded, pages: 0, window,
           reusedWorkspace: { id: existing.workspace_id, tabId: existing.tab_id, view: composed.id },
-          notes: [...windowNotes, "Existing workspace contents were kept; no layout refresh or new tiles were requested. Check the new terminal shows the intended view."],
+          notes: [...windowNotes, "Existing workspace contents were kept; no layout refresh or new tiles were requested. Check the selected space shows the intended view."],
         };
       }
       const result = await client.post<OpenViewResult>("/api/terminal/open", { view, provider: "herdr", expectedPlan: planId, ...(viewportColumns !== undefined ? { viewportColumns } : {}) }, { timeoutMs: 45_000 });
       if (result.status >= 400) return { ...failed(result.data.error ?? `The daemon refused the view (HTTP ${result.status}).`), window, notes: windowNotes, absent: composed.absent, degraded: composed.degraded };
       if (!Array.isArray(result.data?.opened)) throw new Error("The terminal opened, but the daemon returned no view result. Inspect it before retrying.");
-      return { ...result.data, window, notes: [...(result.data.notes ?? []), ...windowNotes, "Check the new terminal shows the intended view; window creation alone is not visual confirmation."] };
+      return { ...result.data, window, notes: [...(result.data.notes ?? []), ...windowNotes, currentHerdr ? "Check the selected space shows the intended view." : "Check the new terminal shows the intended view; window creation alone is not visual confirmation."] };
     }
 
+    if (typeof launchWindow !== "function") throw new Error("No terminal window launcher is available.");
     const tmux = (await deps.exec("/bin/sh", ["-c", "command -v tmux"]).catch(() => "")).trim();
     if (!tmux) throw new Error("tmux is unavailable; run rig setup first.");
     viewer = `openrig-view-${deps.id()}`;
@@ -374,6 +380,11 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
     }
     return { provider, ok: true, opened: composed.opened.map(pane => pane.seat), absent: composed.absent, degraded: composed.degraded, pages: composed.pages.length, window, notes: [`Viewing session: ${viewer}. Existing conversations were preserved.`, ...windowNotes, "Check the new terminal shows the intended view; window creation alone is not visual confirmation."] };
   } catch (err) {
+    if (windowAttempted && /-1743\b/.test(`${(err as Error).message} ${(err as { stderr?: string }).stderr ?? ""}`)) {
+      windowNotes.push("macOS denied Automation access. In System Settings > Privacy & Security > Automation, allow the calling app to control the terminal app before trying again.");
+      if (manualCommand) windowNotes.push(`To continue without Automation, open a terminal yourself and run: ${manualCommand}`);
+      if (provider === "herdr") windowNotes.push(`After Herdr starts, have the agent place the view: rig terminal open ${shellQuote(view)} --provider herdr`);
+    }
     return { ...failed((err as Error).message), ...(window ? { window } : {}), ...(windowNotes.length || viewer ? { notes: [...windowNotes, ...(viewer ? [`Viewing session ${viewer} may exist. Inspect it before retrying; no existing conversation was replaced.`] : [])] } : {}) };
   }
 }

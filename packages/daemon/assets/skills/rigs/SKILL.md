@@ -41,9 +41,9 @@ guidance in `AGENTS.md` or `CLAUDE.md` plus the team's skills and plugins. Say s
   first. It opens a new terminal tab/window itself, using herdr when installed or plain tmux otherwise.
   Below 120 measured columns (or unknown width), the operator fills the first page; from 120, dashboard and operator
   share it equally. The advisor always has a separate tab or tmux window; select one to switch.
-  Inside Herdr, it opens and focuses a new space in the matching current session without another window.
-  On a Mac, Claude Desktop, iTerm and VS Code callers get a new Ghostty window if installed, otherwise Terminal.
-  Tell the person **Allow is fine** if macOS asks to control that app: it opens the welcome view they requested.
+  Inside Herdr, it focuses a matching view or creates one in the current session without another window.
+  On a Mac, Claude Desktop, iTerm and VS Code callers get a new supported Ghostty window, otherwise Terminal.
+  Before running it, tell the person **Allow is fine** if macOS asks to control that app: it opens the welcome view they requested.
   Preserve the current terminal. Check the result and visible content, or report what cannot be
   verified. On a Mac the first open can raise two macOS prompts: “… is an app downloaded from the Internet”
   (Open) and “… wants access to control …” (Allow). Tell the person to expect them and accept both; if the open
