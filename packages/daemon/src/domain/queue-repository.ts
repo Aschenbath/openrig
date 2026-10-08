@@ -28,7 +28,7 @@ import {
 } from "./queue-wake-repository.js";
 import { WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
 import { armQueueWait, backOffQueueWait, refreshQueueWaits, evaluateQueueWait, retargetQueueWait, isQueueWait } from "./queue-wait-backoff.js";
-import { parseHumanQuestions, unansweredQuestions, type HumanQuestion, type HumanAnswers, type RecordHumanAnswerResult } from "./human-questions.js";
+import { parseHumanQuestions, unansweredQuestions, describeTypedReplyPlacement, type HumanQuestion, type HumanAnswers, type TypedHumanReply, type RecordHumanAnswerResult } from "./human-questions.js";
 
 export const QUEUE_STATES = [
   "pending",
@@ -3131,22 +3131,26 @@ export class QueueRepository {
         || parseSessionName(item.destinationSession).kind !== "external") return null;
 
       const text = input.decision.trim();
-      const question = this.hasHumanQuestionsColumn && text && text !== "[file reply]"
-        ? unansweredQuestions(item.humanQuestions ?? [], item.humanAnswers ?? {})[0]
-        : undefined;
+      const unanswered = this.hasHumanQuestionsColumn && text && text !== "[file reply]"
+        ? unansweredQuestions(item.humanQuestions ?? [], item.humanAnswers ?? {})
+        : [];
+      const question = unanswered[0];
+      let transitionNote = "direct human reply received";
       if (question) {
-        const answers: HumanAnswers = { ...item.humanAnswers, [question.id]: text };
+        const typedReply: TypedHumanReply = {
+          kind: "typed-reply", text, placement: "first-unanswered", unansweredCount: unanswered.length - 1,
+        };
+        const answers: HumanAnswers = { ...item.humanAnswers, [question.id]: typedReply };
         this.db.prepare("UPDATE queue_items SET human_answers = ? WHERE qitem_id = ?")
           .run(JSON.stringify(answers), input.qitemId);
+        transitionNote += `; ${describeTypedReplyPlacement(question, typedReply)}`;
       }
       return this.updateInTransactionalContext({
         qitemId: input.qitemId,
         actorSession: input.actorSession,
         state: "done",
         closureReason: "no-follow-on",
-        transitionNote: question
-          ? `direct human reply received; typed answer recorded for question ${question.id}`
-          : "direct human reply received",
+        transitionNote,
         ownerNotificationKind: "human-decision-resolved",
       });
     })();

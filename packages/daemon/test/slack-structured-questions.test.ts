@@ -31,6 +31,9 @@ const questions = [
   { id: "db", question: "Which database?", options: [{ id: "pg", label: "Postgres", recommended: true }, { id: "sqlite", label: "SQLite" }] },
   { id: "ship", question: "Ship this week?", options: [{ id: "yes", label: "Yes" }, { id: "no", label: "No" }] },
 ];
+const typedReply = (text: string, unansweredCount: number) => ({
+  kind: "typed-reply", text, placement: "first-unanswered", unansweredCount,
+});
 
 describe("structured human questions (#193)", () => {
   let home: string;
@@ -353,9 +356,11 @@ describe("structured human questions (#193)", () => {
       stops.push(unsubscribe);
       await typeReply(text, { root });
       const item = repo.getById(id)!;
-      expect(item).toMatchObject({ state: "done", closureReason: "no-follow-on", humanAnswers: { ship: text } });
-      expect(formatHumanAnswers(item.humanQuestions!, item.humanAnswers!)).toEqual([`Ship this week?: ${text}`]);
-      expect(observed).toEqual([{ ship: text }]);
+      expect(item).toMatchObject({ state: "done", closureReason: "no-follow-on", humanAnswers: { ship: typedReply(text, 0) } });
+      expect(formatHumanAnswers(item.humanQuestions!, item.humanAnswers!)).toEqual([
+        `Whole typed reply, automatically placed under first unanswered question "Ship this week?"; 0 questions left unanswered: ${text}`,
+      ]);
+      expect(observed).toEqual([{ ship: typedReply(text, 0) }]);
       expect(repliesToSeat()[0]?.body).toContain(text);
     });
 
@@ -364,8 +369,14 @@ describe("structured human questions (#193)", () => {
       await typeReply(text);
       await typeReply(text); // Socket Mode redelivery must not fill the next question.
       const item = repo.getById(decisionId)!;
-      expect(item).toMatchObject({ state: "done", humanAnswers: { db: text } });
+      expect(item).toMatchObject({ state: "done", humanAnswers: { db: typedReply(text, 1) } });
       expect(unansweredQuestions(item.humanQuestions!, item.humanAnswers!)).toEqual([questions[1]]);
+      expect(formatHumanAnswers(item.humanQuestions!, item.humanAnswers!)).toEqual([
+        `Whole typed reply, automatically placed under first unanswered question "Which database?"; 1 question left unanswered: ${text}`,
+      ]);
+      expect(repo.transitionLog.listForQitem(decisionId).at(-1)?.transitionNote).toBe(
+        'direct human reply received; Whole typed reply, automatically placed under first unanswered question "Which database?"; 1 question left unanswered',
+      );
       expect(repliesToSeat()).toHaveLength(1);
       expect(repliesToSeat()[0]?.body).toContain(text);
     });
@@ -374,8 +385,35 @@ describe("structured human questions (#193)", () => {
       await click("db", "pg");
       const text = "Not this week — wait for the migration.";
       await typeReply(text);
-      expect(repo.getById(decisionId)).toMatchObject({ state: "done", humanAnswers: { db: "pg", ship: text } });
+      expect(repo.getById(decisionId)).toMatchObject({ state: "done", humanAnswers: { db: "pg", ship: typedReply(text, 0) } });
       expect(repliesToSeat()).toHaveLength(1);
+    });
+
+    it("distinguishes a typed option id from a clicked choice on the HTTP row and in its formatter", async () => {
+      const collision = [{ id: "approval", question: "May we publish?", options: [
+        { id: "later", label: "Approve publication now" }, { id: "stop", label: "Decline" },
+      ] }];
+      const { id, root } = await postDecision(collision);
+      await typeReply("later", { root });
+      const app = new Hono();
+      app.use("*", async (c, next) => { (c.set as (k: string, v: unknown) => void)("queueRepo", repo); await next(); });
+      app.route("/api/queue", queueRoutes());
+      const response = await app.request(`/api/queue/${id}`);
+      expect(response.status).toBe(200);
+      const row = await response.json();
+      expect(row.humanAnswers).toEqual({ approval: typedReply("later", 0) });
+      const formatted = formatHumanAnswers(row.humanQuestions, row.humanAnswers);
+      expect(formatted).toEqual([
+        'Whole typed reply, automatically placed under first unanswered question "May we publish?"; 0 questions left unanswered: later',
+      ]);
+      expect(formatted.join("\n")).not.toContain("Approve publication now");
+      expect(repliesToSeat()[0]?.body).toContain("later");
+
+      const clicked = await postDecision(collision);
+      await click("approval", "later", { root: clicked.root });
+      const clickedRow = repo.getById(clicked.id)!;
+      expect(clickedRow.humanAnswers).toEqual({ approval: "later" });
+      expect(formatHumanAnswers(clickedRow.humanQuestions!, clickedRow.humanAnswers!)).toEqual(["May we publish?: Approve publication now"]);
     });
 
     it("keeps plain-decision text replies on their existing path", async () => {
@@ -411,7 +449,7 @@ describe("structured human questions (#193)", () => {
       append.mockRestore();
       expect(await resolver(input)).toBe("resolved");
       expect(await resolver(input)).toBe("already-resolved");
-      expect(repo.getById(decisionId)?.humanAnswers).toEqual({ db: input.decision });
+      expect(repo.getById(decisionId)?.humanAnswers).toEqual({ db: typedReply(input.decision, 1) });
     });
   });
 });
