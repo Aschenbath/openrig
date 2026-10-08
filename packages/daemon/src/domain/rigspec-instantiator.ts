@@ -420,6 +420,7 @@ export interface ColdFirstStartPlan {
   fingerprint: string;
   runtime: string;
   cwd: string;
+  codexConfigProfile: string | null;
   model: { value: string | null; source: string; observation: string };
   effort: { value: string | null; source: string };
   permissions: {
@@ -428,6 +429,7 @@ export interface ColdFirstStartPlan {
     launchPosture: string;
     nativeOverride: ReturnType<NativePermissionStore["read"]>;
     bindingOverride: ReturnType<NativePermissionStore["launchOverride"]>;
+    observation: string;
   };
   nonTargetEffects: "unchanged";
 }
@@ -1172,7 +1174,8 @@ export class PodRigInstantiator {
     const guard = this.deps.tmuxAdapter?.deliveryGuard;
     if (!guard) return refuse("cold_start_unavailable", "The node lifecycle guard is unavailable; no first start attempted.");
     if (!guard.ownsLifecycle(nodeId)) {
-      return guard.lifecycle([nodeId], () => this.coldFirstStart(rigId, nodeId, rigSpecYaml, rigRoot, options));
+      return guard.lifecycle([nodeId], () => this.coldFirstStart(rigId, nodeId, rigSpecYaml, rigRoot, options))
+        .catch(error => refuse("cold_start_refused", error instanceof Error ? error.message : String(error)));
     }
     if (!nodePath.isAbsolute(rigRoot) || !this.deps.fsOps.exists(rigRoot)) return refuse("invalid_source_root", "Supply an existing absolute --rig-root on the daemon host.");
     if (!options.plan && !options.fingerprint) return refuse("cold_start_plan_required", "Obtain a first-start plan before executing it.");
@@ -1260,11 +1263,12 @@ export class PodRigInstantiator {
       for (const entry of projection.plan.entries) capture(entry.absolutePath);
       const profile = resolved.resolved.spec.profiles[member.profile];
       const plan: ColdFirstStartPlan = {
-        rigId, nodeId, logicalId: node.logicalId, fingerprint: "", runtime: member.runtime, cwd: config.config.cwd,
+        rigId, nodeId, logicalId: node.logicalId, fingerprint: "", runtime: member.runtime, cwd: config.config.cwd, codexConfigProfile: member.codexConfigProfile ?? null,
         model: { value: config.config.model ?? null, source: modelSelected ? "seat set-model" : member.model ? "member" : profile?.preferences?.model ? "profile" : config.config.model ? "agent default" : "runtime default",
           observation: config.config.model ? "requested; native selection unobserved" : "runtime default; concrete native model unobserved" },
         effort: { value: config.config.effort ?? null, source: member.effort ? "member" : profile?.preferences?.effort ? "profile" : config.config.effort ? "agent default" : "runtime default" },
-        permissions: { memberRef: member.permissionPolicy ?? null, rigRef: rigPolicy, launchPosture: posture, nativeOverride: permissions.read(nodeId), bindingOverride },
+        permissions: { memberRef: member.permissionPolicy ?? null, rigRef: rigPolicy, launchPosture: posture, nativeOverride: permissions.read(nodeId), bindingOverride,
+          observation: "requested posture; native effective permissions unobserved" },
         nonTargetEffects: "unchanged",
       };
       plan.fingerprint = createHash("sha256").update(JSON.stringify({ rigSpecYaml, rigRoot, node, podRow, plan, config: config.config,

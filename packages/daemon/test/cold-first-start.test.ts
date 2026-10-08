@@ -4,6 +4,8 @@ import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delive
 import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import { NativePermissionStore } from "../src/domain/native-permission-store.js";
+import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
+import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_guard.js";
 import { serve } from "@hono/node-server";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -17,6 +19,8 @@ afterEach(() => { for (const close of closers.splice(0)) close(); });
 
 async function fixture(options: { model?: string; profileModel?: string; policy?: string; runtime?: "pi" | "codex" } = {}) {
   const db = createFullTestDb();
+  db.exec(outboxEntriesSchema.sql);
+  db.exec(seatDeliveryGuardSchema.sql);
   closers.push(() => db.close());
   const tmux = mockTmuxAdapter();
   tmux.deliveryGuard = new SeatDeliveryGuard(db, target => resolveGuardTarget(db, target));
@@ -101,6 +105,38 @@ describe("explicit cold single-member first start", () => {
     expect(f.adapter.launchHarness).not.toHaveBeenCalled();
   });
 
+  it("preserves non-target session, binding, held event, source and edge rows", async () => {
+    const f = await fixture();
+    const sibling = f.rigRepo.getRig(f.rigId)!.nodes.find(n => n.id !== f.node.id)!;
+    const old = f.sessionRegistry.registerSession(sibling.id, "dev-sibling@cold-start");
+    f.sessionRegistry.updateStatus(old.id, "exited");
+    f.sessionRegistry.updateBinding(sibling.id, { tmuxSession: "dev-sibling@cold-start", tmuxPane: "%77" });
+    f.eventBus.emit({ type: "node.held", rigId: f.rigId, nodeId: sibling.id, logicalId: sibling.logicalId, reason: "retained operator choice" });
+    const preserved = () => ({
+      nodes: f.db.prepare("SELECT * FROM nodes WHERE id != ? ORDER BY id").all(f.node.id),
+      sessions: f.db.prepare("SELECT * FROM sessions WHERE node_id != ? ORDER BY id").all(f.node.id),
+      bindings: f.db.prepare("SELECT * FROM bindings WHERE node_id != ? ORDER BY id").all(f.node.id),
+      held: f.db.prepare("SELECT * FROM events WHERE node_id = ? ORDER BY seq").all(sibling.id),
+      edges: f.db.prepare("SELECT * FROM edges ORDER BY id").all(),
+      files: JSON.stringify(f.files),
+    });
+    const before = preserved();
+    const plan = await f.plan();
+    expect((await f.request(false, plan.fingerprint)).status).toBe(201);
+    expect(preserved()).toEqual(before);
+  });
+
+  it("refuses a typing-protected seat without clearing its guard", async () => {
+    const f = await fixture();
+    await f.tmux.deliveryGuard!.set(f.node.id, true, "fixture", "person typing");
+    const before = f.db.prepare("SELECT total_changes() AS n").get();
+    const response = await f.request();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ ok: false, code: "cold_start_refused" });
+    expect(f.db.prepare("SELECT total_changes() AS n").get()).toEqual(before);
+    expect(f.adapter.launchHarness).not.toHaveBeenCalled();
+  });
+
   it.each(["session", "ready", "failed"])("refuses prior %s history without modifying it", async history => {
     const f = await fixture();
     if (history === "session") f.sessionRegistry.registerSession(f.node.id, "dev-worker@cold-start");
@@ -180,7 +216,9 @@ describe("explicit cold single-member first start", () => {
     const f = await fixture();
     const plan = await f.plan();
     if (phase === "context") f.db.exec("CREATE TRIGGER fail_context BEFORE INSERT ON node_startup_context BEGIN SELECT RAISE(ABORT, 'fixture persistence failure'); END");
-    else vi.mocked(f.adapter.deliverStartup).mockResolvedValue({ delivered: 0, failed: [{ path: "role.md", error: "fixture delivery failure" }] });
+    else vi.mocked(f.adapter.deliverStartup)
+      .mockResolvedValueOnce({ delivered: 0, failed: [] })
+      .mockResolvedValue({ delivered: 0, failed: [{ path: "role.md", error: "fixture delivery failure" }] });
     const response = await f.request(false, plan.fingerprint);
     expect((await response.json()).ok).toBe(false);
     if (phase === "context") expect(f.adapter.launchHarness).not.toHaveBeenCalled();

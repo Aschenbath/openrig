@@ -389,7 +389,10 @@ describe("P17 — conflicts surface LOUDLY (never a silent overwrite)", () => {
     const fsMod = require("node:fs") as typeof import("node:fs");
     const src = fsMod.readFileSync(new URL("../src/domain/rigspec-instantiator.ts", import.meta.url), "utf8");
     const assertWiring = (source: string) => {
-      const callBlock = /planProjection\(\{[\s\S]*?\n\s*\}\);/.exec(source)?.[0] ?? "";
+      // The read-only first-start planner also calls planProjection. This pin
+      // protects the effectful launch path's conflict detection and warnings.
+      const launchSource = source.slice(source.indexOf("private async launchExistingAgentMember("));
+      const callBlock = /planProjection\(\{[\s\S]*?\n\s*\}\);/.exec(launchSource)?.[0] ?? "";
       // The resolver can branch by runtime. Target behavior is covered by
       // codex-skill-projection.test.ts; this pin protects the wiring itself.
       expect(callBlock, "planProjection call must inject resolveTargetPath").toMatch(
