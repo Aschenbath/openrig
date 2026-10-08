@@ -1,4 +1,6 @@
 import nodePath from "node:path";
+import { createHash } from "node:crypto";
+import { readdirSync, realpathSync } from "node:fs";
 import type Database from "better-sqlite3";
 import {
   resolvePermissionPolicyAttachment,
@@ -307,6 +309,7 @@ import { RigSpecSchema as PodRigSpecSchema, VALID_EDGE_KINDS } from "./rigspec-s
 import { rigPreflight, preflightValidatedSpec } from "./rigspec-preflight.js";
 import { resolveAgentRef, type AgentResolverFsOps } from "./agent-resolver.js";
 import { resolveNodeConfig } from "./profile-resolver.js";
+import { NativePermissionStore } from "./native-permission-store.js";
 import { resolveStartup } from "./startup-resolver.js";
 import { planProjection, claudeConflictTargetPath, projectionConflictWarnings, filterProtectedProjections, type ProjectionPlan } from "./projection-planner.js";
 import { ProjectionManifestStore } from "./projection-manifest-store.js";
@@ -408,6 +411,25 @@ export interface LaunchMaterializedNodeResult {
   status: "launched" | "failed" | "attention_required";
   error?: string;
   sessionName?: string;
+}
+
+export interface ColdFirstStartPlan {
+  rigId: string;
+  nodeId: string;
+  logicalId: string;
+  fingerprint: string;
+  runtime: string;
+  cwd: string;
+  model: { value: string | null; source: string; observation: string };
+  effort: { value: string | null; source: string };
+  permissions: {
+    memberRef: string | null;
+    rigRef: string | null;
+    launchPosture: string;
+    nativeOverride: ReturnType<NativePermissionStore["read"]>;
+    bindingOverride: ReturnType<NativePermissionStore["launchOverride"]>;
+  };
+  nonTargetEffects: "unchanged";
 }
 
 export type LaunchMaterializedOutcome =
@@ -1137,6 +1159,141 @@ export class PodRigInstantiator {
         warnings: [...(materialized.result.warnings ?? []), ...(launchOutcome.result.warnings ?? [])],
       },
     };
+  }
+
+  /** Explicitly start one materialized, never-occupied member. Planning is read-only;
+   * execution requires the source/state fingerprint returned by planning. Never
+   * restore, materialize topology, or converge a different source on this path. */
+  async coldFirstStart(rigId: string, nodeId: string, rigSpecYaml: string, rigRoot: string, options: { plan: boolean; fingerprint?: string }): Promise<
+    { ok: false; code: string; message: string } |
+    { ok: true; planOnly: boolean; plan: ColdFirstStartPlan; status?: "launched"; sessionName?: string; warnings?: string[] }
+  > {
+    const refuse = (code: string, message: string) => ({ ok: false as const, code, message });
+    const guard = this.deps.tmuxAdapter?.deliveryGuard;
+    if (!guard) return refuse("cold_start_unavailable", "The node lifecycle guard is unavailable; no first start attempted.");
+    if (!guard.ownsLifecycle(nodeId)) {
+      return guard.lifecycle([nodeId], () => this.coldFirstStart(rigId, nodeId, rigSpecYaml, rigRoot, options));
+    }
+    if (!nodePath.isAbsolute(rigRoot) || !this.deps.fsOps.exists(rigRoot)) return refuse("invalid_source_root", "Supply an existing absolute --rig-root on the daemon host.");
+    if (!options.plan && !options.fingerprint) return refuse("cold_start_plan_required", "Obtain a first-start plan before executing it.");
+
+    const prepare = () => {
+      const rig = this.deps.rigRepo.getRig(rigId);
+      const node = rig?.nodes.find(n => n.id === nodeId);
+      const podRow = node && this.deps.podRepo.getPodsForRig(rigId).find(p => p.id === node.podId);
+      if (!rig || !node || !podRow || node.runtime === "terminal") throw new Error("First start requires an existing agent member in a pod.");
+      if (this.db.prepare("SELECT 1 FROM rigs WHERE id = ? AND archived_at IS NOT NULL").get(rigId)) throw new Error("Archived rigs cannot be first-started.");
+      if (this.deps.sessionRegistry.getBindingForNode(nodeId)
+        || this.deps.sessionRegistry.getSessionsForRig(rigId).some(s => s.nodeId === nodeId)
+        || this.db.prepare("SELECT 1 FROM node_startup_context WHERE node_id = ?").get(nodeId)
+        || this.db.prepare("SELECT 1 FROM occupant_tenures WHERE node_id = ?").get(nodeId)
+        || this.db.prepare("SELECT 1 FROM events WHERE node_id = ? AND type IN ('node.launched', 'node.startup_ready', 'node.startup_failed')").get(nodeId)
+        || node.occupantLifecycle || node.previousOccupant || node.handoverAt) {
+        throw new Error("Seat has binding, session, startup or occupancy history; use its existing restore/retry path.");
+      }
+      const raw = PodRigSpecCodec.parse(rigSpecYaml);
+      const validation = PodRigSpecSchema.validate(raw);
+      if (!validation.valid) throw new Error(validation.errors.join("; "));
+      const rigSpec = PodRigSpecSchema.normalize(raw as Record<string, unknown>);
+      const selected = this.findMemberContext(rigSpec, node.logicalId);
+      if (!selected) throw new Error("source_convergence_required: source does not contain the retained member.");
+      const { pod, member } = selected;
+      const same = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
+      const modelEvent = this.db.prepare("SELECT payload FROM events WHERE node_id = ? AND type = 'node.model_changed' ORDER BY seq DESC LIMIT 1").get(nodeId) as { payload: string } | undefined;
+      const modelSelected = modelEvent && JSON.parse(modelEvent.payload).to === node.model;
+      const rigPolicy = this.deps.rigRepo.getRigPermissionPolicy(rigId);
+      if (rigSpec.name !== rig.rig.name || pod.id !== podRow.namespace || pod.label !== podRow.label
+        || !same(member.agentRef, node.agentRef) || !same(member.profile, node.profile) || !same(member.runtime, node.runtime)
+        || !same(member.role, node.role) || !same(member.label, node.label) || !same(member.codexConfigProfile, node.codexConfigProfile)
+        || !same(member.permissionPolicy, node.permissionPolicy) || !same(rigSpec.permissionPolicy, rigPolicy)
+        || !same(resolveLaunchCwd(member.cwd, rigRoot), node.cwd) || !same(member.restorePolicy, node.restorePolicy)
+        || !same(member.effort, node.effort) || (!modelSelected && !same(member.model, node.model))) {
+        throw new Error("source_convergence_required: explicit source disagrees with retained identity, cwd or configuration; nothing was changed.");
+      }
+      if (member.sessionSource || node.sessionSource) throw new Error("First start cannot fork, rebuild or consume a prior native session.");
+      const reads = new Map<string, string | null>();
+      const fsOps: AgentResolverFsOps = {
+        exists: path => this.deps.fsOps.exists(path),
+        readFile: path => { const bytes = this.deps.fsOps.readFile(path); reads.set(path, bytes); return bytes; },
+      };
+      const resolved = resolveAgentRef(member.agentRef, rigRoot, fsOps);
+      if (!resolved.ok) throw new Error(resolved.code === "validation_failed" ? resolved.errors.join("; ") : resolved.error);
+      if (node.resolvedSpecHash && node.resolvedSpecHash !== resolved.resolved.hash) throw new Error("source_convergence_required: retained agent source hash differs.");
+      const config = resolveNodeConfig({ baseSpec: resolved.resolved, importedSpecs: resolved.imports, collisions: resolved.collisions,
+        profileName: member.profile, specRoot: rigRoot, member, pod, rig: rigSpec, skillsRoot: this.resolveSkillsRoot(), ...this.systemWorldResolutionContext() });
+      if (!config.ok) throw new Error(config.errors.join("; "));
+      if (config.config.runtime !== node.runtime || config.config.cwd !== node.cwd) throw new Error("source_convergence_required: resolved runtime or cwd differs.");
+      if (modelSelected) config.config.model = node.model ?? undefined;
+      const ref = resolvePermissionPolicyRefValue(member.permissionPolicy, rigSpec.permissionPolicy);
+      const attachment = ref ? resolvePermissionPolicyAttachment(ref, rigRoot, fsOps) : undefined;
+      const nodePolicy = this.deps.rigRepo.getNodePolicyProvenance(nodeId);
+      const inheritedPolicy = this.deps.rigRepo.getRigPolicyProvenance(rigId);
+      if (attachment && nodePolicy && (attachment.launchPosture !== nodePolicy.launchPosture
+        || !same(attachment.resolvedTarget, nodePolicy.resolvedTarget) || !same(attachment.declaringDir, nodePolicy.declaringDir))) {
+        throw new Error("source_convergence_required: resolved permission policy differs from retained provenance.");
+      }
+      const permissions = new NativePermissionStore(this.db);
+      const bindingOverride = permissions.launchOverride(nodeId, member.runtime);
+      const posture = bindingOverride.launchPosture ?? attachment?.launchPosture ?? nodePolicy?.launchPosture ?? inheritedPolicy?.launchPosture ?? "floor";
+      const projection = planProjection({ config: config.config, collisions: resolved.collisions, fsOps });
+      if (!projection.ok) throw new Error(projection.errors.join("; "));
+      const files = this.buildResolvedStartupFiles(resolved.resolved.spec, resolved.resolved.sourcePath,
+        resolved.resolved.spec.profiles[member.profile], rigSpec, rigRoot, pod, member);
+      // Bind the resolved source/guidance inputs, including optional-file absence.
+      for (const file of files) {
+        reads.set(file.absolutePath, fsOps.exists(file.absolutePath) ? fsOps.readFile(file.absolutePath) : null);
+      }
+      const directories = new Set<string>();
+      const capture = (path: string): void => {
+        if (!fsOps.exists(path)) { reads.set(path, null); return; }
+        try { fsOps.readFile(path); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EISDIR") throw error;
+          const real = realpathSync(path);
+          if (directories.has(real)) return;
+          directories.add(real);
+          const names = readdirSync(path).sort();
+          reads.set(path, JSON.stringify(names));
+          for (const name of names) capture(nodePath.join(path, name));
+        }
+      };
+      for (const entry of projection.plan.entries) capture(entry.absolutePath);
+      const profile = resolved.resolved.spec.profiles[member.profile];
+      const plan: ColdFirstStartPlan = {
+        rigId, nodeId, logicalId: node.logicalId, fingerprint: "", runtime: member.runtime, cwd: config.config.cwd,
+        model: { value: config.config.model ?? null, source: modelSelected ? "seat set-model" : member.model ? "member" : profile?.preferences?.model ? "profile" : config.config.model ? "agent default" : "runtime default",
+          observation: config.config.model ? "requested; native selection unobserved" : "runtime default; concrete native model unobserved" },
+        effort: { value: config.config.effort ?? null, source: member.effort ? "member" : profile?.preferences?.effort ? "profile" : config.config.effort ? "agent default" : "runtime default" },
+        permissions: { memberRef: member.permissionPolicy ?? null, rigRef: rigPolicy, launchPosture: posture, nativeOverride: permissions.read(nodeId), bindingOverride },
+        nonTargetEffects: "unchanged",
+      };
+      plan.fingerprint = createHash("sha256").update(JSON.stringify({ rigSpecYaml, rigRoot, node, podRow, plan, config: config.config,
+        nodePolicy, inheritedPolicy, modelEvent, reads: [...reads].sort(([a], [b]) => a.localeCompare(b)) })).digest("hex");
+      return { rigSpec, pod, member, resolved, config, plan };
+    };
+
+    try {
+      const initial = prepare();
+      if (!options.plan && initial.plan.fingerprint !== options.fingerprint) return refuse("cold_start_plan_changed", "Source or seat configuration changed since planning; inspect a new plan. No launch attempted.");
+      // Preflight only this member; other declared members and edges remain untouched.
+      const preflight = await preflightValidatedSpec({ ...initial.rigSpec, pods: [{ ...initial.pod, members: [initial.member], edges: [] }], edges: [] }, {
+        rigRoot, fsOps: this.deps.fsOps, skillsRoot: this.resolveSkillsRoot(), ...this.systemWorldResolutionContext(),
+        inheritedPermissionPolicy: this.inheritedPermissionPolicy(rigId), exec: this.deps.exec, claudeActivityAssets: this.deps.claudeActivityAssets,
+      });
+      if (!preflight.ready) return refuse("cold_start_preflight_failed", preflight.errors.join("; "));
+      const sessionName = deriveCanonicalSessionName(initial.pod.id, initial.member.id, initial.rigSpec.name);
+      if ((await this.deps.tmuxAdapter?.probeSession(sessionName))?.state !== "absent") return refuse("cold_start_occupancy_unknown", `Session "${sessionName}" is live or unknown; no launch attempted.`);
+      const current = prepare();
+      if (initial.plan.fingerprint !== current.plan.fingerprint) return refuse("cold_start_plan_changed", "Source or seat state changed during preflight; no launch attempted.");
+      if (options.plan) return { ok: true, planOnly: true, plan: current.plan, warnings: preflight.warnings };
+      const result = await this.launchExistingAgentMember({ rigId, nodeId, qualifiedId: current.plan.logicalId, rigRoot,
+        rigSpec: current.rigSpec, pod: current.pod, member: current.member, resolveResult: current.resolved, configResult: current.config });
+      if (result.status !== "launched") return refuse(result.status, result.error ?? "First start did not reach readiness; inspect retained startup evidence before any recovery.");
+      return { ok: true, planOnly: false, plan: current.plan, status: "launched", sessionName: result.sessionName, warnings: result.warnings };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return refuse(message.startsWith("source_convergence_required:") ? "source_convergence_required" : "cold_start_refused", message);
+    }
   }
 
   /** Recover the legacy gap where projection failed before startup context was

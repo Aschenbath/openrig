@@ -2,7 +2,7 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { launchCommand } from "../src/commands/launch.js";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -91,6 +91,39 @@ describe("rig launch --seats", () => {
     });
     expect(logs.join("\n")).toContain("Launched node dev.pi");
     expect(process.exitCode).toBeUndefined();
+  });
+
+  it.each(["plan", "execute", "lost-response", "unsupported", "changed-plan"])("cold first start: %s, no fallback or automatic retry", async mode => {
+    const directory = mkdtempSync(join(tmpdir(), "cold-start-cli-"));
+    const source = join(directory, "rig.yaml");
+    writeFileSync(source, "version: '0.2'\nname: cold\n");
+    const deps = makeDeps({});
+    const plan = { ok: true, planOnly: true, plan: { fingerprint: "a".repeat(64), model: { value: null, observation: "runtime default; concrete native model unobserved" } } };
+    deps._client.post.mockImplementation(async (_url, body) => {
+      const input = body as { plan: boolean; fingerprint?: string };
+      if (mode === "unsupported") return { status: 404, data: { ok: false } };
+      if (input.plan) return { status: 200, data: plan };
+      expect(logs.map(line => JSON.parse(line))).toEqual([plan]);
+      expect(input.fingerprint).toBe(plan.plan.fingerprint);
+      if (mode === "lost-response") throw new Error("Response unreadable; unknown outcome");
+      if (mode === "changed-plan") return { status: 409, data: { ok: false, code: "cold_start_plan_changed" } };
+      return { status: 201, data: { ok: true, status: "launched" } };
+    });
+    try {
+      await launchCommand(deps).parseAsync(["node", "rig", "rig-1", "dev.worker", "--first-start-from", source, "--rig-root", directory, "--json", ...(mode === "plan" ? ["--plan"] : [])]);
+      expect(deps._client.post).toHaveBeenCalledTimes(mode === "plan" || mode === "unsupported" ? 1 : 2);
+      expect(deps._client.post.mock.calls.every(([url]) => url.endsWith("/launch/first-start"))).toBe(true);
+      if (["lost-response", "unsupported", "changed-plan"].includes(mode)) expect(process.exitCode).toBe(1);
+      else expect(process.exitCode).toBeUndefined();
+      if (mode === "lost-response") expect(errors.join("\n")).toContain("outcome unconfirmed");
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it.each([["--snapshot-id", "s"], ["--seats", "dev.worker"], ["--retry-startup-from", "member.yaml"], ["--hold-reason", "reason"]])("refuses ambiguous cold options %j without a request", async (...extra) => {
+    const deps = makeDeps({});
+    await launchCommand(deps).parseAsync(["node", "rig", "rig-1", "dev.worker", "--first-start-from", "/absent", "--rig-root", "/project", ...extra]);
+    expect(deps._client.post).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
   });
 
   it.each([["--snapshot-id", "s"], ["--seats", "dev.pi"], ["--plan"], ["--hold-reason", "reason"]])("refuses ambiguous retry options %j before a request", async (...extra) => {

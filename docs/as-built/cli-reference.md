@@ -794,7 +794,24 @@ Root: `rig`; declared option: `-V, --version`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig launch <rigId> [nodeRef]` | — | `--seats <ids>`<br>`--hold-reason <reason>`<br>`--snapshot-id <id>`<br>`--retry-startup-from <member-file>`<br>`--rig-root <path>`<br>`--plan`<br>`--json`<br>`--host <id>` |
+| `rig launch <rigId> [nodeRef]` | — | `--seats <ids>`<br>`--hold-reason <reason>`<br>`--snapshot-id <id>`<br>`--retry-startup-from <member-file>`<br>`--first-start-from <rig-file>`<br>`--rig-root <path>`<br>`--plan`<br>`--json`<br>`--host <id>` |
+
+For an existing pod member that has never started, use
+`rig launch <rigId> <nodeRef> --first-start-from <rig.yaml> --rig-root <absolute-root> --plan`.
+The complete RigSpec supplies the selected member's inherited guidance; only that
+existing node is eligible to launch. Its identity, source references, cwd and policy
+must agree with the retained member. A mismatch requires separate source convergence.
+The root and referenced files must already exist on the selected daemon host.
+
+Omit `--plan` to print the resolved model, effort and permission plan, then execute
+it once. `--json` emits a plan JSON line followed by a result JSON line; with
+`--plan` it emits only the plan. Execution revalidates the source/state fingerprint.
+An unset model means the runtime default is requested; the concrete native model
+is unobserved. Persisted `rig seat set-model` and native permission choices apply.
+Prior sessions, startup context or native history require the ordinary restore or
+retry paths. Live or unknown occupancy refuses first start. No other seat, edge or
+held state is changed. After a lost response, inspect the seat before recovery;
+the command does not retry automatically.
 
 ### remove
 

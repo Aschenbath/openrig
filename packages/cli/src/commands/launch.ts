@@ -63,16 +63,57 @@ export function launchCommand(depsOverride?: StatusDeps): Command {
     .option("--hold-reason <reason>", "Reason for holding non-target seats")
     .option("--snapshot-id <id>", "Use this exact restore-usable snapshot")
     .option("--retry-startup-from <member-file>", "Retry a stopped first start that failed during projection, using its original member fragment")
-    .option("--rig-root <path>", "Original absolute source root for --retry-startup-from")
-    .option("--plan", "Show subset selection and non-target effects without mutation")
+    .option("--first-start-from <rig-file>", "Start one existing never-started member from an explicit complete RigSpec")
+    .option("--rig-root <path>", "Absolute daemon-host source root for explicit first start or first-start retry")
+    .option("--plan", "Show subset selection or explicit cold first-start configuration without mutation")
     .option("--json", "JSON output")
     .option("--host <id>", "Run on a remote host declared in ~/.openrig/hosts.yaml")
-    .action(async (rigId: string, nodeRef: string | undefined, opts: { json?: boolean; holdReason?: string; seats?: string; host?: string; snapshotId?: string; plan?: boolean; retryStartupFrom?: string; rigRoot?: string }) => {
+    .action(async (rigId: string, nodeRef: string | undefined, opts: { json?: boolean; holdReason?: string; seats?: string; host?: string; snapshotId?: string; plan?: boolean; retryStartupFrom?: string; firstStartFrom?: string; rigRoot?: string }) => {
       // OPR.0.4.6.MH1 FR-2: selected-host routing — explicit --host wins;
       // else the persisted selection feeds the SHIPPED --host path; no
       // selection = today exactly.
       opts.host = resolveEffectiveHost(opts.host);
       const deps = getDeps();
+      if (opts.firstStartFrom) {
+        if (!nodeRef || !opts.rigRoot || !isAbsolute(opts.rigRoot) || opts.retryStartupFrom || opts.seats || opts.snapshotId || opts.holdReason) {
+          console.error("Cold first start requires one node and an absolute --rig-root; do not combine it with retry, snapshot or subset options.");
+          process.exitCode = 1;
+          return;
+        }
+        let executing = false;
+        try {
+          const rigSpecYaml = readFileSync(opts.firstStartFrom, "utf8");
+          const path = `/api/rigs/${encodeURIComponent(rigId)}/nodes/${encodeURIComponent(nodeRef)}/launch/first-start`;
+          const client = opts.host ? null : await getClient(deps);
+          if (!opts.host && !client) { process.exitCode = 1; return; }
+          const post = async (body: unknown) => {
+            if (opts.host) {
+              const { runRemoteHttpOp } = await import("../remote-host-ops.js");
+              const result = await runRemoteHttpOp(opts.host, "POST", path, body, deps, opts);
+              if (!result.ok) throw new Error(JSON.stringify(result.data ?? result.error));
+              return result.data;
+            }
+            const response = await client!.post(path, body);
+            if (response.status >= 400) throw new Error(JSON.stringify(response.data));
+            return response.data;
+          };
+          const body = { rigSpecYaml, rigRoot: opts.rigRoot };
+          const planned = await post({ ...body, plan: true }) as { ok?: boolean; planOnly?: boolean; plan?: { fingerprint?: string } };
+          if (!planned?.ok || planned.planOnly !== true || !/^[a-f0-9]{64}$/.test(planned.plan?.fingerprint ?? "")) throw new Error("Daemon did not return a supported cold first-start plan; execution not attempted.");
+          // The receipt is visible BEFORE execution. --json emits two JSON lines
+          // (plan then result); --plan emits only the first, with no launch effects.
+          console.log(opts.json ? JSON.stringify(planned) : `First-start plan:\n${JSON.stringify(planned, null, 2)}`);
+          if (opts.plan) return;
+          executing = true;
+          const result = await post({ ...body, plan: false, fingerprint: planned.plan!.fingerprint }) as { ok?: boolean; status?: string };
+          console.log(JSON.stringify(result, null, opts.json ? undefined : 2));
+          if (!result?.ok || result.status !== "launched") process.exitCode = 1;
+        } catch (error) {
+          console.error(`${executing ? "First-start outcome unconfirmed; inspect the seat before recovery. No automatic retry." : "First start not executed."} ${error instanceof Error ? error.message : String(error)}`);
+          process.exitCode = 1;
+        }
+        return;
+      }
       let retryBody: { retryStartupFrom: { member: Record<string, unknown>; rigRoot: string } } | undefined;
       if (opts.retryStartupFrom || opts.rigRoot) {
         if (!nodeRef || !opts.retryStartupFrom || !opts.rigRoot || !isAbsolute(opts.rigRoot) || opts.seats || opts.snapshotId || opts.plan || opts.holdReason) {

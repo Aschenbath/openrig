@@ -244,6 +244,25 @@ nodesRoutes.get("/:logicalId", async (c) => {
   return c.json(detail);
 });
 
+// Separate mode URL: old daemons must return 404, never mistake a plan for restore.
+nodesRoutes.post("/:logicalId/launch/first-start", async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const ref = c.req.param("logicalId")!;
+  const rig = getDeps(c).rigRepo.getRig(rigId);
+  const node = rig?.nodes.find(n => n.logicalId === ref || n.id === ref);
+  if (!node) return c.json({ ok: false, code: "node_not_found", message: "Existing rig member not found." }, 404);
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body.rigSpecYaml !== "string" || typeof body.rigRoot !== "string" || typeof body.plan !== "boolean"
+    || (!body.plan && typeof body.fingerprint !== "string")
+    || Object.keys(body).some(key => !["rigSpecYaml", "rigRoot", "plan", "fingerprint"].includes(key))) {
+    return c.json({ ok: false, code: "invalid_first_start", message: "Supply rigSpecYaml, absolute rigRoot, plan, and the planned fingerprint for execution." }, 400);
+  }
+  const instantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+  if (!instantiator) return c.json({ ok: false, code: "internal_error", message: "Pod instantiator unavailable" }, 500);
+  const result = await instantiator.coldFirstStart(rigId, node.id, body.rigSpecYaml, body.rigRoot, body);
+  return c.json(result, result.ok ? result.planOnly ? 200 : 201 : result.code === "failed" ? 500 : 409);
+});
+
 // POST /api/rigs/:rigId/nodes/:logicalId/launch
 nodesRoutes.post("/:logicalId/launch", async (c) => {
   const rigId = c.req.param("rigId")!;
