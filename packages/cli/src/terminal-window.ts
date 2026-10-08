@@ -83,7 +83,7 @@ async function herdrBinary(deps: WindowDeps): Promise<string | null> {
 }
 
 /** New surfaces only. No System Events keystrokes or existing-terminal input. */
-async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((command: string) => Promise<{ app: string; surface: string; columns?: number }>) | string> {
+async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((command: string) => Promise<{ app: string; surface: string; columns?: number }>) | { currentHerdr: true } | string> {
   // Shell tools can pipe stdio while still running inside the person's terminal.
   const program = deps.env["TERM_PROGRAM"];
   const linuxHost = deps.platform !== "linux" ? undefined
@@ -92,10 +92,16 @@ async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((comm
   const host = !program || program === "tmux" ? deps.env["__CFBundleIdentifier"] ?? linuxHost : program;
   if (deps.env["CI"] && !["0", "false"].includes(deps.env["CI"])) return "This is a CI run.";
   if (deps.env["SSH_CONNECTION"] || deps.env["SSH_CLIENT"] || deps.env["SSH_TTY"]) return "This is an SSH session; no desktop window is opened over SSH.";
+  if (host === "herdr") return { currentHerdr: true };
   if (deps.platform === "darwin") {
     const inGhostty = host === "ghostty" || host === "com.mitchellh.ghostty";
-    if (!inGhostty && host !== "Apple_Terminal" && host !== "com.apple.Terminal") return `Unrecognised or unscriptable hosting terminal: ${JSON.stringify(host ?? "unknown")}.`;
-    const app = inGhostty ? ["/Applications/Ghostty.app", path.join(deps.env["HOME"] ?? homedir(), "Applications/Ghostty.app")].find(deps.exists) : undefined;
+    const inTerminal = host === "Apple_Terminal" || host === "com.apple.Terminal";
+    const newApp = !inGhostty && !inTerminal;
+    // Desktop shell tools need no stdin TTY, but a background job must not summon an app.
+    if (newApp && (await deps.exec("/bin/launchctl", ["managername"]).catch(() => "")).trim() !== "Aqua") {
+      return "No local macOS desktop session could be confirmed.";
+    }
+    const app = !inTerminal ? ["/Applications/Ghostty.app", path.join(deps.env["HOME"] ?? homedir(), "Applications/Ghostty.app")].find(deps.exists) : undefined;
     let ghostty = false;
     if (app) {
       try {
@@ -104,13 +110,14 @@ async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((comm
         ghostty = major! > 1 || (major === 1 && minor! >= 3);
       } catch { /* No other app is a substitute for the hosting terminal. */ }
     }
-    if (inGhostty && !ghostty) return "The hosting Ghostty does not provide a supported scripting interface.";
+    if ((inGhostty || app) && !ghostty) return "The installed Ghostty does not provide a supported scripting interface (1.3 or newer required).";
+    if (newApp) notes.push(`Tell the person: it is fine to click Allow if macOS asks to control ${ghostty ? "Ghostty" : "Terminal"}; this lets OpenRig open the requested welcome view. The app uses its own new-window size because this caller has no scriptable terminal window to copy.`);
     // A tab group shares bounds: copying its current bounds also leaves the original unchanged.
     const script = ghostty ? `on run argv
 tell application "Ghostty"
   set cfg to new surface configuration
   set command of cfg to item 1 of argv
-  if (count of windows) > 0 then
+  if ${newApp ? "false" : "(count of windows) > 0"} then
     set newTab to new tab in front window with configuration cfg
     select tab newTab
     focus (focused terminal of newTab)
@@ -125,7 +132,7 @@ end tell
 end run` : `on run argv
 tell application "Terminal"
   set personBounds to missing value
-  if (count of windows) > 0 then set personBounds to bounds of front window
+  ${newApp ? "-- No hosting Terminal window: keep the new-window profile defaults." : "if (count of windows) > 0 then set personBounds to bounds of front window"}
   set viewTab to do script ""
   set viewWindow to front window
   if personBounds is not missing value then set bounds of viewWindow to personBounds
@@ -138,10 +145,12 @@ end run`;
     return async command => {
       const reported = (await deps.exec("/usr/bin/osascript", ["-e", script, command], 120_000)).trim();
       const columns = Number(reported.split(":")[1]);
-      notes.push(ghostty
+      notes.push(newApp
+        ? `${ghostty ? "Ghostty" : "Terminal"} opened a new window using its own profile settings; no existing window was resized.`
+        : ghostty
         ? "Ghostty keeps the person's window size; layout uses the hosting terminal's measured width when available."
         : "The new Terminal view copies the person's front-window bounds when available; existing window settings were kept.");
-      return { app: ghostty ? "Ghostty" : "Terminal", surface: ghostty ? reported : "window", ...(Number.isSafeInteger(columns) && columns > 0 ? { columns } : {}) };
+      return { app: ghostty ? "Ghostty" : "Terminal", surface: ghostty ? reported : "window", ...(Number.isSafeInteger(columns) && columns > 0 ? { columns } : newApp ? { columns: undefined } : {}) };
     };
   }
   if (deps.platform !== "linux") return `No supported desktop launcher on ${deps.platform}.`;
@@ -183,7 +192,7 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
     if (!localDaemon(client.baseUrl)) throw new Error("The window launcher must run on the daemon's own desktop; the configured daemon is remote.");
     if (requestedProvider && !["herdr", "tmux"].includes(requestedProvider)) throw new Error("--window supports herdr or tmux. Use cmux without --window.");
     const launchWindow = await windowLauncher(deps, windowNotes);
-    const measured = typeof launchWindow === "function" ? await deps.columns?.().catch(() => undefined) : undefined;
+    const measured = typeof launchWindow !== "string" ? await deps.columns?.().catch(() => undefined) : undefined;
     let viewportColumns = Number.isSafeInteger(measured) && measured! > 0 ? measured : undefined;
     const herdr = requestedProvider === "tmux" ? null : await herdrBinary(deps);
     if (!herdr && requestedProvider === "herdr") throw new Error("Herdr is not installed. Run rig setup, or use --provider tmux --window.");
@@ -200,7 +209,7 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
     }
     if (!composed.opened.length) return { ...failed("No conversations are attachable."), absent: composed.absent, degraded: composed.degraded };
     const measureWindow = async () => {
-      if (window?.columns !== undefined && window.columns !== viewportColumns && composed.kernelLayout) {
+      if (window && "columns" in window && window.columns !== viewportColumns && composed.kernelLayout) {
         viewportColumns = window.columns;
         const next = await client.get<Preview | OpenViewResult>(previewUrl());
         if (next.status >= 400 || !("composed" in next.data)) throw new Error("Could not compose the measured terminal view.");
@@ -213,6 +222,19 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
         : `Welcome layout measured at ${viewportColumns} columns: ${viewportColumns >= 120 ? "dashboard and operator side by side; advisor on a separate page" : "operator first; dashboard and advisor on separate pages"}.`);
     };
     const socket = preview.data.status.launch?.socketPath;
+    if (typeof launchWindow === "object") {
+      provider = "herdr";
+      if (requestedProvider === "tmux") return failed("The current Herdr view requires provider herdr; no extra window was opened.");
+      const base = path.join(deps.env["HOME"] ?? homedir(), ".config", "herdr");
+      const callerSocket = deps.env["HERDR_SOCKET_PATH"] ?? (deps.env["HERDR_SESSION"]
+        ? path.join(base, "sessions", deps.env["HERDR_SESSION"], "herdr.sock") : path.join(base, "herdr.sock"));
+      if (!socket || path.resolve(socket) !== path.resolve(callerSocket)) return failed("The current Herdr endpoint differs from the daemon's endpoint; no space was opened in another session.");
+      const result = await client.post<OpenViewResult>("/api/terminal/open", { view, provider, expectedPlan: planId, ...(viewportColumns !== undefined ? { viewportColumns } : {}) }, { timeoutMs: 45_000 });
+      if (!Array.isArray(result.data?.opened)) return failed("The daemon returned no view result for the current Herdr session. Inspect it before retrying.");
+      return { ...result.data, notes: [...(result.data.notes ?? []), result.data.ok
+        ? "Opened the view in the current Herdr session; no terminal window or personal config was changed. Check the selected space is visible."
+        : "The current Herdr view was not confirmed; no terminal window or personal config was changed."] };
+    }
     let configEnv = "";
     let configPrefix = "";
     if (herdr && socket) {

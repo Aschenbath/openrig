@@ -7,7 +7,7 @@ function fixture(options: { herdr?: boolean; ghostty?: string; refusal?: number;
   const composed = { id: "kernel", opened: options.empty ? [] : panes, pages: options.empty ? [] : [panes], columns: 3, absent: [], degraded: [] };
   const preview = { planId: "bound-plan", composed, status: { launch: { socketPath: "/daemon home/herdr.sock", session: "daemon-session" } } };
   const get = vi.fn(async (url: string): Promise<{ status: number; data: unknown }> => ({ status: 200, data: url.includes("preview") ? preview : { providers: [{ liveness: { alive: options.alive !== false } }] } }));
-  const post = vi.fn(async () => options.refusal ? { status: options.refusal, data: { error: "view changed" } } : { status: 200, data: { provider: "herdr", ok: true, opened: panes.map(p => p.seat), absent: [], degraded: [], pages: 1 } });
+  const post = vi.fn(async (): Promise<{ status: number; data: unknown }> => options.refusal ? { status: options.refusal, data: { error: "view changed" } } : { status: 200, data: { provider: "herdr", ok: true, opened: panes.map(p => p.seat), absent: [], degraded: [], pages: 1 } });
   const client = { baseUrl: "http://localhost:7433", get, post } as unknown as DaemonClient;
   let pane = 0;
   const exec = vi.fn(async (file: string, args: string[]) => {
@@ -107,7 +107,7 @@ describe("desktop terminal view", () => {
   });
 
   it.each([
-    { platform: "darwin", env: { TERM_PROGRAM: "vscode" }, reason: "Unrecognised or unscriptable", where: "new terminal window" },
+    { platform: "darwin", env: { TERM_PROGRAM: "vscode" }, reason: "No local macOS desktop session", where: "new terminal window" },
     { platform: "darwin", env: { TERM_PROGRAM: "Apple_Terminal", CI: "true" }, reason: "CI run", where: "new terminal window" },
     { platform: "darwin", env: { TERM_PROGRAM: "Apple_Terminal", SSH_TTY: "/dev/ttys1" }, reason: "SSH session", where: "new SSH session" },
     { platform: "linux", env: {}, reason: "No desktop display", where: "new SSH session" },
@@ -473,5 +473,115 @@ describe("measured welcome layout", () => {
     expect(launch[1][2]).toContain("HERDR_CONFIG_PATH='/fixture/wide.toml'");
     expect(launch[1][2]).toContain("HERDR_CONFIG_PATH='/fixture/narrow.toml'");
     expect(launch[1][1]!.indexOf("set bounds")).toBeLessThan(launch[1][1]!.indexOf("do script (item 1 of argv) in viewTab"));
+  });
+});
+
+
+describe("welcome launcher for desktop apps and an existing Herdr client", () => {
+  function desktop(env: NodeJS.ProcessEnv, ghostty?: string) {
+    const f = fixture({ ghostty });
+    f.deps.env = { HOME: "/fixture", ...env };
+    const original = f.deps.exec;
+    f.deps.exec = vi.fn(async (file, args, timeoutMs) => file === "/bin/launchctl" ? "Aqua\n" : file === "/usr/bin/osascript" ? "window" : original(file, args, timeoutMs));
+    return f;
+  }
+
+  it.each([{}, { TERM_PROGRAM: "iTerm.app" }, { TERM_PROGRAM: "vscode" }])("opens Terminal from a desktop caller when Ghostty is absent: %j", async env => {
+    const f = desktop(env);
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: true, window: { app: "Terminal", surface: "window" } });
+    const launches = vi.mocked(f.deps.exec).mock.calls.filter(([file]) => file === "/usr/bin/osascript");
+    expect(launches).toHaveLength(1);
+    expect(launches[0]![2]).toBe(120_000);
+    expect(launches[0]![1][1]).toContain('tell application "Terminal"');
+    expect(launches[0]![1][1]).not.toContain("set personBounds to bounds of front window");
+    expect(result.notes?.join(" ")).toContain("fine to click Allow");
+    expect(result.notes?.join(" ")).toContain("own new-window size");
+  });
+
+  it.each([{}, { TERM_PROGRAM: "iTerm.app" }, { TERM_PROGRAM: "vscode" }])("prefers a new Ghostty window for a desktop caller: %j", async env => {
+    const f = desktop(env, "1.3.0");
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: true, window: { app: "Ghostty" } });
+    const launches = vi.mocked(f.deps.exec).mock.calls.filter(([file]) => file === "/usr/bin/osascript");
+    expect(launches).toHaveLength(1);
+    expect(launches[0]![1][1]).toContain("if false then");
+    expect(launches[0]![1][1]).toContain("new window with configuration cfg");
+    expect(result.notes?.join(" ")).toContain("control Ghostty");
+    expect(f.post).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not borrow a VS Code pane width for a new Ghostty window of unknown width", async () => {
+    const f = desktop({ TERM_PROGRAM: "vscode" }, "1.3.0");
+    f.deps.columns = async () => 200;
+    Object.assign(f.preview.composed, { kernelLayout: "dual-runtime" });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result.ok).toBe(true);
+    expect(result.notes?.join(" ")).toContain("width could not be measured");
+    expect(f.get).toHaveBeenCalledWith("/api/terminal/preview?view=saved%3Akernel&provider=herdr&viewportColumns=200");
+    expect(f.get).toHaveBeenCalledWith("/api/terminal/preview?view=saved%3Akernel&provider=herdr");
+    expect(f.post).toHaveBeenCalledWith("/api/terminal/open", { view: "saved:kernel", provider: "herdr", expectedPlan: "bound-plan" }, expect.anything());
+  });
+
+  it.each(["Background", "System", "", "error"])("keeps guidance-only behavior without a confirmed desktop: %s", async manager => {
+    const f = desktop({}); const original = f.deps.exec;
+    f.deps.exec = vi.fn(async (file, args) => {
+      if (file === "/bin/launchctl") { if (manager === "error") throw new Error("probe failed"); return manager; }
+      return original(file, args);
+    });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: false, windowAttempted: false });
+    expect(result.error).toContain("No local macOS desktop session");
+    expect(vi.mocked(f.deps.exec).mock.calls.some(([file]) => file === "/usr/bin/osascript")).toBe(false);
+    expect(f.post).not.toHaveBeenCalled();
+  });
+
+  it.each(["denied", "timed out"])("never retries or changes apps after an uncertain desktop launch: %s", async message => {
+    const f = desktop({}, "1.3.0"); const original = f.deps.exec;
+    f.deps.exec = vi.fn(async (file, args) => { if (file === "/usr/bin/osascript") throw new Error(message); return original(file, args); });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: false, windowAttempted: true });
+    expect(result.error).toContain("status is unknown");
+    expect(vi.mocked(f.deps.exec).mock.calls.filter(([file]) => file === "/usr/bin/osascript")).toHaveLength(1);
+    expect(f.post).not.toHaveBeenCalled();
+  });
+
+  it.each([{}, { HERDR_SESSION: "personal" }, { HERDR_SOCKET_PATH: "/personal/herdr.sock" }])("opens a fresh space in the current Herdr endpoint without a window: %j", async extra => {
+    const f = fixture();
+    f.deps.env = { HOME: "/fixture", TERM_PROGRAM: "herdr", __CFBundleIdentifier: "com.apple.Terminal", ...extra };
+    f.preview.status.launch.socketPath = extra.HERDR_SOCKET_PATH ?? (extra.HERDR_SESSION ? "/fixture/.config/herdr/sessions/personal/herdr.sock" : "/fixture/.config/herdr/herdr.sock");
+    f.deps.columns = async () => 174;
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: true }); expect(result.window).toBeUndefined();
+    expect(f.post).toHaveBeenCalledExactlyOnceWith("/api/terminal/open", { view: "saved:kernel", provider: "herdr", expectedPlan: "bound-plan", viewportColumns: 174 }, { timeoutMs: 45_000 });
+    expect(f.deps.herdrConfig).not.toHaveBeenCalled(); expect(f.deps.launch).not.toHaveBeenCalled();
+    expect(f.exec.mock.calls.some(([file]) => file === "/usr/bin/osascript" || file === "/bin/launchctl" || file === "/usr/bin/env")).toBe(false);
+  });
+
+  it("does not place the current Herdr caller's view on a different daemon endpoint", async () => {
+    const f = fixture(); f.deps.env.TERM_PROGRAM = "herdr";
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: false, windowAttempted: false });
+    expect(result.error).toContain("endpoint differs"); expect(f.post).not.toHaveBeenCalled();
+    expect(f.deps.herdrConfig).not.toHaveBeenCalled();
+  });
+
+  it("reports a current-Herdr daemon refusal without claiming that a space opened", async () => {
+    const f = fixture({ refusal: 409 });
+    f.deps.env.TERM_PROGRAM = "herdr";
+    f.deps.env.HERDR_SOCKET_PATH = f.preview.status.launch.socketPath;
+    // A structured daemon refusal still has the ordinary result shape.
+    f.post.mockResolvedValue({ status: 409, data: { provider: "herdr", ok: false, error: "preview changed", opened: [], absent: [], degraded: [], pages: 0 } });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: false, error: "preview changed" });
+    expect(result.notes?.join(" ")).not.toContain("Opened the view");
+    expect(f.deps.launch).not.toHaveBeenCalled();
+  });
+
+  it.each([{ CI: "true" }, { SSH_CONNECTION: "remote" }, { SSH_CLIENT: "remote" }, { SSH_TTY: "/dev/ttys1" }])("keeps current-Herdr opens behind the CI/SSH boundary: %j", async extra => {
+    const f = fixture(); f.deps.env = { HOME: "/fixture", TERM_PROGRAM: "herdr", ...extra };
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: false, windowAttempted: false });
+    expect(f.post).not.toHaveBeenCalled();
   });
 });
