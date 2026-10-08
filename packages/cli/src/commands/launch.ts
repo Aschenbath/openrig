@@ -6,6 +6,7 @@ import { DaemonClient } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
+import { answerShowsAction, isPlanAnswer, notAPlanMessage, planSupportRefusal } from "../launch-plan-guard.js";
 
 type LaunchResponse = {
   ok: boolean;
@@ -118,10 +119,31 @@ export function launchCommand(depsOverride?: StatusDeps): Command {
           process.exitCode = 1;
           return;
         }
+        if (opts.plan) {
+          const host = opts.host;
+          let readError: string | undefined;
+          const refusal = await planSupportRefusal(async (path) => {
+            const read = await runRemoteHttpOp(host, "GET", path, undefined, deps, {});
+            if (!read.ok) readError = read.error;
+            return read.ok ? read.data : undefined;
+          });
+          if (refusal) {
+            console.error(`Host ${host}: ${refusal}${readError ? ` (version read: ${readError})` : ""}`);
+            process.exitCode = 1;
+            return;
+          }
+        }
         const result = await runRemoteHttpOp(opts.host, "POST", apiPath, body, deps, opts);
+        const notAPlan = Boolean(opts.plan && !isPlanAnswer(result.data) && answerShowsAction(result.ok, result.data));
+        if (notAPlan) {
+          console.error(`Host ${opts.host}: ${notAPlanMessage(opts.host)}`);
+          process.exitCode = 1;
+        }
         if (opts.json) {
           console.log(JSON.stringify(result));
           if (!result.ok) process.exitCode = 1;
+        } else if (notAPlan && result.ok) {
+          console.error(JSON.stringify(result.data, null, 2));
         } else if (result.ok) {
           console.log(JSON.stringify(result.data, null, 2));
         } else {
@@ -143,11 +165,38 @@ export function launchCommand(depsOverride?: StatusDeps): Command {
         const body: { seats: string[]; holdReason?: string; snapshotId?: string; plan?: boolean } = { seats: seatList };
         if (opts.holdReason) body.holdReason = opts.holdReason;
         if (opts.snapshotId) body.snapshotId = opts.snapshotId;
-        if (opts.plan) body.plan = true;
+        if (opts.plan) {
+          let readError: string | undefined;
+          const refusal = await planSupportRefusal(async (path) => {
+            try {
+              const read = await client.get<unknown>(path);
+              if (read.status !== 200) readError = `HTTP ${read.status}`;
+              return read.status === 200 ? read.data : undefined;
+            } catch (err) {
+              readError = (err as Error).message;
+              return undefined;
+            }
+          });
+          if (refusal) {
+            console.error(`${refusal}${readError ? ` (version read: ${readError})` : ""}`);
+            process.exitCode = 1;
+            return;
+          }
+          body.plan = true;
+        }
         const res = await client.post<LaunchResponse>(`/api/rigs/${encodeURIComponent(rigId)}/nodes/launch-subset`, body);
+        const notAPlan = Boolean(opts.plan && !isPlanAnswer(res.data) && answerShowsAction(res.status >= 200 && res.status < 300, res.data));
+        if (notAPlan) {
+          console.error(notAPlanMessage());
+          process.exitCode = 1;
+        }
         if (opts.json) {
           console.log(JSON.stringify(res.data, null, 2));
           if (res.status >= 400) process.exitCode = 1;
+          return;
+        }
+        if (notAPlan) {
+          console.error(JSON.stringify(res.data, null, 2));
           return;
         }
         if (opts.plan && res.data.planOnly) {
