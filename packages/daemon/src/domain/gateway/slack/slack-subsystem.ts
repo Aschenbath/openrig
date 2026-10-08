@@ -361,6 +361,11 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     return choice;
   };
 
+  // One run = one wire build. The abort controller lets stop() cancel anything this
+  // run still has in flight — chiefly the inline rate-limit wait in postChatMessage,
+  // whose stale retry must never post once a restart's replay owns the decision.
+  const runCtl = new AbortController();
+
   // Late-bound so deliver can release the driver's in-flight guard (built after the wire).
   let releaseRef: (qitemId: string) => void = () => {};
 
@@ -379,6 +384,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
         pinChannel: Boolean(cfg.channelMap?.length),
         sourceLabel: cfg.sourceLabel,
         fetchImpl: opts.fetchImpl,
+        stopSignal: runCtl.signal,
         delivered,
         attempted,
         outboundSeen,
@@ -705,6 +711,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       for (const s of starts) s();
     },
     stop: () => {
+      runCtl.abort(); // cancel this run's pending rate-limit waits before teardown
       for (const s of stops) { try { s(); } catch { /* best-effort */ } }
       baseStop();
     },
