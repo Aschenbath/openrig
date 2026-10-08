@@ -99,6 +99,11 @@ clicks arrive over the same socket, so no request URL is needed. An app created 
 manifest has Interactivity off: turn it on under **Interactivity & Shortcuts**, or the buttons
 will do nothing. A typed reply in the thread still answers the decision either way.
 
+Typed replies are stored in the decision's `humanAnswers` under its first unanswered question.
+Earlier button answers are preserved; no other questions are filled in. The reply still closes
+the decision even if questions remain unanswered, so read the recorded words rather than treating
+`done` as approval. A file-only reply closes the decision without recording a typed answer.
+
 ## What the connector does with the tokens
 
 The tokens stay in the env file you created. The connector reads them from that file and uses them

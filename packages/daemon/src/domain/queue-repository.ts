@@ -3118,6 +3118,43 @@ export class QueueRepository {
     for (const event of events) this.eventBus.notifySubscribers(event);
   }
 
+  /** Close a direct human request and retain its typed answer in the same transaction.
+   * A thread reply has no question id: store it under the first unanswered question only,
+   * preserving earlier clicks and leaving the other questions unanswered. A completed
+   * button set is already final; its resolve continuation must not overwrite those answers.
+   */
+  resolveDirectHumanReply(input: { qitemId: string; actorSession: string; decision: string }): boolean {
+    const result = this.db.transaction(() => {
+      const item = this.getById(input.qitemId);
+      if (item?.state !== "pending" || item.humanIntent === "update"
+        || item.destinationSession !== input.actorSession
+        || parseSessionName(item.destinationSession).kind !== "external") return null;
+
+      const text = input.decision.trim();
+      const question = this.hasHumanQuestionsColumn && text && text !== "[file reply]"
+        ? unansweredQuestions(item.humanQuestions ?? [], item.humanAnswers ?? {})[0]
+        : undefined;
+      if (question) {
+        const answers: HumanAnswers = { ...item.humanAnswers, [question.id]: text };
+        this.db.prepare("UPDATE queue_items SET human_answers = ? WHERE qitem_id = ?")
+          .run(JSON.stringify(answers), input.qitemId);
+      }
+      return this.updateInTransactionalContext({
+        qitemId: input.qitemId,
+        actorSession: input.actorSession,
+        state: "done",
+        closureReason: "no-follow-on",
+        transitionNote: question
+          ? `direct human reply received; typed answer recorded for question ${question.id}`
+          : "direct human reply received",
+        ownerNotificationKind: "human-decision-resolved",
+      });
+    })();
+    if (!result) return false;
+    for (const event of result.persistedEvents) this.eventBus.notifySubscribers(event);
+    return true;
+  }
+
   /**
    * #193 — record one clicked answer on a pending decision that carries structured questions.
    * Only the decision's own human may answer, and only while it is pending. A click may change

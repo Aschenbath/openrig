@@ -15,7 +15,7 @@ export interface HumanQuestion {
   options: HumanQuestionOption[];
 }
 
-/** questionId → chosen optionId. */
+/** questionId → chosen optionId or a typed reply. */
 export type HumanAnswers = Record<string, string>;
 
 /** The outcome of recording one clicked answer (QueueRepository.recordHumanAnswer). */
@@ -72,13 +72,13 @@ export function parseHumanQuestions(value: unknown): HumanQuestionsParse {
   return { ok: true, questions };
 }
 
-/** The recorded option for a question. Own keys only: a question id like "constructor" must
+/** The recorded answer for a question. Own keys only: a question id like "constructor" must
  *  not read the inherited Object.prototype member as an answer. */
 function ownAnswer(answers: HumanAnswers, questionId: string): string | undefined {
   return Object.prototype.hasOwnProperty.call(answers, questionId) ? answers[questionId] : undefined;
 }
 
-/** One "question: chosen label" line per answered question, in question order. */
+/** One "question: chosen label or typed reply" line per answered question, in question order. */
 export function formatHumanAnswers(questions: readonly HumanQuestion[], answers: HumanAnswers): string[] {
   return questions.flatMap((q) => {
     const optionId = ownAnswer(answers, q.id);
