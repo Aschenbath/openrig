@@ -511,6 +511,21 @@ describe("welcome launcher for desktop apps and an existing Herdr client", () =>
     expect(f.post).toHaveBeenCalledTimes(1);
   });
 
+  it("explains the Allow prompt before invoking the app, including on failure", async () => {
+    const f = desktop({}, "1.3.0");
+    const order: string[] = [];
+    f.deps.notice = message => { expect(message).toContain("fine to click Allow"); order.push("notice"); };
+    const original = f.deps.exec;
+    f.deps.exec = async (file, args) => {
+      if (file === "/usr/bin/osascript") { order.push("launch"); throw new Error("Automation denied"); }
+      return original(file, args);
+    };
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(order).toEqual(["notice", "launch"]);
+    expect(result).toMatchObject({ ok: false, windowAttempted: true });
+    expect(result.notes?.join(" ")).toContain("control Ghostty");
+  });
+
   it("does not borrow a VS Code pane width for a new Ghostty window of unknown width", async () => {
     const f = desktop({ TERM_PROGRAM: "vscode" }, "1.3.0");
     f.deps.columns = async () => 200;

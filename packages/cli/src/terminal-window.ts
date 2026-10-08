@@ -27,6 +27,7 @@ export interface WindowDeps {
   herdrConfig(socketPath: string, columns?: number): string;
   /** Hosting terminal measurement also works for an agent shell tool with piped stdio. */
   columns?(): Promise<number | undefined>;
+  notice?(message: string): void;
 }
 
 export function defaultWindowDeps(): WindowDeps {
@@ -43,6 +44,7 @@ export function defaultWindowDeps(): WindowDeps {
     }),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     id: () => randomUUID().slice(0, 12),
+    notice: message => process.stderr.write(`${message}\n`),
     herdrConfig: (socketPath, columns) => prepareHerdrLaunchConfig(env, socketPath, columns),
     columns: async () => {
       if (process.stdout.isTTY && process.stdout.columns > 0) return process.stdout.columns;
@@ -111,7 +113,8 @@ async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((comm
       } catch { /* No other app is a substitute for the hosting terminal. */ }
     }
     if ((inGhostty || app) && !ghostty) return "The installed Ghostty does not provide a supported scripting interface (1.3 or newer required).";
-    if (newApp) notes.push(`Tell the person: it is fine to click Allow if macOS asks to control ${ghostty ? "Ghostty" : "Terminal"}; this lets OpenRig open the requested welcome view. The app uses its own new-window size because this caller has no scriptable terminal window to copy.`);
+    const permissionNotice = `It is fine to click Allow if macOS asks to control ${ghostty ? "Ghostty" : "Terminal"}; this lets OpenRig open the requested welcome view.`;
+    if (newApp) notes.push(`Tell the person: ${permissionNotice} The app uses its own new-window size because this caller has no scriptable terminal window to copy.`);
     // A tab group shares bounds: copying its current bounds also leaves the original unchanged.
     const script = ghostty ? `on run argv
 tell application "Ghostty"
@@ -143,6 +146,7 @@ end tell
 end run`;
     // A denied/uncertain Automation request is returned once, never replayed in another app.
     return async command => {
+      if (newApp) deps.notice?.(permissionNotice);
       const reported = (await deps.exec("/usr/bin/osascript", ["-e", script, command], 120_000)).trim();
       const columns = Number(reported.split(":")[1]);
       notes.push(newApp
