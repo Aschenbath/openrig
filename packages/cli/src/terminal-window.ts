@@ -154,13 +154,15 @@ async function hasLiveAttachments(existing: HerdrTab, tabs: HerdrTab[], pages: P
     const panes = listed?.result?.panes as Array<{ workspace_id: string; tab_id: string; pane_id: string }> | undefined;
     if (!Array.isArray(panes) || !panes.every(pane => pane && pane.workspace_id === existing.workspace_id && typeof pane.tab_id === "string" && typeof pane.pane_id === "string" && pane.pane_id)) return false;
     const clients = new Map<string, string[]>();
+    // Match view-composer's serialization (these strings are compared, never executed).
+    const quote = (value: string) => "'" + value.replace(/'/g, "'\"'\"'") + "'";
     const inventory = await deps.exec(tmux, ["list-clients", "-F", "#{client_pid}\t#{session_name}\t#{client_readonly}"]);
     for (const line of inventory.trim().split("\n")) {
       const [pid, session, readOnly] = line.split("\t");
       if (!pid || !/^\d+$/.test(pid) || !session || !["0", "1"].includes(readOnly ?? "")) continue;
       // Compare the composer's exact command, including session aliases and read-only mode.
       // SSH/custom commands cannot be confirmed from this local client inventory.
-      clients.set(pid, ["tmux", shellQuote(tmux)].map(binary => `${binary} attach ${readOnly === "1" ? "-r " : ""}-t ${shellQuote(session)}`));
+      clients.set(pid, ["tmux", quote(tmux)].map(binary => `${binary} attach ${readOnly === "1" ? "-r " : ""}-t ${quote(session)}`));
     }
     const used = new Set<string>();
     for (const [index, page] of pages.entries()) {

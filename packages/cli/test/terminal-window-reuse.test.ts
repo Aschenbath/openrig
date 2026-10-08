@@ -125,10 +125,10 @@ describe("reopening a Herdr view in a desktop window", () => {
     expect(f.tabs).toHaveLength(2);
   });
 
-  it("confirms an absolute tmux command, session alias and read-only attachment", async () => {
+  it("confirms an absolute tmux command, quoted session alias and read-only attachment", async () => {
     const f = fixture([{ workspace_id: "old", tab_id: "first", label: label() }]);
-    f.composed.opened[0]!.paneCommand = "'/fixture/bin/tmux' attach -r -t 'aliased session'";
-    f.clients.mockResolvedValue("101\taliased session\t1\n102\tfixture-advisor\t0\n103\tfixture-operator\t0");
+    f.composed.opened[0]!.paneCommand = "'/fixture/bin/tmux' attach -r -t 'alias'\"'\"'s session'";
+    f.clients.mockResolvedValue("101\talias's session\t1\n102\tfixture-advisor\t0\n103\tfixture-operator\t0");
     await f.run();
     expect(f.focus).toHaveBeenCalledExactlyOnceWith("first");
     expect(f.post).not.toHaveBeenCalled();
