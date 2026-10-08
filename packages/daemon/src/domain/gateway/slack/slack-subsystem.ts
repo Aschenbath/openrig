@@ -18,7 +18,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { buildInProcessWire, type GatewayWire, type SubsystemDeliverFn } from "../gateway-subsystem.js";
-import { downloadPrivateFile, postChatMessage } from "./slack-api.js";
+import { downloadPrivateFile, isSlackHost, postChatMessage } from "./slack-api.js";
 import { loadConfig } from "./config.js";
 import { resolveSecret } from "./secrets.js";
 import { SeenStore, DeadLetterStore, InboundReceiptStore } from "./state-store.js";
@@ -131,17 +131,10 @@ export function makeHumanReplyResolver(
  * so messages sharing a timestamp across channels cannot overwrite each other. The resolved path
  * is verified to stay inside `mediaDir` before any write.
  */
-/** R1 F1 — the anchored Slack-host verdict: https + URL-parsed hostname that is
- *  exactly `slack.com` or ends with `.slack.com`. Never a substring match. */
-function isSlackHost(url: string): boolean {
-  try {
-    const u = new URL(url);
-    return u.protocol === "https:" && (u.hostname === "slack.com" || u.hostname.endsWith(".slack.com"));
-  } catch {
-    return false;
-  }
-}
-
+/** R1 F1 — the anchored Slack-host verdict now lives in slack-api.ts and is
+ *  enforced inside `downloadPrivateFile`; the transfer-path check below keeps
+ *  the per-file "missing or non-Slack url_private" failure honest before the
+ *  download is even attempted. */
 export function makeInboundFilePort(opts: {
   token: string;
   mediaDir: string;

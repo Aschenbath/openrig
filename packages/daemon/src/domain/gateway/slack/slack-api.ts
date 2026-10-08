@@ -162,13 +162,26 @@ export async function getGrantedScopes(
 }
 
 /** OPR.0.5.6.2 — authenticated private-file download (`url_private` + Bearer,
- *  the verified inbound mechanic from the human-layer design §4.1). Bounded:
+ *  the verified inbound mechanic from the human-layer design §4.1). The host
+ *  gate (`isSlackHost`) is enforced HERE so the Bearer token can never reach
+ *  a non-Slack URL, whatever caller reaches this function. Bounded:
  *  a body over `maxBytes` is refused, never truncated-and-stored. Slack's
  *  classic auth-failure mode returns an HTML login page with status 200 —
  *  detected by content-type and named, so garbage is never stored as the file.
  *  Errors are MESSAGES, not exceptions: the caller's failure-honesty contract
  *  needs a name per file, never a thrown loss of the whole event. */
 export const INBOUND_FILE_MAX_BYTES = 26_214_400; // 25 MiB — bounded write per product limits
+
+/** R1 F1 — the anchored Slack-host verdict: https + URL-parsed hostname that is
+ *  exactly `slack.com` or ends with `.slack.com`. Never a substring match. */
+export function isSlackHost(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" && (u.hostname === "slack.com" || u.hostname.endsWith(".slack.com"));
+  } catch {
+    return false;
+  }
+}
 
 export async function downloadPrivateFile(
   url: string,
@@ -177,6 +190,11 @@ export async function downloadPrivateFile(
   timeoutMs = 30_000,
   maxBytes = INBOUND_FILE_MAX_BYTES,
 ): Promise<{ ok: true; bytes: Uint8Array } | { ok: false; error: string }> {
+  // The token boundary: refuse before ANY network I/O so a future caller
+  // cannot send this Bearer token off slack.com by forgetting its own check.
+  if (!isSlackHost(url)) {
+    return { ok: false as const, error: "refused: non-Slack url host" };
+  }
   try {
     return await withTimeout(timeoutMs, async (signal) => {
       const res = await fetchImpl(url, { headers: { authorization: `Bearer ${token}` }, signal } as RequestInit);
