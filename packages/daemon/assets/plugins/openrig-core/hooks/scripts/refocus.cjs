@@ -111,9 +111,20 @@ function workPacketEnabled() {
 
 function readQueueWhoami(timeout = 2_000) {
   const args = ["queue", "whoami", "--json", ...(workPacketEnabled() ? ["--work-candidates"] : [])];
-  const result = spawnSync("rig", args, {
+  let result = spawnSync("rig", args, {
     encoding: "utf8", env: process.env, timeout, maxBuffer: 16 * 1024 * 1024,
   });
+  // A rig CLI older than this hook rejects the flag. Ask again without it, inside what is left of
+  // the budget, so the role and the strict answer still arrive (just without candidates).
+  if (args.includes("--work-candidates") && !result.error && result.status !== 0
+    && /unknown option/i.test(`${result.stderr || ""}${result.stdout || ""}`)) {
+    const remaining = remainingLookupBudget();
+    if (remaining > 250) {
+      result = spawnSync("rig", ["queue", "whoami", "--json"], {
+        encoding: "utf8", env: process.env, timeout: remaining, maxBuffer: 16 * 1024 * 1024,
+      });
+    }
+  }
   if (result.error) return { unknown: `queue whoami failed: ${result.error.message}` };
   if (result.status !== 0 || !result.stdout || !result.stdout.trim()) {
     return { unknown: `queue whoami exited ${result.status ?? "without a status"} with no answer` };

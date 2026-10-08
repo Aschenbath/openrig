@@ -206,6 +206,32 @@ export class QueueTransitionLog {
     return rows.map((r) => this.rowToTransition(r));
   }
 
+  /**
+   * OPR.0.7.0.12 — the continuation `rig queue block --continuation` recorded for the row's
+   * CURRENT park, in three indexed single-row lookups rather than its whole history. The current
+   * park is the trailing run of `blocked` transitions: the daemon appends its own later blocked
+   * transitions (e.g. "parked-owner episode closed"), so the latest one is not the park, and an
+   * earlier park's plan must never resurface. The live table suffices: retention archives only
+   * terminal rows, and a parked row is not terminal.
+   */
+  currentParkContinuation(qitemId: string): string | null {
+    const last = this.db
+      .prepare("SELECT state FROM queue_transitions WHERE qitem_id = ? ORDER BY transition_id DESC LIMIT 1")
+      .get(qitemId) as { state: string } | undefined;
+    if (last?.state !== "blocked") return null;
+    const boundary = this.db
+      .prepare("SELECT MAX(transition_id) AS id FROM queue_transitions WHERE qitem_id = ? AND state != 'blocked'")
+      .get(qitemId) as { id: number | null };
+    const note = this.db
+      .prepare(
+        `SELECT transition_note FROM queue_transitions
+          WHERE qitem_id = ? AND transition_id > ? AND state = 'blocked' AND transition_note LIKE 'continuation: %'
+          ORDER BY transition_id DESC LIMIT 1`,
+      )
+      .get(qitemId, boundary.id ?? 0) as { transition_note: string } | undefined;
+    return note ? note.transition_note.slice("continuation: ".length) : null;
+  }
+
   /** Bounded source adapter: apply the time window and limit before materializing rows. */
   listForQitemWindow(qitemId: string, startedAt: string, endedAt: string, limit: number): QueueTransition[] {
     if (!Number.isInteger(limit) || limit < 1 || limit > 10001) throw new Error("Invalid transition window limit");

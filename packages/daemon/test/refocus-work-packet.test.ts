@@ -4,8 +4,11 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { deriveWorkCandidates, type WorkCandidateLookups } from "../src/domain/current-work.js";
-import { continuationOfCurrentPark } from "../src/routes/queue.js";
+import { deriveWorkCandidates, frontmatterIntent, type WorkCandidateLookups } from "../src/domain/current-work.js";
+import { createDb } from "../src/db/connection.js";
+import { migrate } from "../src/db/migrate.js";
+import { queueTransitionsSchema } from "../src/db/migrations/025_queue_transitions.js";
+import { QueueTransitionLog } from "../src/domain/queue-transition-log.js";
 
 // OPR.0.7.0.12 — refocus knows the seat's work. The candidates sit beside the strict
 // derivation (current-work.test.ts keeps its own contract); the trace renders them only in
@@ -45,7 +48,10 @@ function world() {
   const calls = join(root, "rig-calls.log");
   writeFileSync(rig, `#!/bin/sh
 printf '%s\\n' "$*" >> "$RIG_CALL_LOG"
-if [ "$1 $2" = "queue whoami" ]; then printf '%s' "$RIG_QUEUE_WHOAMI_STDOUT"; exit 0; fi
+if [ "$1 $2" = "queue whoami" ]; then
+  case " $* " in *" --work-candidates "*) if [ -n "$RIG_REJECT_CANDIDATES" ]; then echo "error: unknown option '--work-candidates'" >&2; exit 1; fi;; esac
+  printf '%s' "$RIG_QUEUE_WHOAMI_STDOUT"; exit 0
+fi
 if [ "$1 $2" = "whoami --json" ]; then printf '{"identity":{"rigName":"demo","sessionName":"builder@demo"}}\\n'; exit 0; fi
 if [ "$1 $2" = "config --json" ]; then printf '{}'; exit 0; fi
 if [ "$1 $2" = "scope resolve-notes" ]; then
@@ -151,26 +157,51 @@ describe("deriveWorkCandidates — labelled evidence beside the strict derivatio
   });
 });
 
-describe("continuationOfCurrentPark — the held row's recorded plan", () => {
+describe("currentParkContinuation — the held row's recorded plan, bounded", () => {
+  function log(states: Array<[string, string]>) {
+    const db = createDb();
+    migrate(db, [queueTransitionsSchema]);
+    const transitions = new QueueTransitionLog(db);
+    for (const [state, transitionNote] of states) transitions.append({ qitemId: "q-1", state, transitionNote, actorSession: "seat@rig" } as never);
+    return transitions;
+  }
+
   it("reads the park's continuation past the daemon's later blocked-state transitions", () => {
     // The shape observed on a real ovh07 row: the park, then the daemon's own episode note.
-    expect(continuationOfCurrentPark([
-      { state: "in-progress", transitionNote: "claimed" },
-      { state: "blocked", transitionNote: "continuation: resume the build" },
-      { state: "blocked", transitionNote: "parked-owner episode closed: seat@rig (seat resumed)" },
-    ])).toBe("resume the build");
+    expect(log([
+      ["in-progress", "claimed"],
+      ["blocked", "continuation: resume the build"],
+      ["blocked", "parked-owner episode closed: seat@rig (seat resumed)"],
+    ]).currentParkContinuation("q-1")).toBe("resume the build");
   });
 
   it("never resurfaces an earlier park's plan, and says nothing for a row that is not parked", () => {
-    expect(continuationOfCurrentPark([
-      { state: "blocked", transitionNote: "continuation: old plan" },
-      { state: "in-progress", transitionNote: "unparked" },
-      { state: "blocked", transitionNote: "parked on q-gate" },
-    ])).toBeNull();
-    expect(continuationOfCurrentPark([
-      { state: "blocked", transitionNote: "continuation: old plan" },
-      { state: "in-progress", transitionNote: "unparked" },
-    ])).toBeNull();
+    expect(log([
+      ["blocked", "continuation: old plan"],
+      ["in-progress", "unparked"],
+      ["blocked", "parked on q-gate"],
+    ]).currentParkContinuation("q-1")).toBeNull();
+    expect(log([
+      ["blocked", "continuation: old plan"],
+      ["in-progress", "unparked"],
+    ]).currentParkContinuation("q-1")).toBeNull();
+  });
+
+  it("does not depend on the length of the row's earlier history", () => {
+    const history: Array<[string, string]> = [];
+    for (let i = 0; i < 2000; i++) history.push([i % 2 ? "in-progress" : "blocked", i % 2 ? "unparked" : `continuation: old ${i}`]);
+    history.push(["in-progress", "claimed"], ["blocked", "continuation: current plan"], ["blocked", "episode note"]);
+    expect(log(history).currentParkContinuation("q-1")).toBe("current plan");
+  });
+});
+
+describe("frontmatterIntent — folded and literal intents", () => {
+  it("joins a folded or literal block scalar instead of returning its indicator", () => {
+    expect(frontmatterIntent("---\nid: x\nintent: >-\n  Ship the\n  alpha thing\nstage: wip\n---\n# A\n")).toBe("Ship the alpha thing");
+    expect(frontmatterIntent("---\nintent: |\n  one\n  two\n---\n")).toBe("one two");
+    expect(frontmatterIntent("---\nintent: \"quoted: yes\"\n---\n")).toBe("quoted: yes");
+    expect(frontmatterIntent("---\nintent: plain words\n---\n")).toBe("plain words");
+    expect(frontmatterIntent("# no frontmatter\nintent: nope\n")).toBeNull();
   });
 });
 
@@ -198,9 +229,14 @@ describe("trace-to-root --packet — the work packet as text", () => {
     expect(ask.stdout).toContain("## ORIENTATION — the project-level chain, not your work");
     // The ask alone is not the outcome: following its route must put the intent in front of the agent.
     const route = ask.stdout.split("\n").find((line) => line.includes("--work-start"))!.trim();
-    expect(route).toContain(`--work-start ${w.missions}/<mission>`);
-    const named = w.trace(["--trees", "work", "--work-start", join(w.missions, "release-b")]);
+    expect(route).toContain(`--trees work --packet --work-start ${w.missions}/<mission>`);
+    writeFileSync(join(w.missions, "release-b/NOTES.md"), "## Current state\nB notes now\n", "utf8");
+    writeFileSync(join(w.missions, "release-b/PROGRESS.md"), "## Current state\nB progress now\n", "utf8");
+    // Exactly the offered route, with the agent's answer substituted for <mission>.
+    const named = w.trace(["--trees", "work", "--packet", "--work-start", join(w.missions, "release-b")]);
     expect(named.stdout).toContain("intent: Ship B");
+    expect(named.stdout).toContain("NOTES · NOTES.md\nCurrent state\nB notes now");
+    expect(named.stdout).toContain("PROGRESS · PROGRESS.md\nCurrent state\nB progress now");
   });
 
   it("lists every candidate's one-line intent and asks instead of pre-selecting one (W4)", () => {
@@ -210,7 +246,7 @@ describe("trace-to-root --packet — the work packet as text", () => {
       { qitemId: "q-2", state: "in-progress", tags: ["mission:release-b"] },
     ], w.missions, nothingElse);
     const result = w.trace(["--trees", "work", "--packet", "--work-candidates", "-"], evidence);
-    expect(result.stdout).toContain("2 candidate missions are in flight");
+    expect(result.stdout).toContain("2 candidates are in flight");
     expect(result.stdout).toContain("- release-a — Ship A — source: tag mission:release-a on row q-1");
     expect(result.stdout).toContain("- release-b — Ship B — source: tag mission:release-b on row q-2");
     expect(result.stdout).not.toContain("WORK FROM QUEUE EVIDENCE");
@@ -272,6 +308,46 @@ describe("trace-to-root --packet — the work packet as text", () => {
     expect(plain).not.toContain("PROGRESS ·");
   });
 
+  it("keeps the packet's text on the cwd path and at full depth (F1)", () => {
+    const w = world();
+    writeFileSync(join(w.slice, "NOTES.md"), "---\nupdated: 2020-01-01\n---\n## Current state\nSlice notes now\n", "utf8");
+    writeFileSync(join(w.slice, "PROGRESS.md"), "## Current state\nSlice progress now\n", "utf8");
+    const fromCwd = spawnSync("python3", [TRACE, "--trees", "work", "--packet"], { encoding: "utf8", env: w.env, cwd: w.slice }).stdout;
+    expect(fromCwd).toContain("NOTES · NOTES.md\nCurrent state\nSlice notes now");
+    expect(fromCwd).toContain("PROGRESS · PROGRESS.md\nCurrent state\nSlice progress now");
+    const full = w.trace(["--trees", "work", "--packet", "--depth", "full", "--work-start", w.slice]).stdout;
+    expect(full).toContain("PROGRESS · PROGRESS.md\n## Current state\nSlice progress now");
+    expect(full).toMatch(/OLD NOTES — .*NOTES\.md, \d+ days old, source updated, threshold 14 days/);
+    // Without --packet, both paths keep today's output.
+    const plainCwd = spawnSync("python3", [TRACE, "--trees", "work"], { encoding: "utf8", env: w.env, cwd: w.slice }).stdout;
+    expect(plainCwd).toMatch(/NOTES · NOTES\.md · \d+ bytes · /);
+    expect(plainCwd).not.toContain("PROGRESS ·");
+    const plainFull = w.trace(["--trees", "work", "--depth", "full", "--work-start", w.slice]).stdout;
+    expect(plainFull).not.toContain("PROGRESS ·");
+    expect(plainFull).not.toContain("OLD NOTES");
+  });
+
+  it("names each duty section that is missing even when another matched (O1)", () => {
+    const w = world();
+    writeFileSync(join(w.seat, "LEARNED.md"), "# Builder\n\n## MY JOB HERE\nLead T2.\n\n## Duties\n- keep rows honest\n", "utf8");
+    const out = w.trace(["--trees", "topology", "--packet", "--topology-start", w.seat]).stdout;
+    expect(out).toContain("MY JOB HERE\nLead T2.");
+    expect(out).toContain(`SECTION NOT FOUND — no "STANDING DUTIES" heading in ${join(w.seat, "LEARNED.md")}`);
+    expect(out).toContain("- keep rows honest");
+  });
+
+  it("prints a folded mission intent as text in the candidate list (F3)", () => {
+    const w = world();
+    writeFileSync(join(w.missions, "release-b/SPEC.md"), "---\nintent: >-\n  Ship B,\n  folded\n---\n# B\n", "utf8");
+    const evidence = deriveWorkCandidates([
+      { qitemId: "q-1", state: "in-progress", tags: ["mission:release-a"] },
+      { qitemId: "q-2", state: "in-progress", tags: ["mission:release-b"] },
+    ], w.missions, nothingElse);
+    const out = w.trace(["--trees", "work", "--packet", "--work-candidates", "-"], evidence).stdout;
+    expect(out).toContain("- release-b — Ship B, folded — source: tag mission:release-b on row q-2");
+    expect(out).not.toContain(">-");
+  });
+
   it("keeps today's pointer rendering when --packet is off", () => {
     const w = world();
     writeFileSync(join(w.slice, "NOTES.md"), "## Current state\nAll green.\n", "utf8");
@@ -328,6 +404,19 @@ describe("refocus hook — OPENRIG_REFOCUS_WORK_PACKET switch", () => {
     expect(argv).toContain("--work-candidates -");
     expect(argv).not.toContain("--work-start");
     expect(JSON.parse(stdin).candidates[0].mission).toBe("release-a");
+  });
+
+  it("when on with an older rig CLI that rejects the flag, falls back to the plain whoami (N2)", () => {
+    const w = world();
+    // An older CLI's plain answer has no workCandidates field.
+    const older = JSON.stringify({ currentWork: { mission: "release-a", slice: "12-refocus", workNodePath: w.slice, basis: "one typed" },
+      currentWorkBasis: "one typed", role: { state: "not-declared", files: [] } });
+    const { argv, stdin } = fire(w, { OPENRIG_REFOCUS_WORK_PACKET: "1", RIG_REJECT_CANDIDATES: "1", RIG_QUEUE_WHOAMI_STDOUT: older });
+    expect(w.calls()).toContain("queue whoami --json --work-candidates\nqueue whoami --json\n");
+    // The strict answer still arrives, so the trace gets the work node rather than an UNKNOWN.
+    expect(argv).toContain(`--work-start ${w.slice}`);
+    expect(argv).not.toContain("--work-unknown");
+    expect(stdin).toBe("");
   });
 
   it("when on, an explicit work node still wins and the evidence adds only held and next work", () => {

@@ -42,24 +42,6 @@ const QUEUE_FORWARD_TIMEOUT_MS = 10_000;
 /** OPR.0.7.0.12 — held and next rows listed in a refocus packet; past this the packet says the list was cut. */
 const WORK_CANDIDATE_LIST_LIMIT = 50;
 
-/**
- * OPR.0.7.0.12 — the continuation `rig queue block --continuation` recorded for the row's
- * CURRENT park. The daemon appends its own later transitions in the blocked state (for example
- * "parked-owner episode closed"), so the latest blocked transition is not the park itself.
- * Only notes after the row last entered `blocked` count, so an earlier park's plan never
- * resurfaces.
- */
-export function continuationOfCurrentPark(transitions: Array<{ state: string; transitionNote?: string | null }>): string | null {
-  let parkStart = -1;
-  for (let i = 0; i < transitions.length; i++) {
-    if (transitions[i]!.state === "blocked" && (i === 0 || transitions[i - 1]!.state !== "blocked")) parkStart = i;
-  }
-  if (parkStart < 0 || transitions.at(-1)?.state !== "blocked") return null;
-  const note = transitions.slice(parkStart).map((t) => t.transitionNote ?? "")
-    .filter((text) => text.startsWith("continuation: ")).at(-1);
-  return note ? note.slice("continuation: ".length) : null;
-}
-
 // OPR.0.4.6.MH3 D-4 (FR-2/R2a): the cross-host provenance shape appended to a
 // FORWARDED body's tags — a marker (`cross-host`) + the forwarding daemon's
 // self-declared name (`from-host:<name>`). Honest best-effort provenance, not
@@ -883,7 +865,7 @@ export function queueRoutes(): Hono {
         missionsRoot,
         {
           getRow: (qitemId) => repo.getById(qitemId) ?? null,
-          continuationOf: (qitemId) => continuationOfCurrentPark(repo.listTransitions(qitemId)),
+          continuationOf: (qitemId) => repo.currentParkContinuation(qitemId),
         },
       );
       return c.json({ ...position, ...derived, role,

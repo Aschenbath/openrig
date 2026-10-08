@@ -395,10 +395,43 @@ export interface WorkCandidateLookups {
 
 const MISSIONS_ON_HOST_LIMIT = 30;
 
+const BLOCK_SCALAR = new Set(["|", ">", "|-", ">-", "|+", ">+"]);
+
+/**
+ * The one-line `intent:` from SPEC.md frontmatter, read the way trace-to-root.py's `intent()`
+ * reads it: a block scalar (`>-`, `|`, …) joins its indented lines with spaces, and wrapping
+ * quotes are removed. parseFrontmatter is line-by-line and would return the indicator itself.
+ */
+export function frontmatterIntent(raw: string): string | null {
+  const match = /^---\s*\n([\s\S]*?)\n---(?:\s*\n|$)/.exec(raw);
+  if (!match) return null;
+  const lines = match[1]!.split("\n");
+  for (let index = 0; index < lines.length; index++) {
+    const found = /^intent:\s*(.*)$/.exec(lines[index]!);
+    if (!found) continue;
+    const value = found[1]!.trim();
+    if (BLOCK_SCALAR.has(value)) {
+      const block: string[] = [];
+      for (const later of lines.slice(index + 1)) {
+        if (later && !/^\s/.test(later)) break;
+        if (later.trim()) block.push(later.trim());
+      }
+      return block.join(" ") || null;
+    }
+    if (value.length >= 2 && value[0] === value.at(-1) && (value[0] === '"' || value[0] === "'")) {
+      if (value[0] === '"') {
+        try { return JSON.parse(value) as string; } catch { /* fall through to a plain strip */ }
+      }
+      return value.slice(1, -1) || null;
+    }
+    return value || null;
+  }
+  return null;
+}
+
 function readIntent(nodePath: string): string | null {
   try {
-    const value = parseFrontmatter(fs.readFileSync(path.join(nodePath, "SPEC.md"), "utf8"))["intent"];
-    return typeof value === "string" && value.trim() ? value.trim() : null;
+    return frontmatterIntent(fs.readFileSync(path.join(nodePath, "SPEC.md"), "utf8"));
   } catch {
     return null;
   }

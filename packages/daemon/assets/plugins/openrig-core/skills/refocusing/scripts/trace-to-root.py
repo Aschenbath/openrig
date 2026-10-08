@@ -180,10 +180,17 @@ def heading_sections(text, wanted):
 
 def by_section(text, wanted, path):
     found = heading_sections(text, wanted)
-    if found:
-        return "\n\n".join(f"{title}\n{body}" if body else title for title, body in found)
-    names = " or ".join(f'"{phrase.upper()}"' for phrase in wanted)
-    return f"SECTION NOT FOUND — no {names} heading in {path}; bounded excerpt follows\n{light_learned(text)}"
+    shown = "\n\n".join(f"{title}\n{body}" if body else title for title, body in found)
+    missing = [phrase for phrase in wanted if not any(title.lower().startswith(phrase) for title, _ in found)]
+    if not missing:
+        return shown
+    if not found:
+        names = " or ".join(f'"{phrase.upper()}"' for phrase in wanted)
+        return f"SECTION NOT FOUND — no {names} heading in {path}; bounded excerpt follows\n{light_learned(text)}"
+    # Some sections matched: name each one that did not, with the same bounded excerpt, so text
+    # kept under another heading is not silently dropped.
+    names = ", ".join(f'"{phrase.upper()}"' for phrase in missing)
+    return f"{shown}\n\nSECTION NOT FOUND — no {names} heading in {path}; bounded excerpt follows\n{light_learned(text)}"
 
 
 def notes_max_age_days():
@@ -280,6 +287,9 @@ def render_work(start, root, depth, failures, fallback=None, packet=False):
                     output.append(f"NOTES RESOLUTION GAP — resolved {notes_name} became unreadable at {notes_path}")
                 else:
                     output.append(f"\nNOTES · {notes_name}\n{notes_text.strip()}")
+                    cue = age_cue(notes_path, notes_text) if packet else None
+                    if cue:
+                        output.append(cue)
             elif packet:
                 notes_text = read(notes_path)
                 if notes_text is None:
@@ -304,9 +314,10 @@ def render_work(start, root, depth, failures, fallback=None, packet=False):
         # The SDLC convention keeps a node's current delivery state in PROGRESS.md; carry it
         # as text when present. Its absence is not a gap: many nodes have no PROGRESS.md.
         progress_path = node / "PROGRESS.md"
-        progress_text = read(progress_path) if packet and depth != "full" else None
+        progress_text = read(progress_path) if packet else None
         if progress_text is not None:
-            output.append(f"\nPROGRESS · PROGRESS.md\n{by_section(progress_text, NOTES_STATE_HEADINGS, progress_path)}")
+            progress_body = progress_text.strip() if depth == "full" else by_section(progress_text, NOTES_STATE_HEADINGS, progress_path)
+            output.append(f"\nPROGRESS · PROGRESS.md\n{progress_body}")
             cue = age_cue(progress_path, progress_text)
             if cue:
                 output.append(cue)
@@ -366,7 +377,7 @@ def render_candidates(evidence, root, depth, failures):
         output.append("No in-progress queue row names your work. If you are working from messages, "
                       "name the mission they belong to; if you have no current work, say so.")
     elif len(candidates) > 1:
-        output.append(f"{len(candidates)} candidate missions are in flight. Say which one you are actually working on.")
+        output.append(f"{len(candidates)} candidates are in flight. Say which mission you are actually working on.")
     else:
         output.append("The queue evidence does not settle your work. Confirm a candidate or name your mission.")
     if candidates:
@@ -382,7 +393,7 @@ def render_candidates(evidence, root, depth, failures):
             listing = ", ".join(names) + (", …" if evidence.get("missionsOnHostTruncated") else "")
             output.append(f"Missions on this host: {listing}")
     output.append("Then read that mission's current intent as text:")
-    output.append(f"  python3 {Path(__file__).resolve()} --trees work --work-start {missions_root}/<mission>")
+    output.append(f"  python3 {Path(__file__).resolve()} --trees work --packet --work-start {missions_root}/<mission>")
     orientation = render_work(root, root, "light", failures, packet=True)
     _, _, rest = orientation.partition("\n")
     output.append("\n## ORIENTATION — the project-level chain, not your work\n" + rest.lstrip("\n"))
@@ -504,7 +515,7 @@ def main():
             elif args.work_candidates:
                 pass  # the unreadable-evidence gap above is the answer; never fall back to the root
             elif args.work_basis == NO_CURRENT_BATON_BASIS:
-                sections.append(render_work(root, root, args.depth, failures, fallback=(
+                sections.append(render_work(root, root, args.depth, failures, packet=args.packet, fallback=(
                     f"no current typed baton ({args.work_basis}). Showing the project-level chain from the work root: "
                     "a broad orientation, not evidence of a current mission")))
             elif args.work_basis:
@@ -513,7 +524,7 @@ def main():
                 sections.append(gap(f"## WORK TRACE\nTRACE GAP — current work node UNKNOWN: {args.work_unknown}"))
             else:
                 start = derive_work_start(root)
-                sections.append(render_work(start, root, args.depth, failures) if start else
+                sections.append(render_work(start, root, args.depth, failures, packet=args.packet) if start else
                                 gap("## WORK TRACE\nTRACE GAP — current work node is unresolved; pass --work-start with a literal absolute path (or configure OPENRIG_REFOCUS_WORK_NODE separately)"))
             held_and_next = render_held_and_next(evidence) if evidence else ""
             if held_and_next:

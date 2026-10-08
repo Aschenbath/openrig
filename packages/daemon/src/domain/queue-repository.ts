@@ -3025,6 +3025,11 @@ export class QueueRepository {
     return "park_timer_target_terminal";
   }
 
+  /** OPR.0.7.0.12 — the current park's recorded continuation, bounded (see the transition log). */
+  currentParkContinuation(qitemId: string): string | null {
+    return this.transitionLog.currentParkContinuation(qitemId);
+  }
+
   listTransitions(qitemId: string): Array<ReturnType<QueueTransitionLog["listForQitem"]>[number] & { wake?: ReturnType<QueueWakeRepository["getForTransition"]> }> {
     return this.transitionLog.listForQitem(qitemId).map((transition) => {
       const wake = this.wakeRepo.getForTransition(transition.transitionId);
