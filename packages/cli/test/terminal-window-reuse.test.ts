@@ -111,6 +111,49 @@ describe("reopening a Herdr view in a desktop window", () => {
     expect(process.exitCode).toBeUndefined();
   });
 
+  it("reuses a live matching copy after a stale one instead of creating repeatedly", async () => {
+    const f = fixture([
+      { workspace_id: "restored", tab_id: "stale", label: label("kernel", "old") },
+      { workspace_id: "live", tab_id: "fresh", label: label("kernel", "new") },
+    ]);
+    f.processInfo.mockImplementation(async paneId => JSON.stringify({ result: { process_info: { pane_id: paneId,
+      foreground_processes: [{ pid: paneId.startsWith("stale-") ? 999 : 101 + ["tui", "advisor", "operator"].findIndex(seat => paneId.endsWith(seat)) }],
+    } } }));
+    await f.run();
+    expect(f.focus).toHaveBeenCalledExactlyOnceWith("fresh");
+    expect(f.post).not.toHaveBeenCalled();
+    expect(f.tabs).toHaveLength(2);
+  });
+
+  it("confirms an absolute tmux command, session alias and read-only attachment", async () => {
+    const f = fixture([{ workspace_id: "old", tab_id: "first", label: label() }]);
+    f.composed.opened[0]!.paneCommand = "'/fixture/bin/tmux' attach -r -t 'aliased session'";
+    f.clients.mockResolvedValue("101\taliased session\t1\n102\tfixture-advisor\t0\n103\tfixture-operator\t0");
+    await f.run();
+    expect(f.focus).toHaveBeenCalledExactlyOnceWith("first");
+    expect(f.post).not.toHaveBeenCalled();
+  });
+
+  it("ignores an inert filler once the expected tiles have live attachments", async () => {
+    const f = fixture([{ workspace_id: "old", tab_id: "first", label: label() }]);
+    f.paneList.mockResolvedValue(JSON.stringify({ result: { panes: ["blank", "tui", "advisor", "operator"].map(seat => ({ workspace_id: "old", tab_id: "first", pane_id: `first-${seat}` })) } }));
+    f.processInfo.mockImplementation(async paneId => JSON.stringify({ result: { process_info: { pane_id: paneId,
+      ...(paneId.endsWith("blank") ? {} : { foreground_processes: [{ pid: 101 + ["tui", "advisor", "operator"].findIndex(seat => paneId.endsWith(seat)) }] }),
+    } } }));
+    await f.run();
+    expect(f.focus).toHaveBeenCalledExactlyOnceWith("first");
+    expect(f.post).not.toHaveBeenCalled();
+  });
+
+  it("creates a fresh SSH view when local attachment inventory cannot prove it", async () => {
+    const f = fixture([{ workspace_id: "old", tab_id: "first", label: label() }]);
+    f.composed.opened[0]!.paneCommand = "ssh 'remote' 'tmux attach -t remote-seat'";
+    await f.run();
+    expect(f.focus).not.toHaveBeenCalled();
+    expect(f.post).toHaveBeenCalledTimes(1);
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it("creates the first space, then opens another window on it without adding tabs or spaces", async () => {
     const f = fixture();
     await f.run();
