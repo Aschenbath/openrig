@@ -123,16 +123,27 @@ describe("a retained Slack post replayed after its row closed", () => {
     expect(notes(item.qitemId).some((n) => n.startsWith("slack-owner-notification-dropped "))).toBe(false);
   });
 
-  it("enable drains undelivered retries from the buffer along with the active backlog", async () => {
-    const buffer = new DispatchBuffer(home);
-    buffer.enqueue({ kind: "outbound_decision", decisionId: "d-old", op: "post_message", entityBindingRef: "human-founder@external", payload: { qitemId: "q-old", notificationKey: "q-old:7" } });
-    const seen = new SeenStore(join(home, "outbound-seen.jsonl"));
+  it("at enable an open row's retry still posts and a closed row's is dropped; the status line says what waits", async () => {
+    const openRow = await failFirstPost(); // pending, its failed post retained
+    const closed = await repo.create({ ...request, summary: "Closed since" });
+    repo.update({ qitemId: closed.qitemId, actorSession: "human-founder@external", state: "done", closureReason: "no-follow-on", transitionNote: "answered" });
+    retain("d-closed", { qitemId: closed.qitemId, notificationKey: `${closed.qitemId}:1`, destinationSession: request.destinationSession, summary: "S", body: "B" });
 
-    const seed = await seedBacklogAsHistory({ queue: { listHumanAlerts: async () => [] }, seen, filter: {}, buffer });
+    const seed = await seedBacklogAsHistory({
+      queue: makeQueuePorts(repo, { loadHumanRegistry: () => registry }), seen: new SeenStore(join(home, "outbound-seen.jsonl")),
+      filter: {}, buffer: new DispatchBuffer(home),
+    });
+    expect(seed.onlineStatus).toContain("2 earlier undelivered post(s) wait in the replay buffer");
+    expect(new DispatchBuffer(home).pending(), "enable drains nothing").toHaveLength(2);
 
-    expect(seed.seeded).toBe(1);
-    expect(seed.onlineStatus).toContain("0 pre-existing alert(s) seeded as history (not reposted), and 1 undelivered retry dropped from the replay buffer");
-    expect(buffer.pending()).toEqual([]);
-    expect(seen.load().has("q-old:7")).toBe(true);
+    let posts = 0;
+    wire(async (url) => {
+      if (isPost(url)) { posts += 1; return reply({ ok: true, ts: "late-but-open.1" }); }
+      return reply({ ok: true, messages: [] });
+    }).startServices?.();
+    await vi.waitFor(() => expect(new DispatchBuffer(home).pending()).toHaveLength(0), { timeout: 5_000 });
+    expect(posts, "the open row's alert, which the person never saw, posts").toBe(1);
+    expect(notes(openRow).some((n) => n.startsWith("slack-owner-notification-dropped "))).toBe(false);
+    expect(notes(closed.qitemId).filter((n) => n.startsWith("slack-owner-notification-dropped "))).toHaveLength(1);
   });
 });
