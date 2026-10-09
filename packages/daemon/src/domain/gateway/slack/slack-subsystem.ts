@@ -32,7 +32,7 @@ import { makeThreadRouteResolver } from "./thread-routing.js";
 import { resolveOutboundChannel, unsupportedChannelMapFields } from "./channel-map.js";
 import { startSocketInbound, type SocketInboundHandle, type WsLike } from "./socket-inbound.js";
 import { loadHumanRegistry, resolveSlackHandle } from "../human-registry.js";
-import { hasLiveHumanGate, type QueueRepository } from "../../queue-repository.js";
+import { hasLiveHumanGate, isBlockerLive, type QueueRepository } from "../../queue-repository.js";
 import { formatReplyToChoice, REPLY_TO_CHOICE_ACTOR, type ReplyToChoice } from "../../reply-to-choice.js";
 import { parseSessionName } from "../../session-name.js";
 import type { FetchImpl } from "./slack-api.js";
@@ -541,8 +541,29 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       transitionNote: formatDeliveryTermination(decision.termination, key),
     });
   };
+  // A notification for a row that has left the active states is history, not news: a retained
+  // decision replayed at a later restart or rewire (a post that failed, retried a day later) posts
+  // nothing, and the row says why. Returning ok drains it from the dispatch buffer.
+  const dropStaleNotification = (p: OutboundPostPayload, state: string): void => {
+    const key = p.notificationKey ?? p.qitemId;
+    const note = `slack-owner-notification-dropped notification_key=${key} reason=row-not-active state=${state}`;
+    if (!opts.queueRepo.transitionLog.listForQitem(p.qitemId).some((t) => t.transitionNote === note)) {
+      opts.queueRepo.update({ qitemId: p.qitemId, actorSession: "daemon@kernel", transitionNote: note });
+    }
+    outboundSeen.mark(key, "dropped-row-not-active");
+    releaseRef(key);
+  };
   const engineDeliver: SubsystemDeliverFn = async (decision) => {
     const p = ((decision as { payload?: unknown }).payload ?? {}) as OutboundPostPayload & { deliveryDeferralFire?: boolean };
+    // The decision-resolved notice is written at closure, so a closed row is its normal case.
+    if (p.qitemId && p.ownerNotificationKind !== "human-decision-resolved"
+      && !(p as { deliveryDigestPost?: boolean }).deliveryDigestPost) {
+      const state = opts.queueRepo.getById(p.qitemId)?.state;
+      if (state && !isBlockerLive(state)) {
+        dropStaleNotification(p, state);
+        return { ok: true as const };
+      }
+    }
     // The T+30 deferral FIRE executes an already-made decision — never re-consult
     // (a re-consult would re-defer: the immediate-plus-deferred shape AM-F3 forbids).
     // R2 B-3 belt: an episode that already carries its posted receipt (a replayed

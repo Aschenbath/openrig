@@ -110,13 +110,23 @@ export async function seedBacklogAsHistory(opts: {
   queue: OutboundQueuePort;
   seen: import("./state-store.js").SeenStore;
   filter: AlertFilterOpts;
+  /** The durable dispatch buffer: posts that failed earlier and wait there for a replay. Enable
+   *  drains them too, or the restart that follows would post them, however old. */
+  buffer?: Pick<import("../dispatch-buffer.js").DispatchBuffer, "pending" | "ack">;
   log?: (msg: string) => void;
 }): Promise<{ seeded: number; onlineStatus: string }> {
   const alerts = await opts.queue.listHumanAlerts(opts.filter);
+  const retries = (opts.buffer?.pending() ?? []).filter((d) => d.op === "post_message");
+  const retryKeys = retries.map((d) => {
+    const p = (d.payload ?? {}) as { notificationKey?: string | null; qitemId?: string };
+    return p.notificationKey ?? p.qitemId ?? d.decisionId;
+  });
   const already = opts.seen.load();
-  const toSeed = alerts.map((a) => a.notificationKey ?? a.qitemId).filter((id) => !already.has(id));
+  const toSeed = [...new Set([...alerts.map((a) => a.notificationKey ?? a.qitemId), ...retryKeys])].filter((id) => !already.has(id));
   const seeded = opts.seen.seed(toSeed, "seeded-at-enable");
-  const onlineStatus = `slack outbound ENABLED at enable-time: ${seeded} pre-existing alert(s) seeded as history (not reposted); only alerts created after this point will deliver.`;
+  for (const d of retries) opts.buffer!.ack(d.decisionId);
+  const retryNote = retries.length > 0 ? `, ${retries.length} undelivered retr${retries.length === 1 ? "y" : "ies"} dropped from the replay buffer` : "";
+  const onlineStatus = `slack outbound ENABLED at enable-time: ${seeded} pre-existing alert(s) seeded as history (not reposted)${retryNote}; only alerts created after this point will deliver.`;
   opts.log?.(onlineStatus);
   return { seeded, onlineStatus };
 }
