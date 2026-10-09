@@ -119,6 +119,14 @@ describe.skipIf(process.platform === "win32")("native draft-aware terminal deliv
       });
       expect(await send("ghost", "owned delivery")).toMatchObject({ ok: true, delivery: { state: "complete", attempts: 1 } });
       await vi.waitFor(() => expect(state().submissions).toEqual(["one\nmessage", "direct human message", "owned delivery"]));
+
+      const framedDraft = "intro\n────────────────────\n❯ \n────────────────────\n? for shortcuts\n────────────────────\n❯ ";
+      await tmux(["send-keys", "-t", panes.a!, "C-t"]);
+      expect(await adapter.humanInput("worker@test", () => adapter.sendText("worker@test", framedDraft))).toEqual({ ok: true });
+      await waitInput(framedDraft);
+      await vi.waitFor(async () => expect(inspectComposerInput(await adapter.captureComposerSnapshot(panes.a!)).state).toBe("text"));
+      expect(await send("nested-prompt", "automatic message")).toMatchObject({ outcome: "retained", delivery: { reason: "draft_input_busy" } });
+      expect(state()).toEqual({ input: framedDraft, submissions: ["one\nmessage", "direct human message", "owned delivery"] });
     } finally {
       await transport?.deferredDelivery?.stop();
       await tmux(["kill-server"]).catch(() => {});

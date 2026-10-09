@@ -70,6 +70,9 @@ Faint placeholders and autocomplete suggestions after the cursor are display
 hints, not draft text. Their styling must be present in the capture. Typing the
 same words and moving the cursor to the start still counts as a draft. A mixed
 suffix containing normal text cannot be discarded as a suggestion.
+Claude frame boundaries use the current terminal footer and matching indentation.
+Prompt or frame examples within a multiline draft cannot stand in for that boundary;
+a clipped input whose actual opening marker is unavailable stays unverified.
 
 | Delivery state | Meaning |
 |---|---|

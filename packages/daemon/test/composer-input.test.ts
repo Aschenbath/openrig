@@ -10,6 +10,14 @@ function claude(body: string, cursor?: { x: number; y: number }, width = 80): Co
 }
 
 describe("cursor-bound composer input", () => {
+  it("keeps nested prompt examples inside the current draft, including when its head is clipped", () => {
+    const body = "intro\n────────────────────\n❯ \n────────────────────\n? for shortcuts\n────────────────────\n❯ ";
+    const snapshot = claude(body, { x: 4, y: 8 });
+    expect(inspectComposerInput(snapshot).state).toBe("text");
+    const clipped = { ...snapshot, screen: snapshot.screen.split("\n").slice(3).join("\n"), cursor: { ...snapshot.cursor, y: 5 } };
+    expect(inspectComposerInput(clipped).state).toBe("unknown");
+  });
+
   it("uses the styled input read for opted-in readiness, while preserving default draft and permission checks", () => {
     const snapshot = claude("\x1b[2msuggested follow-up\x1b[22m", { x: 2, y: 2 });
     snapshot.screen = snapshot.screen.replace("? for shortcuts", "⏵⏵ accept edits on (shift+tab to cycle) · ← for agents\n✘ Auto-update failed: no write permission to npm prefix · Run claude doctor");

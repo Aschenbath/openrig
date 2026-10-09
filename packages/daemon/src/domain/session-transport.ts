@@ -182,14 +182,20 @@ export interface ClassifyPaneOptions {
   runtime?: string | null;
 }
 
+/** The current Claude footer follows the input frame; earlier examples are history or draft text. */
+function findClaudeFooterIndex(lines: string[]): number {
+  let bar = lines.length - 1;
+  while (bar >= 0 && (!lines[bar]!.trim() || CLAUDE_STATUS_WARNINGS.some(pattern => pattern.test(lines[bar]!.trim())))) bar--;
+  return bar;
+}
+
 function findClaudeComposer(paneContent: string, options: ClassifyPaneOptions = {}) {
   // Preserve columns: a multiline draft may contain indented border/prompt text.
   // This classifier scans at most 20 physical lines; captures can be taller.
   // Exhausting the scan without reaching the status head is unknown, not idle.
   const lines = paneContent.split("\n").slice(-20)
     .map((line) => line.trimEnd()).filter((line) => line.trim().length > 0);
-  let bar = lines.length - 1;
-  while (bar >= 0 && CLAUDE_STATUS_WARNINGS.some((pattern) => pattern.test(lines[bar]!.trim()))) bar--;
+  const bar = findClaudeFooterIndex(lines);
   const supportedWarningFooter = lines[bar]?.trim() === "⏵⏵ accept edits on (shift+tab to cycle) · ← for agents";
   const modeFooter = CLAUDE_MODE_FOOTER.test(lines[bar]?.trim() ?? "");
   let indent = /^([ \t]*)─{3,}$/.exec(lines[bar - 1] ?? "")?.[1];
@@ -278,6 +284,10 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
   const lines = styled.map(line => line.text);
   if (lines.at(-1) === "") lines.pop();
   if (lines.length > height || !lines[y]) return unknown();
+  const footerAt = findClaudeFooterIndex(lines);
+  const footer = lines[footerAt]?.trim() ?? "";
+  let claudeEnd = footerAt - 1;
+  while (claudeEnd >= 0 && !lines[claudeEnd]!.trim()) claudeEnd--;
   const candidates: ComposerInput[] = [];
   for (let start = 0; start <= y; start++) {
     const prompt = readComposerPromptLine(lines[start] ?? "", promptClass);
@@ -286,11 +296,12 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
     const prefix = prompt.prefix;
     let end = -1;
     if (prompt.glyph === "❯") {
-      if (!rule(lines[start - 1] ?? "")) continue;
-      for (let i = start + 1; i < lines.length; i++) {
-        const footer = lines.slice(i + 1).find(line => line.trim())?.trim() ?? "";
-        if (rule(lines[i]!) && isComposerFooter(footer)) { end = i; break; }
-      }
+      // Share the main reader's terminal footer anchor. A quoted frame within a
+      // multiline draft cannot supply either the closing rule or its indentation.
+      const alignedRule = (line: string) => rule(line) && line.length - line.trimStart().length === prompt.indent.length;
+      if ((!isComposerFooter(footer) && !CLAUDE_MODE_FOOTER.test(footer))
+        || !alignedRule(lines[start - 1] ?? "") || !alignedRule(lines[claudeEnd] ?? "")) continue;
+      end = claudeEnd;
     } else {
       for (let i = start + 1; i < lines.length; i++) {
         if (lines[i]!.trim()) continue;
