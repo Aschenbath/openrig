@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { composerContainsOwnedText, inspectComposerInput, ownCollapsedPaste, type ComposerSnapshot } from "../src/domain/composer-input.js";
+import { classifyPaneActivity, inspectComposerInput } from "../src/domain/session-transport.js";
+import { composerContainsOwnedText, ownCollapsedPaste, type ComposerSnapshot } from "../src/domain/composer-prompts.js";
 
 function claude(body: string, cursor?: { x: number; y: number }, width = 80): ComposerSnapshot {
   const rows = body.split("\n");
@@ -9,6 +10,31 @@ function claude(body: string, cursor?: { x: number; y: number }, width = 80): Co
 }
 
 describe("cursor-bound composer input", () => {
+  it("uses the styled input read for opted-in readiness, while preserving default draft and permission checks", () => {
+    const snapshot = claude("\x1b[2msuggested follow-up\x1b[22m", { x: 2, y: 2 });
+    snapshot.screen = snapshot.screen.replace("? for shortcuts", "⏵⏵ accept edits on (shift+tab to cycle) · ← for agents\n✘ Auto-update failed: no write permission to npm prefix · Run claude doctor");
+    const plain = snapshot.screen.replace(/\x1b\[[0-9;]*m/g, "");
+    expect(classifyPaneActivity(plain)).toMatchObject({ state: "attention", reason: "prompt_draft" });
+    expect(classifyPaneActivity(plain, { composerSnapshot: snapshot })).toMatchObject({ state: "agent_idle" });
+    const permission = { ...snapshot, screen: snapshot.screen.replace("Ready", "Do you want to allow this command?") };
+    expect(classifyPaneActivity(plain, { composerSnapshot: permission })).toMatchObject({ state: "attention", reason: "permission_prompt" });
+  });
+
+  it("ignores a dim autocomplete suggestion at an empty cursor, preserving real drafts with the same spelling", () => {
+    const ghost = "Summarize the recent changes";
+    expect(inspectComposerInput(claude(`\x1b[2m${ghost}\x1b[22m`, { x: 2, y: 2 })).state).toBe("empty");
+    expect(inspectComposerInput(claude(ghost, { x: 2, y: 2 })).state).toBe("text");
+  });
+
+  it("excludes only a wholly dim suffix after the cursor when identifying staged text", () => {
+    const input = inspectComposerInput(claude("owned\x1b[2m ghost suggestion\x1b[22m", { x: 7, y: 2 }));
+    expect(input.state).toBe("text");
+    expect(composerContainsOwnedText(input, "owned")).toBe(true);
+    expect(composerContainsOwnedText(input, "owned ghost suggestion")).toBe(false);
+    const mixed = inspectComposerInput(claude("owned\x1b[2m ghost\x1b[22m human", { x: 7, y: 2 }));
+    expect(composerContainsOwnedText(mixed, "owned")).toBe(false);
+  });
+
   it("recognizes Claude's non-breaking prompt space without erasing draft content", () => {
     for (const body of ["", "unfinished request"]) {
       const snapshot = claude(body);

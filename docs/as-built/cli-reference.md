@@ -20,9 +20,9 @@ The inventory below comes from the actual Commander tree returned by
 [`createProgram()`](../../packages/cli/src/index.ts), not a grep of command
 strings or an installed CLI from a different commit.
 
-There are **87 top-level registrations**, **358 registered command objects**
+There are **87 top-level registrations**, **356 registered command objects**
 below `rig` (including groups and the hidden `restore apply` command), and
-**1,089 explicitly registered option objects**, including the root version
+**1,086 explicitly registered option objects**, including the root version
 option. Aliases do not add command objects; short/long spellings of one
 option do not add option objects. Commander-generated help is additional.
 These are source counts, not a claim about a deployed release.
@@ -858,9 +858,7 @@ Root: `rig`; declared option: `-V, --version`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig seat` | — | — |
-| `rig seat set-delivery-policy <seat>` | — | `--mode <mode>` **required**<br>`--hold-seconds <n>`<br>`--max-attempts <n>`<br>`--reason <text>` **required**<br>`--json` |
-| `rig seat delivery-policy <seat>` | — | `--json` |
-| `rig seat set-typing-guard <seat>` | — | `--enabled <boolean>` **required**<br>`--reason <text>` **required**<br>`--json` |
+| `rig seat set-typing-guard <seat>` | — | `--enabled <boolean>`<br>`--mode <mode>`<br>`--hold-seconds <n>`<br>`--max-attempts <n>`<br>`--reason <text>` **required**<br>`--json` |
 | `rig seat held-messages <seat>` | — | `--limit <n>`<br>`--offset <n>`<br>`--id <id>`<br>`--json` |
 | `rig seat retire-held-message <seat> <id>` | — | `--reason <text>` **required**<br>`--json` |
 | `rig seat status <seat>` | — | `--json` |

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { migrate } from "../src/db/migrate.js";
-import type { ComposerSnapshot } from "../src/domain/composer-input.js";
+import type { ComposerSnapshot } from "../src/domain/composer-prompts.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
@@ -89,7 +89,7 @@ function fixture(saved?: Buffer) {
   cleanup.push(async () => { await deferred.stop(); db.close(); });
   return { db, guard, tmux, transport, deferred, outbox, repo, app, bodies, history, writes, submissions, hooks,
     advance: (ms = 4000) => { at += ms; },
-    enable: (settings = {}) => guard.setPolicy("a", { mode: "draft-aware", holdSeconds: 12, maxAttempts: 3, ...settings }, "human@test", "keep draft"),
+    enable: (settings = {}) => guard.set("a", { mode: "draft-aware", holdSeconds: 12, maxAttempts: 3, ...settings }, "human@test", "keep draft"),
     send: (id: string, text = "incoming message", opts: SendOpts = {}) => transport.send("worker@test", text, { deliveryId: id, actorSession: "human@test", verify: true, ...opts }),
     post: (path: string, body: unknown, actor = "human@test") => app.request(path, { method: "POST", headers: { "content-type": "application/json", "x-openrig-session": actor }, body: JSON.stringify(body) }),
   };
@@ -137,7 +137,7 @@ describe("durable draft-aware delivery through the real transport", () => {
     expect(f.submissions).toEqual(["incoming message"]);
     expect(f.outbox.getById("one")).toMatchObject({ body: "incoming message", deliveryState: "delivered" });
     expect(f.db.prepare("SELECT count(*) n FROM outbox_entries").get()).toEqual({ n: 1 });
-    await f.guard.setPolicy("a", { mode: "automatic" }, "human@test", "normal delivery");
+    await f.guard.set("a", { mode: "off" }, "human@test", "normal delivery");
     expect(await f.send("one")).toMatchObject({ delivery: { state: "complete", attempts: 3 } });
     expect(f.submissions).toHaveLength(1);
     expect(await f.send("one", "different message")).toMatchObject({ ok: false, reason: "delivery_identity_conflict" });
@@ -164,10 +164,12 @@ describe("durable draft-aware delivery through the real transport", () => {
     expect(resumed.submissions).toEqual(["incoming message"]);
   });
 
-  it("never replays an attempt interrupted between its durable claim and its write result", async () => {
+  it.each([false, true])("never replays an interrupted attempt (generic recovery first: %s)", async genericFirst => {
     const first = fixture(); await first.enable(); first.bodies.a = "draft"; await first.send("crash");
-    first.db.exec("UPDATE seat_deferred_messages SET state='sending'; UPDATE outbox_entries SET delivery_state='sending';");
-    const resumed = fixture(first.db.serialize()); resumed.deferred.recover(); resumed.advance(5000);
+    first.db.exec("UPDATE outbox_entries SET delivery_state='sending',retry_request=json_set(retry_request,'$.reason','attempting');");
+    const resumed = fixture(first.db.serialize());
+    if (genericFirst) resumed.outbox.reconcileAbandonedSending("crash");
+    resumed.deferred.recover(); resumed.advance(5000);
     await resumed.deferred.drain();
     expect(resumed.deferred.readback("crash")).toMatchObject({ ok: false, reason: "delivery_indeterminate", delivery: { state: "indeterminate", reason: "interrupted_write" } });
     expect(resumed.outbox.getById("crash")!.deliveryState).toBe("indeterminate"); expect(resumed.writes).toEqual([]);
@@ -197,7 +199,7 @@ describe("durable draft-aware delivery through the real transport", () => {
     const f = fixture(); await f.enable(); f.bodies.a = "draft"; await f.send("old");
     if (change === "retired") f.outbox.retire("old", "human@test", "read elsewhere");
     if (change === "policy") {
-      await f.guard.setPolicy("a", { mode: "automatic" }, "human@test", "new mode"); await f.enable();
+      await f.guard.set("a", { mode: "off" }, "human@test", "new mode"); await f.enable();
     }
     if (change === "manual") { await f.guard.set("a", true, "human@test", "pause"); await f.guard.set("a", false, "human@test", "new sends"); }
     if (change === "recipient") f.db.exec("INSERT INTO occupant_tenures(id,node_id,generation_ordinal,generation_uuid,kind) VALUES ('new','a',2,'new-generation','fresh');");
@@ -243,18 +245,18 @@ describe("durable draft-aware delivery through the real transport", () => {
 });
 
 describe("supported seat and queue integration", () => {
-  it("exposes policy, audit identity, held-message progress and retirement through HTTP", async () => {
+  it("exposes guard modes, audit identity, held-message progress and retirement through HTTP", async () => {
     const f = fixture(); f.bodies.a = "draft";
-    const policy = await f.post("/api/seat/set-delivery-policy/worker@test", { mode: "draft-aware", holdSeconds: 12, maxAttempts: 3, actor: "spoof", reason: "draft" });
+    const policy = await f.post("/api/seat/set-typing-guard/worker@test", { mode: "draft-aware", holdSeconds: 12, maxAttempts: 3, actor: "spoof", reason: "draft" });
     expect(policy.status).toBe(200);
-    expect(await policy.json()).toMatchObject({ desired: { mode: "draft-aware" }, effective: { mode: "draft-aware" }, pending: false });
-    expect(f.db.prepare("SELECT actor FROM seat_delivery_policies").get()).toEqual({ actor: "human@test" });
+    expect(await policy.json()).toMatchObject({ desiredMode: "draft-aware", effectiveMode: "draft-aware", pending: false });
+    expect(f.db.prepare("SELECT actor FROM seat_delivery_guards").get()).toEqual({ actor: "human@test" });
     const response = await f.post("/api/transport/send", { session: "worker@test", text: "http message", deliveryId: "http", actorSession: "spoof", verify: true });
     expect(await response.json()).toMatchObject({ outcome: "retained", outboxIds: ["http"], delivery: { state: "waiting" } });
     const page = await (await f.app.request("/api/seat/held-messages/worker@test")).json();
     expect(page.items[0]).toMatchObject({ senderSession: "human@test", body: "http message", delivery: { attempts: 1, maxAttempts: 3 } });
     expect(f.db.prepare("SELECT identity_provenance FROM outbox_entries").get()).toEqual({ identity_provenance: "transport:v1" });
-    expect(await (await f.app.request("/api/seat/delivery-policy/worker@test")).json()).toMatchObject({ deliveries: [{ id: "http", state: "waiting" }] });
+    expect(await (await f.app.request("/api/seat/status/worker@test")).json()).toMatchObject({ typingGuard: { effectiveMode: "draft-aware", heldCount: 1 } });
     expect((await f.post("/api/seat/retire-held-message/sibling@test/http", { reason: "read" })).status).toBe(404);
     expect((await f.post("/api/seat/retire-held-message/worker@test/http", { reason: "read" })).status).toBe(200);
     expect(await (await f.app.request("/api/seat/held-messages/worker@test?id=http")).json()).toMatchObject({ entry: { deliveryState: "retired" }, delivery: { state: "held", reason: "message_retired" } });
@@ -277,18 +279,18 @@ describe("supported seat and queue integration", () => {
     expect(f.submissions).toEqual(["broadcast message", "broadcast message"]);
   });
 
-  it("validates policy settings and ignores any body-supplied sender identity", async () => {
+  it("validates guard settings and ignores any body-supplied sender identity", async () => {
     const f = fixture();
-    for (const body of [{ mode: "typo", reason: "draft" }, { mode: "draft-aware", maxAttempts: 0, reason: "draft" }, { mode: "inbox-only" }]) {
-      expect((await f.post("/api/seat/set-delivery-policy/worker@test", body)).status).toBe(400);
+    for (const body of [{ enabled: true, mode: "draft-aware", reason: "ambiguous" }, { reason: "missing selector" }, { enabled: "true", reason: "invalid type" }, { mode: "automatic", reason: "old mode" }, { mode: "typo", reason: "draft" }, { mode: "draft-aware", maxAttempts: 0, reason: "draft" }, { mode: "hold" }]) {
+      expect((await f.post("/api/seat/set-typing-guard/worker@test", body)).status).toBe(400);
     }
-    expect((await f.post("/api/seat/set-delivery-policy/worker@test", { mode: "inbox-only", reason: "draft", actor: "spoof" }, "")).status).toBe(400);
-    expect(f.guard.policies.get("a").effective.mode).toBe("automatic");
+    expect((await f.post("/api/seat/set-typing-guard/worker@test", { mode: "hold", reason: "draft", actor: "spoof" }, "")).status).toBe(400);
+    expect(f.guard.configuration("a").effective.mode).toBe("off");
   });
 
-  it("inbox-only retains indefinitely while the sibling still receives automatic messages", async () => {
-    const f = fixture(); await f.guard.setPolicy("a", { mode: "inbox-only" }, "human@test", "manual terminal");
-    expect(await f.send("inbox")).toMatchObject({ outcome: "retained", reason: "inbox_only" });
+  it("hold mode retains indefinitely while the sibling still receives automatic messages", async () => {
+    const f = fixture(); await f.guard.set("a", { mode: "hold" }, "human@test", "manual terminal");
+    expect(await f.send("inbox")).toMatchObject({ outcome: "retained", reason: "typing_guard_enabled" });
     expect(await f.transport.send("sibling@test", "sibling message", { verify: true })).toMatchObject({ ok: true });
     f.advance(60000); await f.deferred.drain();
     expect(f.submissions).toEqual(["sibling message"]); expect(f.deferred.lookup("inbox")).toBeNull();
@@ -354,7 +356,7 @@ describe("supported seat and queue integration", () => {
     const original = ids.map(id => f.outbox.getById(id)!.body);
     await f.repo.drainPendingWakeIntents();
     expect(f.deferred.lookup(ids[1]!)).toEqual(f.deferred.lookup(ids[0]!));
-    expect(f.db.prepare("SELECT count(*) n FROM seat_deferred_messages").get()).toEqual({ n: 1 });
+    expect(f.db.prepare("SELECT count(*) n FROM outbox_entries WHERE retry_request IS NOT NULL").get()).toEqual({ n: 1 });
     f.bodies.a = ""; f.advance(); await f.deferred.drain();
     expect(f.submissions).toHaveLength(1);
     ids.forEach((id, i) => expect(f.outbox.getById(id)).toMatchObject({ body: original[i], deliveryState: "delivered" }));

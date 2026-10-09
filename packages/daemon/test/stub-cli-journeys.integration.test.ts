@@ -75,11 +75,11 @@ describe("stub CLI journeys", () => {
     // Exact arrays, not subset matches: an extra sibling is a failure.
   }, 60_000);
 
-  it("inbox-only policy retains a CLI send outside its pane and exposes its original ID", async () => {
-    const marker = `inbox-only-${randomUUID()}`;
+  it("hold mode retains a CLI send outside its pane and exposes its original ID", async () => {
+    const marker = `typing-guard-${randomUUID()}`;
     try {
-      const policy = await cli(["seat", "set-delivery-policy", recipient, "--mode", "inbox-only", "--reason", "fixture manual input", "--json"]);
-      expect(policy).toMatchObject({ effective: { mode: "inbox-only" }, pending: false });
+      const preference = await cli(["seat", "set-typing-guard", recipient, "--mode", "hold", "--reason", "fixture manual input", "--json"]);
+      expect(preference).toMatchObject({ effective: true, effectiveMode: "hold", pending: false });
       const receipt = await cli(["send", recipient, marker, "--verify", "--json"]);
       expect(receipt).toMatchObject({ outcome: "retained", sent: false, verified: false });
       expect(receipt.outboxIds).toHaveLength(1);
@@ -88,9 +88,9 @@ describe("stub CLI journeys", () => {
       expect(retained.entry).toMatchObject({ outboxId: id, deliveryState: "retained", destinationSession: recipient });
       expect(retained.entry.body).toContain(marker);
       expect(JSON.stringify(await cli(["capture", recipient, "--json"]))).not.toContain(marker);
-      expect(await cli(["seat", "delivery-policy", sender, "--json"])).toMatchObject({ effective: { mode: "automatic" } });
+      expect(await cli(["seat", "status", sender, "--json"])).toMatchObject({ typingGuard: { effective: false, effectiveMode: "off" } });
     } finally {
-      await cli(["seat", "set-delivery-policy", recipient, "--mode", "automatic", "--reason", "fixture cleanup", "--json"]);
+      await cli(["seat", "set-typing-guard", recipient, "--enabled", "false", "--reason", "fixture cleanup", "--json"]);
     }
   }, 60_000);
 

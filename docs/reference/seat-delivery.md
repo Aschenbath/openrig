@@ -1,18 +1,18 @@
 # Per-seat terminal delivery
 
 Choose how OpenRig sends messages into one seat's terminal. The default remains
-`automatic`; opting in on one seat does not change its siblings.
+typing guard `off`; opting in on one seat does not change its siblings.
 
 | Mode | Terminal input | When input is unavailable |
 |---|---|---|
-| `automatic` | Existing delivery and prompt checks | Existing send result |
+| `off` | Existing delivery and prompt checks | Existing send result |
 | `draft-aware` | Paste only into a recognized empty input; check the staged text again before Enter | Retain the original message and retry within a deadline and attempt cap |
-| `inbox-only` | No automatic terminal input, even at an empty prompt | Retain for inspection outside the pane; no automatic retry |
+| `hold` | No automatic terminal input, even at an empty prompt | Retain for inspection outside the pane; no automatic retry |
 
-These are delivery preferences, separate from runtime permissions. Existing
-recipient, interactive-prompt and manual typing-guard checks still apply.
+These are three modes of the existing typing guard, separate from runtime
+permissions. Existing recipient and interactive-prompt checks still apply.
 `--raw`, `--force` and `--dangerously-interact` do not bypass a protected seat's
-delivery policy. Direct human terminal input remains available.
+typing guard. Direct human terminal input remains available.
 
 ## Configure and inspect
 
@@ -20,27 +20,30 @@ Run from a seat shell with `OPENRIG_SESSION_NAME` set. The daemon derives the
 preference's audit actor from the request's transport identity.
 
 ```sh
-rig seat set-delivery-policy dev-impl@my-rig --mode draft-aware \
+rig seat set-typing-guard dev-impl@my-rig --mode draft-aware \
   --hold-seconds 120 --max-attempts 10 --reason "preserve my unfinished input"
-rig seat delivery-policy dev-impl@my-rig --json
 rig seat status dev-impl@my-rig
 ```
 
-`--hold-seconds` defaults to 120 and accepts integers from 1 to 3600.
-`--max-attempts` defaults to 10 and accepts integers from 1 to 100, including
-the initial attempt. Retries are spaced by the hold duration divided by the
+`--hold-seconds` initially defaults to 120 and accepts integers from 1 to 3600.
+`--max-attempts` initially defaults to 10 and accepts integers from 1 to 100, including
+the initial attempt. Omitted limits keep the seat’s previous settings.
+Use exactly one of `--mode off|draft-aware|hold` or the compatible
+`--enabled true|false`: true means hold, false means off.
+Retries are spaced by the hold duration divided by the
 attempt cap, with a minimum interval of 250 ms. A busy operation lease can
 delay an attempt; it cannot extend the deadline.
 
 Activation waits for an already-started seat operation to finish. The API can
-return HTTP 202 with `pending: true`; inspect `desired` and `effective` and wait
-for the requested policy to become effective before relying on it. The preference
+return HTTP 202 with `pending: true`; inspect `desiredMode` and `effectiveMode`
+in `rig seat status` and wait for `pending: false` before relying on the requested
+mode. The legacy `desired` and `effective` booleans still mean hold everything.
+The preference
 and waiting deliveries survive daemon restart. Reapplying identical settings
-keeps the existing policy revision and its retries.
+keeps the existing guard revision and its retries.
 
-`rig seat delivery-policy` also shows the latest 100 deferred deliveries, with
-their original ID, state, attempts, cap, deadline, next attempt and reason.
-`rig seat held-messages` lists retained bodies and includes deferred status:
+`rig seat held-messages` lists retained bodies and includes each retry’s original
+ID, state, attempts, cap, deadline, next attempt and reason:
 
 ```sh
 rig seat held-messages dev-impl@my-rig --json
@@ -63,10 +66,10 @@ The check runs after payload preparation, immediately before paste, and again
 before Enter. A changed input after paste remains visible for human review;
 OpenRig does not clear it or submit it.
 
-An empty placeholder must retain its faint display styling in the capture.
-Typing the same words and moving the cursor to the start still counts as a
-draft. A capture without enough styling evidence holds the message instead of
-guessing that the input is empty.
+Faint placeholders and autocomplete suggestions after the cursor are display
+hints, not draft text. Their styling must be present in the capture. Typing the
+same words and moving the cursor to the start still counts as a draft. A mixed
+suffix containing normal text cannot be discarded as a suggestion.
 
 | Delivery state | Meaning |
 |---|---|
@@ -80,7 +83,7 @@ A held send returns `outcome: "retained"`, `sent: false` and `outboxIds`.
 Retries keep those IDs and original bodies. They do not create replacement
 queue items or duplicate audit rows. A caller using the HTTP `deliveryId` can
 read back that original request by repeating the same content and sender,
-even after changing policy. Use the by-ID inspection command for historical
+even after changing guard mode. Use the by-ID inspection command for historical
 results, including retired and uncertain deliveries.
 
 The cap or deadline leaves the message retained. There is no final warning
@@ -100,12 +103,12 @@ after its transaction and takes retention over the limit.
 `rig seat set-typing-guard <seat> --enabled true --reason <text>` remains a
 manual pause of all automatic terminal input. Enabling it permanently stops
 scheduled draft retries. Disabling it permits new sends; it does not replay
-old ones. Changing delivery mode or retry settings likewise ends retries
-created under the older policy revision.
+old ones. Changing guard mode or retry settings likewise ends retries
+created under the older guard revision.
 
-With `inbox-only`, writing lifecycle operations refuse before effects. With
+With `hold`, writing lifecycle operations refuse before effects. With
 `draft-aware`, a writing lifecycle operation on an active seat also requires
-an explicit switch to `automatic` first. Fresh startup is exempt from draft
+an explicit switch to `off` first. Fresh startup is exempt from draft
 inspection only after the adapter creates a new pane or successfully respawns
 a dead pane within that lifecycle operation. An absent/dead binding permits
 the lifecycle preflight, but adopting or rebinding an existing pane does not
@@ -117,8 +120,9 @@ cannot prevent a separate program or direct tmux client from writing after
 the final observation. Collapsed paste labels are accepted only when observed
 after this operation's paste, with the expected line count and unchanged
 label/cursor at submission. Unrecognized provider versions and other runtimes
-retain until the hold bound; choose `automatic` when that tradeoff is unsuitable.
+retain until the hold bound; choose `off` when that tradeoff is unsuitable.
 
-HTTP equivalents are `POST /api/seat/set-delivery-policy/:seatRef` with
-`{mode, holdSeconds?, maxAttempts?, reason}`, `GET /api/seat/delivery-policy/:seatRef`,
-and the existing held-message routes. No RigSpec field is required.
+HTTP equivalents are `POST /api/seat/set-typing-guard/:seatRef` with
+`{mode, holdSeconds?, maxAttempts?, reason}` or `{enabled, reason}`, plus
+`GET /api/seat/status/:seatRef` and the existing held-message routes.
+No RigSpec field is required.

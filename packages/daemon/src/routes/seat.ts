@@ -20,51 +20,30 @@ import { OPENRIG_HOME } from "../openrig-compat.js";
 import { SettingsStore } from "../domain/user-settings/settings-store.js";
 import { transportSenderSession } from "./require-sender-identity.js";
 import type { SessionTransport } from "../domain/session-transport.js";
-import { SeatDeliveryPolicyError } from "../domain/seat-delivery-policy.js";
+import { DeliveryGuardError } from "../domain/seat-delivery-guard.js";
 
 export const seatRoutes = new Hono();
-
-seatRoutes.post("/set-delivery-policy/:seatRef", async c => {
-  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
-  if (!guard?.policies.available) return c.json({ error: "Delivery policy unavailable" }, 503);
-  const body = await c.req.json<Record<string, unknown>>().catch(() => null);
-  if (!body || typeof body.reason !== "string" || !body.reason.trim()) return c.json({ error: "A delivery policy and reason are required" }, 400);
-  const actor = transportSenderSession(c);
-  if (!actor) return c.json({ error: "Sender identity required for preference audit; run from a seat shell with OPENRIG_SESSION_NAME set" }, 400);
-  try {
-    const target = guard.target(c.req.param("seatRef"));
-    const preference = await guard.setPolicy(target.nodeId, body, actor, body.reason);
-    return c.json({ ...preference, tradeoff: "Changing policy stops retries of older held messages. Wait for effective policy before relying on activation; inspect messages with rig seat held-messages." }, preference.pending ? 202 : 200);
-  } catch (error) {
-    return c.json({ error: (error as Error).message, code: (error as { code?: string }).code }, error instanceof SeatDeliveryPolicyError ? 400 : 409);
-  }
-});
-
-seatRoutes.get("/delivery-policy/:seatRef", c => {
-  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
-  if (!guard?.policies.available) return c.json({ error: "Delivery policy unavailable" }, 503);
-  try {
-    const target = guard.target(c.req.param("seatRef"));
-    const deferred = (c.get("sessionTransport" as never) as SessionTransport | undefined)?.deferredDelivery;
-    return c.json({ ...guard.policies.get(target.nodeId), deliveries: deferred?.inspect(target.nodeId) ?? [] });
-  } catch (error) { return c.json({ error: (error as Error).message }, 409); }
-});
 
 // S09 is an independent delivery preference, never a lifecycle or permission change.
 seatRoutes.post("/set-typing-guard/:seatRef", async c => {
   const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
   if (!guard) return c.json({ error: "Delivery guard unavailable" }, 503);
-  const body = await c.req.json<Record<string, unknown>>();
-  if (typeof body.enabled !== "boolean" || typeof body.reason !== "string" || !body.reason.trim()) {
-    return c.json({ error: "enabled boolean and reason required" }, 400);
+  const body = await c.req.json<Record<string, unknown>>().catch(() => null);
+  if (!body || typeof body.reason !== "string" || !body.reason.trim()
+    || (body.enabled === undefined) === (body.mode === undefined)
+    || body.enabled !== undefined && typeof body.enabled !== "boolean") {
+    return c.json({ error: "Supply exactly one enabled boolean or mode, and a reason" }, 400);
   }
   const actor = transportSenderSession(c);
   if (!actor) return c.json({ error: "Sender identity required for preference audit" }, 400);
   try {
     const target = guard.target(c.req.param("seatRef"));
-    const preference = await guard.set(target.nodeId, body.enabled, actor, body.reason);
-    return c.json({ ...preference, tradeoff: "Automatic terminal input is paused while enabled, even at an empty prompt. Disabling does not replay retained messages." }, preference.pending ? 202 : 200);
-  } catch (error) { return c.json({ error: (error as Error).message }, 409); }
+    const preference = await guard.set(target.nodeId, { mode: body.mode ?? (body.enabled ? "hold" : "off"),
+      holdSeconds: body.holdSeconds, maxAttempts: body.maxAttempts }, actor, body.reason);
+    return c.json({ ...preference, tradeoff: "Hold retains all automatic input. Draft-aware waits for a clear composer within its limits. Off permits new sends. Changing mode does not flush earlier held messages." }, preference.pending ? 202 : 200);
+  } catch (error) {
+    return c.json({ error: (error as Error).message, code: (error as { code?: string }).code }, error instanceof DeliveryGuardError && error.code === "invalid_typing_guard" ? 400 : 409);
+  }
 });
 
 seatRoutes.get("/held-messages/:seatRef", c => {
@@ -113,7 +92,7 @@ seatRoutes.get("/status/:seatRef", (c) => {
   if (result.ok) {
     const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter | undefined)?.deliveryGuard;
     const target = guard?.maybeTarget(c.req.param("seatRef")!);
-    return c.json({ ...result.status, ...(guard && target ? { deliveryPolicy: guard.policies.get(target.nodeId), typingGuard: {
+    return c.json({ ...result.status, ...(guard && target ? { typingGuard: {
       ...guard.preference(target.nodeId), heldCount: new OutboxHandler(guard.db).heldForNode(target.nodeId, 1).total,
     } } : {}) });
   }

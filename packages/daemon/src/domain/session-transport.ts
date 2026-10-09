@@ -1,5 +1,6 @@
+import stringWidth from "string-width";
 import { randomUUID } from "node:crypto";
-import { inspectStartupStagedText, startupSubmissionEvidence, type StartupSubmissionEvidence } from "./startup-submission-evidence.js";
+import { isComposerFooter, inspectStartupStagedText, startupSubmissionEvidence, type StartupSubmissionEvidence } from "./startup-submission-evidence.js";
 import {
   composerPromptClassForRuntime,
   composerPromptIsAmbiguous,
@@ -11,6 +12,10 @@ import {
   COMPOSER_SELECTION_SCAN_PATTERN,
   findComposerInputLineIndex,
   stripComposerPromptGlyph,
+  readComposerPromptLine,
+  COMPOSER_COLLAPSED_PASTE_PATTERN,
+  type ComposerInput,
+  type ComposerSnapshot,
 } from "./composer-prompts.js";
 export { inspectStartupStagedText } from "./startup-submission-evidence.js";
 import { OutboxHandler } from "./outbox-handler.js";
@@ -172,6 +177,9 @@ const CLAUDE_TIMERLESS_STATUS_PATTERN = /^[✶✢✳✻✽·*]\s+\S.*(?:…|\.{3
 export interface ClassifyPaneOptions {
   /** Treat a timer-less live status row above the composer as work in progress. */
   timerlessStatusIsLive?: boolean;
+  /** Opted-in typing guards retain styling and cursor evidence for this read. */
+  composerSnapshot?: ComposerSnapshot;
+  runtime?: string | null;
 }
 
 function findClaudeComposer(paneContent: string, options: ClassifyPaneOptions = {}) {
@@ -193,13 +201,14 @@ function findClaudeComposer(paneContent: string, options: ClassifyPaneOptions = 
     // Keep Codex footers and a bare prompt with no visible block on their old path.
     if (bar < 2 || !/^(?:⏵⏵ (?:accept edits|bypass permissions) on\b|⏸ plan mode on\b|\? for shortcuts$)/.test(lines[bar]!.trim())) return null;
     prompt = lines[bar - 1] ?? "";
-    indent = /^([ \t]*)❯\s*$/.exec(prompt)?.[1];
+    const input = readComposerPromptLine(prompt, composerPromptClassForRuntime("claude-code"));
+    indent = input && !input.text.trim() ? input.indent : undefined;
     if (indent === undefined) return null;
     statusStart = bar - 2;
   } else {
     const upper = lines[bar - 3] ?? "";
     if (!upper.startsWith(indent) || !/^─{3,}(?: .+ ─+)?$/.test(upper.slice(indent.length)) ||
-        !prompt.startsWith(`${indent}❯`) || !/^❯(?:\s|$)/.test(prompt.slice(indent.length))) return null;
+        !prompt.startsWith(`${indent}❯`) || !readComposerPromptLine(prompt, composerPromptClassForRuntime("claude-code"))) return null;
   }
 
   let liveStatus: string | null = null;
@@ -222,6 +231,117 @@ function findClaudeComposer(paneContent: string, options: ClassifyPaneOptions = 
   return { text: prompt.slice(indent.length), bar: lines[bar]!.trim(), framed, hasWarnings: bar < lines.length - 1, supportedWarningFooter, modeFooter, headSeen, liveStatus };
 }
 
+const unknown = (): ComposerInput => ({ state: "unknown", rows: [], columns: 0, cursorAtEnd: false, collapsedPaste: null });
+const rule = (line: string): boolean => /^[─━═-]{6,}(?: .+ [─━═-]+)?$/.test(line.trim());
+const codexFooter = (line: string): boolean => isComposerFooter(line)
+  || /(?:\b\d+% context left\b|\bContext \[)/.test(line);
+
+/** Preserve faint styling so autocomplete ghosts can be separated from authored
+ * text. Color channel values must never be interpreted as style codes. */
+function styledLines(screen: string) {
+  let faint = false;
+  return screen.replace(/\r\n/g, "\n").split("\n").map(raw => {
+    let text = "", offset = 0;
+    const faintCells: boolean[] = [];
+    const append = (value: string) => { text += value; faintCells.push(...Array<boolean>(value.length).fill(faint)); };
+    for (const match of raw.matchAll(/\x1b\[([0-9;:]*)m/g)) {
+      append(raw.slice(offset, match.index));
+      const codes = match[1]!.split(";");
+      for (let i = 0; i < codes.length; i++) {
+        const code = codes[i]!;
+        if (/^(?:38|48|58):/.test(code)) continue; // Colon-form color is one parameter.
+        if (code === "38" || code === "48" || code === "58") {
+          const skip = codes[i + 1] === "5" ? 2 : codes[i + 1] === "2" ? (codes[i + 2] === "" ? 5 : 4) : 0;
+          // Color channels are not style codes. Ambiguous compound sequences
+          // provide no faint-style proof, rather than interpreting an RGB 2 as dim.
+          if (!skip || i + skip !== codes.length - 1) { faint = false; break; }
+          i += skip;
+        } else if (code === "" || code === "0" || code === "22") faint = false;
+        else if (code === "2") faint = true;
+      }
+      offset = match.index! + match[0].length;
+    }
+    append(raw.slice(offset));
+    return { text, faintCells };
+  });
+}
+
+/** Inspect only the visible input containing the current cursor. Activity, hook
+ * freshness and text elsewhere in the pane are not evidence that input is empty.
+ */
+export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime: string | null = null): ComposerInput {
+  const promptClass = composerPromptClassForRuntime(runtime);
+  if (!snapshot || snapshot.inMode) return unknown();
+  const { x, y, width, height } = snapshot.cursor;
+  if (![x, y, width, height].every(Number.isInteger) || x < 0 || y < 0 || x >= width || y >= height || width < 3 || height < 1) return unknown();
+  const styled = styledLines(snapshot.screen);
+  const lines = styled.map(line => line.text);
+  if (lines.at(-1) === "") lines.pop();
+  if (lines.length > height || !lines[y]) return unknown();
+  const candidates: ComposerInput[] = [];
+  for (let start = 0; start <= y; start++) {
+    const prompt = readComposerPromptLine(lines[start] ?? "", promptClass);
+    if (!prompt || !/^ *$/.test(prompt.indent) || composerSelectionPrefixPattern(promptClass).test(lines[start]!.trimStart())
+      || /^\d+[.)]\s/.test(prompt.text)) continue;
+    const prefix = prompt.prefix;
+    let end = -1;
+    if (prompt.glyph === "❯") {
+      if (!rule(lines[start - 1] ?? "")) continue;
+      for (let i = start + 1; i < lines.length; i++) {
+        const footer = lines.slice(i + 1).find(line => line.trim())?.trim() ?? "";
+        if (rule(lines[i]!) && isComposerFooter(footer)) { end = i; break; }
+      }
+    } else {
+      for (let i = start + 1; i < lines.length; i++) {
+        if (lines[i]!.trim()) continue;
+        const tail = lines.slice(i + 1).filter(line => line.trim());
+        if (lines[i + 1]?.trim() && tail.length === 1 && codexFooter(tail[0]!.trim())) { end = i; break; }
+      }
+    }
+    if (end <= y || x < prefix) continue;
+    const rows = [prompt.text];
+    let valid = true;
+    for (let i = start + 1; i < end; i++) {
+      const line = lines[i]!;
+      if (line.trim() && !line.startsWith(" ".repeat(prefix))) { valid = false; break; }
+      rows.push(line.slice(prefix));
+    }
+    if (!valid) continue;
+    // A suggestion is a wholly dim suffix beginning at the current cursor.
+    // A literal placeholder or text before a moved cursor remains authored input.
+    const cursorRow = y - start;
+    let ghost: ComposerInput["ghost"];
+    const currentRow = rows[cursorRow]!;
+    let cursorOffset = x === prefix ? 0 : -1;
+    let offset = 0;
+    for (const character of currentRow) {
+      offset += character.length;
+      if (stringWidth(currentRow.slice(0, offset)) === x - prefix) cursorOffset = offset;
+    }
+    if (cursorOffset >= 0) {
+      const suffix = rows.slice(cursorRow).map((row, i) => ({
+        text: row.slice(i === 0 ? cursorOffset : 0),
+        faint: styled[y + i]!.faintCells.slice(prefix + (i === 0 ? cursorOffset : 0), prefix + row.length),
+      }));
+      if (suffix.some(row => row.text.length > 0) && suffix.every(row => row.faint.every(Boolean))) {
+        ghost = { line: y, offset: prefix + cursorOffset, continuationRows: rows.length - cursorRow - 1 };
+        rows.splice(cursorRow + 1);
+        rows[cursorRow] = currentRow.slice(0, cursorOffset);
+      }
+    }
+    const visible = rows.map(line => line.trimEnd());
+    const atStart = y === start && x === prefix;
+    const empty = atStart && rows.length === 1 && rows[0] === "";
+    const last = visible.length - 1;
+    const cursorAtEnd = y === start + last && x === prefix + stringWidth(visible[last] ?? "");
+    const label = visible.length === 1 && COMPOSER_COLLAPSED_PASTE_PATTERN.test(visible[0]!) ? visible[0]! : null;
+    candidates.push({ state: empty ? "empty" : "text", rows: visible, columns: width - prefix, cursorAtEnd, collapsedPaste: label,
+      ...(ghost ? { ghost } : {}) });
+  }
+  return candidates.length === 1 ? candidates[0]! : unknown();
+}
+
+
 function findPromptDraftBeforeFooter(paneContent: string): string | null {
   const rawLines = paneContent.split("\n").map((line) => line.trimEnd());
   let lastLineIndex = rawLines.length - 1;
@@ -238,7 +358,8 @@ function findPromptDraftBeforeFooter(paneContent: string): string | null {
   if (priorLine.trim().length === 0) return null;
 
   const priorTrimmed = priorLine.trim();
-  const looksLikeDraft = PROMPT_DRAFT_PATTERNS.some((pattern) => pattern.test(priorTrimmed));
+  const prompt = readComposerPromptLine(priorLine);
+  const looksLikeDraft = prompt !== null && prompt.text.trim().length > 0;
   const looksLikeSelection = COMPOSER_SELECTION_PATTERN.test(priorTrimmed);
   if (!looksLikeDraft || looksLikeSelection) return null;
 
@@ -246,6 +367,16 @@ function findPromptDraftBeforeFooter(paneContent: string): string | null {
 }
 
 export function classifyPaneActivity(paneContent: string, options: ClassifyPaneOptions = {}): PaneActivityClassification {
+  if (options.composerSnapshot) {
+    const snapshot = options.composerSnapshot;
+    const { ghost } = inspectComposerInput(snapshot, options.runtime);
+    const lines = styledLines(snapshot.screen).map(line => line.text);
+    if (ghost) {
+      lines[ghost.line] = lines[ghost.line]!.slice(0, ghost.offset);
+      lines.splice(ghost.line + 1, ghost.continuationRows);
+    }
+    paneContent = lines.join("\n");
+  }
   const lastNonBlank = trimPaneLines(paneContent);
   if (lastNonBlank.length === 0) {
     return { state: "unknown", reason: "empty_capture", evidence: null };
@@ -390,6 +521,8 @@ export async function probeSessionActivity(input: {
   binding?: Omit<ObservedBinding, "sessionName">;
   /** See ClassifyPaneOptions.timerlessStatusIsLive. */
   timerlessStatusIsLive?: boolean;
+  /** Supplied only by an active draft-aware send; ordinary observations stay unchanged. */
+  composerSnapshot?: () => Promise<ComposerSnapshot | null>;
 }): Promise<AgentActivity> {
   // Capture routing and observation labels must share the entry context. The
   // caller may reuse/mutate its input while hasSession is pending.
@@ -500,9 +633,11 @@ export async function probeSessionActivity(input: {
   };
   const captureSeq = observed ? nextCaptureSeq++ : 0;
   try {
-    const paneContent = await tmuxAdapter.capturePaneContent(sessionName, 20);
+    const snapshot = input.composerSnapshot ? await input.composerSnapshot().catch(() => null) : null;
+    const paneContent = snapshot?.screen ?? await tmuxAdapter.capturePaneContent(sessionName, 20);
     const capturedAt = new Date().toISOString();
-    const classification = classifyPaneActivity(paneContent ?? "", { timerlessStatusIsLive: input.timerlessStatusIsLive === true });
+    const classification = classifyPaneActivity(paneContent ?? "", { timerlessStatusIsLive: input.timerlessStatusIsLive === true,
+      composerSnapshot: snapshot ?? undefined, runtime });
     return observeProbe(captureSlot(paneContent, capturedAt, captureSeq), {
       state: mapPaneState(classification.state),
       reason: classification.reason,
@@ -884,7 +1019,7 @@ export class SessionTransport {
     this.captureObserver = deps.captureObserver;
     this.listProcesses = deps.listProcesses;
     const guard = this.tmuxAdapter.deliveryGuard;
-    if (guard?.policies.available) this.deferredDelivery = new DraftAwareDelivery(this.db, guard,
+    if (guard?.retries.available) this.deferredDelivery = new DraftAwareDelivery(this.db, guard,
       (session, text, opts) => this.sendUnguarded(session, text, opts), this.now);
   }
 
@@ -1182,15 +1317,14 @@ export class SessionTransport {
     const target = guard?.maybeTarget(sessionName);
     if (!guard || !target) return null;
     const pref = guard.preference(target.nodeId);
-    const policy = guard.policies.get(target.nodeId);
-    return pref.desired || pref.effective || policy.desired.mode === "inbox-only" || policy.effective.mode === "inbox-only" ? target : null;
+    return pref.desired || pref.effective ? target : null;
   }
 
   draftAwareTarget(sessionName: string) {
     const guard = this.tmuxAdapter.deliveryGuard;
     const target = guard?.maybeTarget(sessionName);
     if (!guard || !target) return null;
-    const policy = guard.policies.get(target.nodeId);
+    const policy = guard.configuration(target.nodeId);
     return policy.desired.mode === "draft-aware" || policy.effective.mode === "draft-aware" ? target : null;
   }
 
@@ -1260,8 +1394,7 @@ export class SessionTransport {
             completedAt: this.now().toISOString(),
           });
         }
-        const preference = guard.preference(target.nodeId);
-        return retainedResult(preference.desired || preference.effective ? "typing_guard_enabled" : "inbox_only");
+        return retainedResult();
       });
     } catch (error) {
       return { ok: false, sessionName, sent: false, reason: (error as { code?: string }).code ?? "guard_unavailable", error: (error as Error).message };
@@ -1850,6 +1983,8 @@ export class SessionTransport {
     readinessFromPaneOnly?: boolean;
   }): Promise<AgentActivity> {
     const now = this.now();
+    const composerSnapshot = this.tmuxAdapter.deliveryGuard?.needsInputCheck(input.sessionName)
+      ? () => this.tmuxAdapter.captureComposerSnapshot(input.binding?.pane ?? input.sessionName) : undefined;
     const hookActivity = this.agentActivityStore?.getLatestForNode({
       sessionName: input.sessionName,
       now,
@@ -1894,6 +2029,7 @@ export class SessionTransport {
         // vetoes (→ refuse); an unknown pane (the flaky-Codex case this trust
         // exists for) or a clean idle pane does NOT veto → trust the stale hook.
         const paneVeto = await probeSessionActivity({
+          composerSnapshot,
           sessionName: input.sessionName,
           runtime: input.runtime,
           attachmentType: input.attachmentType as "tmux" | "external_cli" | null | undefined,
@@ -1910,6 +2046,7 @@ export class SessionTransport {
     }
 
     const probe = await probeSessionActivity({
+      composerSnapshot,
       sessionName: input.sessionName,
       runtime: input.runtime,
       attachmentType: input.attachmentType as "tmux" | "external_cli" | null | undefined,

@@ -3,7 +3,8 @@ import { writeFile as fsWriteFile, unlink as fsUnlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { ComposerSnapshot } from "../domain/composer-input.js";
+import type { ComposerSnapshot } from "../domain/composer-prompts.js";
+import { inspectComposerInput } from "../domain/session-transport.js";
 
 export type ExecFn = (cmd: string) => Promise<string>;
 
@@ -317,7 +318,7 @@ export class TmuxAdapter {
   get deliveryGuard(): SeatDeliveryGuard | undefined { return this.inputGuard; }
   set deliveryGuard(guard: SeatDeliveryGuard | undefined) {
     this.inputGuard = guard;
-    guard?.attachInputInspection(target => this.captureComposerSnapshot(target.pane ?? target.session), async target => {
+    guard?.attachInputInspection(async target => inspectComposerInput(await this.captureComposerSnapshot(target.pane ?? target.session)), async target => {
       if (!target.pane) return true;
       const probe = await this.probeSession(target.session);
       if (probe.state === "absent") return true;

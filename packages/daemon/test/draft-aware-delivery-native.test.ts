@@ -10,7 +10,7 @@ import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { shellQuote } from "../src/adapters/shell-quote.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { migrate } from "../src/db/migrate.js";
-import { inspectComposerInput } from "../src/domain/composer-input.js";
+import { inspectComposerInput } from "../src/domain/session-transport.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
@@ -59,7 +59,7 @@ describe.skipIf(process.platform === "win32")("native draft-aware terminal deliv
       transport = new SessionTransport({ db, tmuxAdapter: adapter, rigRepo: new RigRepository(db), sessionRegistry: new SessionRegistry(db),
         now: () => new Date(at), sleep: async ms => { if (ms === 200) await hooks.beforeEnter?.(); await pause(ms); } });
       const send = (id: string, text: string) => transport!.send("worker@test", text, { deliveryId: id, actorSession: "sender@test", verify: true });
-      await guard.setPolicy("a", { mode: "draft-aware", holdSeconds: 12, maxAttempts: 3 }, "human@test", "native fixture");
+      await guard.set("a", { mode: "draft-aware", holdSeconds: 12, maxAttempts: 3 }, "human@test", "native fixture");
       await vi.waitFor(async () => expect(inspectComposerInput(await adapter.captureComposerSnapshot(panes.a!)).state).toBe("empty"), { timeout: 5000 });
 
       // A real human input arriving while the payload buffer is prepared must
@@ -89,8 +89,8 @@ describe.skipIf(process.platform === "win32")("native draft-aware terminal deliv
       await tmux(["copy-mode", "-t", panes.a!]);
       expect(await send("copy-mode", "held during copy")).toMatchObject({ outcome: "retained", delivery: { reason: "draft_input_unknown" } });
       await tmux(["send-keys", "-t", panes.a!, "-X", "cancel"]);
-      await guard.setPolicy("a", { mode: "inbox-only" }, "human@test", "manual terminal");
-      expect(await send("inbox", "stay in the inbox")).toMatchObject({ outcome: "retained", reason: "inbox_only" });
+      await guard.set("a", { mode: "hold" }, "human@test", "manual terminal");
+      expect(await send("inbox", "stay in the inbox")).toMatchObject({ outcome: "retained", reason: "typing_guard_enabled" });
       expect(await transport.send("sibling@test", "sibling delivery", { verify: true })).toMatchObject({ ok: true });
       await vi.waitFor(() => expect(state("b").submissions).toEqual(["sibling delivery"]));
       expect(state().submissions).toEqual(["one\nmessage"]);
@@ -101,13 +101,24 @@ describe.skipIf(process.platform === "win32")("native draft-aware terminal deliv
         expect(await adapter.sendKeys("worker@test", ["Enter"])).toEqual({ ok: true });
       });
       await vi.waitFor(() => expect(state().submissions).toEqual(["one\nmessage", "direct human message"]));
-      await guard.setPolicy("a", { mode: "draft-aware", holdSeconds: 12, maxAttempts: 3 }, "human@test", "protect literal input");
+      await guard.set("a", { mode: "draft-aware", holdSeconds: 12, maxAttempts: 3 }, "human@test", "protect literal input");
       await tmux(["send-keys", "-t", panes.a!, "-l", "Ask Codex to do anything"]);
       await waitInput("Ask Codex to do anything");
       await tmux(["send-keys", "-t", panes.a!, "C-a"]);
       await vi.waitFor(async () => expect((await adapter.captureComposerSnapshot(panes.a!))?.cursor.x).toBe(2));
       expect(await send("literal-placeholder", "automatic message")).toMatchObject({ outcome: "retained", delivery: { reason: "draft_input_busy" } });
       expect(state()).toEqual({ input: "Ask Codex to do anything", submissions: ["one\nmessage", "direct human message"] });
+
+      // The native capture must retain dim styling, both for an empty input and
+      // for an autocomplete suffix after the text owned by the delivery lease.
+      await tmux(["send-keys", "-t", panes.a!, "C-u", "C-t"]); await waitInput("");
+      await vi.waitFor(async () => {
+        const snapshot = await adapter.captureComposerSnapshot(panes.a!);
+        expect(snapshot?.screen).toContain("suggested follow-up");
+        expect(inspectComposerInput(snapshot).state).toBe("empty");
+      });
+      expect(await send("ghost", "owned delivery")).toMatchObject({ ok: true, delivery: { state: "complete", attempts: 1 } });
+      await vi.waitFor(() => expect(state().submissions).toEqual(["one\nmessage", "direct human message", "owned delivery"]));
     } finally {
       await transport?.deferredDelivery?.stop();
       await tmux(["kill-server"]).catch(() => {});

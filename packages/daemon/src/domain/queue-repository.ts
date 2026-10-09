@@ -855,7 +855,7 @@ export class QueueRepository {
     classified: "verified" | "indeterminate" | "failed" | "retained"; nudgeResult: string;
   } {
     if (res.outcome === "retained") return { classified: "retained", nudgeResult: res.reason?.startsWith("draft_delivery_")
-      ? "retained:draft_aware" : res.reason === "inbox_only" ? "retained:inbox_only" : "retained:typing_guard" };
+      ? "retained:draft_aware" : "retained:typing_guard" };
     if (res.ok) return res.verified ? { classified: "verified", nudgeResult: "verified" } : { classified: "indeterminate", nudgeResult: "delivered-ack-pending" };
     const detail = res.error ?? res.reason ?? "unknown";
     if (res.delivery?.state === "indeterminate" || res.delivery?.state === "sending" || isWakeTimeoutSignal(res.reason) || isWakeTimeoutSignal(res.error)) {

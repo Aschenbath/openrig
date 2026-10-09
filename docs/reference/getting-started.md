@@ -881,7 +881,8 @@ The rig-level verbs are `rig policy permissions list`, `show`, `current` and
 aliases with the same JSON and exit behavior. Pi resource trust and the per-seat
 typing guard are separate controls. To retain automatic messages while you have
 an unfinished terminal input, opt that seat into [draft-aware delivery](seat-delivery.md).
-The same per-seat control offers `inbox-only` delivery for a manual terminal.
+The same typing guard offers `hold` for a manual terminal (`--enabled true`)
+and `off` for ordinary automatic sends (`--enabled false`).
 
 ### Claude Code: a different launch flag
 
