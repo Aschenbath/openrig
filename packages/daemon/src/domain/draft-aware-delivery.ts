@@ -234,7 +234,15 @@ export class DraftAwareDelivery {
     }
     if (inputWritten) result = { ...result, sent: true };
     const retryable = ["draft_input_busy", "draft_input_unknown", "draft_input_changed", "draft_hold_expired", "target_needs_input", "wait_for_idle_timeout", "target_activity_unknown"].includes(result.reason ?? "");
-    const noWrite = !result.ok && !inputWritten && (result.sent === false || result.reason === "target_needs_input");
+    const preInputRefusal = retryable || ["draft_wake_superseded", "target_runtime_unverified", "target_runtime_not_running", "target_runtime_conflict",
+      "invalid_wait_for_idle", "invalid_dangerously_interact", "dangerously_interact_requires_reason", "prompt_override_audit_unavailable",
+      "transport_unavailable", "session_missing", "tmux_unavailable"].includes(result.reason ?? "");
+    const noWrite = !result.ok && !inputWritten && preInputRefusal;
+    // The legacy wait path labels a failed tmux call sent=false even when its
+    // native result was lost. Only an explicit pre-input refusal proves that.
+    if (!noWrite && !inputWritten && result.sent === false) {
+      const { sent: _sent, ...unresolved } = result; result = unresolved;
+    }
     this.db.transaction(() => {
       const current = this.row(id)!;
       if (noWrite) {

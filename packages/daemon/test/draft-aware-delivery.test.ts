@@ -75,7 +75,8 @@ function fixture(saved?: Buffer) {
   });
   let at = Date.now();
   const rigRepo = new RigRepository(db), sessionRegistry = new SessionRegistry(db), outbox = new OutboxHandler(db);
-  const transport = new SessionTransport({ db, tmuxAdapter: tmux, rigRepo, sessionRegistry, now: () => new Date(at), sleep: async ms => { await hooks.sleep?.(ms); } });
+  const transport = new SessionTransport({ db, tmuxAdapter: tmux, rigRepo, sessionRegistry, now: () => new Date(at), sleep: async ms => { await hooks.sleep?.(ms); },
+    agentActivityStore: { getLatestForNode: () => ({ state: "idle", reason: "fixture idle hook", evidenceSource: "runtime_hook", sampledAt: new Date(at).toISOString(), evidence: null }) } as never });
   const deferred = transport.deferredDelivery!;
   const repo = new QueueRepository(db, new EventBus(db), { transport, loadHumanRegistry: () => ({ ok: true, entities: [], warnings: [] }) });
   repo.attachOutbox(outbox);
@@ -185,9 +186,9 @@ describe("durable draft-aware delivery through the real transport", () => {
     f.advance(); await f.deferred.drain(); expect(f.writes).toHaveLength(1); expect(f.submissions).toEqual([]);
   });
 
-  it("does not retry an unknown native paste result or claim no write", async () => {
-    const f = fixture(); await f.enable(); f.hooks.paste = () => { throw new Error("lost native result after dispatch"); };
-    expect(await f.send("unknown-write")).toMatchObject({ ok: false, delivery: { state: "indeterminate" } });
+  it.each([false, true])("does not retry an unknown native paste result or claim no write (wait mode: %s)", async wait => {
+    const f = fixture(); await f.enable(); f.hooks.paste = () => { f.bodies.a = "incoming message"; throw new Error("lost native result after dispatch"); };
+    expect(await f.send("unknown-write", "incoming message", wait ? { waitForIdleMs: 1000 } : {})).toMatchObject({ ok: false, delivery: { state: "indeterminate" } });
     expect(f.deferred.readback("unknown-write")!.sent).toBeUndefined();
     f.advance(); await f.deferred.drain(); expect(f.deferred.lookup("unknown-write")!.attempts).toBe(1);
   });

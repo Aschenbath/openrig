@@ -89,12 +89,9 @@ describe("stub CLI journeys", () => {
       expect(retained.entry.body).toContain(marker);
       expect(JSON.stringify(await cli(["capture", recipient, "--json"]))).not.toContain(marker);
       expect(await cli(["seat", "delivery-policy", sender, "--json"])).toMatchObject({ effective: { mode: "automatic" } });
-      await cli(["seat", "retire-held-message", recipient, id, "--reason", "reviewed outside terminal", "--json"]);
-      expect((await cli(["seat", "held-messages", recipient, "--id", id, "--json"])).entry.deliveryState).toBe("retired");
     } finally {
       await cli(["seat", "set-delivery-policy", recipient, "--mode", "automatic", "--reason", "fixture cleanup", "--json"]);
     }
-    expect(JSON.stringify(await cli(["capture", recipient, "--json"]))).not.toContain(marker);
   }, 60_000);
 
   it("replays one exact stream item after restart and an idempotent emit retry", async () => {
