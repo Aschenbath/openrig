@@ -93,6 +93,38 @@ const STATUS = {
   restore_outcome: "n-a",
 };
 
+describe("seat delivery policy commands", () => {
+  it("sends a bounded per-seat policy without accepting a body actor", async () => {
+    const paths: string[] = [], bodies: unknown[] = [];
+    const deps = makeDeps({ status: 200, data: { effective: { mode: "draft-aware" }, pending: false } }, paths, bodies);
+    const result = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "set-delivery-policy", "worker@test",
+      "--mode", "draft-aware", "--hold-seconds", "60", "--max-attempts", "5", "--reason", "keep my draft", "--json"]).then(() => undefined));
+    expect(result.exitCode).toBeUndefined();
+    expect(paths).toEqual(["/api/seat/set-delivery-policy/worker%40test"]);
+    expect(bodies).toEqual([{ mode: "draft-aware", holdSeconds: 60, maxAttempts: 5, reason: "keep my draft" }]);
+    expect(JSON.parse(result.logs.join(""))).toMatchObject({ effective: { mode: "draft-aware" } });
+  });
+
+  it.each([["--mode", "typo"], ["--hold-seconds", "NaN"], ["--hold-seconds", "3601"], ["--max-attempts", "0"], ["--max-attempts", "1.5"]])("rejects invalid %s %s before requesting a change", async (flag, value) => {
+    const paths: string[] = [];
+    const deps = makeDeps({ status: 200, data: {} }, paths);
+    const result = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "set-delivery-policy", "worker@test",
+      "--mode", "draft-aware", "--reason", "draft", flag, value]).then(() => undefined));
+    expect(result.exitCode).toBe(1); expect(paths).toEqual([]);
+  });
+
+  it("reads delivery attempts and prints requested/effective activation in seat status", async () => {
+    const paths: string[] = [];
+    const policy = { desired: { mode: "inbox-only", holdSeconds: 120, maxAttempts: 10 }, effective: { mode: "draft-aware", holdSeconds: 60, maxAttempts: 5 }, pending: true };
+    const deps = makeDeps({ status: 200, data: { ...STATUS, deliveryPolicy: policy } }, paths);
+    const status = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "status", "worker@test"]).then(() => undefined));
+    expect(status.logs.join("\n")).toContain("Delivery policy: draft-aware (activation pending; requested inbox-only)");
+    expect(status.logs.join("\n")).toContain("Draft hold: 60s, at most 5 attempts");
+    await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "delivery-policy", "worker@test", "--json"]).then(() => undefined));
+    expect(paths.at(-1)).toBe("/api/seat/delivery-policy/worker%40test");
+  });
+});
+
 const HANDOVER_PLAN = {
   ok: true,
   dryRun: true,

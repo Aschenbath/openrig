@@ -19,8 +19,36 @@ import { buildRebuildPrimingChain } from "../domain/rebuild-priming-chain.js";
 import { OPENRIG_HOME } from "../openrig-compat.js";
 import { SettingsStore } from "../domain/user-settings/settings-store.js";
 import { transportSenderSession } from "./require-sender-identity.js";
+import type { SessionTransport } from "../domain/session-transport.js";
+import { SeatDeliveryPolicyError } from "../domain/seat-delivery-policy.js";
 
 export const seatRoutes = new Hono();
+
+seatRoutes.post("/set-delivery-policy/:seatRef", async c => {
+  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
+  if (!guard?.policies.available) return c.json({ error: "Delivery policy unavailable" }, 503);
+  const body = await c.req.json<Record<string, unknown>>().catch(() => null);
+  if (!body || typeof body.reason !== "string" || !body.reason.trim()) return c.json({ error: "A delivery policy and reason are required" }, 400);
+  const actor = transportSenderSession(c);
+  if (!actor) return c.json({ error: "Sender identity required for preference audit; run from a seat shell with OPENRIG_SESSION_NAME set" }, 400);
+  try {
+    const target = guard.target(c.req.param("seatRef"));
+    const preference = await guard.setPolicy(target.nodeId, body, actor, body.reason);
+    return c.json({ ...preference, tradeoff: "Changing policy stops retries of older held messages. Wait for effective policy before relying on activation; inspect messages with rig seat held-messages." }, preference.pending ? 202 : 200);
+  } catch (error) {
+    return c.json({ error: (error as Error).message, code: (error as { code?: string }).code }, error instanceof SeatDeliveryPolicyError ? 400 : 409);
+  }
+});
+
+seatRoutes.get("/delivery-policy/:seatRef", c => {
+  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
+  if (!guard?.policies.available) return c.json({ error: "Delivery policy unavailable" }, 503);
+  try {
+    const target = guard.target(c.req.param("seatRef"));
+    const deferred = (c.get("sessionTransport" as never) as SessionTransport | undefined)?.deferredDelivery;
+    return c.json({ ...guard.policies.get(target.nodeId), deliveries: deferred?.inspect(target.nodeId) ?? [] });
+  } catch (error) { return c.json({ error: (error as Error).message }, 409); }
+});
 
 // S09 is an independent delivery preference, never a lifecycle or permission change.
 seatRoutes.post("/set-typing-guard/:seatRef", async c => {
@@ -45,13 +73,18 @@ seatRoutes.get("/held-messages/:seatRef", c => {
   try {
     const target = guard.target(c.req.param("seatRef"));
     const outbox = new OutboxHandler(guard.db);
+    const deferred = (c.get("sessionTransport" as never) as SessionTransport | undefined)?.deferredDelivery;
     const id = c.req.query("id");
     if (id) {
       const entry = outbox.getById(id);
       if (entry?.guardBinding?.nodeId !== target.nodeId) return c.json({ error: "No retained history for this node and ID" }, 404);
-      return c.json({ entry });
+      return c.json({ entry, ...(deferred?.lookup(id) ? { delivery: deferred.lookup(id) } : {}) });
     }
-    return c.json(outbox.heldForNode(target.nodeId, Number(c.req.query("limit") ?? 100), Number(c.req.query("offset") ?? 0)));
+    const page = outbox.heldForNode(target.nodeId, Number(c.req.query("limit") ?? 100), Number(c.req.query("offset") ?? 0));
+    return c.json({ ...page, items: page.items.map(entry => {
+      const delivery = deferred?.lookup(entry.outboxId);
+      return delivery ? { ...entry, delivery } : entry;
+    }) });
   } catch (error) { return c.json({ error: (error as Error).message }, 400); }
 });
 
@@ -65,7 +98,9 @@ seatRoutes.post("/retire-held-message/:seatRef/:id", async c => {
     const target = guard.target(c.req.param("seatRef"));
     const outbox = new OutboxHandler(guard.db); const id = c.req.param("id");
     if (outbox.getById(id)?.guardBinding?.nodeId !== target.nodeId) return c.json({ error: "No held message for this node and ID" }, 404);
-    return c.json({ entry: outbox.retire(id, actor, body.reason), effect: "Retired from active quota; evidence preserved. No delivery, native consumption or work closure is asserted." });
+    const entry = outbox.retire(id, actor, body.reason);
+    (c.get("sessionTransport" as never) as SessionTransport | undefined)?.deferredDelivery?.retired(id);
+    return c.json({ entry, effect: "Retired from active quota; evidence preserved. No delivery, native consumption or work closure is asserted." });
   } catch (error) { return c.json({ error: (error as Error).message }, 409); }
 });
 
@@ -77,7 +112,7 @@ seatRoutes.get("/status/:seatRef", (c) => {
   if (result.ok) {
     const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter | undefined)?.deliveryGuard;
     const target = guard?.maybeTarget(c.req.param("seatRef")!);
-    return c.json({ ...result.status, ...(guard && target ? { typingGuard: {
+    return c.json({ ...result.status, ...(guard && target ? { deliveryPolicy: guard.policies.get(target.nodeId), typingGuard: {
       ...guard.preference(target.nodeId), heldCount: new OutboxHandler(guard.db).heldForNode(target.nodeId, 1).total,
     } } : {}) });
   }

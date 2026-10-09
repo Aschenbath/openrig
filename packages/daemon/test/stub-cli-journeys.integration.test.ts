@@ -75,6 +75,28 @@ describe("stub CLI journeys", () => {
     // Exact arrays, not subset matches: an extra sibling is a failure.
   }, 60_000);
 
+  it("inbox-only policy retains a CLI send outside its pane and exposes its original ID", async () => {
+    const marker = `inbox-only-${randomUUID()}`;
+    try {
+      const policy = await cli(["seat", "set-delivery-policy", recipient, "--mode", "inbox-only", "--reason", "fixture manual input", "--json"]);
+      expect(policy).toMatchObject({ effective: { mode: "inbox-only" }, pending: false });
+      const receipt = await cli(["send", recipient, marker, "--verify", "--json"]);
+      expect(receipt).toMatchObject({ outcome: "retained", sent: false, verified: false });
+      expect(receipt.outboxIds).toHaveLength(1);
+      const id = receipt.outboxIds[0];
+      const retained = await cli(["seat", "held-messages", recipient, "--id", id, "--json"]);
+      expect(retained.entry).toMatchObject({ outboxId: id, deliveryState: "retained", destinationSession: recipient });
+      expect(retained.entry.body).toContain(marker);
+      expect(JSON.stringify(await cli(["capture", recipient, "--json"]))).not.toContain(marker);
+      expect(await cli(["seat", "delivery-policy", sender, "--json"])).toMatchObject({ effective: { mode: "automatic" } });
+      await cli(["seat", "retire-held-message", recipient, id, "--reason", "reviewed outside terminal", "--json"]);
+      expect((await cli(["seat", "held-messages", recipient, "--id", id, "--json"])).entry.deliveryState).toBe("retired");
+    } finally {
+      await cli(["seat", "set-delivery-policy", recipient, "--mode", "automatic", "--reason", "fixture cleanup", "--json"]);
+    }
+    expect(JSON.stringify(await cli(["capture", recipient, "--json"]))).not.toContain(marker);
+  }, 60_000);
+
   it("replays one exact stream item after restart and an idempotent emit retry", async () => {
     const id = `journey-${randomUUID()}`;
     const tag = `journey-tag-${randomUUID()}`;

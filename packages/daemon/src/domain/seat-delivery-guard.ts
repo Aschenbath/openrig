@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type Database from "better-sqlite3";
+import { SeatDeliveryPolicyStore, type VersionedDeliveryPolicy } from "./seat-delivery-policy.js";
+import { composerContainsOwnedText, inspectComposerInput, ownCollapsedPaste, type ComposerSnapshot } from "./composer-input.js";
 
 /** A binding is captured before waiting. Never rebind an old operation to a new occupant. */
 export interface GuardTarget {
@@ -14,6 +16,10 @@ interface Lease {
   active: boolean;
   origin: "automatic" | "human";
   lifecycle?: boolean;
+  freshLifecycle?: boolean;
+  policy?: VersionedDeliveryPolicy;
+  humanEpoch: number;
+  staged?: { text: string; collapsedPaste: string | null };
 }
 
 export class DeliveryGuardError extends Error {
@@ -40,11 +46,20 @@ export class SeatDeliveryGuard {
   private readonly tails = new Map<string, Promise<void>>();
   private readonly scope = new AsyncLocalStorage<Map<string, Lease>>();
   private readonly humanLeases = new Set<Lease>();
+  private readonly humanEpochs = new Map<string, number>();
+  private inspectInput?: (target: GuardTarget) => Promise<ComposerSnapshot | null>;
+  private inputAbsent?: (target: GuardTarget) => Promise<boolean>;
+  readonly policies: SeatDeliveryPolicyStore;
 
   constructor(
     readonly db: Database.Database,
     private readonly resolve: (target: string) => GuardTarget | null,
-  ) {}
+  ) { this.policies = new SeatDeliveryPolicyStore(db); }
+
+  attachInputInspection(inspect: (target: GuardTarget) => Promise<ComposerSnapshot | null>, absent: (target: GuardTarget) => Promise<boolean>): void {
+    this.inspectInput = inspect;
+    this.inputAbsent = absent;
+  }
 
   /** Startup-only, before exposing routes or starting writers. A stopped operation cannot
    * retain an in-memory lease. Persisted desired protection applies at the new boundary. */
@@ -53,6 +68,12 @@ export class SeatDeliveryGuard {
       this.db.prepare("UPDATE seat_delivery_guards SET effective = desired WHERE effective != desired").run();
       this.db.prepare("UPDATE seat_delivery_guard_changes SET effective_at = ? WHERE effective_at IS NULL")
         .run(new Date().toISOString());
+      this.policies.recoverActivation(new Date().toISOString());
+      if (this.policies.available) {
+        for (const row of this.db.prepare("SELECT node_id FROM seat_delivery_guards WHERE desired=1").all() as Array<{ node_id: string }>) {
+          this.policies.holdPending(row.node_id, "typing_guard_enabled");
+        }
+      }
     })();
   }
 
@@ -101,6 +122,7 @@ export class SeatDeliveryGuard {
       this.db.transaction(() => {
         // Later requests are serialized too. Apply each accepted transition, in order.
         this.db.prepare("UPDATE seat_delivery_guards SET effective = ? WHERE node_id = ?").run(Number(enabled), nodeId);
+        if (enabled) this.policies.holdPending(nodeId, "typing_guard_enabled");
         this.db.prepare("UPDATE seat_delivery_guard_changes SET effective_at = ? WHERE id = ?")
           .run(new Date().toISOString(), change);
       })();
@@ -110,6 +132,23 @@ export class SeatDeliveryGuard {
       await Promise.race([activation, new Promise<void>(resolve => { timer = setTimeout(resolve, timeoutMs); })]);
       return this.preference(nodeId);
     } finally { if (timer) clearTimeout(timer); }
+  }
+
+  async setPolicy(nodeId: string, value: unknown, actor: string, reason: string, timeoutMs = 2000) {
+    const desired = this.policies.request(nodeId, value, actor, reason, new Date().toISOString());
+    const activation = this.serial(nodeId, async () => {
+      this.policies.activate(nodeId, desired, new Date().toISOString());
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([activation, new Promise<void>(resolve => { timer = setTimeout(resolve, timeoutMs); })]);
+      return this.policies.get(nodeId);
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
+  operationPolicy(name: string): VersionedDeliveryPolicy {
+    const target = this.target(name);
+    return this.scope.getStore()?.get(target.nodeId)?.policy ?? this.policies.get(target.nodeId).effective;
   }
 
   /** fn must include lifecycle preflight, effects and last write. Retention callbacks
@@ -125,11 +164,13 @@ export class SeatDeliveryGuard {
       const current = this.target(name);
       if (!this.same(bound, current)) throw new DeliveryGuardError("guard_target_changed", "Input target changed while waiting; no input written.");
       const pref = this.preference(bound.nodeId);
-      if (pref.effective || pref.desired) {
+      const policy = this.policies.get(bound.nodeId);
+      if (pref.effective || pref.desired || policy.desired.mode === "inbox-only" || policy.effective.mode === "inbox-only") {
         if (held) return held(bound);
-        throw new DeliveryGuardError("typing_guard_enabled", "Automatic input is paused for this seat. Disable its typing guard explicitly before this writing operation.");
+        throw new DeliveryGuardError("typing_guard_enabled", "Automatic input is paused for this seat. Disable its typing guard or inbox-only policy explicitly before this writing operation.");
       }
-      const lease: Lease = { target: bound, active: true, origin: "automatic" };
+      const lease: Lease = { target: bound, active: true, origin: "automatic", humanEpoch: this.humanEpochs.get(bound.nodeId) ?? 0,
+        policy: policy.desired.mode === "draft-aware" ? policy.desired : policy.effective };
       try { return await this.scope.run(new Map([...(this.scope.getStore() ?? []), [lease.target.nodeId, lease]]), fn); }
       finally { lease.active = false; }
     });
@@ -151,6 +192,14 @@ export class SeatDeliveryGuard {
       if (this.ownsLifecycle(id)) return acquire(index + 1);
       return this.operation(id, async () => {
         const lease = this.scope.getStore()!.get(id)!;
+        if (lease.policy?.mode === "draft-aware") {
+          // Only a positively absent input may receive fresh startup/resume writes.
+          // An active protected seat requires an explicit policy change first.
+          const absent = !lease.target.pane || await this.inputAbsent?.(lease.target) === true;
+          this.assertCurrent(id, lease);
+          if (!absent) throw new DeliveryGuardError("draft_aware_lifecycle", "This active seat uses draft-aware delivery. Select automatic delivery before a writing lifecycle operation; held messages are not replayed.");
+          lease.freshLifecycle = true;
+        }
         lease.lifecycle = true;
         return acquire(index + 1);
       });
@@ -178,6 +227,60 @@ export class SeatDeliveryGuard {
     const lease = this.scope.getStore()?.get(target.nodeId);
     if (!lease) throw new DeliveryGuardError("guard_lease_required", "Input requires an active operation lease.");
     this.assertCurrent(name, lease);
+    if (lease.origin === "automatic" && !lease.freshLifecycle && lease.policy?.mode === "draft-aware"
+      && lease.humanEpoch !== (this.humanEpochs.get(target.nodeId) ?? 0)) {
+      throw new DeliveryGuardError("draft_input_changed", "Human input arrived during this delivery. No further automatic input was written.");
+    }
+  }
+
+  needsInputCheck(name: string): boolean {
+    const target = this.maybeTarget(name);
+    if (!target) return false; // Proven private probes have no managed-seat policy.
+    const lease = this.scope.getStore()?.get(target.nodeId);
+    return !!lease?.active && lease.origin === "automatic" && !lease.freshLifecycle && lease.policy?.mode === "draft-aware";
+  }
+
+  /** Called at the paste/key boundary after file and buffer preparation. */
+  async beforeInput(name: string, submit = false): Promise<void> {
+    if (!this.needsInputCheck(name)) return;
+    const target = this.target(name);
+    const lease = this.scope.getStore()!.get(target.nodeId)!;
+    const snapshot = await this.inspectInput?.(target).catch(() => null) ?? null;
+    this.checkInput(name);
+    const input = inspectComposerInput(snapshot);
+    if (input.state === "unknown") throw new DeliveryGuardError("draft_input_unknown", "The current input cannot be read. Automatic delivery is held.");
+    if (submit) {
+      const owned = lease.staged && (composerContainsOwnedText(input, lease.staged.text)
+        || !!lease.staged.collapsedPaste && input.cursorAtEnd && input.collapsedPaste === lease.staged.collapsedPaste);
+      if (!owned) throw new DeliveryGuardError("draft_input_changed", "The input no longer contains only this delivery's staged text. Enter was not sent.");
+    } else if (input.state !== "empty") {
+      throw new DeliveryGuardError("draft_input_busy", "The seat has an unsubmitted input. Automatic delivery is held.");
+    }
+  }
+
+  expectStagedInput(name: string, text: string): void {
+    if (!this.needsInputCheck(name)) return;
+    const target = this.target(name);
+    this.scope.getStore()!.get(target.nodeId)!.staged = { text, collapsedPaste: null };
+  }
+
+  async notePasted(name: string, text: string): Promise<void> {
+    try {
+      if (!this.needsInputCheck(name)) return;
+      const target = this.target(name);
+      const lease = this.scope.getStore()!.get(target.nodeId)!;
+      lease.staged = { text, collapsedPaste: null };
+      const snapshot = await this.inspectInput?.(target).catch(() => null) ?? null;
+      lease.staged.collapsedPaste = ownCollapsedPaste(inspectComposerInput(snapshot), text);
+    } catch { /* Observation cannot turn a completed paste into a claimed no-write failure. */ }
+  }
+
+  noteSubmitted(name: string): void {
+    try {
+      const target = this.maybeTarget(name);
+      const lease = target && this.scope.getStore()?.get(target.nodeId);
+      if (lease) lease.staged = undefined;
+    } catch { /* Enter already succeeded. */ }
   }
 
   /** Reconciliation is a synchronous DB transaction, not a nested input operation.
@@ -191,7 +294,8 @@ export class SeatDeliveryGuard {
       throw new DeliveryGuardError("guard_operation_in_progress", "Seat operation in progress; reconciliation did not change custody. Retry after it finishes.");
     }
     const pref = this.preference(expected.nodeId);
-    if (pref.desired || pref.effective) {
+    const policy = this.policies.get(expected.nodeId);
+    if (pref.desired || pref.effective || policy.desired.mode !== "automatic" || policy.effective.mode !== "automatic") {
       throw new DeliveryGuardError("typing_guard_enabled", "Reconciliation cannot replace the occupant while typing protection is enabled.");
     }
     return commit();
@@ -207,7 +311,9 @@ export class SeatDeliveryGuard {
   /** Internal broker path only; never an option accepted by the send HTTP route. */
   async humanInput<T>(name: string, fn: () => Promise<T>): Promise<T> {
     const target = this.target(name);
-    const lease: Lease = { target, active: true, origin: "human" };
+    const humanEpoch = (this.humanEpochs.get(target.nodeId) ?? 0) + 1;
+    this.humanEpochs.set(target.nodeId, humanEpoch);
+    const lease: Lease = { target, active: true, origin: "human", humanEpoch };
     this.humanLeases.add(lease);
     try { return await this.scope.run(new Map([...(this.scope.getStore() ?? []), [lease.target.nodeId, lease]]), fn); }
     finally { lease.active = false; this.humanLeases.delete(lease); }

@@ -25,6 +25,11 @@ interface SeatStatusResponse {
   runtime: string | null;
   current_occupant: string | null;
   typingGuard?: { desired: boolean; effective: boolean; pending: boolean; heldCount: number };
+  deliveryPolicy?: {
+    desired: { mode: string; holdSeconds: number; maxAttempts: number };
+    effective: { mode: string; holdSeconds: number; maxAttempts: number };
+    pending: boolean;
+  };
   permissions?: {
     selectionState: "explicit" | "inherit" | "unknown";
     desired: { mode: string } | null;
@@ -159,6 +164,11 @@ function printHuman(status: SeatStatusResponse): void {
     console.log(`Typing guard: ${g.effective ? "on" : "off"}${g.pending ? ` (activation pending; requested ${g.desired ? "on" : "off"})` : ""}; ${g.heldCount} retained`);
     console.log("Automatic input pauses while on, including writing lifecycle. Disabling does not replay held messages.");
   }
+  if (status.deliveryPolicy) {
+    const policy = status.deliveryPolicy;
+    console.log(`Delivery policy: ${policy.effective.mode}${policy.pending ? ` (activation pending; requested ${policy.desired.mode})` : ""}`);
+    if (policy.effective.mode === "draft-aware") console.log(`Draft hold: ${policy.effective.holdSeconds}s, at most ${policy.effective.maxAttempts} attempts; inspect with rig seat delivery-policy ${status.seat_ref}.`);
+  }
   console.log(`Session: ${display(status.session_status, "unknown")}`);
   if (status.permissions) {
     const p = status.permissions;
@@ -288,6 +298,49 @@ export function seatCommand(depsOverride?: SeatDeps & { readStdin?: () => Promis
     console.log(JSON.stringify(result.data, null, json ? undefined : 2));
     if (result.status >= 400) process.exitCode = result.status >= 500 ? 2 : 1;
   };
+  cmd.command("set-delivery-policy").argument("<seat>")
+    .requiredOption("--mode <mode>", "automatic, draft-aware or inbox-only")
+    .option("--hold-seconds <n>", "Draft hold deadline, 1–3600 seconds (default: 120)")
+    .option("--max-attempts <n>", "Total delivery attempts, 1–100 (default: 10)")
+    .requiredOption("--reason <text>", "Reason recorded with the per-seat preference").option("--json")
+    .description("Choose automatic delivery, bounded draft-aware retry, or inbox-only retention for one seat")
+    .addHelpText("after", `
+Automatic is the default. Draft-aware checks the current Claude/Codex input before
+paste and again before Enter. Drafts or unreadable input defer the original message;
+the hold deadline and attempt cap end retries without typing a final warning.
+Inbox-only retains messages without automatic terminal input, even at an empty prompt.
+Direct human input and other seats keep their existing behavior.
+
+Run from a seat shell with OPENRIG_SESSION_NAME set for the preference audit.
+Inspect requested/effective activation and attempts with rig seat delivery-policy <seat>.
+Read bodies with rig seat held-messages <seat> --id <id>. Repeating a delivery ID
+reads its existing result; uncertain writes are never automatically replayed.
+Changing policy or enabling the manual typing guard ends older retries. Returning
+to automatic or disabling the guard does not flush held messages.
+Writing lifecycle operations on an active protected seat require automatic mode;
+fresh startup with proven absent input retains its existing lifecycle checks.
+
+Examples:
+  rig seat set-delivery-policy dev-impl@my-rig --mode draft-aware --reason "preserve my draft"
+  rig seat set-delivery-policy dev-impl@my-rig --mode inbox-only --reason "manual terminal"
+`)
+    .action(async (seat: string, opts: { mode: string; holdSeconds?: string; maxAttempts?: string; reason: string; json?: boolean }) => {
+      const holdSeconds = opts.holdSeconds === undefined ? undefined : Number(opts.holdSeconds);
+      const maxAttempts = opts.maxAttempts === undefined ? undefined : Number(opts.maxAttempts);
+      if (!["automatic", "draft-aware", "inbox-only"].includes(opts.mode)
+        || holdSeconds !== undefined && (!Number.isInteger(holdSeconds) || holdSeconds < 1 || holdSeconds > 3600)
+        || maxAttempts !== undefined && (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 100)) {
+        console.error("Use --mode automatic|draft-aware|inbox-only, --hold-seconds 1–3600 and --max-attempts 1–100.");
+        process.exitCode = 1; return;
+      }
+      await guardRequest("POST", `/api/seat/set-delivery-policy/${encodeURIComponent(seat)}`,
+        { mode: opts.mode, ...(holdSeconds !== undefined ? { holdSeconds } : {}), ...(maxAttempts !== undefined ? { maxAttempts } : {}), reason: opts.reason }, opts.json);
+    });
+  cmd.command("delivery-policy").argument("<seat>").option("--json")
+    .description("Inspect requested/effective policy and the latest 100 delivery states, attempts and deadlines")
+    .action(async (seat: string, opts: { json?: boolean }) => {
+      await guardRequest("GET", `/api/seat/delivery-policy/${encodeURIComponent(seat)}`, undefined, opts.json);
+    });
   cmd.command("set-typing-guard").argument("<seat>").requiredOption("--enabled <boolean>", "true pauses all automatic terminal input; false permits new sends")
     .requiredOption("--reason <text>").option("--json").description("Protect this seat's draft by retaining automatic delivery, even at an empty prompt")
     .addHelpText("after", `

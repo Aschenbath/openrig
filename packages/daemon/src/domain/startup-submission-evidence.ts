@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 const normalize = (text: string): string => text.replace(/\s+/g, "");
 // Claude 2.1.289 briefly replaces its mode bar after a bracketed paste.
 // Only the bare hint and medium-effort suffix are established by retained captures.
-const isComposerFooter = (line: string): boolean => /(?:shift\+tab to cycle|\? for shortcuts)/i.test(line)
+export const isComposerFooter = (line: string): boolean => /(?:shift\+tab to cycle|\? for shortcuts)/i.test(line)
   || /^paste again to expand(?:\s{2,}◐ medium · \/effort)?$/.test(line);
 // This placeholder occupies an empty composer while submitted text is queued.
 const QUEUED_PLACEHOLDER = normalize("Press up to edit queued messages");

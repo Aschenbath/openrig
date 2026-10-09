@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { inspectStartupStagedText, startupSubmissionEvidence, type StartupSubmissionEvidence } from "./startup-submission-evidence.js";
 export { inspectStartupStagedText } from "./startup-submission-evidence.js";
 import { OutboxHandler } from "./outbox-handler.js";
+import { DraftAwareDelivery, type DeferredDeliverySummary } from "./draft-aware-delivery.js";
+import type { OutboxEntry } from "./outbox-handler.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
@@ -690,6 +692,12 @@ function promptAnswerStaged(pane: string | null, answer: string, runtime: string
 }
 
 export interface SendOpts {
+  /** Internal provenance derived by the authenticated transport route. */
+  identityProvenance?: string;
+  /** Internal wake provenance, never accepted from the public transport route. */
+  queueWake?: boolean;
+  /** Internal observation of a completed input effect; never a permission callback. */
+  onInputEffect?: (phase: "pasted" | "submitted") => void;
   /** Internal managed lifecycle prerequisite; never accepted from HTTP send options. */
   beforeWrite?: () => void;
   /** Stable caller request ID, reused for readback after transport uncertainty. */
@@ -771,6 +779,7 @@ export interface SendResult {
    */
   outcome?: "delivered" | "rendered-unconfirmed" | "failed" | "retained";
   outboxIds?: string[];
+  delivery?: DeferredDeliverySummary;
   warning?: string;
   error?: string;
   reason?: string;
@@ -828,6 +837,7 @@ interface AbsenceProbeTarget { session_id: string; node_id: string; session_name
 
 export class SessionTransport {
   readonly db: Database.Database;
+  readonly deferredDelivery?: DraftAwareDelivery;
   private rigRepo: RigRepository;
   private sessionRegistry: SessionRegistry;
   private tmuxAdapter: TmuxAdapter;
@@ -857,6 +867,13 @@ export class SessionTransport {
     this.activityEndpointFile = deps.activityEndpointFile ?? (() => null);
     this.captureObserver = deps.captureObserver;
     this.listProcesses = deps.listProcesses;
+    const guard = this.tmuxAdapter.deliveryGuard;
+    if (guard?.policies.available) this.deferredDelivery = new DraftAwareDelivery(this.db, guard,
+      (session, text, opts) => this.sendUnguarded(session, text, opts), this.now);
+  }
+
+  configureDeferredWakes(applicable: (entries: readonly OutboxEntry[]) => boolean, observed: (entries: readonly OutboxEntry[], result: SendResult) => void): void {
+    this.deferredDelivery?.configureWakes(applicable, observed);
   }
 
   /** Freeze the registration and binding before asking tmux about this name. */
@@ -1149,7 +1166,16 @@ export class SessionTransport {
     const target = guard?.maybeTarget(sessionName);
     if (!guard || !target) return null;
     const pref = guard.preference(target.nodeId);
-    return pref.desired || pref.effective ? target : null;
+    const policy = guard.policies.get(target.nodeId);
+    return pref.desired || pref.effective || policy.desired.mode === "inbox-only" || policy.effective.mode === "inbox-only" ? target : null;
+  }
+
+  draftAwareTarget(sessionName: string) {
+    const guard = this.tmuxAdapter.deliveryGuard;
+    const target = guard?.maybeTarget(sessionName);
+    if (!guard || !target) return null;
+    const policy = guard.policies.get(target.nodeId);
+    return policy.desired.mode === "draft-aware" || policy.effective.mode === "draft-aware" ? target : null;
   }
 
   async send(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
@@ -1157,8 +1183,8 @@ export class SessionTransport {
     if (!guard) return this.sendUnguarded(sessionName, text, opts);
     const outbox = new OutboxHandler(this.db);
     const ids = opts?.committedOutboxIds ?? [opts?.deliveryId ?? `guard-send-${randomUUID()}`];
-    const retainedResult = (): SendResult => ({ ok: true, sessionName, outcome: "retained", sent: false, verified: false,
-      outboxIds: ids, reason: "typing_guard_enabled", warning: `Retained, not delivered. Inspect with rig seat held-messages ${sessionName}; disabling does not replay held messages.` });
+    const retainedResult = (reason = "typing_guard_enabled"): SendResult => ({ ok: true, sessionName, outcome: "retained", sent: false, verified: false,
+      outboxIds: ids, reason, warning: `Retained, not delivered. Inspect with rig seat held-messages ${sessionName}; changing protection does not replay held messages.` });
     try {
       if (opts?.committedOutboxIds) {
         const target = guard.target(sessionName);
@@ -1170,6 +1196,8 @@ export class SessionTransport {
           }
         }
       }
+      const existing = this.deferredDelivery?.existing(sessionName, text, opts ?? {}, ids);
+      if (existing) return existing;
       // Idempotent readback also after disabling: an old retained ID never becomes a new send.
       // (P2: this readback is NOT a new retention and is outside the retained_no_write seam.)
       if (!opts?.committedOutboxIds && opts?.deliveryId) {
@@ -1181,7 +1209,15 @@ export class SessionTransport {
           if (prior.deliveryState === "retained" || prior.deliveryState === "retired") return retainedResult();
         }
       }
-      return await guard.operation(sessionName, () => this.sendUnguarded(sessionName, text, opts), async target => {
+      return await guard.operation(sessionName, async () => {
+        if (this.deferredDelivery && !opts?.submitOnly && guard.needsInputCheck(sessionName)) {
+          return this.deferredDelivery.send(sessionName, text, opts ?? {}, ids);
+        }
+        const prior = this.deferredDelivery?.existing(sessionName, text, opts ?? {}, ids);
+        return prior ?? this.sendUnguarded(sessionName, text, opts);
+      }, async target => {
+        const prior = this.deferredDelivery?.existing(sessionName, text, opts ?? {}, ids);
+        if (prior) return prior;
         if (opts?.submitOnly) return { ok: false, sessionName, sent: false, reason: "typing_guard_enabled", error: "Typing guard prevents submit-only; no Enter was sent." };
         this.db.transaction(() => {
           for (const id of ids) {
@@ -1189,6 +1225,7 @@ export class SessionTransport {
             if (opts?.committedOutboxIds && (!prior || prior.destinationSession !== sessionName)) throw new Error("Committed wake target/ID mismatch");
             outbox.retain(prior ? { ...prior, outboxId: id, tags: prior.tags ?? undefined, auditPointer: prior.auditPointer ?? undefined } : {
               outboxId: id, senderSession: opts?.actorSession ?? "unknown", destinationSession: sessionName, body: text, auditPointer: opts?.auditPointer,
+              identityProvenance: opts?.identityProvenance,
             }, target, !!opts?.committedOutboxIds);
           }
         })();
@@ -1207,7 +1244,8 @@ export class SessionTransport {
             completedAt: this.now().toISOString(),
           });
         }
-        return retainedResult();
+        const preference = guard.preference(target.nodeId);
+        return retainedResult(preference.desired || preference.effective ? "typing_guard_enabled" : "inbox_only");
       });
     } catch (error) {
       return { ok: false, sessionName, sent: false, reason: (error as { code?: string }).code ?? "guard_unavailable", error: (error as Error).message };
@@ -1381,6 +1419,7 @@ export class SessionTransport {
           error: `submitOnly refused: the pane of '${sessionName}' does not show the expected staged text — pressing Enter here could drive something else entirely. Nothing was submitted.`,
         };
       }
+      this.tmuxAdapter.deliveryGuard?.expectStagedInput(sessionName, expected);
       const targetFailure = await checkClaudeTarget();
       if (targetFailure) return targetFailure;
       const submitResult = await this.runStage(
@@ -1391,6 +1430,7 @@ export class SessionTransport {
       if (!submitResult.ok) {
         return { ok: false, sessionName, reason: "submit_failed", outcome: "failed", error: `submitOnly: Enter did not land on '${sessionName}': ${submitResult.message}` };
       }
+      try { opts.onInputEffect?.("submitted"); } catch { /* Observation cannot change an input result. */ }
       return observe({ ok: true, sessionName, outcome: "rendered-unconfirmed", submitOnly: true });
     }
 
@@ -1544,15 +1584,17 @@ export class SessionTransport {
       (result) => result.ok ? "ok" : "failed",
     );
     if (!textResult.ok) {
+      const policyRefusal = textResult.code.startsWith("draft_");
       return observe({
         ok: false,
         sessionName,
-        reason: "send_failed",
+        reason: policyRefusal ? textResult.code : "send_failed",
         outcome: "failed",
         error: `Failed to send text to '${sessionName}': ${textResult.message}`,
-        ...(waitMode ? { sent: false, ...waitEvidence } : {}),
+        ...(waitMode || policyRefusal ? { sent: false, ...waitEvidence } : {}),
       });
     }
+    try { opts?.onInputEffect?.("pasted"); } catch { /* Observation cannot change a completed paste. */ }
 
     // 4. Wait 200ms (spike-proven delay)
     await this.sleep(200);
@@ -1577,15 +1619,17 @@ export class SessionTransport {
       (result) => result.ok ? "ok" : "failed",
     );
     if (!submitResult.ok) {
+      const policyRefusal = submitResult.code.startsWith("draft_");
       return observe({
         ok: false,
         sessionName,
-        reason: "submit_failed",
+        reason: policyRefusal ? submitResult.code : "submit_failed",
         outcome: "failed",
         error: `Text is visible in '${sessionName}' but was not submitted (Enter failed). The agent may need manual attention.`,
-        ...(waitMode ? { sent: true, ...waitEvidence } : {}),
+        ...(waitMode || policyRefusal ? { sent: true, ...waitEvidence } : {}),
       });
     }
+    try { opts?.onInputEffect?.("submitted"); } catch { /* Observation cannot change a completed submission. */ }
 
     const interaction = promptOverride ? { promptInteraction: "enter-sent" as const } : {};
 

@@ -95,7 +95,12 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
    (`send`, `:1155`). With the seat's typing guard on, the message is held
    instead of typed: the result is `outcome: "retained"` with HTTP 200
    (`routes/transport.ts:115`); operators use `rig seat set-typing-guard` and
-   `rig seat held-messages`.
+   `rig seat held-messages`. The separate per-seat delivery policy defaults to
+   `automatic`. `inbox-only` uses the same no-input retention boundary;
+   `draft-aware` uses `DraftAwareDelivery` to retain original outbox identities
+   and schedule bounded retries when the cursor-bound input is unavailable.
+   The durable request and member mapping live beside the existing outbox in
+   migration `099_seat_delivery_policy`; no replacement queue item is created.
 3. Classify send readiness. Only a positive interactive-prompt reading
    (`needs_input`) refuses, with `target_needs_input`
    (`session-transport.ts:1482`), unless the caller passes
@@ -118,6 +123,13 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
    without `-p` (`session-transport.ts:1541`) and Enter is pressed only if the
    whole answer is still staged (`:1562`–`1570`). A successful paste proves
    transport execution, not runtime consumption.
+   For draft-aware seats, `TmuxAdapter` checks the current composer after buffer
+   preparation and again immediately before keys. The delivery lease records
+   the pasted text and any observed collapsed-paste label; Enter requires that
+   owned input. A late human input, ambiguous write, changed recipient or stopped
+   queue wake ends automatic retry. Unicode cell widths use the daemon's direct
+   `string-width` dependency. See [per-seat terminal delivery](../../reference/seat-delivery.md)
+   for activation, persistence, inspection and lifecycle tradeoffs.
 5. Optional `--verify`: capture the last 30 pane lines before and after the
    send (after a 500 ms wait, `:1597`) and count the message's first 40
    characters in each. A higher count after the send reports

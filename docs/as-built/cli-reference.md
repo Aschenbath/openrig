@@ -858,6 +858,8 @@ Root: `rig`; declared option: `-V, --version`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig seat` | — | — |
+| `rig seat set-delivery-policy <seat>` | — | `--mode <mode>` **required**<br>`--hold-seconds <n>`<br>`--max-attempts <n>`<br>`--reason <text>` **required**<br>`--json` |
+| `rig seat delivery-policy <seat>` | — | `--json` |
 | `rig seat set-typing-guard <seat>` | — | `--enabled <boolean>` **required**<br>`--reason <text>` **required**<br>`--json` |
 | `rig seat held-messages <seat>` | — | `--limit <n>`<br>`--offset <n>`<br>`--id <id>`<br>`--json` |
 | `rig seat retire-held-message <seat> <id>` | — | `--reason <text>` **required**<br>`--json` |
@@ -872,6 +874,9 @@ Root: `rig`; declared option: `-V, --version`.
 | `rig seat stop <seat>` | — | `--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
 | `rig seat clean <seat>` | — | `--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
 | `rig seat set-resume-token <session>` | — | `--token-stdin`<br>`--reason <text>` **required**<br>`--json` |
+
+See [per-seat terminal delivery](../reference/seat-delivery.md) for automatic,
+draft-aware and inbox-only modes, bounded retries and held-message inspection.
 
 ### handover
 

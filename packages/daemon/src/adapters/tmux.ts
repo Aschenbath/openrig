@@ -3,6 +3,7 @@ import { writeFile as fsWriteFile, unlink as fsUnlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { randomUUID } from "node:crypto";
+import type { ComposerSnapshot } from "../domain/composer-input.js";
 
 export type ExecFn = (cmd: string) => Promise<string>;
 
@@ -312,7 +313,19 @@ function parseLines<T>(output: string, parser: (line: string) => T | null): T[] 
 }
 
 export class TmuxAdapter {
-  deliveryGuard?: SeatDeliveryGuard;
+  private inputGuard?: SeatDeliveryGuard;
+  get deliveryGuard(): SeatDeliveryGuard | undefined { return this.inputGuard; }
+  set deliveryGuard(guard: SeatDeliveryGuard | undefined) {
+    this.inputGuard = guard;
+    guard?.attachInputInspection(target => this.captureComposerSnapshot(target.pane ?? target.session), async target => {
+      if (!target.pane) return true;
+      const probe = await this.probeSession(target.session);
+      if (probe.state === "absent") return true;
+      if (probe.state !== "present") return false;
+      const panes = await this.listPanes(target.session);
+      return panes.length === 1 && panes[0]!.id === target.pane && await this.isPaneDead(target.pane);
+    });
+  }
   private readonly freshProbes = new Map<string, string>();
   private readonly freshManaged = new Map<string, {nodeId: string; pane: string}>();
 
@@ -365,7 +378,7 @@ export class TmuxAdapter {
     }
   }
 
-  private async guardedInput(target: string, write: (pane: string, beforeWrite: () => void) => Promise<TmuxResult>, allowAbsent = false): Promise<TmuxResult> {
+  private async guardedInput(target: string, write: (pane: string, beforeWrite: () => void) => Promise<TmuxResult>, allowAbsent = false, inputKind: "control" | "text" | "keys" = "control"): Promise<TmuxResult> {
     const guard = this.deliveryGuard;
     if (!guard) return write(target, () => {});
     try {
@@ -404,6 +417,7 @@ export class TmuxAdapter {
         }
         const pane = fresh ? created.pane : bound.pane;
         if (!pane || panes.length !== 1 || panes[0]!.id !== pane) throw new Error("Managed pane identity unavailable or changed; no input written.");
+        if (inputKind === "control" && guard.needsInputCheck(identity)) await guard.beforeInput(identity);
         // Revalidate registry/occupant after the asynchronous observation. Write
         // to the immutable pane ID, not a session name which could be recycled.
         return guard.input(identity, () => write(pane, () => guard.checkInput(identity)));
@@ -604,10 +618,19 @@ export class TmuxAdapter {
    * seats from colliding.
    */
   async sendText(target: string, text: string, beforeInput?: () => void, options?: { bracketed?: boolean }): Promise<TmuxResult> {
-    return this.guardedInput(target, (pane, beforeWrite) => this.sendTextUnchecked(pane, text, () => { beforeWrite(); beforeInput?.(); }, options?.bracketed));
+    return this.guardedInput(target, (pane, beforeWrite) => {
+      const guard = this.deliveryGuard;
+      const identity = this.freshManaged.get(target)?.nodeId ?? target;
+      const policy = guard?.needsInputCheck(identity) ? {
+        beforePaste: () => guard.beforeInput(identity),
+        afterPaste: () => guard.notePasted(identity, text),
+      } : undefined;
+      return this.sendTextUnchecked(pane, text, () => { beforeWrite(); beforeInput?.(); }, options?.bracketed, policy);
+    }, false, "text");
   }
 
-  private async sendTextUnchecked(target: string, text: string, beforeWrite: () => void, bracketed = true): Promise<TmuxResult> {
+  private async sendTextUnchecked(target: string, text: string, beforeWrite: () => void, bracketed = true,
+    policy?: { beforePaste: () => Promise<void>; afterPaste: () => Promise<void> }): Promise<TmuxResult> {
     const path = this.fileOps.tmpName();
     const buffer = this.fileOps.bufferName();
     let bufferLoaded = false;
@@ -618,12 +641,14 @@ export class TmuxAdapter {
       await this.run(["tmux", "load-buffer", "-b", buffer, path],
         `tmux load-buffer -b ${shellQuote(buffer)} ${shellQuote(path)}`);
       bufferLoaded = true;
+      if (policy) await policy.beforePaste();
       beforeWrite();
       // Explicit prompt answers need key input, not bracketed-paste framing.
       // Keep their bytes in the file: tmux command parsing and argv limits must
       // not alter semicolons or reject long answers (#519, #602).
       await this.run(["tmux", "paste-buffer", "-t", target, "-b", buffer, "-d", "-r", ...(bracketed ? ["-p"] : [])],
         `tmux paste-buffer -t ${shellQuote(target)} -b ${shellQuote(buffer)} -d -r${bracketed ? " -p" : ""}`);
+      if (policy) await policy.afterPaste();
       return { ok: true };
     } catch (err) {
       if (bufferLoaded) {
@@ -695,11 +720,9 @@ export class TmuxAdapter {
         await this.fileOps.writeFile(path, `/bin/rm -f -- ${shellQuote(path)}\n${options.execInScript ? "exec " : ""}${command}\n`, { mode: 0o600, flag: "wx" });
         created = true;
       }
-      const text = beforeInput ? await this.guardedInput(target, (pane, check) => this.sendTextUnchecked(pane, invocation, () => { check(); beforeInput(); }))
-        : await this.sendText(target, invocation);
+      const text = await this.sendText(target, invocation, beforeInput);
       if (!text.ok) return text;
-      const enter = beforeInput ? await this.guardedInput(target, pane => { beforeInput(); return this.sendKeysUnchecked(pane, ["Enter"]); })
-        : await this.sendKeys(target, ["Enter"]);
+      const enter = await this.sendKeys(target, ["Enter"], beforeInput);
       if (!enter.ok) {
         await this.sendKeys(target, ["C-c"]);
         return enter;
@@ -717,7 +740,15 @@ export class TmuxAdapter {
   }
 
   async sendKeys(target: string, keys: string[], beforeInput?: () => void): Promise<TmuxResult> {
-    return this.guardedInput(target, (pane, beforeWrite) => { beforeWrite(); beforeInput?.(); return this.sendKeysUnchecked(pane, keys); });
+    return this.guardedInput(target, async (pane, beforeWrite) => {
+      const identity = this.freshManaged.get(target)?.nodeId ?? target;
+      const submit = keys.some(key => key === "Enter" || key === "C-m");
+      if (this.deliveryGuard?.needsInputCheck(identity)) await this.deliveryGuard.beforeInput(identity, submit);
+      beforeWrite(); beforeInput?.();
+      const result = await this.sendKeysUnchecked(pane, keys);
+      if (result.ok && submit) this.deliveryGuard?.noteSubmitted(identity);
+      return result;
+    }, false, "keys");
   }
 
   private async sendKeysUnchecked(target: string, keys: string[]): Promise<TmuxResult> {
@@ -1105,6 +1136,20 @@ export class TmuxAdapter {
     } catch {
       return null;
     }
+  }
+
+  /** Cursor movement during capture is an unknown input, never permission to type. */
+  async captureComposerSnapshot(paneId: string): Promise<ComposerSnapshot | null> {
+    try {
+      const before = await this.getPaneCursorPosition(paneId);
+      if (!before) return null;
+      const screen = await this.capturePaneScreen(paneId);
+      if (screen === null) return null;
+      const mode = (await this.run(["tmux", "display-message", "-p", "-t", exactTarget(paneId, "pane"), "#{pane_in_mode}"])).trim();
+      const after = await this.getPaneCursorPosition(paneId);
+      if (!after || JSON.stringify(before) !== JSON.stringify(after) || !/^\d+$/.test(mode)) return null;
+      return { screen, cursor: after, inMode: Number(mode) !== 0 };
+    } catch { return null; }
   }
 
   /**
