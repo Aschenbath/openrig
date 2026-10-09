@@ -93,16 +93,33 @@ describe("a retained Slack post replayed after its row closed", () => {
     expect(notes(qitemId).some((n) => n.startsWith("slack-owner-notification-dropped "))).toBe(false);
   });
 
-  it("does not drop a decision-resolved notice, which is written when its row closes", async () => {
+  /** Put a decision in the dispatch buffer as an earlier run would have left it. */
+  const retain = (decisionId: string, payload: Record<string, unknown>) =>
+    new DispatchBuffer(home).enqueue({ kind: "outbound_decision", decisionId, op: "post_message", entityBindingRef: request.destinationSession, payload });
+
+  it("does not drop a replayed decision-resolved notice, which is written when its row closes", async () => {
     const item = await repo.create(request);
     repo.update({ qitemId: item.qitemId, actorSession: "human-founder@external", state: "done", closureReason: "no-follow-on", transitionNote: "resolved" });
-    const w = wire(async (url) => (isPost(url) ? reply({ ok: true, ts: "resolved.1" }) : reply({ ok: true, messages: [] })));
-    w.dispatcher.dispatch("post_message", request.destinationSession, {
+    retain("d-resolved", {
       qitemId: item.qitemId, notificationKey: `${item.qitemId}:resolved`, ownerNotificationKind: "human-decision-resolved",
       destinationSession: request.destinationSession, summary: "Resolved", body: "Your answer was handed back.",
     });
+    wire(async (url) => (isPost(url) ? reply({ ok: true, ts: "resolved.1" }) : reply({ ok: true, messages: [] }))).startServices?.();
     // Whatever the delivery engine decides for it, the decision leaves the buffer; it must not be the stale drop.
     await vi.waitFor(() => expect(new DispatchBuffer(home).pending()).toHaveLength(0));
+    expect(notes(item.qitemId).some((n) => n.startsWith("slack-owner-notification-dropped "))).toBe(false);
+  });
+
+  it("drains a replayed episode that already has its posted receipt without calling it dropped", async () => {
+    const item = await repo.create(request);
+    const key = `${item.qitemId}:posted-before`;
+    repo.update({ qitemId: item.qitemId, actorSession: "daemon@kernel", transitionNote: `slack-owner-notification-posted notification_key=${key} level=ALERT kind=human-required message_ts=9.9 thread_ts=9.9` });
+    repo.update({ qitemId: item.qitemId, actorSession: "human-founder@external", state: "done", closureReason: "no-follow-on", transitionNote: "answered" });
+    retain("d-posted", { qitemId: item.qitemId, notificationKey: key, destinationSession: request.destinationSession, summary: "S", body: "B" });
+    let posts = 0;
+    wire(async (url) => { if (isPost(url)) posts += 1; return isPost(url) ? reply({ ok: true, ts: "dup.1" }) : reply({ ok: true, messages: [] }); }).startServices?.();
+    await vi.waitFor(() => expect(new DispatchBuffer(home).pending()).toHaveLength(0));
+    expect(posts).toBe(0);
     expect(notes(item.qitemId).some((n) => n.startsWith("slack-owner-notification-dropped "))).toBe(false);
   });
 
@@ -114,7 +131,7 @@ describe("a retained Slack post replayed after its row closed", () => {
     const seed = await seedBacklogAsHistory({ queue: { listHumanAlerts: async () => [] }, seen, filter: {}, buffer });
 
     expect(seed.seeded).toBe(1);
-    expect(seed.onlineStatus).toContain("1 undelivered retry dropped from the replay buffer");
+    expect(seed.onlineStatus).toContain("0 pre-existing alert(s) seeded as history (not reposted), and 1 undelivered retry dropped from the replay buffer");
     expect(buffer.pending()).toEqual([]);
     expect(seen.load().has("q-old:7")).toBe(true);
   });

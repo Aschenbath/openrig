@@ -122,11 +122,14 @@ export async function seedBacklogAsHistory(opts: {
     return p.notificationKey ?? p.qitemId ?? d.decisionId;
   });
   const already = opts.seen.load();
-  const toSeed = [...new Set([...alerts.map((a) => a.notificationKey ?? a.qitemId), ...retryKeys])].filter((id) => !already.has(id));
-  const seeded = opts.seen.seed(toSeed, "seeded-at-enable");
+  const alertKeys = [...new Set(alerts.map((a) => a.notificationKey ?? a.qitemId))].filter((id) => !already.has(id));
+  const alertsSeeded = opts.seen.seed(alertKeys, "seeded-at-enable");
+  const seenNow = opts.seen.load();
+  opts.seen.seed([...new Set(retryKeys)].filter((id) => !seenNow.has(id)), "seeded-at-enable");
   for (const d of retries) opts.buffer!.ack(d.decisionId);
-  const retryNote = retries.length > 0 ? `, ${retries.length} undelivered retr${retries.length === 1 ? "y" : "ies"} dropped from the replay buffer` : "";
-  const onlineStatus = `slack outbound ENABLED at enable-time: ${seeded} pre-existing alert(s) seeded as history (not reposted)${retryNote}; only alerts created after this point will deliver.`;
+  const seeded = alertsSeeded + retries.length;
+  const retryNote = retries.length > 0 ? `, and ${retries.length} undelivered retr${retries.length === 1 ? "y" : "ies"} dropped from the replay buffer` : "";
+  const onlineStatus = `slack outbound ENABLED at enable-time: ${alertsSeeded} pre-existing alert(s) seeded as history (not reposted)${retryNote}; only alerts created after this point will deliver.`;
   opts.log?.(onlineStatus);
   return { seeded, onlineStatus };
 }

@@ -18,6 +18,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { buildInProcessWire, type GatewayWire, type SubsystemDeliverFn } from "../gateway-subsystem.js";
+import { DispatchBuffer } from "../dispatch-buffer.js";
 import { downloadPrivateFile, isSlackHost, postChatMessage } from "./slack-api.js";
 import { loadConfig } from "./config.js";
 import { resolveSecret } from "./secrets.js";
@@ -541,13 +542,18 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       transitionNote: formatDeliveryTermination(decision.termination, key),
     });
   };
-  // A notification for a row that has left the active states is history, not news: a retained
-  // decision replayed at a later restart or rewire (a post that failed, retried a day later) posts
-  // nothing, and the row says why. Returning ok drains it from the dispatch buffer.
+  // Decisions already in the dispatch buffer when this wire is built are retained from an earlier
+  // run: posts that failed or never finished, which startServices() replays.
+  const replayedAtStart = new Set(new DispatchBuffer(opts.home).pending().map((d) => d.decisionId));
+  // A replayed notification for a row that has since left the active states is history, not news
+  // (a post that failed, retried a day later): it posts nothing, and the row says why, unless the
+  // episode already has its posted receipt. Returning ok drains it from the dispatch buffer.
   const dropStaleNotification = (p: OutboundPostPayload, state: string): void => {
     const key = p.notificationKey ?? p.qitemId;
+    const notes = opts.queueRepo.transitionLog.listForQitem(p.qitemId).map((t) => t.transitionNote ?? "");
+    const posted = notes.some((n) => n.startsWith("slack-owner-notification-posted ") && n.split(/\s+/).includes(`notification_key=${key}`));
     const note = `slack-owner-notification-dropped notification_key=${key} reason=row-not-active state=${state}`;
-    if (!opts.queueRepo.transitionLog.listForQitem(p.qitemId).some((t) => t.transitionNote === note)) {
+    if (!posted && !notes.includes(note)) {
       opts.queueRepo.update({ qitemId: p.qitemId, actorSession: "daemon@kernel", transitionNote: note });
     }
     outboundSeen.mark(key, "dropped-row-not-active");
@@ -556,7 +562,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   const engineDeliver: SubsystemDeliverFn = async (decision) => {
     const p = ((decision as { payload?: unknown }).payload ?? {}) as OutboundPostPayload & { deliveryDeferralFire?: boolean };
     // The decision-resolved notice is written at closure, so a closed row is its normal case.
-    if (p.qitemId && p.ownerNotificationKind !== "human-decision-resolved"
+    if (replayedAtStart.has(decision.decisionId) && p.qitemId && p.ownerNotificationKind !== "human-decision-resolved"
       && !(p as { deliveryDigestPost?: boolean }).deliveryDigestPost) {
       const state = opts.queueRepo.getById(p.qitemId)?.state;
       if (state && !isBlockerLive(state)) {
