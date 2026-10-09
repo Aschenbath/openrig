@@ -97,23 +97,7 @@ export function makeHumanReplyResolver(
       // correlated inbound row. Closing the request here records the durable
       // disposition; the inbound create is already the one wake back to the
       // source, so a second nudge here would duplicate attention.
-      const direct = queueRepo.getById(input.qitemId);
-      if (
-        direct?.state !== "pending" ||
-        direct.destinationSession !== input.actorSession ||
-        parseSessionName(direct.destinationSession).kind !== "external"
-      ) {
-        return "not-applicable";
-      }
-      queueRepo.update({
-        qitemId: input.qitemId,
-        actorSession: input.actorSession,
-        state: "done",
-        closureReason: "no-follow-on",
-        transitionNote: "direct human reply received",
-        ownerNotificationKind: "human-decision-resolved",
-      });
-      return "resolved";
+      return queueRepo.resolveDirectHumanReply(input) ? "resolved" : "not-applicable";
     }
   };
 }
