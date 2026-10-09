@@ -450,6 +450,9 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
           return undefined;
         },
         onPostedRoot: (p, ts, channel) => {
+          // A healthy connection receives each post back as an event; the inbound liveness watch
+          // waits for it. Every post, root or part, registers once, here or in onPostedPart.
+          inboundHandle?.expectEcho(ts);
           const human = p.destinationSession ?? "";
           const seat = p.sourceSession ?? "";
           threadMap.open({ threadTs: ts, channel, human, seat, conversationId: p.qitemId });
@@ -471,6 +474,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
         // #192: a part is recorded in the channel it was posted to, so a reaction on it in a mapped
         // channel finds its ask (thread_part_map is keyed by channel and message).
         onPostedPart: (p, messageTs, threadTs, channel) => {
+          inboundHandle?.expectEcho(messageTs); // a multipart post's supplemental parts arrive only here
           const seat = p.sourceSession ?? "";
           if (!p.qitemId || !seat || (p as { deliveryDigestPost?: boolean }).deliveryDigestPost) return;
           const human = p.destinationSession ?? "";
