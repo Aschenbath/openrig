@@ -128,10 +128,13 @@ export function connectionsLines(snap: FleetSnapshot, width: number, timeZone = 
   return wrapDetailLines(lines, width);
 }
 
-/** An open socket is not proof that events arrive: a delivery problem is named beside the state. */
-function inboundValue(r: ConnectionsRead["running"]): string {
+/** An open socket is not proof that events arrive, so the delivery word is named beside the state.
+ *  A daemon too old to report delivery leaves the bare state. */
+export function inboundValue(r: ConnectionsRead["running"]): string {
   if (r.inboundDelivery === "events-missing") return `${r.inboundState}; events missing since ${r.inboundEventsMissingSince ?? "unknown"}`;
   if (r.inboundDelivery === "no-server-pings") return `${r.inboundState}; no server pings`;
   if (r.inboundDelivery === "socket-mode-disabled") return `${r.inboundState}; Socket Mode disabled in the Slack app settings`;
+  if (r.inboundState === "connected" && r.inboundDelivery === "delivering") return "connected; delivering";
+  if (r.inboundState === "connected" && r.inboundDelivery === "unknown") return "connected; delivery not yet confirmed";
   return r.inboundState;
 }

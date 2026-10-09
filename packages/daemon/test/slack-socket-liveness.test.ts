@@ -35,6 +35,10 @@ describe("Socket Mode liveness", () => {
   let receipts: InboundReceiptStore;
   let landed: number;
   let handle: SocketInboundHandle | undefined;
+  /** apps.connections.open: held while a gate is set, failing while openFails is set. */
+  let openGate: Promise<void> | null;
+  let openFails: boolean;
+  let openCalls: number;
   const pingChannel: PingChannel = { subscribe: (fn) => { pings.add(fn); }, unsubscribe: (fn) => { pings.delete(fn); } };
   const ping = () => { for (const fn of pings) fn({ payload: Buffer.from("") }); };
 
@@ -43,6 +47,9 @@ describe("Socket Mode liveness", () => {
     sockets = [];
     pings = new Set();
     landed = 0;
+    openGate = null;
+    openFails = false;
+    openCalls = 0;
     const fsx = memFs();
     receipts = new InboundReceiptStore("/s/inbound-receipts.jsonl", fsx);
     const router = new InboundRouter({
@@ -54,7 +61,11 @@ describe("Socket Mode liveness", () => {
       log: () => {},
     });
     handle = startSocketInbound("xapp-EXAMPLE-fake", router, {
-      fetchImpl: openFetch,
+      fetchImpl: async (...args) => {
+        openCalls += 1;
+        if (openGate) await openGate;
+        return openFails ? new Response(JSON.stringify({ ok: false, error: "temporary outage" }), { status: 200 }) : openFetch(...args);
+      },
       wsFactory: () => {
         const fake: FakeWs = { sent: [], closed: false, ws: undefined as unknown as WsLike };
         fake.ws = { send: (d) => fake.sent.push(d), close: () => { fake.closed = true; }, onopen: null, onmessage: null, onclose: null, onerror: null };
@@ -179,6 +190,79 @@ describe("Socket Mode liveness", () => {
     first.ws.onclose!();
     ping(); // one connection open: unambiguous
     expect(handle!.status().lastServerPingAt).toBeDefined();
+  });
+
+  it("does not call our own draining connection another consumer after a refresh", async () => {
+    const first = await openSocket(1);
+    message(first, { envelope_id: "d-4", type: "disconnect", reason: "refresh_requested" });
+    const second = await openSocket(2);
+    message(second, { type: "hello", num_connections: 2 }); // ours: the new one and the draining one
+    expect(handle!.status()).toMatchObject({ numConnections: 2, otherConnections: 0 });
+    message(second, { type: "hello", num_connections: 3 });
+    expect(handle!.status().otherConnections).toBe(1);
+  });
+
+  it("does not arm the new connection with an echo the draining one received", async () => {
+    const first = await openSocket(1);
+    message(first, { envelope_id: "d-5", type: "disconnect", reason: "refresh_requested" });
+    await openSocket(2);
+    message(first, botEcho("600.000001")); // arrives on the draining connection, before registration
+    handle!.expectEcho("600.000001");
+    handle!.expectEcho("600.000002");
+    handle!.expectEcho("600.000003");
+    await vi.advanceTimersByTimeAsync(70_000);
+    expect(sockets, "the new connection never echoed, so its echo rule is not armed").toHaveLength(2);
+    expect(handle!.status().delivery).toBe("unknown");
+  });
+
+  it("abandons a replacement whose open is in flight when Slack reports link_disabled", async () => {
+    const first = await openSocket(1);
+    let release!: () => void;
+    openGate = new Promise<void>((r) => { release = r; });
+    message(first, { envelope_id: "d-6", type: "disconnect", reason: "refresh_requested" });
+    await vi.waitFor(() => expect(openCalls).toBe(2)); // the replacement's open is waiting
+    message(first, { envelope_id: "d-7", type: "disconnect", reason: "link_disabled" });
+    release();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(sockets, "no socket opens after Slack disabled Socket Mode").toHaveLength(1);
+    expect(handle!.status().delivery).toBe("socket-mode-disabled");
+  });
+
+  it("stops retrying a failed replacement open once Slack reports link_disabled", async () => {
+    const first = await openSocket(1);
+    openFails = true;
+    message(first, { envelope_id: "d-8", type: "disconnect", reason: "refresh_requested" });
+    await vi.waitFor(() => expect(openCalls).toBeGreaterThanOrEqual(2)); // failed; a retry is scheduled
+    message(first, { envelope_id: "d-9", type: "disconnect", reason: "link_disabled" });
+    const calls = openCalls;
+    await vi.advanceTimersByTimeAsync(70_000);
+    expect(openCalls, "no retry after the disable").toBe(calls);
+  });
+
+  it("only counts consecutive missing echoes: echo, miss, echo, miss does not replace", async () => {
+    const first = await openSocket(1);
+    handle!.expectEcho("700.000001");
+    message(first, botEcho("700.000001"));
+    handle!.expectEcho("700.000002"); // miss
+    await vi.advanceTimersByTimeAsync(1_000);
+    handle!.expectEcho("700.000003");
+    message(first, botEcho("700.000003")); // a later post came back: the earlier miss is forgiven
+    handle!.expectEcho("700.000004"); // miss
+    await vi.advanceTimersByTimeAsync(70_000);
+    expect(sockets).toHaveLength(1);
+    expect(handle!.status()).toMatchObject({ delivery: "delivering", unechoedPosts: 1 });
+  });
+
+  it("says when the five-minute limit holds an automatic reconnect back", async () => {
+    await openSocket(1);
+    for (let i = 0; i < 2; i++) { ping(); await vi.advanceTimersByTimeAsync(10_000); }
+    await vi.advanceTimersByTimeAsync(40_000); // first replacement: pings stopped
+    await openSocket(2);
+    for (let i = 0; i < 2; i++) { ping(); await vi.advanceTimersByTimeAsync(10_000); }
+    await vi.advanceTimersByTimeAsync(40_000); // stalls again inside five minutes
+    expect(sockets).toHaveLength(2);
+    expect(handle!.status().autoReconnectSuppressedUntil).toBeDefined();
+    expect(handle!.status().delivery).toBe("no-server-pings");
   });
 
   it("stops reconnecting when Slack reports link_disabled, and says why", async () => {

@@ -88,8 +88,12 @@ export interface SocketInboundStatus {
   eventsMissingSince?: string;
   unechoedPosts?: number;
   lastAutoReconnect?: { at: string; reason: string };
-  /** Slack's `hello` count of this app's open connections; above 1 means another consumer. */
+  /** An automatic replacement the 5-minute limit is holding back, until this time. */
+  autoReconnectSuppressedUntil?: string;
+  /** Slack's `hello` count of this app's open connections, ours included. */
   numConnections?: number;
+  /** Connections in `numConnections` that are not ours: above 0 means another consumer. */
+  otherConnections?: number;
 }
 
 interface Conn {
@@ -133,8 +137,9 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
   let current: Conn | undefined;
   /** Our posts waiting for their echo: Slack ts → when we posted it. */
   const expected = new Map<string, number>();
-  /** Event ts seen in the last few minutes: an echo can arrive before the post's ts is registered. */
-  const recentEvents = new Map<string, number>();
+  /** Event ts seen in the last few minutes, with the connection that received it: an echo can
+   *  arrive before the post's ts is registered, and it counts only for that connection. */
+  const recentEvents = new Map<string, { at: number; conn: Conn }>();
   let pendingTimer: ReturnType<typeof setTimeout> | undefined;
   let openTimer: ReturnType<typeof setTimeout> | undefined;
   let retryTimer: ReturnType<typeof setInterval> | undefined;
@@ -146,6 +151,16 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
   };
   /** While a replacement is opening, the old connection may still be up: status follows it. */
   const oldStillOpen = (): boolean => replacing && !!current && !current.closed;
+  /** A post of ours came back on `conn`. On the current connection it is delivering, and misses
+   *  older than this post end the failure episode, so only consecutive misses count. An echo the
+   *  draining old connection received says nothing about the current one. */
+  const echoed = (conn: Conn, postedAt: number): void => {
+    conn.echoArmed = true;
+    if (conn !== current) return;
+    for (const [ts, at] of expected) if (at <= postedAt) expected.delete(ts);
+    status.delivery = "delivering";
+    status.eventsMissingSince = undefined;
+  };
   const receipt = (entry: Parameters<InboundReceiptStore["append"]>[0]): void => {
     try {
       deps.receipts?.append(entry);
@@ -174,8 +189,8 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
       if (target !== undefined ? target !== conn.ws : open.length !== 1) continue;
       conn.lastPingAt = now;
       conn.pingArmed = true;
+      if (conn === current) status.lastServerPingAt = new Date(now).toISOString();
     }
-    if (current && !current.closed && current.pingArmed) status.lastServerPingAt = new Date(now).toISOString();
   };
   pingChannel.subscribe(onPing);
 
@@ -185,8 +200,14 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
   const replace = (reason: string, slackRequested = false): void => {
     if (stopped || disabledBySlack || replacing || !current) return;
     const now = Date.now();
-    if (!slackRequested && lastAutoReplaceAt && now - lastAutoReplaceAt < minAutoReplaceIntervalMs) return;
+    if (!slackRequested && lastAutoReplaceAt && now - lastAutoReplaceAt < minAutoReplaceIntervalMs) {
+      const until = new Date(lastAutoReplaceAt + minAutoReplaceIntervalMs).toISOString();
+      if (status.autoReconnectSuppressedUntil !== until) log(`automatic reconnect (${reason}) held back until ${until}: at most one per ${minAutoReplaceIntervalMs / 60_000} min`);
+      status.autoReconnectSuppressedUntil = until;
+      return;
+    }
     if (!slackRequested) lastAutoReplaceAt = now;
+    status.autoReconnectSuppressedUntil = undefined;
     replacing = true;
     current.retired = true;
     current.retiredFor = reason;
@@ -236,14 +257,15 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
     };
     finish = resolve;
     const connect = async (): Promise<void> => {
-      if (stopped) return resolve();
+      if (stopped || disabledBySlack) return resolve();
       connects++;
       status.generation = connects;
       status.reconnects = Math.max(0, connects - 1);
       if (!oldStillOpen()) status.state = "connecting";
       receipt({ generation: connects, status: "connect-attempt" });
       const open = await openSocketConnection(appToken, deps.fetchImpl);
-      if (stopped) return resolve();
+      // Slack may have disabled Socket Mode while the open was in flight.
+      if (stopped || disabledBySlack) return resolve();
       if (!open.ok || !open.url) {
         log(`connect failed: ${open.error}`);
         if (!oldStillOpen()) {
@@ -251,7 +273,7 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
           status.disconnectedAt = stamp();
         }
         receipt({ generation: connects, status: "connect-failed", reason: "connection-open-failed" });
-        if (deps.inboundMaxConnects && connects >= deps.inboundMaxConnects) return resolve();
+        if (disabledBySlack || (deps.inboundMaxConnects && connects >= deps.inboundMaxConnects)) return resolve();
         pendingTimer = setTimeout(connect, backoff);
         backoff = Math.min(backoff * 2, 60000);
         return;
@@ -275,7 +297,7 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
           status.disconnectedAt = stamp();
         }
         receipt({ generation: conn.generation, status: "connect-failed", reason });
-        if (deps.inboundMaxConnects && connects >= deps.inboundMaxConnects) return resolve();
+        if (disabledBySlack || (deps.inboundMaxConnects && connects >= deps.inboundMaxConnects)) return resolve();
         pendingTimer = setTimeout(connect, backoff);
         backoff = Math.min(backoff * 2, 60000);
       };
@@ -285,6 +307,7 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
         clearTimeout(openTimer);
         openTimer = undefined;
         if (stopped) return;
+        if (disabledBySlack) return closeConn(conn); // opened after Slack disabled Socket Mode
         backoff = 1000;
         log("socket connected");
         const previous = current;
@@ -324,28 +347,35 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
         status.lastEventTs = ev?.ts;
         const helloCount = env.type === "hello" ? (env as { num_connections?: unknown }).num_connections : undefined;
         if (typeof helloCount === "number") {
+          // During a refresh our own draining connection is still open, and Slack counts it.
+          const ours = [...conns].filter((c) => c.opened && !c.closed).length;
           status.numConnections = helloCount;
-          if (helloCount > 1) log(`Slack reports ${helloCount} open connections for this app; another consumer may be taking events`);
+          status.otherConnections = Math.max(0, helloCount - ours);
+          if (status.otherConnections > 0) {
+            log(`Slack reports ${helloCount} open connections for this app, ${ours} of them ours; another consumer may be taking events`);
+          }
         }
         if (env.type === "disconnect") {
           if (env.reason === "link_disabled") {
             disabledBySlack = true;
             status.delivery = "socket-mode-disabled";
             log("Slack disabled Socket Mode for this app (link_disabled); not reconnecting");
+            // Abandon a retry or a replacement already in flight: the timers and sockets this loop owns.
+            if (pendingTimer) clearTimeout(pendingTimer);
+            if (openTimer) clearTimeout(openTimer);
+            for (const other of [...conns]) if (!other.opened) closeConn(other);
           } else if (conn === current && (env.reason === "warning" || env.reason === "refresh_requested")) {
             replace(env.reason, true);
           }
         }
         if (ev?.ts) {
           const now = Date.now();
-          recentEvents.set(ev.ts, now);
-          for (const [ts, at] of recentEvents) if (now - at > 5 * 60_000) recentEvents.delete(ts);
-        }
-        if (ev?.ts && expected.delete(ev.ts)) {
-          conn.echoArmed = true;
-          if (conn === current) {
-            status.delivery = "delivering";
-            status.eventsMissingSince = undefined;
+          recentEvents.set(ev.ts, { at: now, conn });
+          for (const [ts, seen] of recentEvents) if (now - seen.at > 5 * 60_000) recentEvents.delete(ts);
+          const postedAt = expected.get(ev.ts);
+          if (postedAt !== undefined) {
+            expected.delete(ev.ts);
+            echoed(conn, postedAt);
           }
         }
         void handleEnvelope(
@@ -442,15 +472,9 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
     status: () => ({ ...status }),
     expectEcho: (messageTs: string) => {
       if (stopped || !/^\d+\.\d+$/.test(messageTs)) return;
-      if (recentEvents.has(messageTs)) {
-        // The echo beat the registration: it counts as delivered on the connection that is up.
-        if (current && !current.closed) {
-          current.echoArmed = true;
-          status.delivery = "delivering";
-          status.eventsMissingSince = undefined;
-        }
-        return;
-      }
+      const early = recentEvents.get(messageTs);
+      // The echo beat the registration: it counts for the connection that received it.
+      if (early) return echoed(early.conn, Date.now());
       expected.set(messageTs, Date.now());
     },
   };
