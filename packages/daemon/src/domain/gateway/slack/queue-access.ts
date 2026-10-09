@@ -111,7 +111,7 @@ export async function seedBacklogAsHistory(opts: {
   seen: import("./state-store.js").SeenStore;
   filter: AlertFilterOpts;
   /** The durable dispatch buffer, read only to say what the restart will replay: earlier posts that
-   *  failed or never finished. Each still posts if its row is open; a closed row's is dropped. */
+   *  failed or never finished. An alert whose row has since closed is dropped; the rest post. */
   buffer?: Pick<import("../dispatch-buffer.js").DispatchBuffer, "pending">;
   log?: (msg: string) => void;
 }): Promise<{ seeded: number; onlineStatus: string }> {
@@ -121,7 +121,7 @@ export async function seedBacklogAsHistory(opts: {
   const seeded = opts.seen.seed(toSeed, "seeded-at-enable");
   const retained = (opts.buffer?.pending() ?? []).filter((d) => d.op === "post_message").length;
   const retainedNote = retained > 0
-    ? ` ${retained} earlier undelivered post(s) wait in the replay buffer: each posts if its row is still open, and is dropped if its row has closed.`
+    ? ` ${retained} earlier undelivered post(s) wait in the replay buffer: an alert whose row has since closed is dropped; the rest post (open rows' alerts, decision-resolved notices, digests).`
     : "";
   const onlineStatus = `slack outbound ENABLED at enable-time: ${seeded} pre-existing alert(s) seeded as history (not reposted); only alerts created after this point will deliver.${retainedNote}`;
   opts.log?.(onlineStatus);
