@@ -252,7 +252,7 @@ export class DraftAwareDelivery {
           .run(again ? "waiting" : "held", !retryable || again ? result.reason ?? "delivery_refused" : stored.liveOnly ? "live_prerequisite_unavailable" : "hold_limit_reached",
             new Date(Math.min(Date.parse(current.deadline_at), this.now().getTime() + current.retry_interval_ms)).toISOString(), id);
       } else {
-        const state = result.ok && result.verified ? "complete" : "indeterminate";
+        const state = result.ok && (result.verified || !opts.verify) ? "complete" : "indeterminate";
         for (const entry of entries) this.outbox.finalizeDelivery(entry.outboxId, state === "complete" ? "delivered" : "indeterminate");
         this.db.prepare("UPDATE seat_deferred_messages SET state=?, reason=?, result=? WHERE id=? AND state='sending'")
           .run(state, result.reason ?? (state === "complete" ? "delivered" : "delivery_unconfirmed"), JSON.stringify(result), id);

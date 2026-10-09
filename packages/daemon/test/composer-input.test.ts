@@ -9,6 +9,16 @@ function claude(body: string, cursor?: { x: number; y: number }, width = 80): Co
 }
 
 describe("cursor-bound composer input", () => {
+  it("recognizes Claude's non-breaking prompt space without erasing draft content", () => {
+    for (const body of ["", "unfinished request"]) {
+      const snapshot = claude(body);
+      snapshot.screen = snapshot.screen.replace("❯ ", "❯\u00a0");
+      const input = inspectComposerInput(snapshot);
+      expect(input.state).toBe(body ? "text" : "empty");
+      if (body) expect(composerContainsOwnedText(input, body)).toBe(true);
+    }
+  });
+
   it("distinguishes an empty input from a draft even while a work status is visible", () => {
     const empty = claude(""); empty.screen = empty.screen.replace("Ready", "✻ Working… (2s · esc to interrupt)");
     expect(inspectComposerInput(empty).state).toBe("empty");

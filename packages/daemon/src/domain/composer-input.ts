@@ -34,7 +34,7 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null): Compose
   if (lines.length > height || !lines[y]) return unknown();
   const candidates: ComposerInput[] = [];
   for (let start = 0; start <= y; start++) {
-    const prompt = /^( *)([❯›»])(?: (.*)|$)/.exec(lines[start] ?? "");
+    const prompt = /^( *)([❯›»])(?:[ \u00a0](.*)|$)/.exec(lines[start] ?? "");
     if (!prompt || /^\d+[.)]\s/.test(prompt[3] ?? "")) continue;
     const prefix = prompt[1]!.length + 2;
     let end = -1;

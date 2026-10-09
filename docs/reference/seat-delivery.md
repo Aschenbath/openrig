@@ -68,7 +68,7 @@ OpenRig does not clear it or submit it.
 | `waiting` | The original message is retained; another bounded check is scheduled |
 | `sending` | An attempt owns the existing delivery IDs; its result is not resolved yet |
 | `held` | Automatic retries have ended; inspect the retained message and reason |
-| `complete` | Transport execution and the requested render check succeeded; native consumption is not asserted |
+| `complete` | Transport execution succeeded; if render verification was requested it also succeeded. Native consumption is not asserted |
 | `indeterminate` | Input may have occurred, or its render was not confirmed; no automatic replay |
 
 A held send returns `outcome: "retained"`, `sent: false` and `outboxIds`.

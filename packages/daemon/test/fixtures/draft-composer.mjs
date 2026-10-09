@@ -15,7 +15,7 @@ function render() {
   const start = rows.length;
   const body = input.split("\n");
   const displayed = input || (runtime === "codex" ? "Ask Codex to do anything" : "");
-  rows.push(`${runtime === "claude" ? "❯" : "›"} ${displayed.split("\n")[0]}`, ...body.slice(1).map(line => `  ${line}`));
+  rows.push(`${runtime === "claude" ? "❯\u00a0" : "› "}${displayed.split("\n")[0]}`, ...body.slice(1).map(line => `  ${line}`));
   rows.push(...(runtime === "claude" ? ["────────────────────────────────────────", "? for shortcuts"] : ["", "fixture · 90% context left"]));
   process.stdout.write(`\x1b[2J\x1b[H${rows.join("\r\n")}\x1b[${start + body.length};${3 + stringWidth(body.at(-1))}H`);
   writeFileSync(`${stateFile}.tmp`, JSON.stringify({ input, submissions }));

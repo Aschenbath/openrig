@@ -96,6 +96,23 @@ function fixture(saved?: Buffer) {
 }
 
 describe("durable draft-aware delivery through the real transport", () => {
+  it("completes a successful send without requested verification, without claiming render proof", async () => {
+    const f = fixture(); await f.enable();
+    const result = await f.send("no-verify", "message", { verify: false });
+    expect(result).toMatchObject({ ok: true, sent: true, delivery: { state: "complete", attempts: 1 } });
+    expect(result.verified).toBeUndefined();
+    expect(f.outbox.getById("no-verify")!.deliveryState).toBe("delivered");
+    f.advance(); await f.deferred.drain(); expect(f.submissions).toEqual(["message"]);
+  });
+
+  it("keeps requested-but-unconfirmed verification indeterminate without resending", async () => {
+    const f = fixture(); await f.enable();
+    vi.mocked(f.tmux.capturePaneContent).mockResolvedValue("no render evidence");
+    expect(await f.send("not-confirmed")).toMatchObject({ ok: true, sent: true, verified: false, delivery: { state: "indeterminate" } });
+    expect(f.outbox.getById("not-confirmed")!.deliveryState).toBe("indeterminate");
+    f.advance(); await f.deferred.drain(); expect(f.submissions).toHaveLength(1);
+  });
+
   it("the daemon scheduler retries on its timer without another send or manual drain", async () => {
     vi.useFakeTimers();
     const f = fixture();
