@@ -22,6 +22,37 @@ const codexFooter = (line: string): boolean => isComposerFooter(line)
 const emptyPlaceholder = (text: string): boolean => text === "Ask Codex to do anything" || text === "Press up to edit queued messages";
 const collapsedPaste = /^\[Pasted text #\d+ \+(\d+) lines\]$/;
 
+/** Keep faint styling only as evidence for an empty placeholder. Plain text with
+ * the same spelling can be a real draft whose cursor was moved with Home/C-a.
+ */
+function styledLines(screen: string) {
+  let faint = false;
+  return screen.replace(/\r\n/g, "\n").split("\n").map(raw => {
+    let text = "", offset = 0;
+    const faintCells: boolean[] = [];
+    const append = (value: string) => { text += value; faintCells.push(...Array<boolean>(value.length).fill(faint)); };
+    for (const match of raw.matchAll(/\x1b\[([0-9;:]*)m/g)) {
+      append(raw.slice(offset, match.index));
+      const codes = match[1]!.split(";");
+      for (let i = 0; i < codes.length; i++) {
+        const code = codes[i]!;
+        if (/^(?:38|48|58):/.test(code)) continue; // Colon-form color is one parameter.
+        if (code === "38" || code === "48" || code === "58") {
+          const skip = codes[i + 1] === "5" ? 2 : codes[i + 1] === "2" ? (codes[i + 2] === "" ? 5 : 4) : 0;
+          // Color channels are not style codes. Ambiguous compound sequences
+          // provide no faint-style proof, rather than interpreting an RGB 2 as dim.
+          if (!skip || i + skip !== codes.length - 1) { faint = false; break; }
+          i += skip;
+        } else if (code === "" || code === "0" || code === "22") faint = false;
+        else if (code === "2") faint = true;
+      }
+      offset = match.index! + match[0].length;
+    }
+    append(raw.slice(offset));
+    return { text, faintCells };
+  });
+}
+
 /** Inspect only the visible input containing the current cursor. Activity, hook
  * freshness and text elsewhere in the pane are not evidence that input is empty.
  */
@@ -29,7 +60,8 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null): Compose
   if (!snapshot || snapshot.inMode) return unknown();
   const { x, y, width, height } = snapshot.cursor;
   if (![x, y, width, height].every(Number.isInteger) || x < 0 || y < 0 || x >= width || y >= height || width < 3 || height < 1) return unknown();
-  const lines = snapshot.screen.replace(/\r\n/g, "\n").split("\n");
+  const styled = styledLines(snapshot.screen);
+  const lines = styled.map(line => line.text);
   if (lines.at(-1) === "") lines.pop();
   if (lines.length > height || !lines[y]) return unknown();
   const candidates: ComposerInput[] = [];
@@ -62,7 +94,8 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null): Compose
     if (!valid) continue;
     const visible = rows.map(line => line.trimEnd());
     const atStart = y === start && x === prefix;
-    const empty = atStart && rows.length === 1 && (rows[0] === "" || emptyPlaceholder(rows[0]!));
+    const placeholder = emptyPlaceholder(rows[0]!) && styled[start]!.faintCells.slice(prefix, prefix + rows[0]!.length).every(Boolean);
+    const empty = atStart && rows.length === 1 && (rows[0] === "" || placeholder);
     const last = visible.length - 1;
     const cursorAtEnd = y === start + last && x === prefix + stringWidth(visible[last] ?? "");
     const label = visible.length === 1 && collapsedPaste.test(visible[0]!) ? visible[0]! : null;

@@ -63,6 +63,11 @@ The check runs after payload preparation, immediately before paste, and again
 before Enter. A changed input after paste remains visible for human review;
 OpenRig does not clear it or submit it.
 
+An empty placeholder must retain its faint display styling in the capture.
+Typing the same words and moving the cursor to the start still counts as a
+draft. A capture without enough styling evidence holds the message instead of
+guessing that the input is empty.
+
 | Delivery state | Meaning |
 |---|---|
 | `waiting` | The original message is retained; another bounded check is scheduled |
@@ -101,8 +106,10 @@ created under the older policy revision.
 With `inbox-only`, writing lifecycle operations refuse before effects. With
 `draft-aware`, a writing lifecycle operation on an active seat also requires
 an explicit switch to `automatic` first. Fresh startup is exempt from draft
-inspection only when there is no bound input, or the bound session/pane is
-positively absent or dead; existing lifecycle and recipient checks remain.
+inspection only after the adapter creates a new pane or successfully respawns
+a dead pane within that lifecycle operation. An absent/dead binding permits
+the lifecycle preflight, but adopting or rebinding an existing pane does not
+grant this exemption; existing lifecycle and recipient checks remain.
 
 Terminal capture is observational, not an atomic editor API. The before-Enter
 check and brokered-human-input invalidation narrow the paste/submit race, but

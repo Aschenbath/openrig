@@ -101,6 +101,13 @@ describe.skipIf(process.platform === "win32")("native draft-aware terminal deliv
         expect(await adapter.sendKeys("worker@test", ["Enter"])).toEqual({ ok: true });
       });
       await vi.waitFor(() => expect(state().submissions).toEqual(["one\nmessage", "direct human message"]));
+      await guard.setPolicy("a", { mode: "draft-aware", holdSeconds: 12, maxAttempts: 3 }, "human@test", "protect literal input");
+      await tmux(["send-keys", "-t", panes.a!, "-l", "Ask Codex to do anything"]);
+      await waitInput("Ask Codex to do anything");
+      await tmux(["send-keys", "-t", panes.a!, "C-a"]);
+      await vi.waitFor(async () => expect((await adapter.captureComposerSnapshot(panes.a!))?.cursor.x).toBe(2));
+      expect(await send("literal-placeholder", "automatic message")).toMatchObject({ outcome: "retained", delivery: { reason: "draft_input_busy" } });
+      expect(state()).toEqual({ input: "Ask Codex to do anything", submissions: ["one\nmessage", "direct human message"] });
     } finally {
       await transport?.deferredDelivery?.stop();
       await tmux(["kill-server"]).catch(() => {});
