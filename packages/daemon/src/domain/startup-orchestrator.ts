@@ -867,7 +867,7 @@ export class StartupOrchestrator {
   private async settleOwnPaste(tmuxSession: string, pane: string, text: string, runtime: string | null): Promise<{ pane: string; state: ReturnType<typeof inspectStartupStagedText>; looks: number }> {
     let state = inspectStartupStagedText(pane, text, runtime);
     let looks = 0;
-    while (state === "unverified" && looks < STARTUP_SUBMIT_SETTLE_LOOKS && startupOwnCollapsedPaste(pane, text)) {
+    while (state === "unverified" && looks < STARTUP_SUBMIT_SETTLE_LOOKS && startupOwnCollapsedPaste(pane, text, runtime)) {
       await this.sleep(200);
       // A failed re-look adds nothing; the last usable observation stands.
       const next = await this.tmuxAdapter.capturePaneContent(tmuxSession, STARTUP_SUBMIT_CAPTURE_LINES).catch(() => null);

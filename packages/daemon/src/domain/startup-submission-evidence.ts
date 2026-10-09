@@ -51,8 +51,8 @@ export function inspectStartupStagedText(pane: string | null, expected: string, 
 const COLLAPSED_PASTE = /^\[Pastedtext#\d+\+(\d+)lines\]$/;
 
 /** Whether the composer holds only Claude's collapsed label for a paste with the expected text's newline count. */
-export function startupOwnCollapsedPaste(pane: string | null, expected: string): boolean {
-  const { body } = composerRegion(pane);
+export function startupOwnCollapsedPaste(pane: string | null, expected: string, runtime: string | null = null): boolean {
+  const { body } = composerRegion(pane, runtime);
   const label = body === null ? null : COLLAPSED_PASTE.exec(body);
   return label !== null && Number(label[1]) === expected.split("\n").length - 1;
 }
