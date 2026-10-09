@@ -171,12 +171,26 @@ export function slackCommand(deps: SlackDeps = {}): Command {
         for (const r of readiness) log(`  ${r.ok ? "✓" : "✗"} ${r.label}: ${r.detail}`);
         log(`Daemon: ${observation.state}${observation.reason ? ` (${observation.reason})` : ""}`);
         const connector = observation.connector as { configurationDigest?: string;
-          inbound?: { state?: string; generation?: number; lastEventAt?: string };
+          inbound?: { state?: string; generation?: number; lastEventAt?: string; delivery?: string; eventsMissingSince?: string;
+            lastServerPingAt?: string; unechoedPosts?: number; numConnections?: number; lastAutoReconnect?: { at?: string; reason?: string } };
           recovery?: { state?: string; reason?: string; lastScanAt?: string; acceptedThisProcess?: number; deadLetteredThisProcess?: number;
             coverage?: { coverageStart: string; coveredThrough: string; pending?: { upper: string; nextLatest: string }; nextRetryAt?: number } | null;
             limits?: string[] } } | undefined;
         if (connector) {
           log(`  Socket: ${connector.inbound?.state ?? "unknown"}; generation ${connector.inbound?.generation ?? "unknown"}; last event ${connector.inbound?.lastEventAt ?? "unknown"}`);
+          const inbound = connector.inbound;
+          if (inbound?.delivery) {
+            const delivery = inbound.delivery === "events-missing" ? `events missing since ${inbound.eventsMissingSince ?? "unknown"} (${inbound.unechoedPosts ?? 0} of our posts not echoed)`
+              : inbound.delivery === "no-server-pings" ? `no server pings since ${inbound.lastServerPingAt ?? "unknown"}`
+              : inbound.delivery === "socket-mode-disabled" ? "Socket Mode is disabled in the Slack app settings; not reconnecting"
+              : inbound.delivery === "delivering" ? "delivering (our last post came back as an event)"
+              : "not yet confirmed (no post of ours has come back since this connection opened)";
+            log(`  Delivery: ${delivery}${inbound.lastServerPingAt ? `; last server ping ${inbound.lastServerPingAt}` : ""}`);
+          }
+          if (inbound?.lastAutoReconnect?.at) log(`  Last automatic reconnect: ${inbound.lastAutoReconnect.at} (${inbound.lastAutoReconnect.reason ?? "unknown"})`);
+          if (typeof inbound?.numConnections === "number" && inbound.numConnections > 1) {
+            log(`  Slack reports ${inbound.numConnections} open connections for this app: another consumer may be taking events.`);
+          }
           const recovery = connector.recovery;
           log(`  Recovery: ${recovery?.state ?? "unknown"}${recovery?.reason ? ` (${recovery.reason})` : ""}; last scan ${recovery?.lastScanAt ?? "unknown"}`);
           const coverage = recovery?.coverage;

@@ -8,7 +8,15 @@
 // Cold-init receipts (dual-path class "inbound cold-init"): on every (re)connect the router's
 // dead-letter set drains before new traffic matters, and a fresh boot picks up where the
 // durable seen/dead-letter stores left off — no replay storm, no drop.
+//
+// Liveness: an open socket is not proof that Slack delivers events to it. A connection on Build
+// stayed "connected" for an hour while Slack delivered nothing, and two button presses were
+// lost. Two signals catch that, each armed only once this connection has shown it: server pings
+// (what Slack's own Node client watches; undici publishes each one on diagnostics_channel), and
+// the echo of our own posts, which comes back as an event on a healthy connection. A failed
+// signal replaces the connection: a new one opens first, then the old one goes.
 
+import dc from "node:diagnostics_channel";
 import { openSocketConnection, type FetchImpl } from "./slack-api.js";
 import { handleEnvelope, type InboundRouter, type SocketEnvelope } from "./inbound.js";
 import type { InboundReceiptStore, InboundReceiptStatus } from "./state-store.js";
@@ -22,6 +30,11 @@ export interface WsLike {
   onerror: ((this: unknown, ev?: unknown) => void) | null;
 }
 
+export interface PingChannel {
+  subscribe(onMessage: (message: unknown) => void): void;
+  unsubscribe(onMessage: (message: unknown) => void): void;
+}
+
 export interface SocketInboundDeps {
   fetchImpl?: FetchImpl;
   /** Open a Socket Mode WebSocket (default: global WebSocket). Injectable for tests. */
@@ -32,6 +45,17 @@ export interface SocketInboundDeps {
   retryIntervalMs?: number;
   /** How long a new socket may stay opening before it is abandoned and retried (default 30s). */
   openTimeoutMs?: number;
+  /** Server WebSocket pings (default: undici's `undici:websocket:ping` diagnostics channel). */
+  pingChannel?: PingChannel;
+  /** Without a server ping for this long, once one has arrived, the connection is stale (default
+   *  30s, the default of Slack's own Node client). */
+  serverPingTimeoutMs?: number;
+  /** A post of ours whose echo has not arrived after this long counts as missing (default 60s). */
+  echoTimeoutMs?: number;
+  /** Minimum gap between automatic replacements (default 5min). Slack's own refresh ignores it. */
+  minAutoReplaceIntervalMs?: number;
+  /** How often liveness is checked (default 5s). */
+  livenessCheckMs?: number;
   receipts?: InboundReceiptStore;
   recovery?: { run(): Promise<void>; stop(): void };
   log?: (msg: string) => void;
@@ -42,7 +66,12 @@ export interface SocketInboundHandle {
   done: Promise<void>;
   stop(): void;
   status(): SocketInboundStatus;
+  /** A message we just posted (its Slack ts): a healthy connection receives it back as an event. */
+  expectEcho(messageTs: string): void;
 }
+
+/** Delivery health, kept apart from the socket state so "connected" is never the only word. */
+export type SocketDelivery = "unknown" | "delivering" | "no-server-pings" | "events-missing" | "socket-mode-disabled";
 
 export interface SocketInboundStatus {
   generation: number;
@@ -53,7 +82,36 @@ export interface SocketInboundStatus {
   lastEventAt?: string;
   lastEventTs?: string;
   lastDisposition?: InboundReceiptStatus;
+  delivery?: SocketDelivery;
+  lastServerPingAt?: string;
+  /** The oldest of our posts still waiting for its echo, once two have gone missing. */
+  eventsMissingSince?: string;
+  unechoedPosts?: number;
+  lastAutoReconnect?: { at: string; reason: string };
+  /** Slack's `hello` count of this app's open connections; above 1 means another consumer. */
+  numConnections?: number;
 }
+
+interface Conn {
+  ws: WsLike;
+  generation: number;
+  opened: boolean;
+  closed: boolean;
+  /** Replaced: closing it must not schedule a reconnect. */
+  retired: boolean;
+  retiredFor?: string;
+  lastPingAt: number;
+  pingArmed: boolean;
+  echoArmed: boolean;
+}
+
+const PING_CHANNEL = "undici:websocket:ping";
+const defaultPingChannel = (): PingChannel => ({
+  subscribe: (onMessage) => dc.subscribe(PING_CHANNEL, onMessage),
+  unsubscribe: (onMessage) => { dc.unsubscribe(PING_CHANNEL, onMessage); },
+});
+/** How long a connection Slack asked to refresh may keep draining before we close it ourselves. */
+const REFRESH_DRAIN_MS = 30_000;
 
 /** Start the Socket Mode loop (the shipped runner's exact shape, service-ified with a stop()). */
 export function startSocketInbound(appToken: string, router: InboundRouter, deps: SocketInboundDeps = {}): SocketInboundHandle {
@@ -61,16 +119,29 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
   const wsFactory = deps.wsFactory ?? ((url: string) => new (globalThis as unknown as { WebSocket: new (u: string) => WsLike }).WebSocket(url));
   const retryIntervalMs = deps.retryIntervalMs ?? 5 * 60 * 1000;
   const openTimeoutMs = deps.openTimeoutMs ?? 30_000;
+  const serverPingTimeoutMs = deps.serverPingTimeoutMs ?? 30_000;
+  const echoTimeoutMs = deps.echoTimeoutMs ?? 60_000;
+  const minAutoReplaceIntervalMs = deps.minAutoReplaceIntervalMs ?? 5 * 60 * 1000;
+  const pingChannel = deps.pingChannel ?? defaultPingChannel();
   let connects = 0;
   let backoff = 1000;
   let stopped = false;
-  let liveWs: WsLike | undefined;
+  let disabledBySlack = false;
+  let replacing = false;
+  let lastAutoReplaceAt = 0;
+  const conns = new Set<Conn>();
+  let current: Conn | undefined;
+  /** Our posts waiting for their echo: Slack ts → when we posted it. */
+  const expected = new Map<string, number>();
   let pendingTimer: ReturnType<typeof setTimeout> | undefined;
   let openTimer: ReturnType<typeof setTimeout> | undefined;
   let retryTimer: ReturnType<typeof setInterval> | undefined;
   let finish: () => void = () => {};
-  const status: SocketInboundStatus = { generation: 0, reconnects: 0, state: "disconnected" };
+  const status: SocketInboundStatus = { generation: 0, reconnects: 0, state: "disconnected", delivery: "unknown" };
   const stamp = () => new Date().toISOString();
+  const unref = (t: unknown) => {
+    if (typeof (t as { unref?: () => void }).unref === "function") (t as { unref: () => void }).unref();
+  };
   const receipt = (entry: Parameters<InboundReceiptStore["append"]>[0]): void => {
     try {
       deps.receipts?.append(entry);
@@ -88,21 +159,91 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
     });
   };
 
-  const done = new Promise<void>((resolve) => {
+  // A ping proves an open connection alive. undici 6 names no socket in the message, so it
+  // credits every open connection; a later undici that names one credits only that one.
+  const onPing = (message: unknown): void => {
+    const target = (message as { websocket?: unknown } | null)?.websocket;
+    const now = Date.now();
+    for (const conn of conns) {
+      if (conn.closed || !conn.opened || (target !== undefined && target !== conn.ws)) continue;
+      conn.lastPingAt = now;
+      conn.pingArmed = true;
+    }
+    if (current && !current.closed && current.pingArmed) status.lastServerPingAt = new Date(now).toISOString();
+  };
+  pingChannel.subscribe(onPing);
+
+  let connectRef: (() => Promise<void>) | undefined;
+  /** Open a replacement first, then let the old connection go: Slack may hand a payload to any
+   *  open connection, so the old one keeps handling until it closes. */
+  const replace = (reason: string, slackRequested = false): void => {
+    if (stopped || disabledBySlack || replacing || !current) return;
+    const now = Date.now();
+    if (!slackRequested && lastAutoReplaceAt && now - lastAutoReplaceAt < minAutoReplaceIntervalMs) return;
+    if (!slackRequested) lastAutoReplaceAt = now;
+    replacing = true;
+    current.retired = true;
+    current.retiredFor = reason;
+    expected.clear();
+    status.lastAutoReconnect = { at: stamp(), reason };
+    log(`replacing the socket (${reason}): opening a new connection before the old one goes`);
+    receipt({ generation: current.generation, status: "replace-requested", reason });
+    void connectRef?.();
+  };
+
+  const livenessTimer = setInterval(() => {
+    const conn = current;
+    if (stopped || !conn || conn.closed || !conn.opened || conn.retired) return;
+    const now = Date.now();
+    if (conn.pingArmed && now - conn.lastPingAt > serverPingTimeoutMs) {
+      status.delivery = "no-server-pings";
+      replace("no-server-pings");
+      return;
+    }
+    for (const [ts, at] of expected) if (now - at > 10 * echoTimeoutMs) expected.delete(ts); // bound the map
+    const overdue = [...expected.values()].filter((at) => now - at > echoTimeoutMs).sort((a, b) => a - b);
+    status.unechoedPosts = overdue.length;
+    if (conn.echoArmed && overdue.length >= 2) {
+      status.delivery = "events-missing";
+      status.eventsMissingSince = new Date(overdue[0]!).toISOString();
+      replace("events-missing");
+    }
+  }, deps.livenessCheckMs ?? 5_000);
+  unref(livenessTimer);
+
+  const closeConn = (conn: Conn): void => {
+    conn.ws.onopen = conn.ws.onmessage = conn.ws.onclose = conn.ws.onerror = null;
+    conn.closed = true;
+    conns.delete(conn);
+    try {
+      conn.ws.close();
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const done = new Promise<void>((resolveDone) => {
+    const resolve = (): void => {
+      clearInterval(livenessTimer);
+      pingChannel.unsubscribe(onPing);
+      resolveDone();
+    };
     finish = resolve;
     const connect = async (): Promise<void> => {
       if (stopped) return resolve();
       connects++;
       status.generation = connects;
       status.reconnects = Math.max(0, connects - 1);
-      status.state = "connecting";
+      if (!replacing) status.state = "connecting";
       receipt({ generation: connects, status: "connect-attempt" });
       const open = await openSocketConnection(appToken, deps.fetchImpl);
       if (stopped) return resolve();
       if (!open.ok || !open.url) {
         log(`connect failed: ${open.error}`);
-        status.state = "disconnected";
-        status.disconnectedAt = stamp();
+        if (!replacing) {
+          status.state = "disconnected";
+          status.disconnectedAt = stamp();
+        }
         receipt({ generation: connects, status: "connect-failed", reason: "connection-open-failed" });
         if (deps.inboundMaxConnects && connects >= deps.inboundMaxConnects) return resolve();
         pendingTimer = setTimeout(connect, backoff);
@@ -110,53 +251,62 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
         return;
       }
       const ws = wsFactory(open.url);
-      liveWs = ws;
+      const conn: Conn = { ws, generation: connects, opened: false, closed: false, retired: false, lastPingAt: 0, pingArmed: false, echoArmed: false };
+      conns.add(conn);
       // Until the socket opens, onclose cannot be relied on to drive the reconnect: Node's
       // WebSocket (undici 6) fires onerror but never onclose when the handshake fails
       // (refused, reset, or its own 300s headers timeout), and an upgrade that is never
       // answered fires nothing at all. Either way the loop would stay "connecting" forever.
       // So a failure or timeout before onopen detaches the socket and schedules the retry here.
-      let opened = false;
       const abandon = (reason: "socket-open-error" | "socket-open-timeout"): void => {
         clearTimeout(openTimer);
         openTimer = undefined;
         if (stopped) return;
-        ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
-        try {
-          ws.close();
-        } catch {
-          /* ignore */
-        }
-        liveWs = undefined;
+        closeConn(conn);
         log(`socket did not open (${reason}); reconnect in ${backoff}ms`);
-        status.state = "disconnected";
-        status.disconnectedAt = stamp();
-        receipt({ generation: connects, status: "connect-failed", reason });
+        if (!replacing) {
+          status.state = "disconnected";
+          status.disconnectedAt = stamp();
+        }
+        receipt({ generation: conn.generation, status: "connect-failed", reason });
         if (deps.inboundMaxConnects && connects >= deps.inboundMaxConnects) return resolve();
         pendingTimer = setTimeout(connect, backoff);
         backoff = Math.min(backoff * 2, 60000);
       };
       openTimer = setTimeout(() => abandon("socket-open-timeout"), openTimeoutMs);
       ws.onopen = () => {
-        opened = true;
+        conn.opened = true;
         clearTimeout(openTimer);
         openTimer = undefined;
         if (stopped) return;
         backoff = 1000;
         log("socket connected");
+        const previous = current;
+        current = conn;
+        replacing = false;
         status.state = "connected";
         status.connectedAt = stamp();
-        receipt({ generation: connects, status: "connected" });
+        status.delivery = "unknown";
+        status.eventsMissingSince = undefined;
+        status.unechoedPosts = 0;
+        receipt({ generation: conn.generation, status: "connected" });
+        // A connection replaced for a failed signal is presumed broken: close it now. One Slack
+        // asked to refresh stays open so it drains what it is handed, until Slack closes it.
+        if (previous && previous !== conn && previous.retired && !previous.closed) {
+          if (previous.retiredFor === "refresh_requested" || previous.retiredFor === "warning") {
+            const drain = setTimeout(() => { if (!previous.closed) closeConn(previous); }, REFRESH_DRAIN_MS);
+            unref(drain);
+          } else closeConn(previous);
+        }
         retryDeadLetters(); // drain on connect (cold-init)…
         // …AND periodically WHILE connected (B1: recovery after a queue outage
         // must not wait for the next Slack reconnect). Cleared on close.
+        if (retryTimer) clearInterval(retryTimer);
         retryTimer = setInterval(retryDeadLetters, retryIntervalMs);
-        if (typeof (retryTimer as unknown as { unref?: () => void }).unref === "function") {
-          (retryTimer as unknown as { unref: () => void }).unref();
-        }
+        unref(retryTimer);
       };
       ws.onmessage = (m) => {
-        if (stopped) return;
+        if (conn.closed) return;
         let env: SocketEnvelope;
         try {
           env = JSON.parse(String(m.data)) as SocketEnvelope;
@@ -166,23 +316,45 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
         const ev = env.payload?.event;
         status.lastEventAt = stamp();
         status.lastEventTs = ev?.ts;
+        const helloCount = env.type === "hello" ? (env as { num_connections?: unknown }).num_connections : undefined;
+        if (typeof helloCount === "number") {
+          status.numConnections = helloCount;
+          if (helloCount > 1) log(`Slack reports ${helloCount} open connections for this app; another consumer may be taking events`);
+        }
+        if (env.type === "disconnect") {
+          if (env.reason === "link_disabled") {
+            disabledBySlack = true;
+            status.delivery = "socket-mode-disabled";
+            log("Slack disabled Socket Mode for this app (link_disabled); not reconnecting");
+          } else if (conn === current && (env.reason === "warning" || env.reason === "refresh_requested")) {
+            replace(env.reason, true);
+          }
+        }
+        if (ev?.ts && expected.delete(ev.ts)) {
+          conn.echoArmed = true;
+          if (conn === current) {
+            status.delivery = "delivering";
+            status.eventsMissingSince = undefined;
+          }
+        }
         void handleEnvelope(
           env,
           () => env.envelope_id && ws.send(JSON.stringify({ envelope_id: env.envelope_id })),
           router,
           log,
           () => receipt({
-            generation: connects,
+            generation: conn.generation,
             status: "received",
             envelopeId: env.envelope_id,
             eventTs: ev?.ts,
             channel: ev?.channel,
+            ...(typeof helloCount === "number" ? { connections: helloCount } : {}),
           }),
         )
           .then((disposition) => {
             status.lastDisposition = disposition.status;
             receipt({
-              generation: connects,
+              generation: conn.generation,
               status: disposition.status,
               envelopeId: env.envelope_id,
               eventTs: ev?.ts,
@@ -193,7 +365,7 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
           .catch((error) => {
             status.lastDisposition = "handler-failed";
             receipt({
-              generation: connects,
+              generation: conn.generation,
               status: "handler-failed",
               envelopeId: env.envelope_id,
               eventTs: ev?.ts,
@@ -204,21 +376,25 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
           });
       };
       ws.onclose = () => {
+        conn.closed = true;
+        conns.delete(conn);
+        receipt({ generation: conn.generation, status: "disconnected" });
+        // A retired connection's close is the expected end of a replacement: nothing to reconnect.
+        if (conn.retired || conn !== current) return;
         clearTimeout(openTimer);
         openTimer = undefined;
         if (retryTimer) clearInterval(retryTimer);
-        liveWs = undefined;
         status.state = stopped ? "stopped" : "disconnected";
         status.disconnectedAt = stamp();
-        receipt({ generation: connects, status: "disconnected" });
         if (stopped) return resolve();
+        if (disabledBySlack) return resolve();
         log(`socket closed; reconnect in ${backoff}ms`);
         if (deps.inboundMaxConnects && connects >= deps.inboundMaxConnects) return resolve();
         pendingTimer = setTimeout(connect, backoff);
         backoff = Math.min(backoff * 2, 60000);
       };
       ws.onerror = () => {
-        if (!opened) return abandon("socket-open-error");
+        if (!conn.opened) return abandon("socket-open-error");
         try {
           ws.close();
         } catch {
@@ -226,6 +402,7 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
         }
       };
     };
+    connectRef = connect;
     void connect();
   });
 
@@ -235,12 +412,20 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
       stopped = true;
       deps.recovery?.stop();
       if (retryTimer) clearInterval(retryTimer);
+      clearInterval(livenessTimer);
+      pingChannel.unsubscribe(onPing);
       status.state = "stopped";
       if (pendingTimer) clearTimeout(pendingTimer);
       if (openTimer) clearTimeout(openTimer);
-      try { liveWs?.close(); } catch { /* best-effort */ }
+      for (const conn of [...conns]) {
+        try { conn.ws.close(); } catch { /* best-effort */ }
+      }
       finish(); // A canceled backoff has no future connect/close callback to settle done.
     },
     status: () => ({ ...status }),
+    expectEcho: (messageTs: string) => {
+      if (stopped || !/^\d+\.\d+$/.test(messageTs)) return;
+      expected.set(messageTs, Date.now());
+    },
   };
 }

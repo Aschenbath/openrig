@@ -478,6 +478,8 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
         },
         onTransportFailed: recordTransportFailed,
         onPosted: (p, messageTs, threadTs) => {
+          // A healthy connection receives this post back as an event; the inbound liveness watch waits for it.
+          inboundHandle?.expectEcho(messageTs);
           // v3 digest branch: transport truth first — every member receipt is
           // stamped HERE, after the real post, digest-tokened and episode-keyed.
           const digest = (p as unknown as { deliveryDigestPost?: boolean; digestId?: string; memberReceipts?: Array<{ qitemId: string; notificationKey: string; level: string; kind: string }> });
