@@ -848,7 +848,8 @@ export function queueRoutes(): Hono {
     // projection, so a second in-progress baton past the cap would be invisible and the
     // ambiguity refusal would degrade into a confident wrong answer. The derivation reads
     // the unbounded in-progress set, which makes it independent of recentLimit.
-    const derived = deriveCurrentWork(repo.listInProgressForDestination(session), missionsRoot);
+    const inProgress = repo.listInProgressForDestination(session);
+    const derived = deriveCurrentWork(inProgress, missionsRoot);
     let role: RoleOrientation = { state: "unknown", reason: "calling node unavailable", files: [] };
     try {
       const identity = (c.get("whoamiService" as never) as WhoamiService | undefined)
@@ -861,7 +862,7 @@ export function queueRoutes(): Hono {
     if (c.req.query("candidates") === "1") {
       const heldAndNext = repo.list({ destinationSession: session, state: ["pending", "blocked"], limit: WORK_CANDIDATE_LIST_LIMIT + 1 });
       const workCandidates = deriveWorkCandidates(
-        [...repo.listInProgressForDestination(session), ...heldAndNext.slice(0, WORK_CANDIDATE_LIST_LIMIT)],
+        [...inProgress, ...heldAndNext.slice(0, WORK_CANDIDATE_LIST_LIMIT)],
         missionsRoot,
         {
           getRow: (qitemId) => repo.getById(qitemId) ?? null,
