@@ -412,7 +412,17 @@ describe("send --host (http branch)", () => {
     expect(process.exitCode).toBe(1);
   });
 
-  it.each(["ECONNREFUSED", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "EPERM"])("a connection that never reached the remote (%s) still reads as unreachable", async (code) => {
+  it.each(["EHOSTDOWN", "ENETDOWN", "EHOSTUNREACH", "EPERM"])("a code the kernel can also report on a live socket (%s) reads as unconfirmed, not unreachable", async (code) => {
+    const h = mockClient(() => new DaemonConnectionError(`Cannot connect to the OpenRig daemon at http://vps-b:7433: fetch failed (${code})`, code));
+    const cmd = sendCommand(httpDeps(h));
+    await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello", "--json"], { from: "user" });
+    const parsed = JSON.parse(captured.stdoutLines[0]!) as Record<string, any>;
+    expect(parsed.result).toMatchObject({ ok: false, failedStep: "remote-outcome-unknown", outcomeUnknown: true });
+    expect(parsed.error.action).toContain("Check the target before any resend");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it.each(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT"])("a connection that never reached the remote (%s) still reads as unreachable", async (code) => {
     const h = mockClient(() => new DaemonConnectionError(`Cannot connect to the OpenRig daemon at http://vps-b:7433: fetch failed (${code})`, code));
     const cmd = sendCommand(httpDeps(h));
     await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello", "--json"], { from: "user" });
