@@ -54,6 +54,26 @@ function fixture() {
 }
 
 describe("per-seat delivery policy", () => {
+  it("does not treat an adopted existing pane as a newly created lifecycle shell", async () => {
+    const f = fixture(); await f.guard.setPolicy("a", { mode: "draft-aware" }, "operator", "keep my draft");
+    f.targets.a = { ...f.targets.a!, pane: null };
+    await f.guard.lifecycle(["a"], async () => {
+      f.targets.a = { ...f.targets.a!, pane: "%3", occupant: "adopted" };
+      f.guard.rebindLifecycle("a");
+      f.panes.a = screen("existing human draft");
+      expect(await f.tmux.sendText("a", "adoption hint")).toMatchObject({ ok: false, code: "draft_input_busy" });
+      expect(await f.tmux.sendKeys("a", ["Enter"])).toMatchObject({ ok: false, code: "draft_input_changed" });
+    });
+    expect(f.writes).toEqual([]);
+  });
+
+  it("holds literal placeholder text when the operator moved the cursor to its start", async () => {
+    const f = fixture(); await f.guard.setPolicy("a", { mode: "draft-aware" }, "operator", "keep my draft");
+    const draft = screen("Ask Codex to do anything"); draft.cursor.x = 2;
+    f.panes.a = draft;
+    expect(await f.tmux.sendText("a", "message")).toMatchObject({ ok: false, code: "draft_input_busy" });
+    expect(f.writes).toEqual([]);
+  });
   it("defaults to automatic and validates bounded opt-in settings", () => {
     const f = fixture();
     expect(f.guard.policies.get("a").effective.mode).toBe("automatic");
@@ -144,9 +164,23 @@ describe("per-seat delivery policy", () => {
     expect(effects).toBe(0);
     f.targets.a = { ...f.targets.a!, pane: null };
     await f.guard.lifecycle(["a"], async () => {
+      vi.mocked(f.tmux.listPanes).mockResolvedValueOnce([{ id: "%3", index: 0, cwd: "/fixture", width: 120, height: 40, active: true }]);
+      expect(await f.tmux.createSession("a", undefined, { OPENRIG_NODE_ID: "a" })).toEqual({ ok: true });
       f.targets.a = { ...f.targets.a!, pane: "%3", occupant: "new" };
       f.guard.rebindLifecycle("a");
       f.panes.a = null;
+      expect(await f.tmux.sendText("a", "launch the runtime")).toEqual({ ok: true });
+      expect(await f.tmux.sendKeys("a", ["Enter"])).toEqual({ ok: true });
+    });
+    expect(f.writes).toHaveLength(2);
+  });
+
+  it("grants startup input only after a dead pane was successfully respawned", async () => {
+    const f = fixture(); await f.guard.setPolicy("a", { mode: "draft-aware" }, "operator", "protect resumed input");
+    vi.mocked(f.tmux.isPaneDead).mockResolvedValue(true); f.panes.a = null;
+    await f.guard.lifecycle(["a"], async () => {
+      expect(await f.tmux.sendText("a", "premature input")).toMatchObject({ ok: false, code: "draft_input_unknown" });
+      expect(await f.tmux.respawnPane("%1", "/bin/sh")).toEqual({ ok: true });
       expect(await f.tmux.sendText("a", "launch the runtime")).toEqual({ ok: true });
       expect(await f.tmux.sendKeys("a", ["Enter"])).toEqual({ ok: true });
     });

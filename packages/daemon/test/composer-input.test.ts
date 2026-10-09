@@ -9,6 +9,9 @@ function claude(body: string, cursor?: { x: number; y: number }, width = 80): Co
 }
 
 describe("cursor-bound composer input", () => {
+  it.each(["Ask Codex to do anything", "Press up to edit queued messages"])("preserves a literal %s draft at the start cursor", text => {
+    expect(inspectComposerInput(claude(text, { x: 2, y: 2 })).state).toBe("text");
+  });
   it("distinguishes an empty input from a draft even while a work status is visible", () => {
     const empty = claude(""); empty.screen = empty.screen.replace("Ready", "✻ Working… (2s · esc to interrupt)");
     expect(inspectComposerInput(empty).state).toBe("empty");
@@ -20,7 +23,7 @@ describe("cursor-bound composer input", () => {
   });
 
   it.each(["›", "»"])("recognizes the empty Codex placeholder with marker %s only at the input cursor", marker => {
-    const s: ComposerSnapshot = { screen: `Working\n${marker} Ask Codex to do anything\n\ngpt-5 · 90% context left\n`, cursor: { x: 2, y: 1, width: 80, height: 24 }, inMode: false };
+    const s: ComposerSnapshot = { screen: `Working\n${marker} \x1b[2mAsk Codex to do anything\x1b[22m\n\ngpt-5 · 90% context left\n`, cursor: { x: 2, y: 1, width: 80, height: 24 }, inMode: false };
     expect(inspectComposerInput(s).state).toBe("empty");
     expect(inspectComposerInput({ ...s, cursor: { ...s.cursor, x: 12 } }).state).toBe("text");
   });
@@ -31,6 +34,14 @@ describe("cursor-bound composer input", () => {
     expect(inspectComposerInput({ ...claude(""), cursor: { x: 0, y: 0, width: 80, height: 24 } }).state).toBe("unknown");
     expect(inspectComposerInput(claude("1. Approve this command")).state).toBe("unknown");
     expect(inspectComposerInput({ ...claude(""), screen: "❯\n" }).state).toBe("unknown");
+  });
+
+  it("does not mistake color channel values for faint styling", () => {
+    for (const sgr of ["38;2;2;2;2", "38;5;2", "38;2;0;255;255;2", "2;38;5;2;22"]) {
+      const value = claude(`\x1b[${sgr}mAsk Codex to do anything\x1b[0m`, { x: 2, y: 2 });
+      expect(inspectComposerInput(value).state).toBe("text");
+    }
+    expect(inspectComposerInput(claude("\x1b[2;38;5;245mAsk Codex to do anything\x1b[0m", { x: 2, y: 2 })).state).toBe("empty");
   });
 
   it("requires the complete owned text and preserves significant spaces", () => {

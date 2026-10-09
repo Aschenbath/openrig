@@ -5,7 +5,7 @@ import { StringDecoder } from "node:string_decoder";
 import stringWidth from "string-width";
 
 const [runtime, stateFile] = process.argv.slice(2);
-let input = "", pending = "", pasting = false;
+let input = "", pending = "", pasting = false, cursor = 0;
 const submissions = [];
 const decoder = new StringDecoder("utf8");
 
@@ -14,10 +14,11 @@ function render() {
   if (runtime === "claude") rows.push("────────────────────────────────────────");
   const start = rows.length;
   const body = input.split("\n");
-  const displayed = input || (runtime === "codex" ? "Ask Codex to do anything" : "");
+  const displayed = input || (runtime === "codex" ? "\x1b[2mAsk Codex to do anything\x1b[22m" : "");
   rows.push(`${runtime === "claude" ? "❯" : "›"} ${displayed.split("\n")[0]}`, ...body.slice(1).map(line => `  ${line}`));
   rows.push(...(runtime === "claude" ? ["────────────────────────────────────────", "? for shortcuts"] : ["", "fixture · 90% context left"]));
-  process.stdout.write(`\x1b[2J\x1b[H${rows.join("\r\n")}\x1b[${start + body.length};${3 + stringWidth(body.at(-1))}H`);
+  const beforeCursor = input.slice(0, cursor).split("\n");
+  process.stdout.write(`\x1b[2J\x1b[H${rows.join("\r\n")}\x1b[${start + beforeCursor.length};${3 + stringWidth(beforeCursor.at(-1))}H`);
   writeFileSync(`${stateFile}.tmp`, JSON.stringify({ input, submissions }));
   renameSync(`${stateFile}.tmp`, stateFile);
 }
@@ -32,11 +33,14 @@ process.stdin.on("data", data => {
     if (pending.startsWith("\x1b[201~")) { pasting = false; pending = pending.slice(6); continue; }
     if (pending[0] === "\x1b" && pending.length < 6) break;
     const char = pending[0]; pending = pending.slice(1);
-    if (pasting) input += char === "\r" ? "\n" : char;
-    else if (char === "\r" || char === "\n") { submissions.push(input); input = ""; }
-    else if (char === "\x15") input = "";
-    else if (char === "\x7f") input = input.slice(0, -1);
-    else if (char >= " ") input += char;
+    if (pasting || char >= " ") {
+      if (!pasting && char === "\x7f") {
+        if (cursor > 0) { input = input.slice(0, cursor - 1) + input.slice(cursor); cursor--; }
+      } else { input = input.slice(0, cursor) + (char === "\r" ? "\n" : char) + input.slice(cursor); cursor++; }
+    } else if (char === "\r" || char === "\n") { submissions.push(input); input = ""; cursor = 0; }
+    else if (char === "\x15") { input = ""; cursor = 0; }
+    else if (char === "\x01") cursor = 0;
+    else if (char === "\x05") cursor = input.length;
   }
   render();
 });

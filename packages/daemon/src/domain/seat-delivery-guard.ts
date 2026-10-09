@@ -16,7 +16,7 @@ interface Lease {
   active: boolean;
   origin: "automatic" | "human";
   lifecycle?: boolean;
-  freshLifecycle?: boolean;
+  freshLifecyclePane?: string;
   policy?: VersionedDeliveryPolicy;
   humanEpoch: number;
   staged?: { text: string; collapsedPaste: string | null };
@@ -198,7 +198,6 @@ export class SeatDeliveryGuard {
           const absent = !lease.target.pane || await this.inputAbsent?.(lease.target) === true;
           this.assertCurrent(id, lease);
           if (!absent) throw new DeliveryGuardError("draft_aware_lifecycle", "This active seat uses draft-aware delivery. Select automatic delivery before a writing lifecycle operation; held messages are not replayed.");
-          lease.freshLifecycle = true;
         }
         lease.lifecycle = true;
         return acquire(index + 1);
@@ -213,6 +212,20 @@ export class SeatDeliveryGuard {
     const lease = this.scope.getStore()?.get(nodeId);
     if (!lease?.active || !lease.lifecycle) throw new DeliveryGuardError("guard_lease_required", "Binding changes require the complete lifecycle lease.");
     lease.target = this.target(nodeId);
+    delete lease.staged;
+  }
+
+  /** Only a successful adapter creation/respawn may exempt its new shell from composer checks. */
+  noteFreshLifecyclePane(nodeId: string, pane: string): void {
+    const lease = this.scope.getStore()?.get(nodeId);
+    if (!lease?.active || !lease.lifecycle) throw new DeliveryGuardError("guard_lease_required", "A fresh pane requires its creation lifecycle lease.");
+    this.assertCurrent(nodeId, lease);
+    lease.freshLifecyclePane = pane;
+  }
+
+  private ownsFreshInput(lease: Lease): boolean {
+    return !!lease.lifecycle && !!lease.freshLifecyclePane
+      && (lease.target.pane === null || lease.target.pane === lease.freshLifecyclePane);
   }
 
   private assertCurrent(name: string, lease: Lease): void {
@@ -227,7 +240,7 @@ export class SeatDeliveryGuard {
     const lease = this.scope.getStore()?.get(target.nodeId);
     if (!lease) throw new DeliveryGuardError("guard_lease_required", "Input requires an active operation lease.");
     this.assertCurrent(name, lease);
-    if (lease.origin === "automatic" && !lease.freshLifecycle && lease.policy?.mode === "draft-aware"
+    if (lease.origin === "automatic" && !this.ownsFreshInput(lease) && lease.policy?.mode === "draft-aware"
       && lease.humanEpoch !== (this.humanEpochs.get(target.nodeId) ?? 0)) {
       throw new DeliveryGuardError("draft_input_changed", "Human input arrived during this delivery. No further automatic input was written.");
     }
@@ -237,7 +250,7 @@ export class SeatDeliveryGuard {
     const target = this.maybeTarget(name);
     if (!target) return false; // Proven private probes have no managed-seat policy.
     const lease = this.scope.getStore()?.get(target.nodeId);
-    return !!lease?.active && lease.origin === "automatic" && !lease.freshLifecycle && lease.policy?.mode === "draft-aware";
+    return !!lease?.active && lease.origin === "automatic" && !this.ownsFreshInput(lease) && lease.policy?.mode === "draft-aware";
   }
 
   /** Called at the paste/key boundary after file and buffer preparation. */
