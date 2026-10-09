@@ -1,4 +1,4 @@
-import { DaemonClient, remoteDaemonClient } from "./client.js";
+import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, remoteDaemonClient } from "./client.js";
 import { loadHostRegistry, resolveHost, resolveRemoteBearer, bearerAuthHeaders, classifyHttpFailedStep, classifyHttpError, type HttpHostEntry } from "./host-registry.js";
 import { resolveOriginSelfHostId, type LifecycleDeps } from "./daemon-lifecycle.js";
 import type { FailedStep } from "./cross-host-types.js";
@@ -20,6 +20,22 @@ export interface RemoteOpResult {
   failedStep: FailedStep;
   data?: unknown;
   error?: string;
+  /** The request may have reached the remote and been acted on, but no usable answer came back: a timeout, a
+   *  connection reset or dropped mid-request, or an unreadable response. Unset when the connection provably
+   *  never reached the remote. A caller whose request writes must not read such a failure as "not done". */
+  outcomeUnknown?: true;
+}
+
+// Connection failures that prove the request never reached the remote daemon.
+const NOT_CONNECTED_CODES = new Set([
+  "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "EHOSTDOWN", "ENETDOWN", "EADDRNOTAVAIL",
+  "UND_ERR_CONNECT_TIMEOUT", "EPERM", "EACCES", "ERR_INVALID_URL",
+]);
+
+function requestMayHaveArrived(err: unknown): boolean {
+  if (err instanceof DaemonTimeoutError) return true;
+  if (err instanceof DaemonConnectionError) return err.causeCode === undefined || !NOT_CONNECTED_CODES.has(err.causeCode);
+  return true;
 }
 
 export async function runRemoteHttpOp(
@@ -74,7 +90,12 @@ export async function runRemoteHttpOp(
     }
     return { ok: true, failedStep: "none", data: res.data };
   } catch (err) {
-    return { ok: false, failedStep: classifyHttpError(err), error: (err as Error).message };
+    return {
+      ok: false,
+      failedStep: classifyHttpError(err),
+      error: (err as Error).message,
+      ...(requestMayHaveArrived(err) ? { outcomeUnknown: true as const } : {}),
+    };
   }
 }
 
