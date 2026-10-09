@@ -96,6 +96,18 @@ function fixture(saved?: Buffer) {
 }
 
 describe("durable draft-aware delivery through the real transport", () => {
+  it("the daemon scheduler retries on its timer without another send or manual drain", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    try {
+      await f.enable(); f.deferred.start(); f.bodies.a = "draft";
+      await f.send("scheduled"); f.bodies.a = ""; f.advance();
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(f.deferred.lookup("scheduled")).toMatchObject({ state: "complete", attempts: 2 });
+      expect(f.submissions).toEqual(["incoming message"]);
+    } finally { await f.deferred.stop(); vi.useRealTimers(); }
+  });
+
   it("retries the same message until its draft clears, without duplicate paste, Enter or outbox rows", async () => {
     const f = fixture(); await f.enable(); f.bodies.a = "unfinished human request";
     expect(await f.send("one")).toMatchObject({ outcome: "retained", sent: false, outboxIds: ["one"], delivery: { state: "waiting", attempts: 1 } });
@@ -302,6 +314,16 @@ describe("supported seat and queue integration", () => {
     log.append({ qitemId: item.qitemId, state: "pending", actorSession: "worker@test" });
     f.bodies.a = ""; f.advance(); await f.deferred.drain();
     expect(f.deferred.lookup(id)).toMatchObject({ state: "held", reason: "wake_no_longer_applicable" }); expect(f.writes).toEqual([]);
+  });
+
+  it.each(["failed", "denied", "canceled"])("stops a deferred direct nudge when its work is %s", async state => {
+    const f = fixture(); await f.enable(); f.bodies.a = "draft";
+    const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "work", nudge: false });
+    await f.transport.send("worker@test", "direct nudge", { deliveryId: "direct-nudge", actorSession: "sender@test", auditPointer: item.qitemId, queueWake: true, verify: true });
+    f.db.prepare("UPDATE queue_items SET state=? WHERE qitem_id=?").run(state, item.qitemId);
+    f.bodies.a = ""; f.advance(); await f.deferred.drain();
+    expect(f.deferred.lookup("direct-nudge")).toMatchObject({ state: "held", reason: "wake_no_longer_applicable" });
+    expect(f.writes).toEqual([]);
   });
 
   it("coalesced wakes keep every original ID/body and expose the same progress through each member", async () => {

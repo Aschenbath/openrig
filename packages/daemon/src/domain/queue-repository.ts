@@ -827,7 +827,7 @@ export class QueueRepository {
     transport.configureDeferredWakes?.(entries => entries.every(entry => {
       const row = entry.auditPointer ? this.getById(entry.auditPointer) : null;
       if (!row || row.destinationSession !== entry.destinationSession) return false;
-      return entry.outboxId.startsWith(WAKE_INTENT_PREFIX) ? this.currentWakeIntent(entry) : !isTerminalState(row.state);
+      return entry.outboxId.startsWith(WAKE_INTENT_PREFIX) ? this.currentWakeIntent(entry) : isBlockerLive(row.state);
     }), (entries, result) => {
       const outcome = this.classifyWakeResult(result);
       for (const entry of entries) {
