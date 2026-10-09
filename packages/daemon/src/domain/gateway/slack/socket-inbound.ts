@@ -133,6 +133,8 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
   let current: Conn | undefined;
   /** Our posts waiting for their echo: Slack ts → when we posted it. */
   const expected = new Map<string, number>();
+  /** Event ts seen in the last few minutes: an echo can arrive before the post's ts is registered. */
+  const recentEvents = new Map<string, number>();
   let pendingTimer: ReturnType<typeof setTimeout> | undefined;
   let openTimer: ReturnType<typeof setTimeout> | undefined;
   let retryTimer: ReturnType<typeof setInterval> | undefined;
@@ -142,6 +144,8 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
   const unref = (t: unknown) => {
     if (typeof (t as { unref?: () => void }).unref === "function") (t as { unref: () => void }).unref();
   };
+  /** While a replacement is opening, the old connection may still be up: status follows it. */
+  const oldStillOpen = (): boolean => replacing && !!current && !current.closed;
   const receipt = (entry: Parameters<InboundReceiptStore["append"]>[0]): void => {
     try {
       deps.receipts?.append(entry);
@@ -159,13 +163,15 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
     });
   };
 
-  // A ping proves an open connection alive. undici 6 names no socket in the message, so it
-  // credits every open connection; a later undici that names one credits only that one.
+  // A ping proves an open connection alive. undici 6 names no socket in the message, so an
+  // unnamed ping credits a connection only when it is the one open; while two overlap, it could
+  // be the draining one's. A later undici that names the socket credits only that one.
   const onPing = (message: unknown): void => {
     const target = (message as { websocket?: unknown } | null)?.websocket;
     const now = Date.now();
-    for (const conn of conns) {
-      if (conn.closed || !conn.opened || (target !== undefined && target !== conn.ws)) continue;
+    const open = [...conns].filter((conn) => !conn.closed && conn.opened);
+    for (const conn of open) {
+      if (target !== undefined ? target !== conn.ws : open.length !== 1) continue;
       conn.lastPingAt = now;
       conn.pingArmed = true;
     }
@@ -234,13 +240,13 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
       connects++;
       status.generation = connects;
       status.reconnects = Math.max(0, connects - 1);
-      if (!replacing) status.state = "connecting";
+      if (!oldStillOpen()) status.state = "connecting";
       receipt({ generation: connects, status: "connect-attempt" });
       const open = await openSocketConnection(appToken, deps.fetchImpl);
       if (stopped) return resolve();
       if (!open.ok || !open.url) {
         log(`connect failed: ${open.error}`);
-        if (!replacing) {
+        if (!oldStillOpen()) {
           status.state = "disconnected";
           status.disconnectedAt = stamp();
         }
@@ -264,7 +270,7 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
         if (stopped) return;
         closeConn(conn);
         log(`socket did not open (${reason}); reconnect in ${backoff}ms`);
-        if (!replacing) {
+        if (!oldStillOpen()) {
           status.state = "disconnected";
           status.disconnectedAt = stamp();
         }
@@ -330,6 +336,11 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
             replace(env.reason, true);
           }
         }
+        if (ev?.ts) {
+          const now = Date.now();
+          recentEvents.set(ev.ts, now);
+          for (const [ts, at] of recentEvents) if (now - at > 5 * 60_000) recentEvents.delete(ts);
+        }
         if (ev?.ts && expected.delete(ev.ts)) {
           conn.echoArmed = true;
           if (conn === current) {
@@ -380,6 +391,12 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
         conns.delete(conn);
         receipt({ generation: conn.generation, status: "disconnected" });
         // A retired connection's close is the expected end of a replacement: nothing to reconnect.
+        // If its replacement has not opened yet, no socket is up, and status must say so.
+        if (conn.retired && conn === current) {
+          if (retryTimer) clearInterval(retryTimer);
+          status.state = "disconnected";
+          status.disconnectedAt = stamp();
+        }
         if (conn.retired || conn !== current) return;
         clearTimeout(openTimer);
         openTimer = undefined;
@@ -425,6 +442,15 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
     status: () => ({ ...status }),
     expectEcho: (messageTs: string) => {
       if (stopped || !/^\d+\.\d+$/.test(messageTs)) return;
+      if (recentEvents.has(messageTs)) {
+        // The echo beat the registration: it counts as delivered on the connection that is up.
+        if (current && !current.closed) {
+          current.echoArmed = true;
+          status.delivery = "delivering";
+          status.eventsMissingSince = undefined;
+        }
+        return;
+      }
       expected.set(messageTs, Date.now());
     },
   };

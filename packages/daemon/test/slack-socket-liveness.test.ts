@@ -148,6 +148,39 @@ describe("Socket Mode liveness", () => {
     expect(handle!.status()).toMatchObject({ state: "connected", generation: 2 });
   });
 
+  it("reports disconnected when the retired connection closes before its replacement opens", async () => {
+    const first = await openSocket(1);
+    for (let i = 0; i < 2; i++) { ping(); await vi.advanceTimersByTimeAsync(10_000); }
+    await vi.advanceTimersByTimeAsync(40_000);
+    await vi.waitFor(() => expect(sockets).toHaveLength(2)); // the replacement is opening, not open
+    expect(handle!.status().state).toBe("connected"); // the old one is still up
+    first.ws.onclose!();
+    expect(handle!.status().state, "no socket is open, so status must not say connected").toBe("disconnected");
+  });
+
+  it("counts an echo that arrives before the post's ts is registered", async () => {
+    const first = await openSocket(1);
+    handle!.expectEcho("500.000001");
+    message(first, botEcho("500.000001")); // armed
+    message(first, botEcho("500.000002")); // this echo beats its registration
+    handle!.expectEcho("500.000002");
+    handle!.expectEcho("500.000003"); // only this one is really missing
+    await vi.advanceTimersByTimeAsync(70_000);
+    expect(sockets).toHaveLength(1);
+    expect(handle!.status()).toMatchObject({ delivery: "delivering", unechoedPosts: 1 });
+  });
+
+  it("does not credit an unnamed ping to either connection while a refresh overlaps them", async () => {
+    const first = await openSocket(1);
+    message(first, { envelope_id: "d-3", type: "disconnect", reason: "refresh_requested" });
+    await openSocket(2);
+    ping(); // could be the draining connection's
+    expect(handle!.status().lastServerPingAt).toBeUndefined();
+    first.ws.onclose!();
+    ping(); // one connection open: unambiguous
+    expect(handle!.status().lastServerPingAt).toBeDefined();
+  });
+
   it("stops reconnecting when Slack reports link_disabled, and says why", async () => {
     const first = await openSocket(1);
     message(first, { envelope_id: "d-2", type: "disconnect", reason: "link_disabled" });
