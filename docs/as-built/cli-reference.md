@@ -16,7 +16,7 @@ last-updated: 2026-10-09
 # CLI Reference — Registered Commands and Options
 
 Verified against source commit `92a2b8f7157661716a9c79de742cd82a96d1e6f7`.
-The inventory below includes this change’s typing-guard options and comes from the actual Commander tree returned by
+The inventory below comes from the actual Commander tree returned by
 [`createProgram()`](../../packages/cli/src/index.ts), not a grep of command
 strings or an installed CLI from a different commit.
 

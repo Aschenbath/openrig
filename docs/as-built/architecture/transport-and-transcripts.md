@@ -136,8 +136,9 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
    For draft-aware seats, `TmuxAdapter` checks the current composer after buffer
    preparation and again immediately before keys. The delivery lease records
    the pasted text and any observed collapsed-paste label; Enter requires that
-   owned input. A late human input, ambiguous write, changed recipient or stopped
-   queue wake ends automatic retry. Unicode cell widths use the daemon's direct
+   owned input. Late human input, changed recipients or stopped queue wakes refuse
+   further input or hold the message; ambiguous writes remain indeterminate. Nothing
+   is retried automatically. Unicode cell widths use the daemon's direct
    `string-width` dependency. See [per-seat terminal delivery](../../reference/seat-delivery.md)
    for activation, persistence, inspection and lifecycle tradeoffs.
 5. Optional `--verify`: capture the last 30 pane lines before and after the
