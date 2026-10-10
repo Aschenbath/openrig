@@ -318,7 +318,7 @@ export class TmuxAdapter {
   get deliveryGuard(): SeatDeliveryGuard | undefined { return this.inputGuard; }
   set deliveryGuard(guard: SeatDeliveryGuard | undefined) {
     this.inputGuard = guard;
-    guard?.attachInputInspection(async target => inspectComposerInput(await this.captureComposerSnapshot(target.pane ?? target.session)), async target => {
+    guard?.attachInputInspection(async (target, owned) => inspectComposerInput(await this.captureComposerSnapshot(target.pane ?? target.session), null, owned), async target => {
       if (!target.pane) return true;
       const probe = await this.probeSession(target.session);
       if (probe.state === "absent") return true;

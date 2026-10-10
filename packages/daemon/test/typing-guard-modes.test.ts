@@ -7,7 +7,7 @@ import { parseTypingGuardSettings } from "../src/domain/seat-delivery-guard.js";
 import type { ComposerSnapshot } from "../src/domain/composer-prompts.js";
 import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
 import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_guard.js";
-import { typingGuardRetriesSchema } from "../src/db/migrations/100_typing_guard_retries.js";
+import { typingGuardModesSchema } from "../src/db/migrations/100_typing_guard_modes.js";
 
 const cleanup: Array<() => void> = [];
 afterEach(() => cleanup.splice(0).reverse().forEach(fn => fn()));
@@ -21,7 +21,7 @@ function screen(body: string): ComposerSnapshot {
 function fixture() {
   const db = new Database(":memory:"); cleanup.push(() => db.close());
   db.exec("CREATE TABLE nodes(id TEXT PRIMARY KEY); INSERT INTO nodes VALUES ('a'),('b');");
-  db.exec(outboxEntriesSchema.sql); db.exec(seatDeliveryGuardSchema.sql); db.exec(typingGuardRetriesSchema.sql);
+  db.exec(outboxEntriesSchema.sql); db.exec(seatDeliveryGuardSchema.sql); db.exec(typingGuardModesSchema.sql);
   const targets: Record<string, GuardTarget> = {
     a: { nodeId: "a", session: "a", occupant: "g1", pane: "%1" },
     b: { nodeId: "b", session: "b", occupant: "g2", pane: "%2" },
@@ -54,6 +54,84 @@ function fixture() {
 }
 
 describe("typing guard modes", () => {
+
+  it.each(["unchanged", "on", "off", "off-on"])("keeps rollback protection and honors the last legacy write (%s)", async setting => {
+    const f = fixture();
+    await f.guard.set("a", { mode: "draft-aware" }, "operator", "protect input");
+    expect(f.db.prepare("SELECT desired,effective FROM seat_delivery_guards WHERE node_id='a'").get()).toEqual({ desired: 1, effective: 1 });
+    f.db.exec("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,delivery_state,ts_dispatched) VALUES ('held','human','a','keep held','retained','fixture'),('uncertain','human','a','keep uncertain','indeterminate','fixture')");
+    // Main's boolean writer also audits 1 -> 1. Reuse changed_at deliberately:
+    // two writes in one clock tick must still be ordered by the audit row ID.
+    const legacySet = (enabled: number) => f.db.transaction(() => {
+      const row = f.db.prepare("SELECT desired,effective,changed_at FROM seat_delivery_guards WHERE node_id='a'").get() as { desired: number; effective: number; changed_at: string };
+      f.db.prepare("UPDATE seat_delivery_guards SET desired=?,effective=?,actor='legacy',reason='legacy setting' WHERE node_id='a'").run(enabled, enabled);
+      f.db.prepare("INSERT INTO seat_delivery_guard_changes(node_id,desired,previous_desired,previous_effective,actor,reason,requested_at,effective_at) VALUES ('a',?,?,?,'legacy','legacy setting',?,?)")
+        .run(enabled, row.desired, row.effective, row.changed_at, row.changed_at);
+    })();
+    if (setting === "on") legacySet(1);
+    if (setting === "off") legacySet(0);
+    if (setting === "off-on") { legacySet(0); legacySet(1); }
+    const reopened = new SeatDeliveryGuard(f.db, name => f.targets[name] ?? null);
+    reopened.recoverActivation();
+    const expected = setting === "unchanged" ? "draft-aware" : setting === "off" ? "off" : "hold";
+    expect(reopened.preference("a")).toMatchObject({ desiredMode: expected, effectiveMode: expected, pending: false });
+    if (expected === "hold") await expect(reopened.operation("a", async () => { throw new Error("must not write"); })).rejects.toMatchObject({ code: "typing_guard_enabled" });
+    expect(f.db.prepare("SELECT body,delivery_state FROM outbox_entries ORDER BY outbox_id").all()).toEqual([
+      { body: "keep held", delivery_state: "retained" }, { body: "keep uncertain", delivery_state: "indeterminate" },
+    ]);
+    expect(f.writes).toEqual([]);
+  });
+
+  it.each(["ordinary request ", "1. Review the change", "2) Review the change"])("submits its exact ordinary text once: %j", async text => {
+    const f = fixture(); await f.guard.set("a", { mode: "draft-aware" }, "operator", "preserve draft");
+    await f.guard.operation("a", async () => {
+      expect(await f.tmux.sendText("a", text)).toEqual({ ok: true });
+      expect(await f.tmux.sendKeys("a", ["Enter"])).toEqual({ ok: true });
+    });
+    expect(f.writes[0]).toBe("paste:a:" + text);
+    expect(f.writes.filter(line => line.includes("send-keys"))).toHaveLength(1);
+  });
+
+  it.each(["padded", "trimmed"])("uses the cursor to distinguish authored trailing spaces from %s capture cells", async capture => {
+    const f = fixture(); await f.guard.set("a", { mode: "draft-aware" }, "operator", "preserve spaces");
+    await f.guard.operation("a", async () => {
+      expect(await f.tmux.sendText("a", "ordinary request  ")).toEqual({ ok: true });
+      const pane = f.panes.a!;
+      const lines = pane.screen.split("\n");
+      lines[2] = capture === "padded" ? lines[2]!.padEnd(120) : lines[2]!.trimEnd();
+      pane.screen = lines.join("\n");
+      expect(await f.tmux.sendKeys("a", ["Enter"])).toEqual({ ok: true });
+    });
+  });
+
+  it("refuses a real numbered menu before any paste and edits to its numbered body after paste", async () => {
+    const f = fixture(); await f.guard.set("a", { mode: "draft-aware" }, "operator", "protect menus");
+    f.panes.a = screen("1. Approve the command");
+    expect(await f.tmux.sendText("a", "1. Review the change")).toMatchObject({ code: "draft_input_unknown" });
+    expect(f.writes).toEqual([]);
+    f.panes.a = screen("");
+    await f.guard.operation("a", async () => {
+      expect(await f.tmux.sendText("a", "1. Review the change")).toEqual({ ok: true });
+      f.panes.a = screen("1. Review the change with a human edit");
+      expect(await f.tmux.sendKeys("a", ["Enter"])).toMatchObject({ ok: false });
+    });
+    expect(f.writes.filter(line => line.includes("send-keys"))).toHaveLength(0);
+  });
+
+  it.each([false, true])("checks several paste placeholders and their literal tail (edited: %s)", async edited => {
+    const f = fixture(); await f.guard.set("a", { mode: "draft-aware" }, "operator", "large paste");
+    const tail = "This literal tail belongs only to the original message and provides enough visible identity.";
+    const text = ["hidden one", "hidden two", "hidden three", "hidden four", tail].join("\n");
+    const rendered = "[Pasted text #4 +2 lines]\n[Pasted text #5 +2 lines]\n" + tail;
+    f.renderPaste(() => rendered);
+    await f.guard.operation("a", async () => {
+      expect(await f.tmux.sendText("a", text)).toEqual({ ok: true });
+      if (edited) f.panes.a = screen(rendered + " human edit");
+      expect(await f.tmux.sendKeys("a", ["Enter"])).toMatchObject({ ok: !edited });
+    });
+    expect(f.writes.filter(line => line.includes("send-keys"))).toHaveLength(edited ? 0 : 1);
+  });
+
   it("upgrades the existing boolean control and retained outbox without adding any tables", async () => {
     const db = new Database(":memory:"); cleanup.push(() => db.close());
     db.exec("CREATE TABLE nodes(id TEXT PRIMARY KEY); INSERT INTO nodes VALUES ('a');");
@@ -64,16 +142,16 @@ describe("typing guard modes", () => {
     db.exec("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,delivery_state,ts_dispatched) VALUES ('old','human','a','keep these bytes','retained','2026-10-01T00:00:00Z')");
     const tables = () => db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all();
     const before = tables();
-    db.exec(typingGuardRetriesSchema.sql);
+    db.exec(typingGuardModesSchema.sql);
     expect(tables()).toEqual(before);
     const upgraded = new SeatDeliveryGuard(db, () => target);
     upgraded.recoverActivation();
     expect(upgraded.preference("a")).toMatchObject({ desired: true, effective: true, desiredMode: "hold", effectiveMode: "hold", pending: false });
-    expect(db.prepare("SELECT body,delivery_state,retry_request FROM outbox_entries WHERE outbox_id='old'").get())
-      .toEqual({ body: "keep these bytes", delivery_state: "retained", retry_request: null });
-    await upgraded.set("a", { mode: "draft-aware", holdSeconds: 60, maxAttempts: 5 }, "operator", "wait for clear input");
+    expect(db.prepare("SELECT body,delivery_state,guard_delivery FROM outbox_entries WHERE outbox_id='old'").get())
+      .toEqual({ body: "keep these bytes", delivery_state: "retained", guard_delivery: null });
+    await upgraded.set("a", { mode: "draft-aware" }, "operator", "wait for clear input");
     await upgraded.set("a", false, "operator", "legacy off");
-    expect(upgraded.preference("a")).toMatchObject({ effective: false, effectiveMode: "off", holdSeconds: 60, maxAttempts: 5 });
+    expect(upgraded.preference("a")).toMatchObject({ effective: false, effectiveMode: "off" });
     await upgraded.set("a", true, "operator", "legacy hold");
     expect(upgraded.preference("a")).toMatchObject({ effective: true, effectiveMode: "hold" });
     expect(db.prepare("SELECT count(*) n FROM seat_delivery_guards").get()).toEqual({ n: 1 });
@@ -99,10 +177,10 @@ describe("typing guard modes", () => {
     expect(await f.tmux.sendText("a", "message")).toMatchObject({ ok: false, code: "draft_input_busy" });
     expect(f.writes).toEqual([]);
   });
-  it("defaults off and validates bounded opt-in settings", () => {
+  it("defaults off and rejects invalid modes and obsolete retry settings", () => {
     const f = fixture();
     expect(f.guard.configuration("a").effective.mode).toBe("off");
-    expect(parseTypingGuardSettings({ mode: "draft-aware" })).toEqual({ mode: "draft-aware", holdSeconds: 120, maxAttempts: 10 });
+    expect(parseTypingGuardSettings({ mode: "draft-aware" })).toEqual({ mode: "draft-aware" });
     for (const input of [{ mode: "typo" }, { mode: "draft-aware", holdSeconds: 0 }, { mode: "draft-aware", holdSeconds: Infinity },
       { mode: "draft-aware", holdSeconds: 3601 }, { mode: "draft-aware", holdSeconds: null },
       { mode: "draft-aware", maxAttempts: null }, { mode: "draft-aware", maxAttempts: 1.5 }, { mode: "draft-aware", maxAttempts: 101 }]) {
@@ -110,7 +188,7 @@ describe("typing guard modes", () => {
     }
   });
 
-  it("activates after the existing operation, survives restart and keeps same-setting retries idempotent", async () => {
+  it("activates after the existing operation, survives restart and keeps same-setting activation idempotent", async () => {
     const f = fixture(); let release!: () => void; let entered!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });
     const held = new Promise<void>(resolve => { release = resolve; });
@@ -126,6 +204,7 @@ describe("typing guard modes", () => {
 
     const desired = { ...active.desired, mode: "hold", revision: "restart-activation" };
     f.db.prepare("UPDATE seat_delivery_guards SET desired=1,desired_config=? WHERE node_id='a'").run(JSON.stringify(desired));
+    f.db.prepare("UPDATE seat_delivery_guard_changes SET desired_config=? WHERE id=(SELECT max(id) FROM seat_delivery_guard_changes)").run(JSON.stringify(desired));
     f.guard.recoverActivation();
     expect(f.guard.preference("a")).toMatchObject({ desired: true, effective: true, effectiveMode: "hold", pending: false });
   });

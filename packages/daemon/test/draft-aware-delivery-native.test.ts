@@ -59,7 +59,7 @@ describe.skipIf(process.platform === "win32")("native draft-aware terminal deliv
       transport = new SessionTransport({ db, tmuxAdapter: adapter, rigRepo: new RigRepository(db), sessionRegistry: new SessionRegistry(db),
         now: () => new Date(at), sleep: async ms => { if (ms === 200) await hooks.beforeEnter?.(); await pause(ms); } });
       const send = (id: string, text: string) => transport!.send("worker@test", text, { deliveryId: id, actorSession: "sender@test", verify: true });
-      await guard.set("a", { mode: "draft-aware", holdSeconds: 12, maxAttempts: 3 }, "human@test", "native fixture");
+      await guard.set("a", { mode: "draft-aware" }, "human@test", "native fixture");
       await vi.waitFor(async () => expect(inspectComposerInput(await adapter.captureComposerSnapshot(panes.a!)).state).toBe("empty"), { timeout: 5000 });
 
       // A real human input arriving while the payload buffer is prepared must
@@ -69,11 +69,12 @@ describe.skipIf(process.platform === "win32")("native draft-aware terminal deliv
         await tmux(["send-keys", "-t", panes.a!, "-l", "unfinished human draft"]);
         await waitInput("unfinished human draft");
       };
-      expect(await send("deferred", "one\nmessage")).toMatchObject({ outcome: "retained", delivery: { state: "waiting", attempts: 1 } });
+      expect(await send("deferred", "one\nmessage")).toMatchObject({ outcome: "retained", delivery: { state: "held" } });
       expect(state()).toEqual({ input: "unfinished human draft", submissions: [] });
       await tmux(["send-keys", "-t", panes.a!, "C-u"]); await waitInput("");
-      at += 4000; await transport.deferredDelivery!.drain();
-      expect(transport.deferredDelivery!.readback("deferred")).toMatchObject({ ok: true, sent: true, delivery: { state: "complete", attempts: 2 } });
+      expect(await send("deferred", "one\nmessage")).toMatchObject({ outcome: "retained", reason: "draft_input_busy" });
+      expect(state().submissions).toEqual([]);
+      expect(await send("fresh", "one\nmessage")).toMatchObject({ ok: true, sent: true, delivery: { state: "complete" } });
       await vi.waitFor(() => expect(state().submissions).toEqual(["one\nmessage"]));
 
       hooks.beforeEnter = async () => {
@@ -83,7 +84,7 @@ describe.skipIf(process.platform === "win32")("native draft-aware terminal deliv
       };
       expect(await send("late", "second message")).toMatchObject({ ok: false, sent: true, reason: "draft_input_changed", delivery: { state: "indeterminate" } });
       expect(state()).toEqual({ input: "second message plus a human draft", submissions: ["one\nmessage"] });
-      at += 4000; await transport.deferredDelivery!.drain(); expect(state().submissions).toHaveLength(1);
+      await send("late", "second message"); expect(state().submissions).toHaveLength(1);
       await tmux(["send-keys", "-t", panes.a!, "C-u"]); await waitInput("");
 
       await tmux(["copy-mode", "-t", panes.a!]);
@@ -101,7 +102,7 @@ describe.skipIf(process.platform === "win32")("native draft-aware terminal deliv
         expect(await adapter.sendKeys("worker@test", ["Enter"])).toEqual({ ok: true });
       });
       await vi.waitFor(() => expect(state().submissions).toEqual(["one\nmessage", "direct human message"]));
-      await guard.set("a", { mode: "draft-aware", holdSeconds: 12, maxAttempts: 3 }, "human@test", "protect literal input");
+      await guard.set("a", { mode: "draft-aware" }, "human@test", "protect literal input");
       await tmux(["send-keys", "-t", panes.a!, "-l", "Ask Codex to do anything"]);
       await waitInput("Ask Codex to do anything");
       await tmux(["send-keys", "-t", panes.a!, "C-a"]);
@@ -117,7 +118,7 @@ describe.skipIf(process.platform === "win32")("native draft-aware terminal deliv
         expect(snapshot?.screen).toContain("suggested follow-up");
         expect(inspectComposerInput(snapshot).state).toBe("empty");
       });
-      expect(await send("ghost", "owned delivery")).toMatchObject({ ok: true, delivery: { state: "complete", attempts: 1 } });
+      expect(await send("ghost", "owned delivery")).toMatchObject({ ok: true, delivery: { state: "complete" } });
       await vi.waitFor(() => expect(state().submissions).toEqual(["one\nmessage", "direct human message", "owned delivery"]));
 
       const framedDraft = "intro\n────────────────────\n❯ \n────────────────────\n? for shortcuts\n────────────────────\n❯ ";
@@ -128,7 +129,7 @@ describe.skipIf(process.platform === "win32")("native draft-aware terminal deliv
       expect(await send("nested-prompt", "automatic message")).toMatchObject({ outcome: "retained", delivery: { reason: "draft_input_busy" } });
       expect(state()).toEqual({ input: framedDraft, submissions: ["one\nmessage", "direct human message", "owned delivery"] });
     } finally {
-      await transport?.deferredDelivery?.stop();
+      await transport?.guardedDelivery?.stop();
       await tmux(["kill-server"]).catch(() => {});
       db.close(); rmSync(scratch, { recursive: true, force: true });
     }

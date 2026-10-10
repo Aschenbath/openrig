@@ -16,13 +16,13 @@ last-updated: 2026-10-09
 # CLI Reference — Registered Commands and Options
 
 Verified against source commit `92a2b8f7157661716a9c79de742cd82a96d1e6f7`.
-The inventory below comes from the actual Commander tree returned by
+The inventory below includes this change’s typing-guard options and comes from the actual Commander tree returned by
 [`createProgram()`](../../packages/cli/src/index.ts), not a grep of command
 strings or an installed CLI from a different commit.
 
 There are **87 top-level registrations**, **356 registered command objects**
 below `rig` (including groups and the hidden `restore apply` command), and
-**1,086 explicitly registered option objects**, including the root version
+**1,084 explicitly registered option objects**, including the root version
 option. Aliases do not add command objects; short/long spellings of one
 option do not add option objects. Commander-generated help is additional.
 These are source counts, not a claim about a deployed release.
@@ -858,7 +858,7 @@ Root: `rig`; declared option: `-V, --version`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig seat` | — | — |
-| `rig seat set-typing-guard <seat>` | — | `--enabled <boolean>`<br>`--mode <mode>`<br>`--hold-seconds <n>`<br>`--max-attempts <n>`<br>`--reason <text>` **required**<br>`--json` |
+| `rig seat set-typing-guard <seat>` | — | `--enabled <boolean>`<br>`--mode <mode>`<br>`--reason <text>` **required**<br>`--json` |
 | `rig seat held-messages <seat>` | — | `--limit <n>`<br>`--offset <n>`<br>`--id <id>`<br>`--json` |
 | `rig seat retire-held-message <seat> <id>` | — | `--reason <text>` **required**<br>`--json` |
 | `rig seat status <seat>` | — | `--json` |
@@ -873,8 +873,8 @@ Root: `rig`; declared option: `-V, --version`.
 | `rig seat clean <seat>` | — | `--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
 | `rig seat set-resume-token <session>` | — | `--token-stdin`<br>`--reason <text>` **required**<br>`--json` |
 
-See [per-seat terminal delivery](../reference/seat-delivery.md) for automatic,
-draft-aware and inbox-only modes, bounded retries and held-message inspection.
+See [per-seat terminal delivery](../reference/seat-delivery.md) for
+off, draft-aware and hold modes, immediate refusal results and held-message inspection.
 
 ### handover
 

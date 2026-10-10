@@ -1,351 +1,148 @@
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { OutboxHandler, type OutboxEntry } from "./outbox-handler.js";
-import type { GuardTarget, SeatDeliveryGuard } from "./seat-delivery-guard.js";
-import { DeliveryGuardError } from "./seat-delivery-guard.js";
-import type { TypingGuardConfig } from "./seat-delivery-guard.js";
+import { DeliveryGuardError, type SeatDeliveryGuard } from "./seat-delivery-guard.js";
 import type { SendOpts, SendResult } from "./session-transport.js";
 
-export type DeferredDeliveryState = "waiting" | "sending" | "held" | "complete" | "indeterminate";
-export interface DeferredDeliverySummary {
+export interface GuardedDeliverySummary {
   id: string;
-  state: DeferredDeliveryState;
-  attempts: number;
-  maxAttempts: number;
-  deadlineAt: string;
-  nextAttemptAt: string | null;
+  state: "sending" | "held" | "complete" | "indeterminate";
   reason: string;
 }
 
-interface StoredOptions { send: SendOpts; liveOnly: boolean }
-interface RequestRow {
-  id: string; node_id: string; binding: string; outbox_ids: string; outbox_fingerprint: string; body: string; options: string;
-  policy_revision: string; created_at: string; deadline_at: string; next_attempt_at: string;
-  attempts: number; max_attempts: number; retry_interval_ms: number; state: DeferredDeliveryState;
-  reason: string; result: string | null;
-}
+/** Only receipt identity and the observed outcome live beside each original row.
+ * No executable options, timer, deadline or request queue survive a send. */
+interface Receipt { ids: string[]; textHash: string; result?: SendResult }
+const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+type Deliver = (session: string, text: string, opts: SendOpts) => Promise<SendResult>;
 
-type Deliver = (session: string, text: string, opts?: SendOpts) => Promise<SendResult>;
-const sameTarget = (a: GuardTarget, b: GuardTarget): boolean => a.nodeId === b.nodeId && a.session === b.session && a.pane === b.pane && a.occupant === b.occupant;
-const fingerprint = (entries: OutboxEntry[]): string => createHash("sha256").update(JSON.stringify(entries.map(entry => ({
-  id: entry.outboxId, sender: entry.senderSession, destination: entry.destinationSession, body: entry.body, audit: entry.auditPointer,
-  binding: entry.guardBinding,
-})))).digest("hex");
-const summary = (r: RequestRow): DeferredDeliverySummary => ({ id: r.id, state: r.state, attempts: r.attempts,
-  maxAttempts: r.max_attempts, deadlineAt: r.deadline_at, nextAttemptAt: r.state === "waiting" ? r.next_attempt_at : null, reason: r.reason });
-
-function storedOptions(opts: SendOpts): StoredOptions {
-  const send: Record<string, unknown> = {};
-  for (const key of ["verify", "force", "waitForIdleMs", "readinessFromPaneOnly", "dangerouslyInteract", "reason", "actorSession",
-    "stampISO", "expectedStagedText", "expectedStagedLineCount", "deliveryId", "auditPointer", "committedOutboxIds", "queueWake", "identityProvenance"] as const) {
-    if (opts[key] !== undefined) send[key] = opts[key];
-  }
-  return { send: send as SendOpts, liveOnly: !!opts.beforeWrite || !!opts.onStartupMismatch || !!opts.onInputEffect };
-}
-
-/** Retries own only the existing outbox identities. A waiting request survives
- * restart; a request interrupted during an attempted write is never replayed.
- */
 export class DraftAwareDelivery {
   private readonly outbox: OutboxHandler;
-  private timer?: ReturnType<typeof setTimeout>;
-  private started = false;
-  private stopping = false;
-  private draining?: Promise<void>;
   private readonly sends = new Set<Promise<SendResult>>();
   private wakeApplicable?: (entries: readonly OutboxEntry[]) => boolean;
-  private wakeObserved?: (entries: readonly OutboxEntry[], result: SendResult) => void;
 
-  constructor(private readonly db: Database.Database, private readonly guard: SeatDeliveryGuard,
-    private readonly deliver: Deliver, private readonly now: () => Date = () => new Date()) {
+  constructor(private readonly db: Database.Database, private readonly guard: SeatDeliveryGuard, private readonly deliver: Deliver) {
     this.outbox = new OutboxHandler(db);
   }
 
-  configureWakes(applicable: (entries: readonly OutboxEntry[]) => boolean, observed: (entries: readonly OutboxEntry[], result: SendResult) => void): void {
-    this.wakeApplicable = applicable;
-    this.wakeObserved = observed;
+  configureWakes(applicable: (entries: readonly OutboxEntry[]) => boolean): void { this.wakeApplicable = applicable; }
+
+  private receipt(id: string): Receipt | null {
+    const row = this.db.prepare("SELECT guard_delivery FROM outbox_entries WHERE outbox_id=?").get(id) as { guard_delivery: string | null } | undefined;
+    return row?.guard_delivery ? JSON.parse(row.guard_delivery) as Receipt : null;
   }
 
-  private row(id: string): RequestRow | undefined {
-    const retry = this.guard.retries.get(id);
-    if (!retry) return undefined;
-    const { entry, request } = retry;
-    if (!entry.guardBinding) throw new DeliveryGuardError("original_delivery_changed", "The original retry binding is unavailable.");
-    const options = request.options as StoredOptions;
-    const state: DeferredDeliveryState = entry.deliveryState === "retained" ? request.nextAttemptAt ? "waiting" : "held"
-      : entry.deliveryState === "sending" ? "sending" : entry.deliveryState === "delivered" ? "complete"
-      : entry.deliveryState === "retired" ? "held" : "indeterminate";
-    return { id: entry.outboxId, node_id: entry.guardBinding.nodeId, binding: JSON.stringify(entry.guardBinding),
-      outbox_ids: JSON.stringify(options.send.committedOutboxIds ?? [entry.outboxId]), outbox_fingerprint: request.fingerprint,
-      body: request.composedBody ?? entry.body, options: JSON.stringify(options), policy_revision: request.guardRevision,
-      created_at: entry.tsDispatched, deadline_at: request.deadlineAt, next_attempt_at: request.nextAttemptAt ?? request.deadlineAt,
-      attempts: request.attempts, max_attempts: request.maxAttempts, retry_interval_ms: request.retryIntervalMs,
-      state, reason: request.reason, result: request.result ? JSON.stringify(request.result) : null };
+  lookup(id: string): GuardedDeliverySummary | null {
+    const receipt = this.receipt(id);
+    if (!receipt) return null;
+    const entry = this.outbox.getById(id)!;
+    const state = entry.deliveryState === "retained" || entry.deliveryState === "retired" ? "held"
+      : entry.deliveryState === "delivered" ? "complete" : entry.deliveryState === "sending" ? "sending" : "indeterminate";
+    const reason = entry.deliveryState === "retired" ? "message_retired" : receipt.result?.reason
+      ?? (state === "sending" ? "delivery_in_progress" : state === "complete" ? "delivered" : "interrupted_write");
+    return { id: receipt.ids[0]!, state, reason };
   }
 
-  lookup(id: string): DeferredDeliverySummary | null { const row = this.row(id); return row ? summary(row) : null; }
-
-  readback(id: string): SendResult | null {
-    const row = this.row(id);
-    return row ? this.result(row) : null;
+  private result(id: string, receipt: Receipt): SendResult {
+    const entry = this.outbox.getById(id)!;
+    const delivery = this.lookup(id)!;
+    if (receipt.result && entry.deliveryState !== "retired") return { ...receipt.result, outboxIds: receipt.ids, delivery };
+    if (delivery.state === "held") return { ok: true, sessionName: entry.destinationSession, sent: false, verified: false,
+      outcome: "retained", reason: delivery.reason, outboxIds: receipt.ids, delivery };
+    return { ok: false, sessionName: entry.destinationSession, outcome: "failed", outboxIds: receipt.ids, delivery,
+      reason: delivery.state === "sending" ? "delivery_in_progress" : "delivery_indeterminate",
+      error: "This delivery has an unresolved write attempt. Inspect its existing ID; it is not replayed." };
   }
 
   existing(session: string, text: string, opts: SendOpts, ids: string[]): SendResult | null {
-    const row = this.row(ids[0]!);
-    if (!row) return null;
-    const stored = JSON.parse(row.options) as StoredOptions;
-    if (row.body !== text || (JSON.parse(row.binding) as GuardTarget).session !== session || row.outbox_ids !== JSON.stringify(ids)
-      || (stored.send.actorSession ?? "unknown") !== (opts.actorSession ?? "unknown")) {
+    const receipt = this.receipt(ids[0]!);
+    if (!receipt) return null;
+    const entry = this.outbox.getById(ids[0]!)!;
+    if (receipt.textHash !== hash(text) || JSON.stringify(receipt.ids) !== JSON.stringify(ids)
+      || entry.destinationSession !== session || entry.senderSession !== (opts.actorSession ?? "unknown")) {
       throw new DeliveryGuardError("delivery_identity_conflict", "This delivery ID already names different content or identity.");
     }
-    return this.result(row);
+    return this.result(ids[0]!, receipt);
   }
 
-  private result(row: RequestRow): SendResult {
-    const binding = JSON.parse(row.binding) as GuardTarget;
-    const outboxIds = JSON.parse(row.outbox_ids) as string[];
-    const delivery = summary(row);
-    if (row.result) return { ...JSON.parse(row.result) as SendResult, outboxIds, delivery };
-    if (row.state === "sending" || row.state === "indeterminate") return { ok: false, sessionName: binding.session,
-      reason: row.state === "sending" ? "delivery_in_progress" : "delivery_indeterminate", outcome: "failed", outboxIds, delivery,
-      error: "This delivery has an unresolved write attempt. Inspect its existing ID; do not create a replacement send." };
-    return { ok: true, sessionName: binding.session, sent: false, verified: false, outcome: "retained", outboxIds, delivery,
-      reason: row.state === "waiting" ? "draft_delivery_waiting" : "draft_delivery_held",
-      warning: row.state === "waiting"
-        ? `Held for draft-aware delivery (${row.attempts}/${row.max_attempts} attempts). Inspect rig seat held-messages ${binding.session} --id ${row.id}.`
-        : `Retained without automatic retry: ${row.reason}. Inspect rig seat held-messages ${binding.session} --id ${row.id}.` };
-  }
-
-  private retain(ids: string[], target: GuardTarget, text: string, opts: SendOpts): void {
-    for (const id of ids) {
-      const prior = opts.committedOutboxIds ? this.outbox.getById(id) : null;
-      if (opts.committedOutboxIds && !prior) throw new DeliveryGuardError("outbox_not_found", "A committed wake is missing; no replacement message was created.");
-      this.outbox.retain(prior
-        ? { ...prior, outboxId: id, tags: prior.tags ?? undefined, auditPointer: prior.auditPointer ?? undefined }
-        : { outboxId: id, senderSession: opts.actorSession ?? "unknown", destinationSession: target.session, body: text,
-          auditPointer: opts.auditPointer, identityProvenance: opts.identityProvenance },
-      target, !!opts.committedOutboxIds);
-    }
-  }
-
+  /** Called inside SessionTransport's existing per-seat lease. Try exactly once. */
   async send(session: string, text: string, opts: SendOpts, ids: string[]): Promise<SendResult> {
-    const pending = this.guard.operation(session, async () => {
-      const target = this.guard.target(session);
-      const policy = this.guard.operationConfig(session);
-      const prior = this.existing(session, text, opts, ids);
-      if (prior) return prior;
-      if (policy.mode !== "draft-aware" || !this.guard.needsInputCheck(session)) return this.deliver(session, text, opts);
-      const request = this.prepare(target, text, opts, ids, policy);
-      const result = await this.attemptSafely(request.id, opts);
-      this.arm();
-      return result;
-    }, async target => {
-      const prior = this.existing(session, text, opts, ids);
-      if (prior) return prior;
-      this.db.transaction(() => this.retain(ids, target, text, opts))();
-      return { ok: true, sessionName: target.session, sent: false, verified: false, outcome: "retained", outboxIds: ids,
-        reason: "typing_guard_enabled", warning: "Automatic input is paused. These messages will not be replayed when protection is disabled." } as SendResult;
-    });
+    const prior = this.existing(session, text, opts, ids);
+    if (prior) return prior;
+    if (!ids.length || new Set(ids).size !== ids.length) throw new DeliveryGuardError("invalid_delivery_ids", "Distinct delivery IDs are required.");
+    const target = this.guard.target(session);
+    const receipt: Receipt = { ids, textHash: hash(text) };
+    this.db.transaction(() => {
+      for (const id of ids) {
+        const entry = opts.committedOutboxIds ? this.outbox.getById(id) : null;
+        if (opts.committedOutboxIds && !entry) throw new DeliveryGuardError("outbox_not_found", "A committed wake is missing; no replacement message was created.");
+        this.outbox.retain(entry ? { ...entry, tags: entry.tags ?? undefined, auditPointer: entry.auditPointer ?? undefined }
+          : { outboxId: id, senderSession: opts.actorSession ?? "unknown", destinationSession: session, body: text,
+            auditPointer: opts.auditPointer, identityProvenance: opts.identityProvenance }, target, !!opts.committedOutboxIds);
+        const claimed = this.db.prepare("UPDATE outbox_entries SET delivery_state='sending',guard_delivery=? WHERE outbox_id=? AND delivery_state='retained' AND guard_delivery IS NULL")
+          .run(JSON.stringify(receipt), id);
+        if (claimed.changes !== 1) throw new DeliveryGuardError("delivery_already_attempted", "This original delivery cannot be attempted again.");
+      }
+    })();
+    const pending = this.attempt(session, text, opts, receipt);
     this.sends.add(pending);
     try { return await pending; }
     finally { this.sends.delete(pending); }
   }
 
-  private prepare(target: GuardTarget, text: string, opts: SendOpts, ids: string[], policy: TypingGuardConfig): RequestRow {
-    if (!ids.length || new Set(ids).size !== ids.length) throw new DeliveryGuardError("invalid_delivery_ids", "Distinct existing delivery IDs are required.");
-    const at = this.now();
-    return this.db.transaction(() => {
-      this.retain(ids, target, text, opts);
-      const entries = ids.map(id => this.outbox.getById(id)!);
-      this.guard.retries.create(ids, { deadlineAt: new Date(at.getTime() + policy.holdSeconds * 1000).toISOString(),
-        nextAttemptAt: at.toISOString(), attempts: 0, maxAttempts: policy.maxAttempts,
-        retryIntervalMs: Math.max(250, Math.ceil(policy.holdSeconds * 1000 / policy.maxAttempts)), guardRevision: policy.revision,
-        fingerprint: fingerprint(entries), options: storedOptions(opts),
-        ...(text !== entries[0]!.body ? { composedBody: text } : {}), reason: "initial" });
-      return this.row(ids[0]!)!;
-    })();
-  }
-
-  private entries(row: RequestRow): OutboxEntry[] {
-    return (JSON.parse(row.outbox_ids) as string[]).map(id => {
-      const entry = this.outbox.getById(id);
-      if (!entry) throw new DeliveryGuardError("outbox_not_found", "An original delivery record is unavailable.");
-      return entry;
-    });
-  }
-
-  private hold(id: string, reason: string): SendResult {
-    const row = this.row(id)!;
-    if (row.state === "waiting" || this.outbox.getById(row.id)?.deliveryState === "retired") {
-      this.guard.retries.update(row.id, { nextAttemptAt: null, reason });
-    }
-    return this.result(this.row(id)!);
-  }
-
-  /** Retiring any original member cancels the whole composed wake. */
-  retired(outboxId: string): void {
-    const row = this.row(outboxId);
-    if (row) this.hold(row.id, "message_retired");
-  }
-
-  private async attemptSafely(id: string, liveOpts?: SendOpts): Promise<SendResult> {
-    try { return await this.attempt(id, liveOpts); }
-    catch (error) {
-      const row = this.row(id);
-      if (row?.state !== "sending") throw error;
-      // A failed final ledger write cannot become a claimed no-write error at
-      // the HTTP boundary. If reconciliation also fails, leave visible sending
-      // evidence for startup recovery instead of permitting another attempt.
-      try { this.db.transaction(() => this.interrupted(row))(); } catch { /* Recover on the next startup. */ }
-      return this.result(this.row(id) ?? row);
-    }
-  }
-
-  private async attempt(id: string, liveOpts?: SendOpts): Promise<SendResult> {
-    const row = this.row(id)!;
-    if (row.state !== "waiting") return this.result(row);
-    if (this.stopping) return this.result(row);
-    const target = JSON.parse(row.binding) as GuardTarget;
-    const policy = this.guard.operationConfig(target.nodeId);
-    if (!sameTarget(target, this.guard.target(target.nodeId))) return this.hold(id, "recipient_changed");
-    if (policy.mode !== "draft-aware" || policy.revision !== row.policy_revision) return this.hold(id, "typing_guard_changed");
-    if (this.now().getTime() >= Date.parse(row.deadline_at) || row.attempts >= row.max_attempts) return this.hold(id, "hold_limit_reached");
-    const stored = JSON.parse(row.options) as StoredOptions;
-    if (stored.liveOnly && !liveOpts) return this.hold(id, "live_prerequisite_unavailable");
-    const entries = this.entries(row);
-    if (fingerprint(entries) !== row.outbox_fingerprint || entries.some(entry => entry.deliveryState !== "retained" || !entry.guardBinding || !sameTarget(entry.guardBinding, target))) {
-      return this.hold(id, "original_delivery_changed");
-    }
-    if (stored.send.queueWake && (!this.wakeApplicable || !this.wakeApplicable(entries))) return this.hold(id, "wake_no_longer_applicable");
-    const claimed = this.db.transaction(() => {
-      const changed = this.db.prepare(`UPDATE outbox_entries SET delivery_state='sending' WHERE outbox_id=? AND delivery_state='retained'
-        AND retry_request IS NOT NULL AND json_extract(retry_request,'$.nextAttemptAt') IS NOT NULL`).run(id);
-      if (!changed.changes) return false;
-      for (const entry of entries) {
-        if (entry.outboxId === id) continue;
-        if (this.db.prepare("UPDATE outbox_entries SET delivery_state='sending' WHERE outbox_id=? AND delivery_state='retained'").run(entry.outboxId).changes !== 1) {
-          throw new DeliveryGuardError("original_delivery_changed", "The original held delivery changed before its attempt.");
-        }
-      }
-      this.guard.retries.update(id, { attempts: row.attempts + 1, reason: "attempting" }, "sending");
-      return true;
-    })();
-    if (!claimed) return this.result(this.row(id)!);
-    const opts = liveOpts ?? stored.send;
+  private async attempt(session: string, text: string, opts: SendOpts, receipt: Receipt): Promise<SendResult> {
     let result: SendResult;
     let inputWritten = false;
+    const entries = receipt.ids.map(id => this.outbox.getById(id)!);
     try {
-      result = await this.deliver(target.session, row.body, { ...opts,
+      // Draft-aware is an immediate decision, including when a caller requested wait-for-idle.
+      await this.guard.beforeInput(session);
+      result = await this.deliver(session, text, { ...opts,
         onInputEffect: phase => { inputWritten = true; opts.onInputEffect?.(phase); },
-        ...(opts.waitForIdleMs ? { waitForIdleMs: Math.min(opts.waitForIdleMs, Math.max(1, Date.parse(row.deadline_at) - this.now().getTime())) } : {}),
         beforeWrite: () => {
-          if (this.now().getTime() >= Date.parse(row.deadline_at)) throw new DeliveryGuardError("draft_hold_expired", "The hold deadline was reached; no further input was written.");
-          if (stored.send.queueWake && !this.wakeApplicable?.(entries)) throw new DeliveryGuardError("draft_wake_superseded", "The queue wake is no longer applicable; no further input was written.");
+          if (opts.queueWake && !this.wakeApplicable?.(entries)) throw new DeliveryGuardError("draft_wake_superseded", "The queue wake is no longer applicable; no further input was written.");
           opts.beforeWrite?.();
         },
       });
     } catch (error) {
       const refusal = error instanceof DeliveryGuardError && error.code.startsWith("draft_");
-      result = { ok: false, sessionName: target.session, outcome: "failed",
+      result = { ok: false, sessionName: session, outcome: "failed",
         ...(refusal || inputWritten ? { sent: inputWritten } : {}), reason: refusal ? error.code : "delivery_indeterminate",
-        error: refusal ? error.message : "The delivery attempt ended without a reliable write result. Automatic retry is disabled." };
+        error: refusal ? error.message : "The delivery attempt ended without a reliable write result. It is not replayed." };
     }
     if (inputWritten) result = { ...result, sent: true };
-    const retryable = ["draft_input_busy", "draft_input_unknown", "draft_input_changed", "draft_hold_expired", "target_needs_input", "wait_for_idle_timeout", "target_activity_unknown"].includes(result.reason ?? "");
-    const preInputRefusal = retryable || ["draft_wake_superseded", "target_runtime_unverified", "target_runtime_not_running", "target_runtime_conflict",
+    const preInputRefusal = ["draft_input_busy", "draft_input_unknown", "draft_input_changed", "draft_wake_superseded",
+      "target_needs_input", "wait_for_idle_timeout", "target_activity_unknown", "target_runtime_unverified", "target_runtime_not_running", "target_runtime_conflict",
       "invalid_wait_for_idle", "invalid_dangerously_interact", "dangerously_interact_requires_reason", "prompt_override_audit_unavailable",
       "transport_unavailable", "session_missing", "tmux_unavailable"].includes(result.reason ?? "");
     const noWrite = !result.ok && !inputWritten && preInputRefusal;
-    // The legacy wait path labels a failed tmux call sent=false even when its
-    // native result was lost. Only an explicit pre-input refusal proves that.
-    if (!noWrite && !inputWritten && result.sent === false) {
-      const { sent: _sent, ...unresolved } = result; result = unresolved;
-    }
-    this.db.transaction(() => {
-      const current = this.row(id)!;
-      if (noWrite) {
-        const again = retryable && !stored.liveOnly && current.attempts < current.max_attempts && this.now().getTime() < Date.parse(current.deadline_at);
-        for (const entry of entries) this.outbox.finalizeDelivery(entry.outboxId, "retained");
-        this.guard.retries.update(id, {
-          reason: !retryable || again ? result.reason ?? "delivery_refused" : stored.liveOnly ? "live_prerequisite_unavailable" : "hold_limit_reached",
-          nextAttemptAt: again ? new Date(Math.min(Date.parse(current.deadline_at), this.now().getTime() + current.retry_interval_ms)).toISOString() : null,
-        }, "retained");
-      } else {
-        const state = result.ok && (result.verified || !opts.verify) ? "complete" : "indeterminate";
-        for (const entry of entries) this.outbox.finalizeDelivery(entry.outboxId, state === "complete" ? "delivered" : "indeterminate");
-        this.guard.retries.update(id, { nextAttemptAt: null, reason: result.reason ?? (state === "complete" ? "delivered" : "delivery_unconfirmed"), result });
-      }
-    })();
-    const finished = this.result(this.row(id)!);
-    if (stored.send.queueWake && !liveOpts) {
-      try { this.wakeObserved?.(entries, finished); }
-      catch { console.warn("[draft-delivery] wake observation could not be recorded; retained delivery evidence is available."); }
-    }
-    return finished;
-  }
-
-  recover(): void {
-    this.db.transaction(() => {
-      const abandoned = this.guard.retries.interrupted().map(id => this.row(id)!);
-      for (const row of abandoned) this.interrupted(row);
-      this.guard.retries.recoverGuards();
-    })();
-  }
-
-  private interrupted(row: RequestRow): void {
-    for (const id of JSON.parse(row.outbox_ids) as string[]) {
-      if (this.outbox.getById(id)) this.outbox.finalizeDelivery(id, "indeterminate");
-    }
-    this.guard.retries.update(row.id, { nextAttemptAt: null, reason: "interrupted_write" });
-  }
-
-  inspect(nodeId: string, limit = 100) {
-    const rows = this.guard.retries.forNode(nodeId, Math.max(1, Math.min(100, limit))).map(id => this.row(id)!);
-    return rows.map(summary);
-  }
-
-  drain(): Promise<void> {
-    if (this.draining) return this.draining;
-    const run = async () => {
-      const rows = this.guard.retries.due(this.now().toISOString()).map(id => this.row(id)!);
-      let index = 0;
-      const worker = async () => {
-        while (index < rows.length && !this.stopping) {
-          const row = rows[index++]!;
-          try {
-            await this.guard.operation(row.node_id, () => this.attemptSafely(row.id), async () => this.hold(row.id, "typing_guard_enabled"));
-          } catch {
-            this.db.transaction(() => {
-              if (this.row(row.id)?.state === "sending") this.interrupted(row);
-              else this.hold(row.id, "recipient_or_input_unavailable");
-            })();
-          }
+    if (noWrite) result = { ...result, ok: true, sent: false, verified: false, outcome: "retained",
+      warning: "Held, not delivered. No automatic retry is scheduled. Inspect the original ID with rig seat held-messages." };
+    else if (!inputWritten && result.sent === false) { const { sent: _sent, ...uncertain } = result; result = uncertain; }
+    const state = noWrite ? "retained" : result.ok && (result.verified || !opts.verify) ? "delivered" : "indeterminate";
+    try {
+      this.db.transaction(() => {
+        for (const id of receipt.ids) {
+          this.outbox.finalizeDelivery(id, state);
+          this.db.prepare("UPDATE outbox_entries SET guard_delivery=? WHERE outbox_id=?").run(JSON.stringify({ ...receipt, result }), id);
         }
-      };
-      await Promise.all(Array.from({ length: Math.min(4, rows.length) }, worker));
-    };
-    this.draining = run().finally(() => { this.draining = undefined; this.arm(); });
-    return this.draining;
+      })();
+    } catch {
+      // Never turn a lost ledger acknowledgement into permission to replay a write.
+      try { this.db.transaction(() => receipt.ids.forEach(id => this.outbox.finalizeDelivery(id, "indeterminate")))(); } catch { /* Startup recovery owns abandoned claims. */ }
+    }
+    try { return this.result(receipt.ids[0]!, this.receipt(receipt.ids[0]!)!); }
+    catch {
+      return { ok: false, sessionName: session, outcome: "failed", reason: "delivery_indeterminate", outboxIds: receipt.ids,
+        delivery: { id: receipt.ids[0]!, state: "indeterminate", reason: "receipt_unavailable" },
+        error: "The final delivery receipt could not be read. Inspect the original IDs; no replay is authorized." };
+    }
   }
 
-  start(): void { if (!this.started) { this.recover(); this.stopping = false; this.started = true; this.arm(); } }
-  async stop(): Promise<void> {
-    this.started = false;
-    this.stopping = true;
-    if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
-    await this.draining;
-    await Promise.allSettled([...this.sends]);
+  /** Startup reconciles uncertain writes only; held messages stay held. */
+  recover(): void {
+    this.db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE guard_delivery IS NOT NULL AND delivery_state='sending'").run();
   }
 
-  private arm(): void {
-    if (!this.started || this.draining) return;
-    if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
-    const next = this.guard.retries.nextAt();
-    if (!next) return;
-    this.timer = setTimeout(() => {
-      this.timer = undefined;
-      void this.drain().catch(() => { console.warn("[draft-delivery] retry scan failed; no replacement messages were created."); });
-    }, Math.max(100, Date.parse(next) - this.now().getTime()));
-    this.timer.unref();
-  }
+  async stop(): Promise<void> { await Promise.allSettled([...this.sends]); }
 }

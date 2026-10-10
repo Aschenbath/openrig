@@ -94,18 +94,25 @@ const STATUS = {
 };
 
 describe("seat typing guard commands", () => {
-  it("sends bounded draft-aware settings through the existing control", async () => {
+  it("keeps the legacy on prefix when status reports hold", async () => {
+    const paths: string[] = [];
+    const deps = makeDeps({ status: 200, data: { ...STATUS, typingGuard: { desired: true, effective: true, effectiveMode: "hold", pending: false, heldCount: 0 } } }, paths);
+    const status = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "status", "worker@test"]).then(() => undefined));
+    expect(status.logs.join("\n")).toContain("Typing guard: on (hold)");
+  });
+
+  it("sends draft-aware mode through the existing control", async () => {
     const paths: string[] = [], bodies: unknown[] = [];
     const deps = makeDeps({ status: 200, data: { effectiveMode: "draft-aware", pending: false } }, paths, bodies);
     const result = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "set-typing-guard", "worker@test",
-      "--mode", "draft-aware", "--hold-seconds", "60", "--max-attempts", "5", "--reason", "keep my draft", "--json"]).then(() => undefined));
+      "--mode", "draft-aware", "--reason", "keep my draft", "--json"]).then(() => undefined));
     expect(result.exitCode).toBeUndefined();
     expect(paths).toEqual(["/api/seat/set-typing-guard/worker%40test"]);
-    expect(bodies).toEqual([{ mode: "draft-aware", holdSeconds: 60, maxAttempts: 5, reason: "keep my draft" }]);
+    expect(bodies).toEqual([{ mode: "draft-aware", reason: "keep my draft" }]);
     expect(JSON.parse(result.logs.join(""))).toMatchObject({ effectiveMode: "draft-aware" });
   });
 
-  it.each([["--mode", "typo"], ["--hold-seconds", "NaN"], ["--hold-seconds", "3601"], ["--max-attempts", "0"], ["--max-attempts", "1.5"]])("rejects invalid %s %s before requesting a change", async (flag, value) => {
+  it.each([["--mode", "typo"]])("rejects invalid %s %s before requesting a change", async (flag, value) => {
     const paths: string[] = [];
     const deps = makeDeps({ status: 200, data: {} }, paths);
     const result = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "set-typing-guard", "worker@test",
@@ -130,13 +137,13 @@ describe("seat typing guard commands", () => {
     expect(result.exitCode).toBe(1); expect(paths).toEqual([]);
   });
 
-  it("prints requested/effective activation and retry limits in seat status", async () => {
+  it("prints requested/effective activation and immediate send behavior in seat status", async () => {
     const paths: string[] = [];
-    const typingGuard = { desired: true, effective: false, desiredMode: "hold", effectiveMode: "draft-aware", holdSeconds: 60, maxAttempts: 5, pending: true, heldCount: 1 };
+    const typingGuard = { desired: true, effective: false, desiredMode: "hold", effectiveMode: "draft-aware", pending: true, heldCount: 1 };
     const deps = makeDeps({ status: 200, data: { ...STATUS, typingGuard } }, paths);
     const status = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "status", "worker@test"]).then(() => undefined));
     expect(status.logs.join("\n")).toContain("Typing guard: draft-aware (activation pending; requested hold)");
-    expect(status.logs.join("\n")).toContain("Draft hold: 60s, at most 5 attempts");
+    expect(status.logs.join("\n")).toContain("Draft-aware sends return immediately");
     expect(paths.at(-1)).toBe("/api/seat/status/worker%40test");
   });
 });

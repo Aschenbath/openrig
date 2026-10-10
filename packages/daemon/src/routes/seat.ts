@@ -31,16 +31,16 @@ seatRoutes.post("/set-typing-guard/:seatRef", async c => {
   const body = await c.req.json<Record<string, unknown>>().catch(() => null);
   if (!body || typeof body.reason !== "string" || !body.reason.trim()
     || (body.enabled === undefined) === (body.mode === undefined)
-    || body.enabled !== undefined && typeof body.enabled !== "boolean") {
+    || body.enabled !== undefined && typeof body.enabled !== "boolean"
+    || body.holdSeconds !== undefined || body.maxAttempts !== undefined) {
     return c.json({ error: "Supply exactly one enabled boolean or mode, and a reason" }, 400);
   }
   const actor = transportSenderSession(c);
   if (!actor) return c.json({ error: "Sender identity required for preference audit" }, 400);
   try {
     const target = guard.target(c.req.param("seatRef"));
-    const preference = await guard.set(target.nodeId, { mode: body.mode ?? (body.enabled ? "hold" : "off"),
-      holdSeconds: body.holdSeconds, maxAttempts: body.maxAttempts }, actor, body.reason);
-    return c.json({ ...preference, tradeoff: "Hold retains all automatic input. Draft-aware waits for a clear composer within its limits. Off permits new sends. Changing mode does not flush earlier held messages." }, preference.pending ? 202 : 200);
+    const preference = await guard.set(target.nodeId, { mode: body.mode ?? (body.enabled ? "hold" : "off") }, actor, body.reason);
+    return c.json({ ...preference, tradeoff: "Hold retains all automatic input. Draft-aware sends once or immediately holds with the exact refusal reason; it schedules no retry. Off permits new sends. Changing mode does not flush earlier held messages." }, preference.pending ? 202 : 200);
   } catch (error) {
     return c.json({ error: (error as Error).message, code: (error as { code?: string }).code }, error instanceof DeliveryGuardError && error.code === "invalid_typing_guard" ? 400 : 409);
   }
@@ -52,17 +52,17 @@ seatRoutes.get("/held-messages/:seatRef", c => {
   try {
     const target = guard.target(c.req.param("seatRef"));
     const outbox = new OutboxHandler(guard.db);
-    const deferred = (c.get("sessionTransport" as never) as SessionTransport | undefined)?.deferredDelivery;
+    const guarded = (c.get("sessionTransport" as never) as SessionTransport | undefined)?.guardedDelivery;
     const id = c.req.query("id");
     if (id) {
       const entry = outbox.getById(id);
       if (entry?.guardBinding?.nodeId !== target.nodeId) return c.json({ error: "No retained history for this node and ID" }, 404);
-      const delivery = deferred?.lookup(id);
+      const delivery = guarded?.lookup(id);
       return c.json({ entry, ...(delivery ? { delivery } : {}) });
     }
     const page = outbox.heldForNode(target.nodeId, Number(c.req.query("limit") ?? 100), Number(c.req.query("offset") ?? 0));
     return c.json({ ...page, items: page.items.map(entry => {
-      const delivery = deferred?.lookup(entry.outboxId);
+      const delivery = guarded?.lookup(entry.outboxId);
       return delivery ? { ...entry, delivery } : entry;
     }) });
   } catch (error) { return c.json({ error: (error as Error).message }, 400); }
@@ -79,7 +79,6 @@ seatRoutes.post("/retire-held-message/:seatRef/:id", async c => {
     const outbox = new OutboxHandler(guard.db); const id = c.req.param("id");
     if (outbox.getById(id)?.guardBinding?.nodeId !== target.nodeId) return c.json({ error: "No held message for this node and ID" }, 404);
     const entry = outbox.retire(id, actor, body.reason);
-    (c.get("sessionTransport" as never) as SessionTransport | undefined)?.deferredDelivery?.retired(id);
     return c.json({ entry, effect: "Retired from active quota; evidence preserved. No delivery, native consumption or work closure is asserted." });
   } catch (error) { return c.json({ error: (error as Error).message }, 409); }
 });

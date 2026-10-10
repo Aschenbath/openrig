@@ -121,10 +121,14 @@ export interface ComposerSnapshot {
   inMode: boolean;
 }
 
+export interface ComposerOwnership { text: string; frame: string }
+
 export interface ComposerInput {
   state: "empty" | "text" | "unknown";
   rows: string[];
   columns: number;
+  frame?: string;
+  pasteMatchesExpected?: boolean;
   cursorAtEnd: boolean;
   collapsedPaste: string | null;
   /** A proven display-only suffix, so readiness can reuse the same input read. */
@@ -164,6 +168,7 @@ export function composerContainsOwnedText(input: ComposerInput, expected: string
  * the text. Subsequent submission requires that same complete label and cursor.
  */
 export function ownCollapsedPaste(input: ComposerInput, expected: string): string | null {
+  if (input.collapsedPaste && input.cursorAtEnd && input.pasteMatchesExpected) return input.collapsedPaste;
   const match = input.collapsedPaste && input.cursorAtEnd ? COMPOSER_COLLAPSED_PASTE_PATTERN.exec(input.collapsedPaste) : null;
   return match && Number(match[1]) === expected.split("\n").length - 1 ? input.collapsedPaste : null;
 }

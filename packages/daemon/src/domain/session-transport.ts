@@ -2,6 +2,7 @@ import stringWidth from "string-width";
 import { randomUUID } from "node:crypto";
 import { isComposerFooter, inspectStartupStagedText, startupSubmissionEvidence, type StartupSubmissionEvidence } from "./startup-submission-evidence.js";
 import {
+  composerContainsOwnedText,
   composerPromptClassForRuntime,
   composerPromptIsAmbiguous,
   composerSelectionPrefixPattern,
@@ -19,7 +20,7 @@ import {
 } from "./composer-prompts.js";
 export { inspectStartupStagedText } from "./startup-submission-evidence.js";
 import { OutboxHandler } from "./outbox-handler.js";
-import { DraftAwareDelivery, type DeferredDeliverySummary } from "./draft-aware-delivery.js";
+import { DraftAwareDelivery, type GuardedDeliverySummary } from "./draft-aware-delivery.js";
 import type { OutboxEntry } from "./outbox-handler.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
@@ -275,7 +276,7 @@ function styledLines(screen: string) {
 /** Inspect only the visible input containing the current cursor. Activity, hook
  * freshness and text elsewhere in the pane are not evidence that input is empty.
  */
-export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime: string | null = null): ComposerInput {
+export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime: string | null = null, owned?: import("./composer-prompts.js").ComposerOwnership): ComposerInput {
   const promptClass = composerPromptClassForRuntime(runtime);
   if (!snapshot || snapshot.inMode) return unknown();
   const { x, y, width, height } = snapshot.cursor;
@@ -291,8 +292,8 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
   const candidates: ComposerInput[] = [];
   for (let start = 0; start <= y; start++) {
     const prompt = readComposerPromptLine(lines[start] ?? "", promptClass);
-    if (!prompt || !/^ *$/.test(prompt.indent) || composerSelectionPrefixPattern(promptClass).test(lines[start]!.trimStart())
-      || /^\d+[.)]\s/.test(prompt.text)) continue;
+    if (!prompt || !/^ *$/.test(prompt.indent)) continue;
+    const numbered = composerSelectionPrefixPattern(promptClass).test(lines[start]!.trimStart()) || /^\d+[.)]\s/.test(prompt.text);
     const prefix = prompt.prefix;
     let end = -1;
     if (prompt.glyph === "❯") {
@@ -341,13 +342,30 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
       }
     }
     const visible = rows.map(line => line.trimEnd());
+    // The cursor bounds authored whitespace on the last input row. Captures may
+    // omit trailing blank cells or include screen padding; neither changes the bytes to submit.
+    if (cursorRow === rows.length - 1) {
+      const cellWidth = stringWidth(rows[cursorRow]!);
+      if (x - prefix >= cellWidth) visible[cursorRow] = rows[cursorRow]! + " ".repeat(x - prefix - cellWidth);
+      else if (cursorOffset >= 0 && !rows[cursorRow]!.slice(cursorOffset).trim()) visible[cursorRow] = rows[cursorRow]!.slice(0, cursorOffset);
+    }
     const atStart = y === start && x === prefix;
     const empty = atStart && rows.length === 1 && rows[0] === "";
     const last = visible.length - 1;
     const cursorAtEnd = y === start + last && x === prefix + stringWidth(visible[last] ?? "");
     const label = visible.length === 1 && COMPOSER_COLLAPSED_PASTE_PATTERN.test(visible[0]!) ? visible[0]! : null;
-    candidates.push({ state: empty ? "empty" : "text", rows: visible, columns: width - prefix, cursorAtEnd, collapsedPaste: label,
-      ...(ghost ? { ghost } : {}) });
+    const frame = JSON.stringify([prompt.glyph, prefix, width, footer]);
+    const input: ComposerInput = { state: empty ? "empty" : "text", rows: visible, columns: width - prefix, cursorAtEnd, collapsedPaste: label, frame,
+      ...(ghost ? { ghost } : {}) };
+    // A numbered body is allowed only as this operation's exact text in its
+    // previously empty composer. A newly observed menu gains no such authority.
+    if (numbered && !(owned?.frame === frame && composerContainsOwnedText(input, owned.text))) continue;
+    if (owned?.frame === frame && cursorAtEnd && visible.join("\n").includes("[Pasted text #")
+      && hasExpectedStagedText(`${prompt.glyph} ${visible.join("\n")}`, owned.text, runtime)) {
+      input.collapsedPaste = visible.join("\n");
+      input.pasteMatchesExpected = true;
+    }
+    candidates.push(input);
   }
   return candidates.length === 1 ? candidates[0]! : unknown();
 }
@@ -941,7 +959,7 @@ export interface SendResult {
    */
   outcome?: "delivered" | "rendered-unconfirmed" | "failed" | "retained";
   outboxIds?: string[];
-  delivery?: DeferredDeliverySummary;
+  delivery?: GuardedDeliverySummary;
   warning?: string;
   error?: string;
   reason?: string;
@@ -999,7 +1017,7 @@ interface AbsenceProbeTarget { session_id: string; node_id: string; session_name
 
 export class SessionTransport {
   readonly db: Database.Database;
-  readonly deferredDelivery?: DraftAwareDelivery;
+  readonly guardedDelivery?: DraftAwareDelivery;
   private rigRepo: RigRepository;
   private sessionRegistry: SessionRegistry;
   private tmuxAdapter: TmuxAdapter;
@@ -1030,12 +1048,12 @@ export class SessionTransport {
     this.captureObserver = deps.captureObserver;
     this.listProcesses = deps.listProcesses;
     const guard = this.tmuxAdapter.deliveryGuard;
-    if (guard?.retries.available) this.deferredDelivery = new DraftAwareDelivery(this.db, guard,
-      (session, text, opts) => this.sendUnguarded(session, text, opts), this.now);
+    if (guard && (this.db.prepare("PRAGMA table_info(outbox_entries)").all() as Array<{ name: string }>).some(c => c.name === "guard_delivery")) this.guardedDelivery = new DraftAwareDelivery(this.db, guard,
+      (session, text, opts) => this.sendUnguarded(session, text, opts));
   }
 
-  configureDeferredWakes(applicable: (entries: readonly OutboxEntry[]) => boolean, observed: (entries: readonly OutboxEntry[], result: SendResult) => void): void {
-    this.deferredDelivery?.configureWakes(applicable, observed);
+  configureGuardedWakes(applicable: (entries: readonly OutboxEntry[]) => boolean): void {
+    this.guardedDelivery?.configureWakes(applicable);
   }
 
   /** Freeze the registration and binding before asking tmux about this name. */
@@ -1357,7 +1375,7 @@ export class SessionTransport {
           }
         }
       }
-      const existing = this.deferredDelivery?.existing(sessionName, text, opts ?? {}, ids);
+      const existing = this.guardedDelivery?.existing(sessionName, text, opts ?? {}, ids);
       if (existing) return existing;
       // Idempotent readback also after disabling: an old retained ID never becomes a new send.
       // (P2: this readback is NOT a new retention and is outside the retained_no_write seam.)
@@ -1371,13 +1389,13 @@ export class SessionTransport {
         }
       }
       return await guard.operation(sessionName, async () => {
-        if (this.deferredDelivery && !opts?.submitOnly && guard.needsInputCheck(sessionName)) {
-          return this.deferredDelivery.send(sessionName, text, opts ?? {}, ids);
+        if (this.guardedDelivery && !opts?.submitOnly && guard.needsInputCheck(sessionName)) {
+          return this.guardedDelivery.send(sessionName, text, opts ?? {}, ids);
         }
-        const prior = this.deferredDelivery?.existing(sessionName, text, opts ?? {}, ids);
+        const prior = this.guardedDelivery?.existing(sessionName, text, opts ?? {}, ids);
         return prior ?? this.sendUnguarded(sessionName, text, opts);
       }, async target => {
-        const prior = this.deferredDelivery?.existing(sessionName, text, opts ?? {}, ids);
+        const prior = this.guardedDelivery?.existing(sessionName, text, opts ?? {}, ids);
         if (prior) return prior;
         if (opts?.submitOnly) return { ok: false, sessionName, sent: false, reason: "typing_guard_enabled", error: "Typing guard prevents submit-only; no Enter was sent." };
         this.db.transaction(() => {

@@ -97,12 +97,13 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
    (`routes/transport.ts:115`); operators use `rig seat set-typing-guard` and
    `rig seat held-messages`. This same typing guard has `off` (default),
    `draft-aware`, and `hold` modes. The legacy enabled boolean selects hold/off.
-   `DraftAwareDelivery` schedules bounded retries only for opted-in seats whose
-   current input is unavailable. Migration `100_typing_guard_retries` extends
-   the existing guard/audit rows and adds retry metadata to `outbox_entries`;
-   it creates no tables. Original bodies, IDs and delivery states stay there.
-   A combined wake puts its retry request on the first original row and links
-   the other members to it. No replacement queue item is created.
+   `DraftAwareDelivery` makes one attempt for opted-in seats and immediately returns
+   the exact refusal reason and original held IDs when input is unavailable.
+   Migration `100_typing_guard_modes` extends existing guard/audit rows and adds
+   non-executable receipt metadata to the original outbox; it creates no tables
+   or retry scheduler. Combined wakes preserve every original ID/body.
+   Legacy storage bits fail safe to hold on rollback; newer legacy audit writes
+   supersede older saved modes on re-upgrade, including same-value writes.
 3. Classify send readiness. Only a positive interactive-prompt reading
    (`needs_input`) refuses, with `target_needs_input`
    (`session-transport.ts:1482`), unless the caller passes

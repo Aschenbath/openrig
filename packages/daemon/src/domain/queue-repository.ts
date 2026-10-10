@@ -252,8 +252,7 @@ export interface QueueNudgeTransport {
   deliveryTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
   retentionTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
   draftAwareTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
-  configureDeferredWakes?(applicable: (entries: readonly OutboxEntry[]) => boolean,
-    observed: (entries: readonly OutboxEntry[], result: import("./session-transport.js").SendResult) => void): void;
+  configureGuardedWakes?(applicable: (entries: readonly OutboxEntry[]) => boolean): void;
   send(
     sessionName: string,
     // (h): stampISO threads the nudge's compose time so the transport's delivered-latency calc can
@@ -824,17 +823,11 @@ export class QueueRepository {
    */
   attachTransport(transport: QueueNudgeTransport): void {
     this.transport = transport;
-    transport.configureDeferredWakes?.(entries => entries.every(entry => {
+    transport.configureGuardedWakes?.(entries => entries.every(entry => {
       const row = entry.auditPointer ? this.getById(entry.auditPointer) : null;
       if (!row || row.destinationSession !== entry.destinationSession) return false;
       return entry.outboxId.startsWith(WAKE_INTENT_PREFIX) ? this.currentWakeIntent(entry) : isBlockerLive(row.state);
-    }), (entries, result) => {
-      const outcome = this.classifyWakeResult(result);
-      for (const entry of entries) {
-        const row = entry.auditPointer ? this.getById(entry.auditPointer) : null;
-        if (row?.destinationSession === entry.destinationSession) this.recordNudgeAttempt(row.qitemId, outcome.nudgeResult);
-      }
-    });
+    }));
   }
 
   private currentWakeIntent(entry: OutboxEntry): boolean {
@@ -854,7 +847,7 @@ export class QueueRepository {
   private classifyWakeResult(res: Awaited<ReturnType<QueueNudgeTransport["send"]>>): {
     classified: "verified" | "indeterminate" | "failed" | "retained"; nudgeResult: string;
   } {
-    if (res.outcome === "retained") return { classified: "retained", nudgeResult: res.reason?.startsWith("draft_delivery_")
+    if (res.outcome === "retained") return { classified: "retained", nudgeResult: res.reason?.startsWith("draft_")
       ? "retained:draft_aware" : "retained:typing_guard" };
     if (res.ok) return res.verified ? { classified: "verified", nudgeResult: "verified" } : { classified: "indeterminate", nudgeResult: "delivered-ack-pending" };
     const detail = res.error ?? res.reason ?? "unknown";

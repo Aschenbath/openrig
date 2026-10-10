@@ -1,8 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import { OutboxRetryStore } from "./outbox-retry.js";
-import { composerContainsOwnedText, ownCollapsedPaste, type ComposerInput } from "./composer-prompts.js";
+import { composerContainsOwnedText, ownCollapsedPaste, type ComposerInput, type ComposerOwnership } from "./composer-prompts.js";
 
 /** A binding is captured before waiting. Never rebind an old operation to a new occupant. */
 export interface GuardTarget {
@@ -20,6 +19,7 @@ interface Lease {
   freshLifecyclePane?: string;
   config?: TypingGuardConfig;
   humanEpoch: number;
+  inputFrame?: string;
   staged?: { text: string; collapsedPaste: string | null };
 }
 
@@ -39,34 +39,27 @@ export interface GuardPreference {
   pending: boolean;
   desiredMode: TypingGuardMode;
   effectiveMode: TypingGuardMode;
-  holdSeconds: number;
-  maxAttempts: number;
 }
 
 export const TYPING_GUARD_MODES = ["off", "draft-aware", "hold"] as const;
 export type TypingGuardMode = (typeof TYPING_GUARD_MODES)[number];
-export interface TypingGuardSettings { mode: TypingGuardMode; holdSeconds: number; maxAttempts: number }
+export interface TypingGuardSettings { mode: TypingGuardMode }
 export interface TypingGuardConfig extends TypingGuardSettings { revision: string }
-const DEFAULT_GUARD: TypingGuardConfig = { mode: "off", holdSeconds: 120, maxAttempts: 10, revision: "legacy-off" };
+const DEFAULT_GUARD: TypingGuardConfig = { mode: "off", revision: "legacy-off" };
 
-export function parseTypingGuardSettings(value: unknown, previous: TypingGuardSettings = DEFAULT_GUARD): TypingGuardSettings {
+export function parseTypingGuardSettings(value: unknown): TypingGuardSettings {
   const input = typeof value === "boolean" ? { mode: value ? "hold" : "off" } : value;
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new DeliveryGuardError("invalid_typing_guard", "Supply an enabled boolean or a typing-guard mode.");
   const config = input as Record<string, unknown>;
   if (!(TYPING_GUARD_MODES as readonly unknown[]).includes(config.mode)) throw new DeliveryGuardError("invalid_typing_guard", "mode must be off, draft-aware or hold.");
-  const holdSeconds = config.holdSeconds === undefined ? previous.holdSeconds : config.holdSeconds;
-  const maxAttempts = config.maxAttempts === undefined ? previous.maxAttempts : config.maxAttempts;
-  if (typeof holdSeconds !== "number" || !Number.isInteger(holdSeconds) || holdSeconds < 1 || holdSeconds > 3600
-    || typeof maxAttempts !== "number" || !Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 100) {
-    throw new DeliveryGuardError("invalid_typing_guard", "holdSeconds must be 1–3600 and maxAttempts 1–100, both integers.");
-  }
-  return { mode: config.mode as TypingGuardMode, holdSeconds, maxAttempts };
+  if (config.holdSeconds !== undefined || config.maxAttempts !== undefined) throw new DeliveryGuardError("invalid_typing_guard", "Draft-aware sends return their result immediately; retry settings are not supported.");
+  return { mode: config.mode as TypingGuardMode };
 }
 
 function storedGuard(raw: string | null | undefined, enabled: number): TypingGuardConfig {
   if (!raw) return { ...DEFAULT_GUARD, mode: enabled ? "hold" : "off", revision: enabled ? "legacy-hold" : "legacy-off" };
   const value = JSON.parse(raw) as Record<string, unknown>;
-  const settings = parseTypingGuardSettings(value);
+  const settings = parseTypingGuardSettings({ mode: value.mode });
   if (typeof value.revision !== "string" || !value.revision) throw new DeliveryGuardError("invalid_typing_guard", "Stored guard configuration has no revision.");
   return { ...settings, revision: value.revision };
 }
@@ -80,20 +73,18 @@ export class SeatDeliveryGuard {
   private readonly scope = new AsyncLocalStorage<Map<string, Lease>>();
   private readonly humanLeases = new Set<Lease>();
   private readonly humanEpochs = new Map<string, number>();
-  private inspectInput?: (target: GuardTarget) => Promise<ComposerInput | null>;
+  private inspectInput?: (target: GuardTarget, owned?: ComposerOwnership) => Promise<ComposerInput | null>;
   private inputAbsent?: (target: GuardTarget) => Promise<boolean>;
-  readonly retries: OutboxRetryStore;
   private readonly hasModeConfig: boolean;
 
   constructor(
     readonly db: Database.Database,
     private readonly resolve: (target: string) => GuardTarget | null,
   ) {
-    this.retries = new OutboxRetryStore(db);
     this.hasModeConfig = (db.prepare("PRAGMA table_info(seat_delivery_guards)").all() as Array<{ name: string }>).some(c => c.name === "desired_config");
   }
 
-  attachInputInspection(inspect: (target: GuardTarget) => Promise<ComposerInput | null>, absent: (target: GuardTarget) => Promise<boolean>): void {
+  attachInputInspection(inspect: (target: GuardTarget, owned?: ComposerOwnership) => Promise<ComposerInput | null>, absent: (target: GuardTarget) => Promise<boolean>): void {
     this.inspectInput = inspect;
     this.inputAbsent = absent;
   }
@@ -102,12 +93,21 @@ export class SeatDeliveryGuard {
    * retain an in-memory lease. Persisted desired protection applies at the new boundary. */
   recoverActivation(): void {
     this.db.transaction(() => {
+      if (this.hasModeConfig) {
+        // Old daemons append an audit row even for a same-value 1 -> 1 write.
+        // That newer boolean decision supersedes a previously saved mode.
+        this.db.prepare(`UPDATE seat_delivery_guards AS g SET desired_config=NULL,effective_config=NULL
+          WHERE desired_config IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM seat_delivery_guard_changes c WHERE c.id=(SELECT max(id) FROM seat_delivery_guard_changes WHERE node_id=g.node_id)
+              AND c.desired_config=g.desired_config AND c.requested_at=g.changed_at)`).run();
+        this.db.prepare(`UPDATE seat_delivery_guards SET desired=CASE WHEN json_extract(desired_config,'$.mode')='off' THEN 0 ELSE 1 END
+          WHERE desired_config IS NOT NULL`).run();
+      }
       this.db.prepare("UPDATE seat_delivery_guards SET effective = desired WHERE effective != desired").run();
       this.db.prepare("UPDATE seat_delivery_guard_changes SET effective_at = ? WHERE effective_at IS NULL")
         .run(new Date().toISOString());
       if (this.hasModeConfig) {
         this.db.prepare("UPDATE seat_delivery_guards SET effective_config=desired_config WHERE desired_config IS NOT NULL").run();
-        this.retries.recoverGuards();
       }
     })();
   }
@@ -115,12 +115,19 @@ export class SeatDeliveryGuard {
   preference(nodeId: string): GuardPreference {
     const { desired, effective } = this.configuration(nodeId);
     return { nodeId, desired: desired.mode === "hold", effective: effective.mode === "hold", pending: desired.revision !== effective.revision,
-      desiredMode: desired.mode, effectiveMode: effective.mode, holdSeconds: effective.holdSeconds, maxAttempts: effective.maxAttempts };
+      desiredMode: desired.mode, effectiveMode: effective.mode };
   }
 
   configuration(nodeId: string): { desired: TypingGuardConfig; effective: TypingGuardConfig } {
     const row = this.db.prepare("SELECT * FROM seat_delivery_guards WHERE node_id=?").get(nodeId) as
-      { desired: number; effective: number; desired_config?: string | null; effective_config?: string | null } | undefined;
+      { desired: number; effective: number; changed_at: string; desired_config?: string | null; effective_config?: string | null } | undefined;
+    if (row?.desired_config && this.hasModeConfig) {
+      const latest = this.db.prepare("SELECT desired_config,requested_at FROM seat_delivery_guard_changes WHERE node_id=? ORDER BY id DESC LIMIT 1").get(nodeId) as
+        { desired_config: string | null; requested_at: string } | undefined;
+      if (latest?.desired_config !== row.desired_config || latest.requested_at !== row.changed_at) {
+        return { desired: storedGuard(null, row.desired), effective: storedGuard(null, row.effective) };
+      }
+    }
     return { desired: storedGuard(row?.desired_config, row?.desired ?? 0), effective: storedGuard(row?.effective_config, row?.effective ?? 0) };
   }
 
@@ -152,11 +159,12 @@ export class SeatDeliveryGuard {
     const at = new Date().toISOString();
     const { change, desired } = this.db.transaction(() => {
       const old = this.configuration(nodeId);
-      const settings = parseTypingGuardSettings(value, old.desired);
-      if (!this.hasModeConfig && settings.mode === "draft-aware") throw new DeliveryGuardError("typing_guard_unavailable", "Draft-aware guard configuration requires the retry schema.");
-      const unchanged = settings.mode === old.desired.mode && settings.holdSeconds === old.desired.holdSeconds && settings.maxAttempts === old.desired.maxAttempts;
+      const settings = parseTypingGuardSettings(value);
+      if (!this.hasModeConfig && settings.mode === "draft-aware") throw new DeliveryGuardError("typing_guard_unavailable", "Draft-aware guard configuration requires the mode schema.");
+      const unchanged = settings.mode === old.desired.mode;
       const desired = { ...settings, revision: unchanged ? old.desired.revision : randomUUID() };
-      const args = [nodeId, Number(desired.mode === "hold"), Number(old.effective.mode === "hold"), actor, reason, at];
+      // The legacy bits deliberately fail safe to hold when a daemon without modes opens this DB.
+      const args = [nodeId, Number(desired.mode !== "off"), Number(old.effective.mode !== "off"), actor, reason, at];
       if (this.hasModeConfig) {
         this.db.prepare(`INSERT INTO seat_delivery_guards(node_id,desired,effective,actor,reason,changed_at,desired_config,effective_config)
           VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET desired=excluded.desired,actor=excluded.actor,
@@ -167,7 +175,7 @@ export class SeatDeliveryGuard {
           VALUES (?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET desired=excluded.desired,actor=excluded.actor,
           reason=excluded.reason,changed_at=excluded.changed_at`).run(...args);
       }
-      const audit = [nodeId, Number(desired.mode === "hold"), Number(old.desired.mode === "hold"), Number(old.effective.mode === "hold"), actor, reason, at];
+      const audit = [nodeId, Number(desired.mode !== "off"), Number(old.desired.mode !== "off"), Number(old.effective.mode !== "off"), actor, reason, at];
       const change = this.hasModeConfig
         ? this.db.prepare(`INSERT INTO seat_delivery_guard_changes(node_id,desired,previous_desired,previous_effective,actor,reason,requested_at,desired_config)
             VALUES (?,?,?,?,?,?,?,?)`).run(...audit, JSON.stringify(desired)).lastInsertRowid
@@ -178,9 +186,8 @@ export class SeatDeliveryGuard {
     const activation = this.serial(nodeId, async () => {
       this.db.transaction(() => {
         // Later requests are serialized too. Apply each accepted transition, in order.
-        this.db.prepare("UPDATE seat_delivery_guards SET effective = ? WHERE node_id = ?").run(Number(desired.mode === "hold"), nodeId);
+        this.db.prepare("UPDATE seat_delivery_guards SET effective = ? WHERE node_id = ?").run(Number(desired.mode !== "off"), nodeId);
         if (this.hasModeConfig) this.db.prepare("UPDATE seat_delivery_guards SET effective_config=? WHERE node_id=?").run(JSON.stringify(desired), nodeId);
-        this.retries.holdForGuard(nodeId, "typing_guard_changed", desired.mode === "draft-aware" ? desired.revision : undefined);
         this.db.prepare("UPDATE seat_delivery_guard_changes SET effective_at = ? WHERE id = ?")
           .run(new Date().toISOString(), change);
       })();
@@ -190,11 +197,6 @@ export class SeatDeliveryGuard {
       await Promise.race([activation, new Promise<void>(resolve => { timer = setTimeout(resolve, timeoutMs); })]);
       return this.preference(nodeId);
     } finally { if (timer) clearTimeout(timer); }
-  }
-
-  operationConfig(name: string): TypingGuardConfig {
-    const target = this.target(name);
-    return this.scope.getStore()?.get(target.nodeId)?.config ?? this.configuration(target.nodeId).effective;
   }
 
   /** fn must include lifecycle preflight, effects and last write. Retention callbacks
@@ -258,6 +260,7 @@ export class SeatDeliveryGuard {
     if (!lease?.active || !lease.lifecycle) throw new DeliveryGuardError("guard_lease_required", "Binding changes require the complete lifecycle lease.");
     lease.target = this.target(nodeId);
     delete lease.staged;
+    delete lease.inputFrame;
   }
 
   /** Only a successful adapter creation/respawn may exempt its new shell from composer checks. */
@@ -303,7 +306,8 @@ export class SeatDeliveryGuard {
     if (!this.needsInputCheck(name)) return;
     const target = this.target(name);
     const lease = this.scope.getStore()!.get(target.nodeId)!;
-    const input = await this.inspectInput?.(target).catch(() => null) ?? null;
+    const owned = submit && lease.staged && lease.inputFrame ? { text: lease.staged.text, frame: lease.inputFrame } : undefined;
+    const input = await this.inspectInput?.(target, owned).catch(() => null) ?? null;
     this.checkInput(name);
     if (!input || input.state === "unknown") throw new DeliveryGuardError("draft_input_unknown", "The current input cannot be read. Automatic delivery is held.");
     if (submit) {
@@ -312,6 +316,8 @@ export class SeatDeliveryGuard {
       if (!owned) throw new DeliveryGuardError("draft_input_changed", "The input no longer contains only this delivery's staged text. Enter was not sent.");
     } else if (input.state !== "empty") {
       throw new DeliveryGuardError("draft_input_busy", "The seat has an unsubmitted input. Automatic delivery is held.");
+    } else {
+      lease.inputFrame = input.frame;
     }
   }
 
@@ -327,7 +333,7 @@ export class SeatDeliveryGuard {
       const target = this.target(name);
       const lease = this.scope.getStore()!.get(target.nodeId)!;
       lease.staged = { text, collapsedPaste: null };
-      const input = await this.inspectInput?.(target).catch(() => null) ?? null;
+      const input = await this.inspectInput?.(target, lease.inputFrame ? { text, frame: lease.inputFrame } : undefined).catch(() => null) ?? null;
       if (input) lease.staged.collapsedPaste = ownCollapsedPaste(input, text);
     } catch { /* Observation cannot turn a completed paste into a claimed no-write failure. */ }
   }

@@ -1,131 +1,127 @@
 # Per-seat terminal delivery
 
-Choose how OpenRig sends messages into one seat's terminal. The default remains
-typing guard `off`; opting in on one seat does not change its siblings.
+The existing typing guard supports three modes. Before draft-aware mode,
+automatic input either used the ordinary delivery path or was held unconditionally.
+Draft-aware adds an opt-in check for unfinished input without a second control or
+daemon-owned retry scheduler. Sibling seats keep their own mode.
 
 | Mode | Terminal input | When input is unavailable |
 |---|---|---|
-| `off` | Existing delivery and prompt checks | Existing send result |
-| `draft-aware` | Paste only into a recognized empty input; check the staged text again before Enter | Retain the original message and retry within a deadline and attempt cap |
-| `hold` | No automatic terminal input, even at an empty prompt | Retain for inspection outside the pane; no automatic retry |
+| `off` (default) | Existing delivery and prompt checks | Existing send result |
+| `draft-aware` | Paste into a recognized empty composer; check ownership again before Enter | Immediately retain the original message with the exact refusal reason and ID |
+| `hold` | No automatic terminal input, even at an empty prompt | Retain for inspection outside the pane |
 
-These are three modes of the existing typing guard, separate from runtime
-permissions. Existing recipient and interactive-prompt checks still apply.
-`--raw`, `--force` and `--dangerously-interact` do not bypass a protected seat's
-typing guard. Direct human terminal input remains available.
+Runtime permissions are separate. Recipient and interactive-prompt checks still
+apply. `--raw`, `--force` and `--dangerously-interact` do not bypass the typing guard.
+Direct human input remains available.
 
 ## Configure and inspect
 
-Run from a seat shell with `OPENRIG_SESSION_NAME` set. The daemon derives the
-preference's audit actor from the request's transport identity.
+Run from a seat shell with `OPENRIG_SESSION_NAME` set; the daemon derives the
+audit actor from transport identity.
 
-```sh
+~~~sh
 rig seat set-typing-guard dev-impl@my-rig --mode draft-aware \
-  --hold-seconds 120 --max-attempts 10 --reason "preserve my unfinished input"
+  --reason "preserve my unfinished input"
 rig seat status dev-impl@my-rig
-```
-
-`--hold-seconds` initially defaults to 120 and accepts integers from 1 to 3600.
-`--max-attempts` initially defaults to 10 and accepts integers from 1 to 100, including
-the initial attempt. Omitted limits keep the seat’s previous settings.
-Use exactly one of `--mode off|draft-aware|hold` or the compatible
-`--enabled true|false`: true means hold, false means off.
-Retries are spaced by the hold duration divided by the
-attempt cap, with a minimum interval of 250 ms. A busy operation lease can
-delay an attempt; it cannot extend the deadline.
-
-Activation waits for an already-started seat operation to finish. The API can
-return HTTP 202 with `pending: true`; inspect `desiredMode` and `effectiveMode`
-in `rig seat status` and wait for `pending: false` before relying on the requested
-mode. The legacy `desired` and `effective` booleans still mean hold everything.
-The preference
-and waiting deliveries survive daemon restart. Reapplying identical settings
-keeps the existing guard revision and its retries.
-
-`rig seat held-messages` lists retained bodies and includes each retry’s original
-ID, state, attempts, cap, deadline, next attempt and reason:
-
-```sh
 rig seat held-messages dev-impl@my-rig --json
 rig seat held-messages dev-impl@my-rig --id <outbox-id> --json
 rig seat retire-held-message dev-impl@my-rig <outbox-id> --reason "read outside the pane"
-```
+~~~
 
-Reading never sends a message. Retirement releases its active retention quota
-while preserving evidence. Retiring any member of a combined queue wake stops
-that combined delivery; other members remain available for inspection.
-It does not close the underlying queue work.
+Use exactly one of `--mode off|draft-aware|hold` or the compatible
+`--enabled true|false`: true selects hold, false selects off. There are no
+retry settings or deadlines. Activation waits for an already-started seat operation
+to finish. The API may return HTTP 202 with `pending: true`; wait for
+`pending: false` before relying on the requested mode. Status reports desired
+and effective modes and retains the text `Typing guard: on (hold)` for hold.
 
-## Draft checks and retry outcomes
+A held send immediately returns `outcome: "retained"`, `sent: false`,
+`outboxIds` and its exact reason, such as `draft_input_busy` or
+`draft_input_unknown`. No automatic retry is scheduled, including when the
+caller requested wait-for-idle. The caller can inspect or route the retained work
+and decide when to make a new request. Reusing the same delivery ID reads its
+original result; it does not replay that message. Changing modes, clearing a
+draft, or restarting the daemon also does not flush held records.
 
-Draft-aware delivery recognizes framed Claude input and Codex input with a
-known footer. It examines the visible input containing the cursor, independently
-of whether an activity hook reports idle or running. A draft, copy mode, an
-unrecognized layout or an unreadable capture does not permit automatic input.
-The check runs after payload preparation, immediately before paste, and again
-before Enter. A changed input after paste remains visible for human review;
-OpenRig does not clear it or submit it.
+Reading never sends. Retirement frees that record's active retention quota while
+preserving evidence; it does not deliver a message or close queue work.
 
-Faint placeholders and autocomplete suggestions after the cursor are display
-hints, not draft text. Their styling must be present in the capture. Typing the
-same words and moving the cursor to the start still counts as a draft. A mixed
-suffix containing normal text cannot be discarded as a suggestion.
-Claude frame boundaries use the current terminal footer and matching indentation.
-Prompt or frame examples within a multiline draft cannot stand in for that boundary;
-a clipped input whose actual opening marker is unavailable stays unverified.
+## Input evidence and outcomes
+
+The cursor-aware reader lives in `session-transport.ts` and shares the composer
+matchers with ordinary delivery. It recognizes framed Claude input and Codex input
+with a known footer. The visible input containing the cursor is checked independently
+of activity hooks, again after buffer preparation, and immediately before Enter.
+Copy mode, an unreadable capture and an unsupported layout cannot authorize input.
+
+The final check preserves authored whitespace: the cursor distinguishes trailing
+spaces from screen padding or omitted blank capture cells. A numbered message is
+recognized as this operation's own text only within its previously empty composer;
+a newly observed numbered menu is still refused. Human edits after paste stay
+visible and Enter is refused.
+
+Faint placeholders and autocomplete suffixes are display hints only when the
+capture preserves their styling. Typing the same words and moving the cursor to
+the start still counts as a draft. Current footer and indentation anchor the
+Claude frame, so quoted prompt/frame examples inside a draft do not become proof
+of empty input.
+
+A large paste can appear as several labels plus a literal tail. The existing
+`hasExpectedStagedText` check validates the tail and the labels' combined source
+boundary. That complete rendering must be observed after this operation's paste
+and remain unchanged before Enter. Labels alone do not prove arbitrary content.
 
 | Delivery state | Meaning |
 |---|---|
-| `waiting` | The original message is retained; another bounded check is scheduled |
-| `sending` | An attempt owns the existing delivery IDs; its result is not resolved yet |
-| `held` | Automatic retries have ended; inspect the retained message and reason |
-| `complete` | Transport execution succeeded; if render verification was requested it also succeeded. Native consumption is not asserted |
-| `indeterminate` | Input may have occurred, or its render was not confirmed; no automatic replay |
+| `sending` | The original IDs have an unresolved write attempt |
+| `held` | No input was written; the original message remains retained or has been retired |
+| `complete` | Transport execution succeeded, including render verification if requested; native consumption is not asserted |
+| `indeterminate` | Input may have occurred or requested render verification failed; no automatic replay |
 
-A held send returns `outcome: "retained"`, `sent: false` and `outboxIds`.
-Retries keep those IDs and original bodies. They do not create replacement
-queue items or duplicate audit rows. A caller using the HTTP `deliveryId` can
-read back that original request by repeating the same content and sender,
-even after changing guard mode. Use the by-ID inspection command for historical
-results, including retired and uncertain deliveries.
+Migration `100_typing_guard_modes` extends the existing guard/audit rows and
+adds receipt metadata to the original outbox rows; it creates no tables, retry
+indexes or executable requests. Combined wakes retain each original ID and body.
+A held queue wake stays on the existing queue recovery path. Interrupted writes
+become indeterminate at startup regardless of which recovery component runs first.
 
-The cap or deadline leaves the message retained. There is no final warning
-typed into the pane. A changed recipient, changed original record, closed or
-superseded queue wake, or unavailable live prerequisite also ends retries.
-A daemon restart retries waiting requests only: an attempt interrupted while
-writing becomes `indeterminate`. A partial paste or ambiguous native command
-result is never blindly retried.
+The existing retention limits apply: 100 records and 8 MiB per seat, with a 1 MiB
+message limit. New admissions refuse at capacity; already-committed queue intent
+remains durable even if concurrent activation exceeds the limit.
 
-The existing active retention limits apply: 100 records and 8 MiB per seat,
-with a 1 MiB message limit. New admissions fail explicitly at capacity.
-Already-committed queue intent remains durable even if protection activates
-after its transaction and takes retention over the limit.
+## Rollback and lifecycle
 
-## Manual pause and lifecycle operations
+Persisted legacy guard bits are on for both hold and draft-aware, so an older
+daemon holds messages instead of typing into a protected seat. On re-upgrade,
+the most recent guard audit row and change timestamp determine whether the saved
+mode is still authoritative. A later boolean write by the older daemon takes
+precedence, including a same-value on-to-on write in the same clock tick.
+Without a later setting change, the draft-aware mode survives re-upgrade.
+Held and uncertain deliveries are never replayed by this reconciliation.
 
-`rig seat set-typing-guard <seat> --enabled true --reason <text>` remains a
-manual pause of all automatic terminal input. Enabling it permanently stops
-scheduled draft retries. Disabling it permits new sends; it does not replay
-old ones. Changing guard mode or retry settings likewise ends retries
-created under the older guard revision.
+Current API `desired` and `effective` booleans continue to describe hold-all;
+mode fields describe draft-aware protection. Storage's fail-safe legacy bits
+are deliberately broader.
 
-With `hold`, writing lifecycle operations refuse before effects. With
-`draft-aware`, a writing lifecycle operation on an active seat also requires
-an explicit switch to `off` first. Fresh startup is exempt from draft
-inspection only after the adapter creates a new pane or successfully respawns
-a dead pane within that lifecycle operation. An absent/dead binding permits
-the lifecycle preflight, but adopting or rebinding an existing pane does not
-grant this exemption; existing lifecycle and recipient checks remain.
+With hold, writing lifecycle operations refuse before effects. With draft-aware,
+an active seat requires an explicit switch to off before writing lifecycle work.
+Fresh startup is exempt only after creating a new pane or successfully respawning
+a dead pane within the same lifecycle operation. Adopting or rebinding an existing
+pane grants no such exemption.
 
-Terminal capture is observational, not an atomic editor API. The before-Enter
-check and brokered-human-input invalidation narrow the paste/submit race, but
-cannot prevent a separate program or direct tmux client from writing after
-the final observation. Collapsed paste labels are accepted only when observed
-after this operation's paste, with the expected line count and unchanged
-label/cursor at submission. Unrecognized provider versions and other runtimes
-retain until the hold bound; choose `off` when that tradeoff is unsuitable.
+Terminal capture is observational, not an atomic editor API. A direct tmux writer
+can still act between the last observation and paste. The resulting changed input
+refuses Enter and is not replayed. Unsupported provider layouts remain held.
+Use off when that tradeoff is unsuitable.
 
-HTTP equivalents are `POST /api/seat/set-typing-guard/:seatRef` with
-`{mode, holdSeconds?, maxAttempts?, reason}` or `{enabled, reason}`, plus
-`GET /api/seat/status/:seatRef` and the existing held-message routes.
-No RigSpec field is required.
+HTTP configuration uses `POST /api/seat/set-typing-guard/:seatRef` with
+`{mode, reason}` or `{enabled, reason}`. Status and held-message routes are
+unchanged; no RigSpec field is required.
+
+## Verification scope
+
+Regression tests exercise rollback/re-upgrade, same-value legacy writes, exact
+retained outcomes, restart without replay, unchanged IDs/bodies, trailing spaces,
+numbered bodies, real-menu refusals and multi-placeholder ownership. Native tests
+use private real tmux panes with scripted editable composers. These verify the
+transport mechanics; they are not live Claude/Codex provider sessions.
