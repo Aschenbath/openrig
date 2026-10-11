@@ -100,8 +100,9 @@ describe("stub CLI journeys", () => {
     const destination = join(realpathSync(scaffold!.root), "relocated worker");
     const oldNotes = join(before.cwd, "operator-notes.txt");
     writeFileSync(oldNotes, "Keep shared workspace notes.\n");
+    // tmux can sanitize control characters in formats; use a printable separator.
     const pane = () => execFileSync("tmux", ["-S", scaffold!.tmuxSocketPath, "list-panes",
-      "-t", `=${recipient}:`, "-F", "#{pane_current_path}\t#{pane_pid}"], { encoding: "utf8" }).trim().split("\t");
+      "-t", `=${recipient}:`, "-F", "#{pane_current_path}|#{pane_pid}"], { encoding: "utf8" }).trim().split("|");
     const oldPane = pane();
     expect(oldPane[0]).toBe(realpathSync(before.cwd));
     const qitemId = `cwd-${randomUUID()}`;
