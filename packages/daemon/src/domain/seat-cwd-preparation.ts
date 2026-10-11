@@ -147,7 +147,9 @@ function copyFiles(source: string, targetDir: string, ancestors = new Set<string
   const parents = new Set(ancestors).add(realSource);
   return fs.readdirSync(source).flatMap(name => {
     const child = path.join(source, name);
-    return fs.statSync(child).isDirectory()
+    // Match the adapters' Dirent walk: directory symlinks remain file-shaped
+    // and fail the preflight read before any startup files are written.
+    return fs.lstatSync(child).isDirectory()
       ? copyFiles(child, path.join(targetDir, name), parents)
       : [[child, path.join(targetDir, name)] as [string, string]];
   });

@@ -66,7 +66,7 @@ describe("changing an existing seat's launch directory", () => {
         mkdirp: dir => { fs.mkdirSync(dir, { recursive: true }); },
         copyFile: fs.copyFileSync,
         listFiles: dir => fs.readdirSync(dir, { recursive: true, encoding: "utf8" })
-          .filter(file => fs.statSync(path.join(dir, file)).isFile()),
+          .filter(file => !fs.lstatSync(path.join(dir, file)).isDirectory()),
         homedir: path.join(root, "native-home"),
       },
     });
@@ -142,7 +142,7 @@ describe("changing an existing seat's launch directory", () => {
       readFile: (file: string) => fs.readFileSync(file, "utf8"), writeFile: (file: string, content: string) => fs.writeFileSync(file, content),
       exists: fs.existsSync, mkdirp: (dir: string) => { fs.mkdirSync(dir, { recursive: true }); },
       listFiles: (dir: string) => fs.readdirSync(dir, { recursive: true, encoding: "utf8" })
-        .filter(file => fs.statSync(path.join(dir, file)).isFile()),
+        .filter(file => !fs.lstatSync(path.join(dir, file)).isDirectory()),
       homedir: path.join(root, "native-home"),
     };
     const stateRoot = path.join(root, `${runtime}-state`);
@@ -224,6 +224,22 @@ describe("changing an existing seat's launch directory", () => {
     expect(fs.readFileSync(targetPath, "utf8")).toBe("Operator's current skill helper\n");
     expect(fs.existsSync(path.join(path.dirname(path.dirname(targetPath)), "SKILL.md"))).toBe(false);
     expect(new ProjectionManifestStore(db).get(targetPath)).toBeNull();
+  });
+
+  it.each(["claude-code", "codex"] as const)("rejects a symlinked %s plugin subdirectory before any preparation write", async runtime => {
+    const { seat, sourcePath, selectedAdapter } = copiedResource(runtime, "plugin");
+    const linkedSource = path.join(root, "linked-support");
+    fs.mkdirSync(linkedSource);
+    fs.writeFileSync(path.join(linkedSource, "helper.md"), "Linked helper\n");
+    fs.symlinkSync(linkedSource, path.join(path.dirname(path.dirname(sourcePath)), "linked-support"),
+      process.platform === "win32" ? "junction" : "dir");
+    const project = vi.spyOn(selectedAdapter, "project");
+    expect(await service.setCwd({ seatRef: seat.sessionName, cwd: newCwd, reason: "prepare workspace" }))
+      .toMatchObject({ ok: false, code: "cwd_preparation_failed", preparedCwd: newCwd });
+    expect(fs.readdirSync(newCwd)).toEqual([]);
+    expect(project).not.toHaveBeenCalled();
+    expect(savedCwd(seat.node.id)).toBe(oldCwd);
+    expect(cwdEvents()).toEqual([]);
   });
 
   it.each(["claude-code", "codex", "pi", "omp", "stub"] as const)("tracks %s copies so unchanged output refreshes but subsequent operator edits are protected", async runtime => {
