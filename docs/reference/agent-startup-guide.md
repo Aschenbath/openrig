@@ -236,6 +236,49 @@ post-launch files. If it needs them, first look at what that occupant has done; 
 `rig seat launch <seat> --fresh --reason <text>` starts a blank conversation for the seat. If the occupant is still
 live, the command refuses with `session_live` unless you also pass `--stop`, which replaces that occupant deliberately.
 
+### Change an existing seat's working directory
+
+Editing `cwd` in an already applied RigSpec does not update an existing seat's saved launch directory.
+Use `set-cwd` to prepare that seat's startup files at a new location and persist the selection:
+
+```sh
+rig seat set-cwd planning-lead@project \
+  --cwd /work/project/seats/planning-lead --reason "isolate planning"
+rig seat status planning-lead@project
+```
+
+The path must be absolute **on the daemon's host**. OpenRig creates a missing directory, resolves symlinks to
+its real path, and refuses a filesystem root. It uses the saved runtime resources and filesystem startup files
+that apply on `fresh_start`, with the runtime's normal managed-block and local-edit handling. Interactive
+startup text and actions wait until launch. Arbitrary working files in the old directory are not copied.
+
+The same node, canonical address, queue, session history and skill selection are retained. `set-cwd` serializes
+with that seat's lifecycle operations and automatic delivery; it can run with the typing guard enabled and
+does not change that preference. `rig seat status` shows **Working directory for future launches**
+(`launch_cwd` in JSON). This is saved configuration, not an observation of the running process's directory.
+
+A running occupant keeps its current directory. Subsequent fresh launches and rebuild handovers use the new
+selection. To adopt it immediately, choose the usual lifecycle operation deliberately: `rig handover <seat>
+--source rebuild --reason <text>` carries durable context, while `rig seat launch <seat> --fresh --stop
+--reason <text>` replaces the running occupant with a blank conversation.
+
+Preparation must succeed before the directory and `node.cwd_changed` audit event are committed together.
+Missing or malformed saved startup context, a required file/projection failure, or an audit-write failure
+leaves the prior selection recoverable. A concurrent configuration change is reported rather than overwritten.
+Filesystem writes cannot be rolled back with the database: a failed call may leave prepared files at the
+destination, named by `preparedCwd` when available. Inspect the reported warnings and seat status before
+retrying. A CLI timeout means the outcome is unknown; preparation may still finish in the daemon. Repeating
+the operation re-prepares files, but selecting the same canonical directory creates no second cwd audit event.
+
+Files in the old directory stay in place. Check every seat using that shared location before removing its
+managed files explicitly. The command also leaves the source RigSpec declaration unchanged; update that
+declaration separately if a future recreation should use the new directory.
+
+Regression coverage uses real SQLite and Claude/Codex file adapters in `seat-set-cwd.test.ts`, route and CLI
+tests, and the stub CLI journey for persistence and process-directory checks. Rebuild handover is covered at
+the service/launcher boundary. These tests do not establish native Claude/Codex conversation-resume behavior
+across directories or filesystem rollback after a daemon crash.
+
 ### The `applies_on` Field
 
 Each startup file and action specifies when it applies:
