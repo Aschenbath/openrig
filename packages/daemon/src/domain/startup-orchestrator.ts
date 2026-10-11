@@ -448,16 +448,30 @@ export class StartupOrchestrator {
     if (input.skipHarnessLaunch && forkContext) {
       // Continuing a fork is a read-only identity check, never another fork or
       // a resume of its parent. Do this after readiness, before any prompt.
+      let identity: { resumeToken: string; resumeType: string } | null | undefined;
+      let captureError: string | undefined;
       try {
-        const identity = await input.adapter.captureForkIdentity?.(input.binding, forkContext.parentToken);
-        if (!identity?.resumeToken || identity.resumeToken === forkContext.parentToken || identity.resumeType !== "codex_id") {
-          return this.fail(input, "attention_required", ["The fork's child identity is not verified yet; no startup context was sent."], undefined, forkContext);
-        }
-        const current = this.db.prepare("SELECT id FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1").get(input.nodeId) as { id: string } | undefined;
-        const binding = this.sessionRegistry.getBindingForNode(input.nodeId);
-        if (current?.id !== input.sessionId || binding?.tmuxPane !== input.binding.tmuxPane || binding?.tmuxSession !== input.binding.tmuxSession) {
-          return { ok: false, startupStatus: "attention_required", errors: ["The occupant or terminal binding changed during fork verification; no startup context was sent."] };
-        }
+        identity = await input.adapter.captureForkIdentity?.(input.binding, forkContext.parentToken);
+      } catch (error) { captureError = String(error); }
+      // Check even a missing/failed observation before publishing a failure.
+      const current = this.db.prepare("SELECT id FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1").get(input.nodeId) as { id: string } | undefined;
+      const binding = this.sessionRegistry.getBindingForNode(input.nodeId);
+      if (current?.id !== input.sessionId) {
+        // The newer occupant owns the node's startup event stream. Update only
+        // the previous session: a late event here could hide the new pending context.
+        this.sessionRegistry.updateStartupStatus(input.sessionId, "attention_required");
+        return { ok: false, startupStatus: "attention_required", errors: ["The occupant changed during fork verification; no startup context was sent."] };
+      }
+      if (binding?.tmuxPane !== input.binding.tmuxPane || binding?.tmuxSession !== input.binding.tmuxSession) {
+        return this.fail(input, "attention_required", ["The terminal binding changed during fork verification; no startup context was sent."]);
+      }
+      if (captureError !== undefined) {
+        return this.fail(input, "attention_required", [`Fork identity verification failed: ${captureError}; no startup context was sent.`], undefined, forkContext);
+      }
+      if (!identity?.resumeToken || identity.resumeToken === forkContext.parentToken || identity.resumeType !== "codex_id") {
+        return this.fail(input, "attention_required", ["The fork's child identity is not verified yet; no startup context was sent."], undefined, forkContext);
+      }
+      try {
         this.sessionRegistry.updateResumeToken(input.sessionId, identity.resumeType, identity.resumeToken, "scrape");
         if (!this.sessionRegistry.resumeTokenMatches(input.sessionId, identity.resumeType, identity.resumeToken)) {
           return this.fail(input, "attention_required", ["The verified fork child conflicts with protected session metadata; no startup context was sent."], undefined, forkContext);

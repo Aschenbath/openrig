@@ -188,6 +188,30 @@ describe("late Codex fork identity", () => {
     expect(await lifecycle().continueStartup("builder@fork-recovery")).toMatchObject({ ok: false, startupStatus: "attention_required" });
     expect(registry.resumeTokenMatches(input.sessionId, "codex_id", CHILD)).toBe(false);
     expect(tmux.sendText).not.toHaveBeenCalled();
+    expect(db.prepare("SELECT startup_status FROM sessions WHERE id = ?").get(input.sessionId)).toEqual({ startup_status: "attention_required" });
+    const event = db.prepare("SELECT payload FROM events WHERE node_id = ? ORDER BY seq DESC LIMIT 1").get(input.nodeId) as { payload: string };
+    expect(JSON.parse(event.payload)).toMatchObject({ type: "node.startup_failed", sessionId: input.sessionId });
+    expect(JSON.parse(event.payload).forkContextPending).toBeUndefined();
+  });
+
+  it.each(["verified", "unavailable", "read failure"])("does not overwrite a newer occupant's pending startup (%s)", async observation => {
+    await orch.startNode(input);
+    threadId = observation === "unavailable" ? undefined : CHILD;
+    let replacementId: string | undefined;
+    duringRead = () => {
+      const replacement = registry.registerSession(input.nodeId, "replacement@fork-recovery");
+      replacementId = replacement.id;
+      registry.updateStatus(replacement.id, "running");
+      registry.updateStartupStatus(replacement.id, "attention_required");
+      events.emit({ type: "node.startup_failed", rigId: input.rigId, nodeId: input.nodeId,
+        sessionId: replacement.id, error: "replacement needs consent", freshContextPending: true });
+      if (observation === "read failure") throw new Error("native identity read failed");
+    };
+    expect(await lifecycle().continueStartup("builder@fork-recovery")).toMatchObject({ ok: false, startupStatus: "attention_required" });
+    expect(db.prepare("SELECT startup_status FROM sessions WHERE id = ?").get(input.sessionId)).toEqual({ startup_status: "attention_required" });
+    expect(orch.canContinueStartup(input.nodeId, replacementId!)).toBe(true);
+    expect(registry.resumeTokenMatches(input.sessionId, "codex_id", CHILD)).toBe(false);
+    expect(tmux.sendText).not.toHaveBeenCalled();
   });
 
   it("keeps protected conflicting metadata and leaves the role owed", async () => {
