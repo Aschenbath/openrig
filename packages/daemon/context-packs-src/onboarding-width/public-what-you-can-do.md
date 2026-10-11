@@ -471,6 +471,9 @@ version, from checking the environment to a useful report to the OpenRig team.
   material and save an existing seat's future launch directory on the daemon's host. Its node,
   address, queue and history stay intact; a running occupant keeps its current directory until a
   deliberate fresh launch or rebuild handover. `rig seat status` shows the saved `launch_cwd`.
+  Copied destination resources are checked before startup writes: conflicting local edits or unrecorded
+  differing files refuse the change and report protected paths. Inspect and move/merge those files or use
+  a clean destination. Managed guidance and native configuration merges keep their runtime policy.
   Failed preparation does not commit the selection, though the destination may contain prepared
   files. Inspect status after an unknown outcome. Old shared-directory files need explicit cleanup.
 - **`rig seat set-permissions <seat> --mode <mode> --reason <text>`** — select one seat's native

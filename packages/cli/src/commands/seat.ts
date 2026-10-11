@@ -619,6 +619,8 @@ resume/successor launch reads it at call time. Examples:
 Prepares filesystem startup material before saving the directory. Interactive
 startup messages and actions run at launch. An existing process keeps its cwd
 until you relaunch it. The seat's identity, queue and session history are retained.
+Conflicting copied destination files are refused before startup writes; inspect
+the reported paths or choose a clean destination before retrying.
 Files in the old directory are left for explicit cleanup after checking other users.
 Example:
   rig seat set-cwd planning-lead@project --cwd /work/project/seats/planning-lead --reason "isolate planning"`)

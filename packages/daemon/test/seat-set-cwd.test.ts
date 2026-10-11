@@ -16,8 +16,15 @@ import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delive
 import { SeatStatusService } from "../src/domain/seat-status-service.js";
 import { ClaudeCodeAdapter } from "../src/adapters/claude-code-adapter.js";
 import { CodexRuntimeAdapter } from "../src/adapters/codex-runtime-adapter.js";
+import { PiRuntimeAdapter } from "../src/adapters/pi-runtime-adapter.js";
+import { OmpRuntimeAdapter } from "../src/adapters/omp-runtime-adapter.js";
+import { StubRuntimeAdapter } from "../src/adapters/stub-runtime-adapter.js";
+import { TerminalAdapter } from "../src/adapters/terminal-adapter.js";
+import { piSeatPaths } from "../src/adapters/pi-runner-protocol.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
-import type { ResolvedStartupFile } from "../src/domain/runtime-adapter.js";
+import type { ResolvedStartupFile, RuntimeAdapter } from "../src/domain/runtime-adapter.js";
+import { ProjectionManifestStore } from "../src/domain/projection-manifest-store.js";
+import { hashContent } from "../src/domain/conflict-detector.js";
 
 describe("changing an existing seat's launch directory", () => {
   let db: Database.Database;
@@ -49,12 +56,17 @@ describe("changing an existing seat's launch directory", () => {
     } as unknown as TmuxAdapter;
     adapter = new ClaudeCodeAdapter({
       tmux,
+      recordProjection: (targetPath, content) => new ProjectionManifestStore(db).record({
+        targetPath, lastHash: hashContent(content), writtenAt: new Date().toISOString(),
+      }),
       fsOps: {
         readFile: file => fs.readFileSync(file, "utf8"),
         writeFile: (file, content) => fs.writeFileSync(file, content),
         exists: fs.existsSync,
         mkdirp: dir => { fs.mkdirSync(dir, { recursive: true }); },
         copyFile: fs.copyFileSync,
+        listFiles: dir => fs.readdirSync(dir, { recursive: true, encoding: "utf8" })
+          .filter(file => fs.statSync(path.join(dir, file)).isFile()),
         homedir: path.join(root, "native-home"),
       },
     });
@@ -121,6 +133,201 @@ describe("changing an existing seat's launch directory", () => {
     migrate(db, [outboxEntriesSchema, seatDeliveryGuardSchema]);
     return tmux.deliveryGuard = new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name));
   }
+
+  function copiedResource(runtime: "claude-code" | "codex" | "pi" | "omp" | "stub", kind: "subagent" | "startup-skill" | "plugin" | "skill" | "runtime_resource") {
+    const seat = seed();
+    db.prepare("UPDATE nodes SET runtime = ? WHERE id = ?").run(runtime, seat.node.id);
+    db.prepare("UPDATE node_startup_context SET runtime = ? WHERE node_id = ?").run(runtime, seat.node.id);
+    const fsOps = {
+      readFile: (file: string) => fs.readFileSync(file, "utf8"), writeFile: (file: string, content: string) => fs.writeFileSync(file, content),
+      exists: fs.existsSync, mkdirp: (dir: string) => { fs.mkdirSync(dir, { recursive: true }); },
+      listFiles: (dir: string) => fs.readdirSync(dir, { recursive: true, encoding: "utf8" })
+        .filter(file => fs.statSync(path.join(dir, file)).isFile()),
+      homedir: path.join(root, "native-home"),
+    };
+    const stateRoot = path.join(root, `${runtime}-state`);
+    const runnerDeps = { tmux, fsOps, stateRoot, runnerEntryPath: path.join(root, "unused-runner.js") };
+    const adapters: Record<typeof runtime, RuntimeAdapter> = {
+      "claude-code": adapter,
+      codex: new CodexRuntimeAdapter({ tmux, fsOps }),
+      pi: new PiRuntimeAdapter(runnerDeps),
+      omp: new OmpRuntimeAdapter(runnerDeps),
+      stub: new StubRuntimeAdapter({ tmux, fsOps }),
+    };
+    const selectedAdapter = adapters[runtime];
+    service = new SeatLifecycleService({ db, rigRepo, sessionRegistry: registry, eventBus, tmuxAdapter: tmux,
+      runtimeAdapters: { [runtime]: selectedAdapter } });
+    const sourceDir = path.join(root, "review-resource");
+    const directoryResource = kind === "plugin" || kind === "skill";
+    const sourcePath = path.join(sourceDir, kind === "startup-skill" ? "SKILL.md" : directoryResource ? "nested/helper.js" : "reviewer.md");
+    fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+    fs.writeFileSync(sourcePath, "Updated resource from the saved startup context\n");
+    if (kind === "skill") fs.writeFileSync(path.join(sourceDir, "SKILL.md"), "# Review skill\n");
+    if (kind === "startup-skill") {
+      db.prepare("UPDATE node_startup_context SET resolved_files_json = ? WHERE node_id = ?").run(JSON.stringify([
+        ...seat.files, { path: "SKILL.md", absolutePath: sourcePath, ownerRoot: sourceDir,
+          deliveryHint: "skill_install", required: true, appliesOn: ["fresh_start"] },
+      ]), seat.node.id);
+    } else {
+      const row = db.prepare("SELECT projection_entries_json FROM node_startup_context WHERE node_id = ?").get(seat.node.id) as { projection_entries_json: string };
+      db.prepare("UPDATE node_startup_context SET projection_entries_json = ? WHERE node_id = ?").run(JSON.stringify([
+        ...JSON.parse(row.projection_entries_json), { category: kind, effectiveId: "review-resource", sourceSpec: "agent.yaml",
+          sourcePath: sourceDir, resourcePath: directoryResource ? "." : "reviewer.md", absolutePath: directoryResource ? sourceDir : sourcePath,
+          ...(kind === "plugin" ? { pluginType: runtime === "claude-code" ? "claude" : "codex" } : {}), },
+      ]), seat.node.id);
+    }
+    const skillsRoot = runtime === "pi" || runtime === "omp"
+      ? path.join(piSeatPaths(stateRoot, seat.sessionName).agentDir, "skills")
+      : path.join(newCwd, runtime === "stub" ? ".openrig/stub" : runtime === "claude-code" ? ".claude" : ".agents", "skills");
+    const targetPath = kind === "startup-skill" || kind === "skill"
+      ? path.join(skillsRoot, "review-resource", kind === "startup-skill" ? "SKILL.md" : "nested/helper.js")
+      : kind === "plugin"
+        ? path.join(newCwd, runtime === "claude-code" ? ".claude" : ".codex", "plugins", "review-resource", "nested/helper.js")
+        : kind === "runtime_resource"
+          ? path.join(newCwd, runtime === "claude-code" ? ".claude" : ".agents", "extensions", "review-resource", "reviewer.md")
+          : path.join(newCwd, runtime === "claude-code" ? ".claude/agents" : ".agents", "reviewer.md");
+    return { seat, sourcePath, targetPath, selectedAdapter };
+  }
+
+  it.each([
+    ["claude-code", "subagent"], ["codex", "subagent"],
+    ["claude-code", "startup-skill"], ["codex", "startup-skill"],
+    ["claude-code", "plugin"], ["codex", "plugin"],
+    ["claude-code", "runtime_resource"], ["codex", "runtime_resource"],
+    ["pi", "startup-skill"], ["omp", "startup-skill"], ["stub", "startup-skill"],
+  ] as const)("protects an operator-edited %s %s before any preparation write", async (runtime, kind) => {
+    const { seat, targetPath, selectedAdapter } = copiedResource(runtime, kind);
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    const operatorContent = "Operator's local edit must survive directory selection\n";
+    fs.writeFileSync(targetPath, operatorContent);
+    new ProjectionManifestStore(db).record({ targetPath, lastHash: hashContent("Previous OpenRig projection\n"), writtenAt: new Date().toISOString() });
+    const before = custody();
+    const project = vi.spyOn(selectedAdapter, "project");
+    const deliver = vi.spyOn(selectedAdapter, "deliverStartup");
+    const result = await service.setCwd({ seatRef: seat.sessionName, cwd: newCwd, reason: "isolate workspace" });
+    expect(fs.readFileSync(targetPath, "utf8")).toBe(operatorContent);
+    expect(result).toMatchObject({ ok: false, code: "cwd_destination_conflict", preparedCwd: newCwd });
+    expect(JSON.stringify(result)).toContain(targetPath);
+    expect(project).not.toHaveBeenCalled();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(savedCwd(seat.node.id)).toBe(oldCwd);
+    expect(custody()).toEqual(before);
+    expect(cwdEvents()).toEqual([]);
+  });
+
+  it.each(["claude-code", "codex", "pi", "omp", "stub"] as const)("leaves %s ambient skills to the current loadout instead of replaying an old catalog selection", async runtime => {
+    const { seat, targetPath } = copiedResource(runtime, "skill");
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, "Operator's current skill helper\n");
+    expect(await service.setCwd({ seatRef: seat.sessionName, cwd: newCwd, reason: "prepare workspace" }))
+      .toMatchObject({ ok: true });
+    expect(fs.readFileSync(targetPath, "utf8")).toBe("Operator's current skill helper\n");
+    expect(fs.existsSync(path.join(path.dirname(path.dirname(targetPath)), "SKILL.md"))).toBe(false);
+    expect(new ProjectionManifestStore(db).get(targetPath)).toBeNull();
+  });
+
+  it.each(["claude-code", "codex", "pi", "omp", "stub"] as const)("tracks %s copies so unchanged output refreshes but subsequent operator edits are protected", async runtime => {
+    const { seat, sourcePath, targetPath } = copiedResource(runtime, "startup-skill");
+    const input = { seatRef: seat.sessionName, cwd: newCwd, reason: "prepare workspace" };
+    expect(await service.setCwd(input)).toMatchObject({ ok: true });
+    fs.writeFileSync(sourcePath, "New upstream startup content\n");
+    expect(await service.setCwd(input)).toMatchObject({ ok: true, changed: false });
+    expect(fs.readFileSync(targetPath, "utf8")).toBe("New upstream startup content\n");
+    fs.writeFileSync(targetPath, "Operator refinement\n");
+    expect(await service.setCwd(input)).toMatchObject({ ok: false, code: "cwd_destination_conflict" });
+    expect(fs.readFileSync(targetPath, "utf8")).toBe("Operator refinement\n");
+    expect(savedCwd(seat.node.id)).toBe(newCwd);
+    expect(cwdEvents()).toHaveLength(1);
+  });
+
+  it.each(["claude-code", "codex"] as const)("protects an unrecorded %s destination file with different content", async runtime => {
+    const { seat, targetPath } = copiedResource(runtime, "subagent");
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, "Pre-existing operator resource\n");
+    expect(await service.setCwd({ seatRef: seat.sessionName, cwd: newCwd, reason: "isolate workspace" }))
+      .toMatchObject({ ok: false, code: "cwd_destination_conflict" });
+    expect(fs.readFileSync(targetPath, "utf8")).toBe("Pre-existing operator resource\n");
+    expect(savedCwd(seat.node.id)).toBe(oldCwd);
+  });
+
+  it.each(["claude-code", "codex", "pi", "omp", "stub"] as const)("does not acquire ownership of an identical unrecorded %s startup file", async runtime => {
+    const { seat, sourcePath, targetPath } = copiedResource(runtime, "startup-skill");
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    const original = fs.readFileSync(sourcePath, "utf8");
+    fs.writeFileSync(targetPath, original);
+    const input = { seatRef: seat.sessionName, cwd: newCwd, reason: "prepare workspace" };
+    expect(await service.setCwd(input)).toMatchObject({ ok: true });
+    expect(new ProjectionManifestStore(db).get(targetPath)).toBeNull();
+    fs.writeFileSync(sourcePath, "Updated source must not overwrite the unowned file\n");
+    expect(await service.setCwd(input)).toMatchObject({ ok: false, code: "cwd_destination_conflict" });
+    expect(fs.readFileSync(targetPath, "utf8")).toBe(original);
+  });
+
+  it("protects destination files when the projection manifest cannot be read", async () => {
+    const { seat, targetPath } = copiedResource("claude-code", "subagent");
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, "Operator resource\n");
+    vi.spyOn(ProjectionManifestStore.prototype, "lastHash").mockImplementation(() => { throw new Error("manifest unreadable"); });
+    expect(await service.setCwd({ seatRef: seat.sessionName, cwd: newCwd, reason: "prepare workspace" }))
+      .toMatchObject({ ok: false, code: "cwd_destination_conflict" });
+    expect(fs.readFileSync(targetPath, "utf8")).toBe("Operator resource\n");
+    expect(savedCwd(seat.node.id)).toBe(oldCwd);
+  });
+
+  it("refuses different startup sources for the same destination before writing either", async () => {
+    const { seat, sourcePath, targetPath, selectedAdapter } = copiedResource("claude-code", "startup-skill");
+    const otherSource = path.join(root, "other-source", "review-resource", "SKILL.md");
+    fs.mkdirSync(path.dirname(otherSource), { recursive: true });
+    fs.writeFileSync(otherSource, "Conflicting startup source\n");
+    const row = db.prepare("SELECT resolved_files_json FROM node_startup_context WHERE node_id = ?").get(seat.node.id) as { resolved_files_json: string };
+    const files = JSON.parse(row.resolved_files_json) as ResolvedStartupFile[];
+    files.push({ ...files.find(file => file.absolutePath === sourcePath)!, absolutePath: otherSource, ownerRoot: path.dirname(otherSource) });
+    db.prepare("UPDATE node_startup_context SET resolved_files_json = ? WHERE node_id = ?").run(JSON.stringify(files), seat.node.id);
+    const project = vi.spyOn(selectedAdapter, "project");
+    expect(await service.setCwd({ seatRef: seat.sessionName, cwd: newCwd, reason: "prepare workspace" }))
+      .toMatchObject({ ok: false, code: "cwd_destination_conflict" });
+    expect(fs.existsSync(targetPath)).toBe(false);
+    expect(project).not.toHaveBeenCalled();
+    expect(savedCwd(seat.node.id)).toBe(oldCwd);
+  });
+
+  it("keeps terminal startup delivery a no-op while saving its launch directory", async () => {
+    const { seat } = copiedResource("claude-code", "startup-skill");
+    db.prepare("UPDATE nodes SET runtime = 'terminal' WHERE id = ?").run(seat.node.id);
+    db.prepare("UPDATE node_startup_context SET runtime = 'terminal' WHERE node_id = ?").run(seat.node.id);
+    service = new SeatLifecycleService({ db, rigRepo, sessionRegistry: registry, eventBus, tmuxAdapter: tmux,
+      runtimeAdapters: { terminal: new TerminalAdapter() } });
+    expect(await service.setCwd({ seatRef: seat.sessionName, cwd: newCwd, reason: "move shell workspace" }))
+      .toMatchObject({ ok: true, to: newCwd });
+    expect(fs.readdirSync(newCwd)).toEqual([]);
+  });
+
+  it("warns and skips a missing optional startup copy", async () => {
+    const { seat, sourcePath, targetPath } = copiedResource("claude-code", "startup-skill");
+    const row = db.prepare("SELECT resolved_files_json FROM node_startup_context WHERE node_id = ?").get(seat.node.id) as { resolved_files_json: string };
+    const files = JSON.parse(row.resolved_files_json) as ResolvedStartupFile[];
+    files.find(file => file.absolutePath === sourcePath)!.required = false;
+    db.prepare("UPDATE node_startup_context SET resolved_files_json = ? WHERE node_id = ?").run(JSON.stringify(files), seat.node.id);
+    fs.unlinkSync(sourcePath);
+    expect(await service.setCwd({ seatRef: seat.sessionName, cwd: newCwd, reason: "prepare workspace" }))
+      .toMatchObject({ ok: true, warnings: expect.arrayContaining([expect.stringContaining("SKILL.md was skipped")]) });
+    expect(fs.existsSync(targetPath)).toBe(false);
+  });
+
+  it("does not commit when a prepared resource changes before verification", async () => {
+    const { seat, targetPath, selectedAdapter } = copiedResource("claude-code", "subagent");
+    const deliver = selectedAdapter.deliverStartup.bind(selectedAdapter);
+    vi.spyOn(selectedAdapter, "deliverStartup").mockImplementation(async (...args) => {
+      const result = await deliver(...args);
+      fs.writeFileSync(targetPath, "Concurrent operator edit\n");
+      return result;
+    });
+    expect(await service.setCwd({ seatRef: seat.sessionName, cwd: newCwd, reason: "prepare workspace" }))
+      .toMatchObject({ ok: false, code: "cwd_preparation_failed", preparedCwd: newCwd });
+    expect(fs.readFileSync(targetPath, "utf8")).toBe("Concurrent operator edit\n");
+    expect(savedCwd(seat.node.id)).toBe(oldCwd);
+    expect(cwdEvents()).toEqual([]);
+  });
 
   it("prepares real startup files and changes only the addressed seat's launch cwd, preserving live custody", async () => {
     const seat = seed();

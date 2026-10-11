@@ -249,8 +249,17 @@ rig seat status planning-lead@project
 
 The path must be absolute **on the daemon's host**. OpenRig creates a missing directory, resolves symlinks to
 its real path, and refuses a filesystem root. It uses the saved runtime resources and filesystem startup files
-that apply on `fresh_start`, with the runtime's normal managed-block and local-edit handling. Interactive
-startup text and actions wait until launch. Arbitrary working files in the old directory are not copied.
+that apply on `fresh_start`. Interactive startup text and actions wait until launch. Arbitrary working files
+in the old directory are not copied.
+
+Before any startup writes, OpenRig checks copied resources at their actual runtime destinations, including
+nested plugin files and startup skills. An operator-edited file or an unrecorded file with different content
+refuses the change with `cwd_destination_conflict` and names the protected paths. Use a clean destination or
+inspect and move/merge those files before retrying. An unchanged, previously recorded copy can refresh;
+an identical unrecorded file stays unowned. Managed guidance blocks and native configuration merges use the
+runtime adapter's existing policy. Pi and OMP startup skills use their seat state directory, even when it is
+outside the selected cwd. Ambient skill selection remains with the current loadout; an older catalog
+selection is not replayed.
 
 The same node, canonical address, queue, session history and skill selection are retained. `set-cwd` serializes
 with that seat's lifecycle operations and automatic delivery; it can run with the typing guard enabled and
@@ -266,7 +275,8 @@ Preparation must succeed before the directory and `node.cwd_changed` audit event
 Missing or malformed saved startup context, a required file/projection failure, or an audit-write failure
 leaves the prior selection recoverable. A concurrent configuration change is reported rather than overwritten.
 Filesystem writes cannot be rolled back with the database: a failed call may leave prepared files at the
-destination, named by `preparedCwd` when available. Inspect the reported warnings and seat status before
+destination or in runtime-managed state directories. `preparedCwd` names the requested launch directory
+when available. Inspect the reported warnings and seat status before
 retrying. A CLI timeout means the outcome is unknown; preparation may still finish in the daemon. Repeating
 the operation re-prepares files, but selecting the same canonical directory creates no second cwd audit event.
 
@@ -274,7 +284,7 @@ Files in the old directory stay in place. Check every seat using that shared loc
 managed files explicitly. The command also leaves the source RigSpec declaration unchanged; update that
 declaration separately if a future recreation should use the new directory.
 
-Regression coverage uses real SQLite and Claude/Codex file adapters in `seat-set-cwd.test.ts`, route and CLI
+Regression coverage uses real SQLite and Claude/Codex/Pi/OMP/stub file adapters in `seat-set-cwd.test.ts`, route and CLI
 tests, and the stub CLI journey for persistence and process-directory checks. Rebuild handover is covered at
 the service/launcher boundary. These tests do not establish native Claude/Codex conversation-resume behavior
 across directories or filesystem rollback after a daemon crash.

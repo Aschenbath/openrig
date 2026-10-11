@@ -23,6 +23,8 @@ import { validateNativePermissionSelection, unresolvedClaudePermissionModes } fr
 import fs from "node:fs";
 import path from "node:path";
 import { resolveConcreteHint, type NodeBinding } from "./runtime-adapter.js";
+import { ProjectionManifestStore } from "./projection-manifest-store.js";
+import { planCwdPreparation, recordCwdPreparation } from "./seat-cwd-preparation.js";
 
 /**
  * S5 (OPR.0.5.4.7) — the seat-lifecycle verb surface: set-model, single-seat stop,
@@ -75,6 +77,7 @@ export interface SeatRefusal {
     | "cwd_preparation_failed"
     | "cwd_persistence_failed"
     | "cwd_configuration_changed"
+    | "cwd_destination_conflict"
     | "missing_reason"
     | "permission_selection_refused"
     | "no_session"
@@ -322,15 +325,25 @@ export class SeatLifecycleService {
       ...(managedBlockFile ? { claudeManagedBlockFile: managedBlockFile } : {}),
     };
     const inspect = `Inspect the configured directory with: rig seat status ${input.seatRef}`;
-    const preparationGuidance = `The requested directory may contain prepared files. ${inspect} The previous directory's files are not cleaned up.`;
+    const preparationGuidance = `Startup preparation may have written files in the requested directory or runtime-managed state directories. ${inspect} The previous directory's files are not cleaned up.`;
     try {
       binding = new NativePermissionStore(this.db).apply(binding, node.runtime);
-      const projection = await adapter.project({ ...startup.context.plan, cwd: to }, binding);
+      const manifest = new ProjectionManifestStore(this.db);
+      const preparation = planCwdPreparation({ ...startup.context.plan, cwd: to }, files, binding, adapter, manifest);
+      warnings.push(...preparation.warnings);
+      if (preparation.conflicts.length) {
+        warnings.push(...preparation.conflicts.map(copy => `Protected destination file: ${copy.targetPath}`));
+        return { ok: false, code: "cwd_destination_conflict", preparedCwd: to, warnings,
+          message: "Destination resource files conflict with the saved startup context; no startup files were written and the cwd was not committed.",
+          guidance: "Use a clean destination, or inspect and move/merge the reported files before retrying." };
+      }
+      const projection = await adapter.project(preparation.plan, binding);
       warnings.push(...(projection.warnings ?? []));
       if (projection.failed.length) throw new Error(projection.failed.map(f => `${f.effectiveId}: ${f.error}`).join("; "));
-      const delivery = await adapter.deliverStartup(files, binding, async () => { throw new Error("Interactive startup is deferred until launch."); });
+      const delivery = await adapter.deliverStartup(preparation.files, binding, async () => { throw new Error("Interactive startup is deferred until launch."); });
       warnings.push(...(delivery.warnings ?? []));
       if (delivery.failed.length) throw new Error(delivery.failed.map(f => `${f.path}: ${f.error}`).join("; "));
+      warnings.push(...this.db.transaction(() => recordCwdPreparation(preparation, manifest))());
     } catch (error) {
       return { ok: false, code: "cwd_preparation_failed", message: `Working directory selection was not committed: ${(error as Error).message}`,
         guidance: preparationGuidance, preparedCwd: to, warnings };

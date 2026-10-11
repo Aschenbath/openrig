@@ -198,6 +198,19 @@ describe("rig seat set-cwd", () => {
       guidance: expect.stringContaining("rig seat status planner@project") });
     expect(exitCode).toBe(1);
   });
+
+  it("prints protected destination paths and recovery guidance for a conflict", async () => {
+    const protectedPath = "/srv/remote/planner/.claude/agents/reviewer.md";
+    const data = { ok: false, code: "cwd_destination_conflict", message: "Destination files conflict; cwd was not committed",
+      guidance: "Use a clean destination, or inspect and move/merge the reported files before retrying.",
+      warnings: [`Protected destination file: ${protectedPath}`] };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { errors, exitCode } = await captureLogs(() => makeCommand(makeDeps({ status: 409, data }, [])).parseAsync(args).then(() => {}));
+    expect(warn).toHaveBeenCalledWith(`Warning: Protected destination file: ${protectedPath}`);
+    expect(errors.join("\n")).toContain("cwd was not committed");
+    expect(errors.join("\n")).toContain("inspect and move/merge");
+    expect(exitCode).toBe(1);
+  });
 });
 
 describe("rig seat set-model", () => {
