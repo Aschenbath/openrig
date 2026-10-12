@@ -265,6 +265,25 @@ describe("SeatLifecycleService", () => {
       expect(summary(stopped.rig.id).lifecycleState).toBe("running");
     });
 
+    it("does not hide an exit between the live probe and the kill", async () => {
+      const stopped = seatFixture("stop-race", "dev.qa");
+      seatFixture("stop-race", "dev.impl");
+      vi.spyOn(tmux.adapter, "killSession").mockImplementationOnce(async () => {
+        tmux.setAlive(stopped.sessionName, false);
+        return { ok: false, code: "session_not_found", message: "session exited before kill" };
+      });
+
+      expect((await service.stopSeat({ seatRef: stopped.sessionName, reason: "pause review" })).ok).toBe(true);
+      expect(tmux.adapter.killSession).toHaveBeenCalledWith(stopped.sessionName);
+      expect(summary(stopped.rig.id)).toMatchObject({
+        lifecycleState: "degraded", status: "partial", nodeCount: 2, runningCount: 1,
+      });
+      expect(getNodeInventory(db, stopped.rig.id).find((entry) => entry.nodeId === stopped.node.id)).toMatchObject({
+        sessionStatus: "exited", intentionallyStopped: false,
+      });
+      expect(sessionRegistry.getBindingForNode(stopped.node.id)).toBeNull();
+    });
+
     it("does not leave a stopped seat's old startup prompt in the rig lifecycle", async () => {
       const stopped = seatFixture("stop-prompt", "dev.qa");
       seatFixture("stop-prompt", "dev.impl");

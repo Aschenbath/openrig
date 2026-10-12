@@ -938,7 +938,12 @@ export class SeatLifecycleService {
     }
     let persisted: PersistedEvent | null = null;
     const tx = this.db.transaction(() => {
-      this.sessionRegistry.markIntentionallyStopped(session.id);
+      if (kill?.ok) {
+        this.sessionRegistry.markIntentionallyStopped(session.id);
+      } else {
+        // The session disappeared after the live probe; do not hide that exit.
+        this.sessionRegistry.updateStatus(session.id, "exited");
+      }
       this.sessionRegistry.clearBinding(resolved.nodeId);
       persisted = this.eventBus.persistWithinTransaction({
         type: "session.stopped",
