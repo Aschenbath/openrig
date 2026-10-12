@@ -25,7 +25,7 @@ import { resolvePickupThresholdMinutes } from "./queue-pickup.js";
 
 import { defaultResolveOrchestrator } from "./queue-owner.js";
 import type Database from "better-sqlite3";
-import { deriveCrossHostSuccessorId, type QueueItem, type QueueRepository } from "./queue-repository.js";
+import { deriveCrossHostSuccessorId, QueueRepositoryError, type QueueItem, type QueueRepository } from "./queue-repository.js";
 import { stalledPickupFinding } from "./queue-pickup.js";
 import { SettingsStore } from "./user-settings/settings-store.js";
 import { loadHostRegistry } from "./hosts/hosts-registry-reader.js";
@@ -248,8 +248,8 @@ function hasSeatTargetSuccessor(db: Database.Database, sourceQitemId: string, ta
  *  and delivery receipts do not transfer responsibility. A newer cancellation
  *  without closure metadata still supersedes an older closing actor. */
 function custodyFindingRoute(db: Database.Database, queueRepo: QueueRepository, row: QueueItem): string {
-  // An unavailable registry propagates to the pass's failure boundary, before any
-  // finding is created or resolved. Unknown identity must not become a durable route.
+  // Unknown identity cannot establish a new owner. The caller retains this row's
+  // established destination if the registry needed for classification is unavailable.
   if (!queueRepo.isHumanDestination(row.destinationSession)) return row.destinationSession;
   const closure = db.prepare(
     `SELECT actor_session FROM (
@@ -585,10 +585,19 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
         return !hasSeatTargetSuccessor(deps.db, row.qitemId, target);
       });
       if (verificationTargets.length === 0) continue;
+      let route = row.destinationSession;
+      try {
+        route = custodyFindingRoute(deps.db, deps.queueRepo, row);
+      } catch (err) {
+        if (!(err instanceof QueueRepositoryError) || err.code !== "human_registry_unavailable") throw err;
+        // The registry may not exist before the first human is registered. Losing
+        // owner refinement must not stop unrelated findings or their resolution.
+        log(`[stuck-sweep] keeping custody route for ${row.qitemId} at ${row.destinationSession}: ${err.message}`);
+      }
       candidates.push({
         kind: "dangling-closure",
         row,
-        route: custodyFindingRoute(deps.db, deps.queueRepo, row),
+        route,
         ageMinutes: minutesSince(row.tsUpdated, now),
         evidenceAt: latestIso(row.tsUpdated),
         why: `closed (${row.closureReason ?? "?"}) with successor custody that this local store cannot fully verify`,

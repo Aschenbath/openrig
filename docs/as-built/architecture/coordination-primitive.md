@@ -154,9 +154,12 @@ agent, the human destination remains the durable fallback. This routing does not
 change custody verification or suppress unresolved findings.
 
 If the human registry is unavailable when a canonical identity needs classification,
-the sweep reports a failed pass with the registry error and leaves findings untouched.
-It retries on the next pass after registry recovery. Reserved human references and
-legacy agent names retain their known classifications without a registry read.
+the sweep retains that item's original destination and logs the registry error. This
+does not infer an agent identity from an unreadable registry, which may not exist before
+the first human is registered. The pass continues to route unrelated findings and close
+repaired ones. Registry recovery restores owner refinement for new findings; existing
+findings keep their established route. Reserved human references and legacy agent names
+retain their known classifications without a registry read.
 
 ## 3. The hot-potato closure contract (where queue closure is enforced)
 

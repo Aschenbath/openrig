@@ -6,7 +6,7 @@ import { EventBus } from "../src/domain/event-bus.js";
 import type { HumanFragment } from "../src/domain/gateway/human-registry.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { archiveAgedTerminalTransitions } from "../src/domain/queue-retention.js";
-import { findingDedupTag, runStuckSweep, STUCK_SWEEP_FINDING_TAG } from "../src/domain/queue-stuck-sweep.js";
+import { createStuckSweepStatus, findingDedupTag, runStuckSweep, STUCK_SWEEP_FINDING_TAG } from "../src/domain/queue-stuck-sweep.js";
 
 describe("#514 custody findings for a human decision", () => {
   const owner: HumanFragment = {
@@ -17,12 +17,16 @@ describe("#514 custody findings for a human decision", () => {
   let db: Database.Database;
   let repo: QueueRepository;
   let sent: string[];
+  let logs: string[];
+  let status: ReturnType<typeof createStuckSweepStatus>;
   let registryError: string | null;
 
   beforeEach(() => {
     db = new Database(":memory:");
     migrate(db, ALL_MIGRATIONS);
     sent = [];
+    logs = [];
+    status = createStuckSweepStatus();
     registryError = null;
     repo = new QueueRepository(db, new EventBus(db), {
       validateRig: () => true,
@@ -42,8 +46,8 @@ describe("#514 custody findings for a human decision", () => {
   }
 
   function sweepResult() {
-    return runStuckSweep({ db, queueRepo: repo, resolveOrchestrator: () => null,
-      unclaimedAgeMinutes: 60, isRegisteredHost: () => false, log: () => {} });
+    return runStuckSweep({ db, queueRepo: repo, status, resolveOrchestrator: () => null,
+      unclaimedAgeMinutes: 60, isRegisteredHost: () => false, log: (line) => { logs.push(line); } });
   }
 
   async function sweep() {
@@ -188,24 +192,32 @@ describe("#514 custody findings for a human decision", () => {
   });
 
   it.each([
-    { destination: "owner@kernel", actor: "closer@r", source: "asker@r", expected: "closer@r" },
-    { destination: "worker@r", actor: "closer@r", source: "asker@r", expected: "worker@r" },
-    { destination: "owner@external", actor: "owner@kernel", source: "asker@r", expected: "asker@r" },
-    { destination: "owner@external", actor: "human@host", source: "owner@kernel", expected: "owner@external" },
-  ])("defers unknown registry classification for $destination / $actor / $source until recovery", async ({ destination, actor, source, expected }) => {
+    { destination: "owner@kernel", actor: "closer@r", source: "asker@r", terminalWakes: ["owner@kernel"] },
+    { destination: "worker@r", actor: "closer@r", source: "asker@r", terminalWakes: ["worker@r"] },
+    // @external delivery retains its existing gateway path without using terminal transport.
+    { destination: "owner@external", actor: "owner@kernel", source: "asker@r", terminalWakes: [] },
+    { destination: "owner@external", actor: "human@host", source: "owner@kernel", terminalWakes: [] },
+  ])("keeps the established route when registry classification is unavailable for $destination / $actor / $source", async ({ destination, actor, source, terminalWakes }) => {
     const row = await ask(destination, source);
     await close(row.qitemId, actor);
     registryError = "fixture human registry is unreadable";
 
-    const result = await sweepResult();
-    expect(result).toMatchObject({ outcome: "failed", findings: [], error: expect.stringContaining(registryError) });
-    expect(findings(row.qitemId)).toHaveLength(0);
-    expect(sent).toEqual([]);
+    const result = await sweep();
+    expect(result).toMatchObject({ outcome: "findings", findings: [{ qitemId: row.qitemId, action: "created" }] });
+    expect(findings(row.qitemId)).toHaveLength(1);
+    const [finding] = findings(row.qitemId);
+    expect(finding!.destinationSession).toBe(destination);
+    expect(sent).toEqual(terminalWakes);
+    expect(logs).toEqual([expect.stringContaining(registryError)]);
+    expect(logs[0]).toContain(row.qitemId);
 
     registryError = null;
-    await sweep();
+    logs.length = 0;
+    expect((await sweep()).findings).toContainEqual(expect.objectContaining({ findingQitemId: finding!.qitemId, action: "refreshed" }));
     expect(findings(row.qitemId)).toHaveLength(1);
-    expect(findings(row.qitemId)[0]!.destinationSession).toBe(expected);
+    expect(findings(row.qitemId)[0]!.destinationSession).toBe(destination);
+    expect(sent).toEqual(terminalWakes);
+    expect(logs).toEqual([]);
   });
 
   it("preserves an open custody finding while its registry classification is unknown", async () => {
@@ -216,11 +228,12 @@ describe("#514 custody findings for a human decision", () => {
     const transitions = repo.transitionLog.listForQitem(finding!.qitemId);
     registryError = "fixture human registry is unreadable";
 
-    expect((await sweepResult()).outcome).toBe("failed");
+    expect((await sweep()).findings).toContainEqual(expect.objectContaining({ findingQitemId: finding!.qitemId, action: "refreshed" }));
     expect(findings(row.qitemId)).toHaveLength(1);
     expect(repo.getById(finding!.qitemId)).toMatchObject({ state: "pending", destinationSession: "closer@r" });
     expect(repo.transitionLog.listForQitem(finding!.qitemId)).toEqual(transitions);
     expect(sent).toEqual(["closer@r"]);
+    expect(logs).toEqual([expect.stringContaining(registryError)]);
 
     registryError = null;
     expect((await sweep()).findings).toContainEqual(expect.objectContaining({ findingQitemId: finding!.qitemId, action: "refreshed" }));
@@ -235,6 +248,58 @@ describe("#514 custody findings for a human decision", () => {
     expect(findings(row.qitemId)).toHaveLength(1);
     expect(findings(row.qitemId)[0]!.destinationSession).toBe("r00-closer");
     expect(sent).toEqual(["r00-closer"]);
+    expect(logs).toEqual([]);
+  });
+
+  it("routes custody, unclaimed and overdue findings when the human registry has not been generated", async () => {
+    registryError = "fixture human registry has not been generated";
+    const custody = await ask("worker@r");
+    await close(custody.qitemId);
+    const unclaimed = await ask("unclaimed@r");
+    const past = new Date(Date.now() - 90 * 60_000).toISOString();
+    db.prepare("UPDATE queue_items SET ts_created = ? WHERE qitem_id = ?").run(past, unclaimed.qitemId);
+    db.prepare("UPDATE queue_transitions SET ts = ? WHERE qitem_id = ?").run(past, unclaimed.qitemId);
+    const overdue = await ask("overdue@r");
+    repo.claim({ qitemId: overdue.qitemId, destinationSession: "overdue@r" });
+    db.prepare("UPDATE queue_items SET closure_required_at = ? WHERE qitem_id = ?").run(past, overdue.qitemId);
+
+    const result = await sweep();
+    expect(result.findings).toHaveLength(3);
+    expect(result.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "dangling-closure", qitemId: custody.qitemId, action: "created" }),
+      expect.objectContaining({ kind: "unclaimed-obligation", qitemId: unclaimed.qitemId, action: "created" }),
+      expect.objectContaining({ kind: "overdue-claim", qitemId: overdue.qitemId, action: "created" }),
+    ]));
+    const destinations = ["overdue@r", "unclaimed@r", "worker@r"];
+    expect(result.findings.map((f) => repo.getById(f.findingQitemId)!.destinationSession).sort()).toEqual(destinations);
+    expect(sent.sort()).toEqual(destinations);
+    expect(logs).toEqual([expect.stringContaining(registryError)]);
+    expect(status.snapshot()).toMatchObject({ lastOutcome: "findings", lastError: null, consecutiveFailures: 0, findingsRouted: 3 });
+
+    expect((await sweep()).findings.map((f) => f.action)).toEqual(["refreshed", "refreshed", "refreshed"]);
+    expect(sent.sort()).toEqual(destinations);
+  });
+
+  it("closes a repaired finding while another custody item needs the unavailable registry", async () => {
+    const repaired = await ask("owner@kernel");
+    await close(repaired.qitemId);
+    await sweep();
+    const [finding] = findings(repaired.qitemId);
+    const unresolved = await ask("worker@r");
+    await close(unresolved.qitemId);
+    registryError = "fixture human registry is unreadable";
+    await repo.create({ sourceSession: "closer@r", destinationSession: "next@r", body: "Continue approved work",
+      chainOfRecord: [repaired.qitemId], nudge: false });
+    sent.length = 0;
+
+    const result = await sweep();
+    expect(result.findings).toHaveLength(2);
+    expect(result.findings).toContainEqual(expect.objectContaining({ findingQitemId: finding!.qitemId, action: "closed" }));
+    expect(repo.getById(finding!.qitemId)).toMatchObject({ state: "done", closureReason: "no-follow-on", destinationSession: "closer@r" });
+    expect(result.findings).toContainEqual(expect.objectContaining({ qitemId: unresolved.qitemId, action: "created" }));
+    expect(findings(unresolved.qitemId)[0]!.destinationSession).toBe("worker@r");
+    expect(sent).toEqual(["worker@r"]);
+    expect(logs).toEqual([expect.stringContaining(registryError)]);
   });
 
   it("deduplicates the agent's finding and closes it when a linked successor repairs custody", async () => {
