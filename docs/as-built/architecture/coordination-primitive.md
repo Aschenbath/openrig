@@ -153,6 +153,11 @@ destination keeps its existing route; if neither closer nor source is an admitte
 agent, the human destination remains the durable fallback. This routing does not
 change custody verification or suppress unresolved findings.
 
+If the human registry is unavailable when a canonical identity needs classification,
+the sweep reports a failed pass with the registry error and leaves findings untouched.
+It retries on the next pass after registry recovery. Reserved human references and
+legacy agent names retain their known classifications without a registry read.
+
 ## 3. The hot-potato closure contract (where queue closure is enforced)
 
 `hot-potato-enforcer.ts` is the pure validator for the load-bearing API

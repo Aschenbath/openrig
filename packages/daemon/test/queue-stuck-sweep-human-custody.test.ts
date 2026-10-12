@@ -17,14 +17,16 @@ describe("#514 custody findings for a human decision", () => {
   let db: Database.Database;
   let repo: QueueRepository;
   let sent: string[];
+  let registryError: string | null;
 
   beforeEach(() => {
     db = new Database(":memory:");
     migrate(db, ALL_MIGRATIONS);
     sent = [];
+    registryError = null;
     repo = new QueueRepository(db, new EventBus(db), {
       validateRig: () => true,
-      loadHumanRegistry: () => ({ ok: true, entities: [owner] }),
+      loadHumanRegistry: () => registryError ? { ok: false, error: registryError } : { ok: true, entities: [owner] },
       transport: { send: async (destination) => { sent.push(destination); return { ok: true, verified: true }; } },
     });
   });
@@ -39,9 +41,13 @@ describe("#514 custody findings for a human decision", () => {
     await repo.update({ qitemId, actorSession, state: "done", closureReason: "handed_off_to", closureTarget: "next@r" });
   }
 
-  async function sweep() {
-    const result = await runStuckSweep({ db, queueRepo: repo, resolveOrchestrator: () => null,
+  function sweepResult() {
+    return runStuckSweep({ db, queueRepo: repo, resolveOrchestrator: () => null,
       unclaimedAgeMinutes: 60, isRegisteredHost: () => false, log: () => {} });
+  }
+
+  async function sweep() {
+    const result = await sweepResult();
     expect(result.outcome, result.error).not.toBe("failed");
     return result;
   }
@@ -179,6 +185,56 @@ describe("#514 custody findings for a human decision", () => {
     await sweep();
     expect(findings(row.qitemId)).toHaveLength(1);
     expect(findings(row.qitemId)[0]!.destinationSession).toBe("worker@r");
+  });
+
+  it.each([
+    { destination: "owner@kernel", actor: "closer@r", source: "asker@r", expected: "closer@r" },
+    { destination: "worker@r", actor: "closer@r", source: "asker@r", expected: "worker@r" },
+    { destination: "owner@external", actor: "owner@kernel", source: "asker@r", expected: "asker@r" },
+    { destination: "owner@external", actor: "human@host", source: "owner@kernel", expected: "owner@external" },
+  ])("defers unknown registry classification for $destination / $actor / $source until recovery", async ({ destination, actor, source, expected }) => {
+    const row = await ask(destination, source);
+    await close(row.qitemId, actor);
+    registryError = "fixture human registry is unreadable";
+
+    const result = await sweepResult();
+    expect(result).toMatchObject({ outcome: "failed", findings: [], error: expect.stringContaining(registryError) });
+    expect(findings(row.qitemId)).toHaveLength(0);
+    expect(sent).toEqual([]);
+
+    registryError = null;
+    await sweep();
+    expect(findings(row.qitemId)).toHaveLength(1);
+    expect(findings(row.qitemId)[0]!.destinationSession).toBe(expected);
+  });
+
+  it("preserves an open custody finding while its registry classification is unknown", async () => {
+    const row = await ask("owner@kernel");
+    await close(row.qitemId);
+    await sweep();
+    const [finding] = findings(row.qitemId);
+    const transitions = repo.transitionLog.listForQitem(finding!.qitemId);
+    registryError = "fixture human registry is unreadable";
+
+    expect((await sweepResult()).outcome).toBe("failed");
+    expect(findings(row.qitemId)).toHaveLength(1);
+    expect(repo.getById(finding!.qitemId)).toMatchObject({ state: "pending", destinationSession: "closer@r" });
+    expect(repo.transitionLog.listForQitem(finding!.qitemId)).toEqual(transitions);
+    expect(sent).toEqual(["closer@r"]);
+
+    registryError = null;
+    expect((await sweep()).findings).toContainEqual(expect.objectContaining({ findingQitemId: finding!.qitemId, action: "refreshed" }));
+  });
+
+  it("keeps reserved human and legacy agent classification when the registry is unavailable", async () => {
+    const row = await ask();
+    await close(row.qitemId, "r00-closer");
+    registryError = "fixture human registry is unreadable";
+
+    await sweep();
+    expect(findings(row.qitemId)).toHaveLength(1);
+    expect(findings(row.qitemId)[0]!.destinationSession).toBe("r00-closer");
+    expect(sent).toEqual(["r00-closer"]);
   });
 
   it("deduplicates the agent's finding and closes it when a linked successor repairs custody", async () => {

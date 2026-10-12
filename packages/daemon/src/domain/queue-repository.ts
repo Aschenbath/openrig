@@ -3625,11 +3625,18 @@ export class QueueRepository {
   }
 
   /** Human ownership includes reserved references and registered aliases, even when
-   *  an alias has a terminal binding. Transport capability does not determine identity. */
+   *  an alias has a terminal binding. Transport capability does not determine identity.
+   *  A canonical identity is unknown when the registry cannot be read: throw instead
+   *  of returning an agent classification that a caller could persist as a route. */
   isHumanDestination(destinationSession: string): boolean {
     if (isHumanSeatSessionRef(destinationSession)) return true;
+    if (parseSessionName(destinationSession).kind !== "canonical") return false;
     const registry = this.loadHumanRegistryFn();
-    return registry.ok && resolveRegisteredHumanAddress(destinationSession, registry.entities) !== null;
+    if (!registry.ok) {
+      throw new QueueRepositoryError("human_registry_unavailable",
+        `Cannot classify '${destinationSession}' as human or agent: human registry unavailable (${registry.error}).`);
+    }
+    return resolveRegisteredHumanAddress(destinationSession, registry.entities) !== null;
   }
 
   /** OPR.0.5.6.14 — the one destination-classification seam, as the wake path consults it.

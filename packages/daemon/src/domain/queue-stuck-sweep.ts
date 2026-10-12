@@ -248,6 +248,8 @@ function hasSeatTargetSuccessor(db: Database.Database, sourceQitemId: string, ta
  *  and delivery receipts do not transfer responsibility. A newer cancellation
  *  without closure metadata still supersedes an older closing actor. */
 function custodyFindingRoute(db: Database.Database, queueRepo: QueueRepository, row: QueueItem): string {
+  // An unavailable registry propagates to the pass's failure boundary, before any
+  // finding is created or resolved. Unknown identity must not become a durable route.
   if (!queueRepo.isHumanDestination(row.destinationSession)) return row.destinationSession;
   const closure = db.prepare(
     `SELECT actor_session FROM (
