@@ -243,6 +243,36 @@ function hasSeatTargetSuccessor(db: Database.Database, sourceQitemId: string, ta
   }
 }
 
+/** Custody verification for a human destination belongs to its closing agent.
+ *  Use the closing transition, including archived history; later same-state notes
+ *  and delivery receipts do not transfer responsibility. A newer cancellation
+ *  without closure metadata still supersedes an older closing actor. */
+function custodyFindingRoute(db: Database.Database, queueRepo: QueueRepository, row: QueueItem): string {
+  if (!queueRepo.isHumanDestination(row.destinationSession)) return row.destinationSession;
+  const closure = db.prepare(
+    `SELECT actor_session FROM (
+       SELECT transition_id, state, actor_session, closure_reason,
+              LAG(state) OVER (ORDER BY transition_id) AS previous_state
+         FROM (
+           SELECT transition_id, state, actor_session, closure_reason FROM queue_transitions WHERE qitem_id = ?
+           UNION ALL
+           SELECT transition_id, state, actor_session, closure_reason FROM queue_transitions_archive WHERE qitem_id = ?
+         )
+     ) WHERE state IN ('done', 'canceled')
+         AND (state IS NOT previous_state OR closure_reason IS NOT NULL)
+       ORDER BY transition_id DESC LIMIT 1`,
+  ).get(row.qitemId, row.qitemId) as { actor_session: string } | undefined;
+  for (const session of [closure?.actor_session, row.sourceSession]) {
+    if (!session || session === "daemon@kernel" || session.endsWith("@system")) continue;
+    if (!queueRepo.isHumanDestination(session) && queueRepo.acceptsDestination(session)) {
+      return session;
+    }
+  }
+  // No admitted agent is attributable: retain the established durable destination
+  // rather than inventing a seat or failing the sweep on an unknown actor's rig.
+  return row.destinationSession;
+}
+
 function hasLiveLadder(db: Database.Database, qitemId: string): boolean {
   const notes = db
     .prepare("SELECT transition_note FROM queue_transitions WHERE qitem_id = ? ORDER BY transition_id DESC")
@@ -556,7 +586,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       candidates.push({
         kind: "dangling-closure",
         row,
-        route: row.destinationSession,
+        route: custodyFindingRoute(deps.db, deps.queueRepo, row),
         ageMinutes: minutesSince(row.tsUpdated, now),
         evidenceAt: latestIso(row.tsUpdated),
         why: `closed (${row.closureReason ?? "?"}) with successor custody that this local store cannot fully verify`,

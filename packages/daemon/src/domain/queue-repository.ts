@@ -3618,6 +3618,20 @@ export class QueueRepository {
     return opts?.compact ? out.map(compactRow) : out;
   }
 
+  /** Read the same address-admission predicate used by queue writes before choosing
+   *  a recovery owner. Admission does not require a live seat or terminal binding. */
+  acceptsDestination(destinationSession: string): boolean {
+    return this.validateRig(destinationSession);
+  }
+
+  /** Human ownership includes reserved references and registered aliases, even when
+   *  an alias has a terminal binding. Transport capability does not determine identity. */
+  isHumanDestination(destinationSession: string): boolean {
+    if (isHumanSeatSessionRef(destinationSession)) return true;
+    const registry = this.loadHumanRegistryFn();
+    return registry.ok && resolveRegisteredHumanAddress(destinationSession, registry.entities) !== null;
+  }
+
   /** OPR.0.5.6.14 — the one destination-classification seam, as the wake path consults it.
    *  Public for the single-row read route; getById itself stays free of topology reads. */
   classifyDestinationOf(destinationSession: string): DestinationClass {

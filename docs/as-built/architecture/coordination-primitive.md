@@ -130,18 +130,28 @@ and drains intents left pending by a crash once (`startup.ts:2361`–`2362`).
 `maybeNudge` remains only as the path for a repository with no outbox.
 
 The standing detector in `queue-stuck-sweep.ts` creates findings through the
-queue repository, with `evidenceRef: rig queue show <source-qitem-id>`
-(`queue-stuck-sweep.ts:605`) pointing to the underlying durable work row. This
-satisfies the existing human-route evidence contract without changing
-destination resolution: a finding goes to the destination's orchestrator when
-one is derivable, otherwise to the destination itself, and that seat may be
-dead. Repeated detections refresh the existing finding; when the source
-condition resolves, the sweep closes its own finding (`:612`–`637`). The sweep
-reports six finding kinds (`:50`). Its custody check covers closures that name
-a successor qitem or a seat (`closure_reason = handed_off_to`) in the last 24
-hours; a seat target is satisfied by a local successor carrying this row's
-lineage, and any target by a `custody-verified: <target> …` note on the closed
-row (`:168`–`244`, `:519`–`554`).
+queue repository, with `evidenceRef: rig queue show <source-qitem-id>` pointing
+to the underlying durable work row. Unclaimed and undelivered findings go to
+the destination's orchestrator when one is derivable, otherwise to the
+destination itself, and that seat may be dead. Overdue claims go to their
+destination. Repeated detections reuse the existing finding without changing
+its route; when the source condition resolves, the sweep closes its own finding.
+
+The sweep reports six finding kinds. Its custody check covers closures that
+name a successor qitem or a seat (`closure_reason = handed_off_to`) in the last
+24 hours, plus older closures with open findings. A seat target is satisfied by
+a local successor carrying this row's lineage, and any target by a
+`custody-verified: <target> …` note on the closed row. A new custody finding for
+a human destination goes to the agent that closed the item, using the closing
+transition from active or archived history. Later notes and notification
+receipts do not change that owner. If the closing actor is missing, human, system
+machinery or not admitted by this host's queue, the asking agent receives the
+finding if its address is admitted. Human identity includes reserved references
+and registered aliases, independent of terminal bindings. Admission uses the
+queue's existing address check and does not require a live seat. An agent
+destination keeps its existing route; if neither closer nor source is an admitted
+agent, the human destination remains the durable fallback. This routing does not
+change custody verification or suppress unresolved findings.
 
 ## 3. The hot-potato closure contract (where queue closure is enforced)
 
