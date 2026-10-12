@@ -430,9 +430,11 @@ members:
 OpenRig passes `--model claude-sonnet-5-5 --effort medium --advisor opus` to this
 Claude session. The primary model stays Sonnet. Advisor resolution uses the member's
 `advisor`, then the profile's `preferences.advisor`, then the agent's `defaults.advisor`.
-The resolved value is retained in node/graph output, exported specs and snapshots,
-and supplied again on resume, restore, fresh restart and handover. A fork uses the
-resulting member's configuration and keeps its own conversation identity.
+Blank candidates are skipped before applying this precedence. Materialization stores
+the resolved value, so node/graph output, exported specs and snapshots include it even
+before the first launch. Launching the original spec re-resolves its current preferences.
+The selection is supplied again on resume, restore, fresh restart and handover. A fork
+uses the resulting member's configuration and keeps its own conversation identity.
 
 This requires a Claude Code version that supports `--advisor`. OpenRig never writes
 `advisorModel` to user or project settings. Members sharing a checkout can therefore

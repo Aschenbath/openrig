@@ -112,6 +112,14 @@ const RESTORE_POLICY_LEVEL: Record<string, number> = {
 
 // -- Public API --
 
+/** Resolve member > profile > agent Advisor preferences, skipping blank or non-string candidates. */
+export function resolveAdvisorModel(member: unknown, profile?: unknown, defaults?: unknown): string | undefined {
+  for (const candidate of [member, profile, defaults]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return undefined;
+}
+
 /**
  * Resolve effective node configuration from agent spec, profile, and rig context.
  * @param ctx - resolution context with all inputs
@@ -153,12 +161,7 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
     ? rawEffort.trim()
     : undefined;
 
-  const rawAdvisor = member.advisor
-    ?? profile.preferences?.advisor
-    ?? spec.defaults?.advisor;
-  const advisor = typeof rawAdvisor === "string" && rawAdvisor.trim()
-    ? rawAdvisor.trim()
-    : undefined;
+  const advisor = resolveAdvisorModel(member.advisor, profile.preferences?.advisor, spec.defaults?.advisor);
 
   const cwd = ctx.cwdOverride
     ? nodePath.resolve(ctx.cwdOverride)

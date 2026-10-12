@@ -307,7 +307,7 @@ import { RigSpecCodec as PodRigSpecCodec } from "./rigspec-codec.js";
 import { RigSpecSchema as PodRigSpecSchema, VALID_EDGE_KINDS } from "./rigspec-schema.js";
 import { rigPreflight, preflightValidatedSpec } from "./rigspec-preflight.js";
 import { resolveAgentRef, type AgentResolverFsOps } from "./agent-resolver.js";
-import { resolveNodeConfig } from "./profile-resolver.js";
+import { resolveAdvisorModel, resolveNodeConfig } from "./profile-resolver.js";
 import { resolveStartup } from "./startup-resolver.js";
 import { planProjection, claudeConflictTargetPath, projectionConflictWarnings, filterProtectedProjections, type ProjectionPlan } from "./projection-planner.js";
 import { ProjectionManifestStore } from "./projection-manifest-store.js";
@@ -1866,12 +1866,25 @@ export class PodRigInstantiator {
     cwdOverride?: string;
   }) {
     const effectiveCwd = resolveLaunchCwd(input.member.cwd, input.rigRoot, input.cwdOverride);
+    // Export and snapshot can run before launch. Resolve inherited Advisor values
+    // during creation; launch still re-resolves the original spec for later edits.
+    let advisor = resolveAdvisorModel(input.member.advisor);
+    if (advisor === undefined && input.member.agentRef !== "builtin:terminal") {
+      const resolved = resolveAgentRef(input.member.agentRef, input.rigRoot, this.deps.fsOps);
+      if (!resolved.ok) {
+        throw new Error(resolved.code === "validation_failed" ? resolved.errors.join("; ") : resolved.error);
+      }
+      const spec = resolved.resolved.spec;
+      const profile = spec.profiles[input.member.profile];
+      if (!profile) throw new Error(`Profile "${input.member.profile}" not found in spec "${spec.name}"`);
+      advisor = resolveAdvisorModel(undefined, profile.preferences?.advisor, spec.defaults?.advisor);
+    }
     const node = this.deps.rigRepo.addNode(input.rigId, input.qualifiedId, {
       role: input.member.role,
       runtime: input.member.runtime,
       model: input.member.model,
       effort: input.member.effort,
-      advisor: input.member.advisor,
+      advisor,
       codexConfigProfile: input.member.codexConfigProfile,
       // OPR.0.4.8.3 Seam B: the member's OWN raw ref persists on the node (like role);
       // rig-level lives on the rig row; precedence applies at RESOLUTION, not storage.

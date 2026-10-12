@@ -178,6 +178,37 @@ describe("per-seat Claude Advisor (#1152)", () => {
     for (const file of f.settings) expect(fs.readFileSync(file, "utf8")).toBe('{"advisorModel":"existing-user-choice","custom":true}\n');
   });
 
+  it.each([
+    { member: "opus", profile: "profile-advisor", defaults: "default-advisor", expected: "opus" },
+    { member: undefined, profile: "profile-advisor", defaults: "default-advisor", expected: "profile-advisor" },
+    { member: undefined, profile: undefined, defaults: "default-advisor", expected: "default-advisor" },
+  ])("materialization retains the resolved Advisor before launch: %j", async values => {
+    const f = setup();
+    f.spec.pods[0]!.members[0]!.advisor = values.member;
+    f.writeAgent("owner", { advisor: values.defaults }, { advisor: values.profile });
+    const yaml = RigSpecCodec.serialize(f.spec);
+    const result = await f.inst.materialize(yaml, f.root);
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+    if (!result.ok) throw Error("fixture failed to materialize");
+    const rigId = result.result.rigId;
+    const rig = f.rigRepo.getRig(rigId)!;
+    const owner = rig.nodes.find(n => n.logicalId === "dev.owner")!;
+    expect(owner.advisor).toBe(values.expected);
+    expect(rig.nodes.find(n => n.logicalId === "dev.reviewer")!.advisor).toBeNull();
+    expect(f.commands).toEqual([]);
+    expect(projectRigToGraph({ ...rig, sessions: [] }).nodes.find(n => n.id === owner.id)?.data.advisor).toBe(values.expected);
+    const exported = RigSpecSchema.normalize(RigSpecCodec.parse(RigSpecCodec.serialize(f.exporter.exportRig(rigId))) as Record<string, unknown>);
+    expect(exported.pods[0]!.members.find(m => m.id === "owner")?.advisor).toBe(values.expected);
+    expect(f.snapshotCapture.captureSnapshot(rigId, "manual").data.nodes.find(n => n.id === owner.id)?.advisor).toBe(values.expected);
+
+    f.writeAgent("owner", { advisor: "updated-default" }, { advisor: "updated-profile" });
+    expect(await f.inst.launchMaterialized(yaml, f.root, rigId)).toMatchObject({ ok: true });
+    const expectedAtLaunch = values.member ?? "updated-profile";
+    expect(f.rigRepo.getRig(rigId)!.nodes.find(n => n.id === owner.id)?.advisor).toBe(expectedAtLaunch);
+    expect(f.commands.find(c => c.session.startsWith("dev-owner") && c.command.includes("--session-id"))?.command)
+      .toContain(`--advisor '${expectedAtLaunch}'`);
+  });
+
   it("re-resolves Advisor for a fork and keeps the new conversation identity", async () => {
     const f = setup();
     const member = f.spec.pods[0]!.members[0]!;
@@ -249,6 +280,26 @@ describe("per-seat Claude Advisor (#1152)", () => {
     const command = f.commands.find(c => c.command.includes("codex"))!.command;
     expect(command).toContain("-m 'gpt-5.4'");
     expect(command).not.toContain("--advisor");
+  });
+
+  it.each([
+    { member: " ", profile: " profile-advisor ", defaults: "default-advisor", expected: "profile-advisor" },
+    { member: "\t", profile: " ", defaults: " default-advisor ", expected: "default-advisor" },
+    { member: undefined, profile: " ", defaults: "default-advisor", expected: "default-advisor" },
+    { member: " ", profile: "\t", defaults: " ", expected: undefined },
+  ])("direct resolution skips blank Advisor candidates: %j", values => {
+    const f = setup();
+    const spec = RigSpecSchema.normalize(RigSpecCodec.parse(RigSpecCodec.serialize(f.spec)) as Record<string, unknown>);
+    const pod = spec.pods[0]!;
+    const member = { ...pod.members[0]!, advisor: values.member };
+    const agent = normalizeAgentSpec({ name: "owner", version: "1.0.0", defaults: {}, resources: { skills: [] },
+      profiles: { default: { preferences: {}, uses: { skills: [] } } } });
+    agent.defaults!.advisor = values.defaults;
+    agent.profiles.default!.preferences!.advisor = values.profile;
+    const config = resolveNodeConfig({ baseSpec: { spec: agent, sourcePath: f.root, hash: "fixture" },
+      importedSpecs: [], collisions: [], profileName: "default", member, pod, rig: spec });
+    expect(config.ok).toBe(true);
+    if (config.ok) expect(config.config.advisor).toBe(values.expected);
   });
 
   it.each([
