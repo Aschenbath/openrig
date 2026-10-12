@@ -637,7 +637,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
         // Age is derived at read time; an unchanged scan is not a transition.
         findings.push({ kind: c.kind, qitemId: c.row.qitemId, findingQitemId: existing.qitem_id, action: "refreshed" });
       } else if (!existing || evidenceIsNewer(c.evidenceAt, existing.ts_updated)) {
-        const created = await deps.queueRepo.create({
+        const input = {
           qitemId: recoveryId(deps.db, c.row.qitemId),
           // The detector is machinery, not a seat: the obligation's own creator is the
           // finding's source (the workflow-exception precedent).
@@ -647,7 +647,10 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
           summary: `Stuck sweep: ${c.verificationTargets ? "successor-verification-required" : c.kind} on ${c.row.qitemId} (${c.ageMinutes} min)`,
           evidenceRef: `rig queue show ${c.row.qitemId}`,
           tags: [STUCK_SWEEP_FINDING_TAG, dedupTag, recoveryTag(c.row.qitemId)],
-        });
+        };
+        const created = c.kind === "dangling-closure"
+          ? await deps.queueRepo.createCustodyFinding(c.row.qitemId, input)
+          : await deps.queueRepo.create(input);
         findings.push({ kind: c.kind, qitemId: c.row.qitemId, findingQitemId: created.qitemId, action: "created" });
       }
     }

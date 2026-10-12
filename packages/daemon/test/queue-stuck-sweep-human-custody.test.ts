@@ -3,10 +3,12 @@ import Database from "better-sqlite3";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { migrate } from "../src/db/migrate.js";
 import { EventBus } from "../src/domain/event-bus.js";
+import { resolveExternal } from "../src/domain/gateway/external-admission.js";
 import type { HumanFragment } from "../src/domain/gateway/human-registry.js";
-import { QueueRepository } from "../src/domain/queue-repository.js";
+import { QueueRepository, type QueueCreateInput, type QueueItem } from "../src/domain/queue-repository.js";
 import { archiveAgedTerminalTransitions } from "../src/domain/queue-retention.js";
 import { createStuckSweepStatus, findingDedupTag, runStuckSweep, STUCK_SWEEP_FINDING_TAG } from "../src/domain/queue-stuck-sweep.js";
+import { parseSessionName } from "../src/domain/session-name.js";
 
 describe("#514 custody findings for a human decision", () => {
   const owner: HumanFragment = {
@@ -20,6 +22,7 @@ describe("#514 custody findings for a human decision", () => {
   let logs: string[];
   let status: ReturnType<typeof createStuckSweepStatus>;
   let registryError: string | null;
+  let registeredHumans: HumanFragment[];
 
   beforeEach(() => {
     db = new Database(":memory:");
@@ -28,9 +31,14 @@ describe("#514 custody findings for a human decision", () => {
     logs = [];
     status = createStuckSweepStatus();
     registryError = null;
+    registeredHumans = [owner];
     repo = new QueueRepository(db, new EventBus(db), {
-      validateRig: () => true,
-      loadHumanRegistry: () => registryError ? { ok: false, error: registryError } : { ok: true, entities: [owner] },
+      validateRig: (destination) => {
+        const parsed = parseSessionName(destination);
+        // Use the same external-entity admission rule as daemon startup.
+        return parsed.kind !== "external" || resolveExternal(parsed.local, registryError ? [] : registeredHumans).kind !== "unregistered";
+      },
+      loadHumanRegistry: () => registryError ? { ok: false, error: registryError } : { ok: true, entities: registeredHumans },
       transport: { send: async (destination) => { sent.push(destination); return { ok: true, verified: true }; } },
     });
   });
@@ -58,6 +66,13 @@ describe("#514 custody findings for a human decision", () => {
 
   function findings(qitemId: string) {
     return repo.list({ limit: 100 }).filter((row) => row.tags?.includes(findingDedupTag("dangling-closure", qitemId)));
+  }
+
+  function custodyInput(row: QueueItem): QueueCreateInput {
+    return { qitemId: "qitem-custody-finding", sourceSession: row.sourceSession, destinationSession: row.destinationSession,
+      body: "Verify the successor's custody", summary: "Successor verification required",
+      evidenceRef: `rig queue show ${row.qitemId}`,
+      tags: [STUCK_SWEEP_FINDING_TAG, findingDedupTag("dangling-closure", row.qitemId)] };
   }
 
   function archive(qitemId: string) {
@@ -220,6 +235,109 @@ describe("#514 custody findings for a human decision", () => {
     expect(logs).toEqual([]);
   });
 
+  describe("custody finding admission during a registry outage", () => {
+    it("still refuses ordinary creates to a previously admitted external destination", async () => {
+      const row = await ask();
+      await close(row.qitemId);
+      registryError = "fixture human registry is unreadable";
+      const input = custodyInput(row);
+
+      await expect(repo.create(input)).rejects.toMatchObject({ code: "human_registry_unavailable" });
+      expect(repo.getById(input.qitemId!)).toBeNull();
+      expect(sent).toEqual([]);
+    });
+
+    it.each(["missing source", "different destination", "different source", "reopened source", "non-custody closure"])(
+      "refuses the custody exception for a %s",
+      async (condition) => {
+        const row = await ask();
+        if (condition === "non-custody closure") {
+          await repo.update({ qitemId: row.qitemId, actorSession: "closer@r", state: "done", closureReason: "no-follow-on" });
+        } else {
+          await close(row.qitemId);
+        }
+        const input = custodyInput(row);
+        const sourceQitemId = condition === "missing source" ? "qitem-no-such-source" : row.qitemId;
+        if (condition === "different destination") input.destinationSession = "stranger@external";
+        if (condition === "different source") input.sourceSession = "another@r";
+        if (condition === "reopened source") {
+          await repo.update({ qitemId: row.qitemId, actorSession: "closer@r", state: "pending", reopen: true,
+            transitionNote: "Recheck the handoff before creating the finding" });
+        }
+        registryError = "fixture human registry is unreadable";
+
+        await expect(repo.createCustodyFinding(sourceQitemId, input)).rejects.toMatchObject({ code: "human_registry_unavailable" });
+        expect(repo.getById(input.qitemId!)).toBeNull();
+        expect(repo.transitionLog.listForQitem(input.qitemId!)).toEqual([]);
+        expect(sent).toEqual([]);
+      },
+    );
+
+    it("still refuses an external identity removed from a healthy registry", async () => {
+      const row = await ask();
+      await close(row.qitemId);
+      registeredHumans = [];
+      const input = custodyInput(row);
+
+      await expect(repo.createCustodyFinding(row.qitemId, input)).rejects.toMatchObject({ code: "unknown_destination_rig" });
+      expect(repo.getById(input.qitemId!)).toBeNull();
+    });
+
+    it.each([false, true])("still refuses an unknown rig (registry unavailable: %s)", async (unavailable) => {
+      const row = await ask("worker@retired-rig");
+      await close(row.qitemId);
+      if (unavailable) registryError = "fixture human registry is unreadable";
+      repo = new QueueRepository(db, new EventBus(db), {
+        validateRig: () => false,
+        loadHumanRegistry: () => registryError ? { ok: false, error: registryError } : { ok: true, entities: registeredHumans },
+      });
+      const input = custodyInput(row);
+
+      await expect(repo.createCustodyFinding(row.qitemId, input)).rejects.toMatchObject({ code: "unknown_destination_rig" });
+      expect(repo.getById(input.qitemId!)).toBeNull();
+    });
+
+    it.each(["summary", "evidenceRef"] as const)("still requires a human-gated finding's %s", async (field) => {
+      const row = await ask();
+      await close(row.qitemId);
+      registryError = "fixture human registry is unreadable";
+      const input = custodyInput(row);
+      input.tier = "human-gate";
+      input[field] = null;
+
+      await expect(repo.createCustodyFinding(row.qitemId, input)).rejects.toMatchObject({ code: "human_route_fields_required" });
+      expect(repo.getById(input.qitemId!)).toBeNull();
+    });
+
+    it("keeps idempotent retry warnings and the original source unchanged", async () => {
+      const row = await ask();
+      await close(row.qitemId);
+      const original = repo.getById(row.qitemId);
+      registryError = "fixture human registry is unreadable";
+      const input = custodyInput(row);
+      const created = await repo.createCustodyFinding(row.qitemId, input);
+      const transitions = repo.transitionLog.listForQitem(created.qitemId);
+
+      const retry = await repo.createCustodyFinding(row.qitemId, { ...input, body: "A different retry body" });
+      expect(retry).toMatchObject({ ...created, createWarning: { code: "qitem_body_not_saved" } });
+      expect(repo.transitionLog.listForQitem(created.qitemId)).toEqual(transitions);
+      expect(repo.getById(row.qitemId)).toEqual(original);
+      expect(sent).toEqual([]);
+    });
+
+    it("persists a canceled item's unresolved custody finding at its external destination", async () => {
+      const row = await ask();
+      await repo.update({ qitemId: row.qitemId, actorSession: "closer@r", state: "canceled",
+        closureReason: "superseded", closureTarget: "qitem-missing-replacement" });
+      registryError = "fixture human registry is unreadable";
+
+      expect((await sweep()).findings).toContainEqual(expect.objectContaining({ qitemId: row.qitemId, action: "created" }));
+      expect(findings(row.qitemId)).toHaveLength(1);
+      expect(findings(row.qitemId)[0]).toMatchObject({ destinationSession: "owner@external", state: "pending" });
+      expect(sent).toEqual([]);
+    });
+  });
+
   it("preserves an open custody finding while its registry classification is unknown", async () => {
     const row = await ask("owner@kernel");
     await close(row.qitemId);
@@ -251,10 +369,14 @@ describe("#514 custody findings for a human decision", () => {
     expect(logs).toEqual([]);
   });
 
-  it("routes custody, unclaimed and overdue findings when the human registry has not been generated", async () => {
-    registryError = "fixture human registry has not been generated";
-    const custody = await ask("worker@r");
+  it.each([
+    { destination: "worker@r", registryInitiallyUnavailable: true, terminalWakes: ["overdue@r", "unclaimed@r", "worker@r"] },
+    { destination: "owner@external", registryInitiallyUnavailable: false, terminalWakes: ["overdue@r", "unclaimed@r"] },
+  ])("routes $destination custody, unclaimed and overdue findings with an unavailable human registry", async ({ destination, registryInitiallyUnavailable, terminalWakes }) => {
+    if (registryInitiallyUnavailable) registryError = "fixture human registry is unavailable";
+    const custody = await ask(destination);
     await close(custody.qitemId);
+    registryError = "fixture human registry is unavailable";
     const unclaimed = await ask("unclaimed@r");
     const past = new Date(Date.now() - 90 * 60_000).toISOString();
     db.prepare("UPDATE queue_items SET ts_created = ? WHERE qitem_id = ?").run(past, unclaimed.qitemId);
@@ -270,22 +392,25 @@ describe("#514 custody findings for a human decision", () => {
       expect.objectContaining({ kind: "unclaimed-obligation", qitemId: unclaimed.qitemId, action: "created" }),
       expect.objectContaining({ kind: "overdue-claim", qitemId: overdue.qitemId, action: "created" }),
     ]));
-    const destinations = ["overdue@r", "unclaimed@r", "worker@r"];
+    const destinations = ["overdue@r", "unclaimed@r", destination].sort();
     expect(result.findings.map((f) => repo.getById(f.findingQitemId)!.destinationSession).sort()).toEqual(destinations);
-    expect(sent.sort()).toEqual(destinations);
+    expect(sent.sort()).toEqual(terminalWakes);
     expect(logs).toEqual([expect.stringContaining(registryError)]);
     expect(status.snapshot()).toMatchObject({ lastOutcome: "findings", lastError: null, consecutiveFailures: 0, findingsRouted: 3 });
 
     expect((await sweep()).findings.map((f) => f.action)).toEqual(["refreshed", "refreshed", "refreshed"]);
-    expect(sent.sort()).toEqual(destinations);
+    expect(sent.sort()).toEqual(terminalWakes);
   });
 
-  it("closes a repaired finding while another custody item needs the unavailable registry", async () => {
+  it.each([
+    { destination: "worker@r", terminalWakes: ["worker@r"] },
+    { destination: "owner@external", terminalWakes: [] },
+  ])("closes a repaired finding while $destination custody needs the unavailable registry", async ({ destination, terminalWakes }) => {
     const repaired = await ask("owner@kernel");
     await close(repaired.qitemId);
     await sweep();
     const [finding] = findings(repaired.qitemId);
-    const unresolved = await ask("worker@r");
+    const unresolved = await ask(destination);
     await close(unresolved.qitemId);
     registryError = "fixture human registry is unreadable";
     await repo.create({ sourceSession: "closer@r", destinationSession: "next@r", body: "Continue approved work",
@@ -297,8 +422,8 @@ describe("#514 custody findings for a human decision", () => {
     expect(result.findings).toContainEqual(expect.objectContaining({ findingQitemId: finding!.qitemId, action: "closed" }));
     expect(repo.getById(finding!.qitemId)).toMatchObject({ state: "done", closureReason: "no-follow-on", destinationSession: "closer@r" });
     expect(result.findings).toContainEqual(expect.objectContaining({ qitemId: unresolved.qitemId, action: "created" }));
-    expect(findings(unresolved.qitemId)[0]!.destinationSession).toBe("worker@r");
-    expect(sent).toEqual(["worker@r"]);
+    expect(findings(unresolved.qitemId)[0]!.destinationSession).toBe(destination);
+    expect(sent).toEqual(terminalWakes);
     expect(logs).toEqual([expect.stringContaining(registryError)]);
   });
 

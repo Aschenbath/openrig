@@ -161,6 +161,14 @@ repaired ones. Registry recovery restores owner refinement for new findings; exi
 findings keep their established route. Reserved human references and legacy agent names
 retain their known classifications without a registry read.
 
+External destinations also require registry-backed admission when a finding is saved.
+`QueueRepository.createCustodyFinding` can retain the original destination only when
+admission fails with `human_registry_unavailable`. Inside the create transaction, it
+re-reads the source and requires a `done` or `canceled` custody closure with matching
+source and destination addresses. Normal creation and all other admission errors still
+refuse the address. The finding uses the same validation, persistence, event and wake
+path as ordinary creation; external delivery remains on the gateway path.
+
 ## 3. The hot-potato closure contract (where queue closure is enforced)
 
 `hot-potato-enforcer.ts` is the pure validator for the load-bearing API
