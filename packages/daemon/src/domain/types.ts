@@ -650,6 +650,9 @@ export interface NodeInventoryEntry {
   sessionStatus: string | null;
   /** Persisted session status, retained for history and registry-based rollups. */
   storedSessionStatus?: string | null;
+  /** The latest session was explicitly stopped and has no replacement binding.
+   * It remains non-running, but is not a missing member in the rig lifecycle. */
+  intentionallyStopped?: boolean;
   // Current projection: an applicable identity failure down-ranks a running
   // session to attention_required; the stored startup result stays unchanged.
   startupStatus: "pending" | "ready" | "attention_required" | "failed" | null;

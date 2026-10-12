@@ -479,6 +479,35 @@ describe("OPR.0.4.0.25 — rig ps token-safe defaults", () => {
     });
   });
 
+  it.each([
+    { mode: "compact", args: [] },
+    { mode: "full", args: ["--full"] },
+    { mode: "fields", args: ["--fields", "logicalId,intentionallyStopped"] },
+  ])(
+    "preserves explicit stop intent in $mode node JSON",
+    async ({ args: extra }) => {
+      const original = NODES_BY_RIG["rig-c"];
+      NODES_BY_RIG["rig-c"] = [
+        { ...RIG_C_NODES[0], intentionallyStopped: true, sessionStatus: "exited" },
+        { ...RIG_C_NODES[1], intentionallyStopped: false },
+        RIG_C_NODES[2], // Older daemons omit the field.
+      ];
+      try {
+        const { logs, errLogs, exitCode } = await captureLogs(async () => {
+          await makeCmd().parseAsync(["node", "rig", "ps", "--nodes", "--rig", "openrig-velocity", "--json", ...extra]);
+        });
+        expect(exitCode ?? 0, errLogs.join("\n")).toBe(0);
+        const output = JSON.parse(logs.join(""));
+        const entries = Array.isArray(output) ? output : output.entries;
+        expect(entries[0].intentionallyStopped).toBe(true);
+        expect(entries[1].intentionallyStopped).toBe(false);
+        expect(entries[2]).not.toHaveProperty("intentionallyStopped");
+      } finally {
+        NODES_BY_RIG["rig-c"] = original;
+      }
+    },
+  );
+
   // -- --verbose alias --
   it("--verbose is an alias for --full", async () => {
     const { logs: fullLogs } = await captureLogs(async () => {

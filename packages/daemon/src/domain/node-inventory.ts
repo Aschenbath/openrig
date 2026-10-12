@@ -51,11 +51,13 @@ interface InventoryRow {
   session_name: string | null;
   session_created_at: string | null;
   session_status: string | null;
+  intentionally_stopped: number | null;
   startup_status: string | null;
   resume_type: string | null;
   resume_token: string | null;
   startup_completed_at: string | null;
   binding_attachment_type: string | null;
+  binding_id: string | null;
   binding_tmux_pane: string | null;
 }
 
@@ -567,11 +569,13 @@ function runInventoryRowQuery(db: Database.Database, whereClause: string, orderC
       s.session_name,
       s.created_at as session_created_at,
       s.status as session_status,
+      s.intentionally_stopped,
       s.startup_status,
       s.resume_type,
       s.resume_token,
       s.startup_completed_at,
       b.attachment_type as binding_attachment_type,
+      b.id as binding_id,
       b.tmux_pane as binding_tmux_pane
     FROM nodes n
     JOIN rigs r ON r.id = n.rig_id
@@ -677,6 +681,8 @@ function buildInventoryEntry(
     runtime: row.runtime,
     sessionStatus,
     storedSessionStatus: row.session_status,
+    intentionallyStopped: row.intentionally_stopped === 1
+      && row.session_status === "exited" && row.binding_id === null,
     // Match the graph's current-status projection without rewriting the startup
     // result. Applicable mismatch (including ambiguity) or pane_missing overrides it.
     storedStartupStatus: row.startup_status as NodeInventoryEntry["startupStatus"],

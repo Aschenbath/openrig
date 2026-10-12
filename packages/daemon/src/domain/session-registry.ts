@@ -331,8 +331,16 @@ export class SessionRegistry {
 
   updateStatus(sessionId: string, status: string): void {
     this.db
-      .prepare("UPDATE sessions SET status = ?, last_seen_at = datetime('now') WHERE id = ?")
+      .prepare("UPDATE sessions SET status = ?, intentionally_stopped = 0, last_seen_at = datetime('now') WHERE id = ?")
       .run(status, sessionId);
+  }
+
+  /** A supported stop is distinct from an observed exit. Any later status write
+   * clears the intent, including a resume of this same session row. */
+  markIntentionallyStopped(sessionId: string): void {
+    this.db.prepare(
+      "UPDATE sessions SET status = 'exited', intentionally_stopped = 1, last_seen_at = datetime('now') WHERE id = ?",
+    ).run(sessionId);
   }
 
   updateStartupStatus(sessionId: string, status: "pending" | "ready" | "attention_required" | "failed", completedAt?: string): void {

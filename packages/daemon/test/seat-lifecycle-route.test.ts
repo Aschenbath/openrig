@@ -112,6 +112,33 @@ describe("POST /api/seat/{set-model,stop,clean}/:seatRef", () => {
     expect((await probe.json() as { code: string }).code).toBe("tmux_probe_failed");
   });
 
+  it("keeps ps and the TUI rig summary consistent after an intentional stop and a sibling crash", async () => {
+    const stopped = seedSeat("dev.qa");
+    const crashed = seedSeat("dev.impl");
+    seedSeat("dev.lead");
+    tmux().hasSession.mockResolvedValue(true);
+    tmux().killSession.mockResolvedValue({ ok: true });
+    expect((await post("stop", stopped.sessionName, { reason: "on-demand review" })).status).toBe(200);
+
+    async function expectSurfaces(lifecycleState: string, runningCount: number) {
+      const ps = await setup.app.request("/api/ps");
+      expect(ps.status).toBe(200);
+      expect(await ps.json()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ rigId: stopped.rig.id, lifecycleState, nodeCount: 3, runningCount, status: "partial" }),
+      ]));
+      const summary = await setup.app.request("/api/rigs/summary");
+      expect(summary.status).toBe(200);
+      expect(await summary.json()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: stopped.rig.id, lifecycleState, nodeCount: 3, hasLiveAgents: true }),
+      ]));
+    }
+
+    await expectSurfaces("running", 2);
+    setup.sessionRegistry.markDetached(crashed.session.id);
+    setup.sessionRegistry.clearBinding(crashed.node.id);
+    await expectSurfaces("degraded", 1);
+  });
+
   it("clean 409 session_live on a live seat; 200 on a dead one; 409 nothing_to_clean when repeated", async () => {
     const { sessionName } = seedSeat();
     tmux().hasSession.mockResolvedValue(true);

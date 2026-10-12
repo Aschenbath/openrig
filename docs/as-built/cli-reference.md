@@ -873,6 +873,24 @@ Root: `rig`; declared option: `-V, --version`.
 | `rig seat clean <seat>` | — | `--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
 | `rig seat set-resume-token <session>` | — | `--token-stdin`<br>`--reason <text>` **required**<br>`--json` |
 
+A successful `rig seat stop` records that the current session was intentionally
+stopped. With other healthy members running, the rig's `lifecycleState` in
+`rig ps` and the TUI stays `running`; the stopped member no longer makes it
+`degraded`. Stopping every member
+leaves the rig `stopped`. Node JSON exposes `intentionallyStopped` in compact,
+`--full`, and `--fields` output.
+
+Process counts still reflect reality: stopping one of two members leaves
+`nodeCount: 2`, `runningCount: 1`, and process `status: partial`. Node lifecycle,
+resume information, and attention diagnostics remain available. A crash or
+attention condition on another member still affects the rig lifecycle.
+
+Stop intent survives daemon restarts and audit retention. It applies only to the
+latest exited session while the seat has no binding; a subsequent session status
+change clears it, and a new session starts without it. Existing exits are not
+backfilled as intentional stops. This changes the lifecycle rollup, not launch
+scheduling or restore policy.
+
 ### handover
 
 | Invocation | Aliases | Declared options |
