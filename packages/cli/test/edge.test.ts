@@ -23,7 +23,7 @@ function lifecycleDeps(): LifecycleDeps {
   };
 }
 
-async function run(client: Partial<DaemonClient>, args: string[]): Promise<{ out: string[]; err: string[]; exitCode: number | undefined }> {
+async function run(client: Partial<DaemonClient>, args: string[], daemonDeps: LifecycleDeps = lifecycleDeps()): Promise<{ out: string[]; err: string[]; exitCode: number | undefined }> {
   const out: string[] = [];
   const err: string[] = [];
   const oldLog = console.log;
@@ -33,7 +33,7 @@ async function run(client: Partial<DaemonClient>, args: string[]): Promise<{ out
   console.log = (...parts: unknown[]) => out.push(parts.join(" "));
   console.error = (...parts: unknown[]) => err.push(parts.join(" "));
   try {
-    const deps: StatusDeps = { lifecycleDeps: lifecycleDeps(), clientFactory: () => client as DaemonClient };
+    const deps: StatusDeps = { lifecycleDeps: daemonDeps, clientFactory: () => client as DaemonClient };
     await createProgram({ edgeDeps: deps }).parseAsync(["node", "rig", "edge", ...args]);
   } finally {
     console.log = oldLog;
@@ -60,6 +60,34 @@ describe("rig edge", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(scratch, { recursive: true, force: true });
+  });
+
+
+  it.each(["single", "batch", "remove"].flatMap((operation) =>
+    ["ECONNREFUSED", "EPERM"].map((causeCode) => ({ operation, causeCode })),
+  ))("returns JSON without an edge request when the daemon is unavailable: $operation / $causeCode", async ({ operation, causeCode }) => {
+    vi.stubEnv("OPENRIG_URL", "http://127.0.0.1:7433");
+    const unavailable: LifecycleDeps = {
+      ...lifecycleDeps(),
+      fetch: vi.fn(async () => { throw Object.assign(new Error(causeCode), { code: causeCode }); }),
+      sleep: vi.fn(async () => {}),
+    };
+    const path = join(scratch, "edges.yaml");
+    writeFileSync(path, "edges:\n  - {from: orch.lead, to: dev.qa, kind: delegates_to}\n");
+    const client = { get: vi.fn(), post: vi.fn(), delete: vi.fn() };
+    const args = operation === "single" ? ["add", "rig-1", "orch.lead", "dev.qa", "--kind", "delegates_to"]
+      : operation === "batch" ? ["add", "rig-1", "--file", path] : ["remove", "rig-1", "edge-1"];
+    const result = await run(client, [...args, "--json"], unavailable);
+    expect(result.exitCode).toBe(1);
+    expect(result.err).toEqual([]);
+    expect(result.out).toHaveLength(1);
+    const error = JSON.parse(result.out[0]!).error;
+    expect(error).toMatchObject({ fact: expect.any(String), consequence: expect.any(String), action: expect.any(String) });
+    if (causeCode === "ECONNREFUSED") expect(error.fact).toBe("Daemon not running.");
+    else expect(error).toMatchObject({ causeCode: "EPERM", fact: expect.stringContaining("blocked") });
+    expect(client.get).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
+    expect(client.delete).not.toHaveBeenCalled();
   });
 
   it("keeps a missing rig distinct from a missing route", async () => {
