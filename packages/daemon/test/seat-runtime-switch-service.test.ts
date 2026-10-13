@@ -14,6 +14,8 @@ import { DefaultOccupantInvalidator } from "../src/domain/occupant-invalidator.j
 import { SeatRuntimeSwitchService } from "../src/domain/seat-runtime-switch-service.js";
 import { recoverRuntimeSwitch, type RuntimeSwitchIntent } from "../src/domain/runtime-switch-recovery.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
+import { SeatActivityService } from "../src/domain/seat-activity-service.js";
+import { runtimeRungInventory } from "../src/domain/activity-taxonomy.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import type { RuntimeAdapter, NodeBinding } from "../src/domain/runtime-adapter.js";
 
@@ -136,6 +138,18 @@ describe("live seat runtime switching", () => {
     expect(db.prepare("SELECT kind FROM snapshots").all()).toEqual([{ kind: "runtime-switch" }]);
     expect(observed.length).toBeGreaterThan(0);
     expect(observed).not.toContain(true);
+  });
+
+  it.each(["codex", "claude-code"] as const)("records the committed tenure in the activity oracle when leaving %s", async runtime => {
+    const f = fixture(runtime);
+    const oracle = new SeatActivityService({ tmux: { readPaneLastActivity: async () => null }, defaultWindowSeconds: 3 });
+    oracle.declareRungInventory({ seatNodeId: f.node.id, sessionName: f.name }, runtimeRungInventory(runtime));
+    const service = new SeatRuntimeSwitchService({ ...f.deps, activityOracle: oracle });
+    const result = await service.setRuntime({ seatRef: f.name, runtime: runtime === "codex" ? "claude-code" : "codex", reason: "fixture switch" });
+    expect(result).toMatchObject({ ok: true, changed: true });
+    const generation = f.sessionRegistry.currentOccupantTenure(f.node.id)!.generationUuid;
+    expect(oracle.getSeatState(f.node.id)?.lastSwap).toMatchObject({ generation });
+    expect(generation).not.toBe(f.generation);
   });
 
   it.each(["launch", "readiness", "context", "submit", "swap", "commit"])("keeps the incumbent and rolls back on %s failure", async phase => {

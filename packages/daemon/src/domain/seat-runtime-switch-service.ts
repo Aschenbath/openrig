@@ -257,7 +257,7 @@ export class SeatRuntimeSwitchService {
       // Observers run after the authoritative transaction; an observer failure
       // must never trigger rollback of an already committed native cutover.
       for (const notify of afterCommit) notify();
-      try { this.deps.activityOracle?.declareOccupantSwap(node.id, sessionId!); } catch { /* durable state remains authoritative */ }
+      try { this.deps.activityOracle?.declareOccupantSwap(node.id, successorGeneration); } catch { /* durable state remains authoritative */ }
       for (const notification of [...notifications, event]) eventBus.notifySubscribers(notification);
       const finished = await recoverRuntimeSwitch(db, tmux, intent, this.deps.runtimeAdapters, this.deps.sleep);
       return { ok: true, changed: true, dryRun: false, ...base, sessionId, generation: successorGeneration, openQueueItems,

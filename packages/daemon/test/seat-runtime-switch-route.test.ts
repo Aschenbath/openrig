@@ -29,6 +29,14 @@ describe("seat runtime switch route", () => {
     expect(response.status).toBe(400); expect(await response.json()).toMatchObject({ code: "invalid_runtime_settings" });
   });
 
+  it.each([{ body: null }, { body: [] }, { body: "invalid" }, { body: 1 }, { body: true }])("rejects a non-object JSON body: $body", async ({ body }) => {
+    const { app } = createTestApp(db);
+    const response = await app.request("/api/seat/set-runtime/operator-agent%40kernel", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ ok: false, code: "invalid_runtime_settings" });
+  });
+
   function seed(runtime = "codex") {
     const repo = new RigRepository(db), registry = new SessionRegistry(db);
     const rig = repo.createRig("fixture"), node = repo.addNode(rig.id, "dev.owner", { runtime });

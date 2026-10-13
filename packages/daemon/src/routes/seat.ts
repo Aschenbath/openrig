@@ -187,9 +187,13 @@ function handoverDeps(c: { get(key: never): unknown }): ConstructorParameters<ty
 }
 
 seatRoutes.post("/set-runtime/:seatRef", async (c) => {
-  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const parsedBody: unknown = await c.req.json().catch(() => ({}));
   const refusal = occupantMutationRefusal(c);
   if (refusal) return refusal;
+  if (typeof parsedBody !== "object" || parsedBody === null || Array.isArray(parsedBody)) {
+    return c.json({ ok: false, code: "invalid_runtime_settings", message: "Runtime settings must be a JSON object." }, 400);
+  }
+  const body = parsedBody as Record<string, unknown>;
   if (body["dryRun"] !== undefined && typeof body["dryRun"] !== "boolean") {
     return c.json({ ok: false, code: "invalid_runtime_settings", message: "dryRun must be a boolean." }, 400);
   }
