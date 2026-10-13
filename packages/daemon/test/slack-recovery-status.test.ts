@@ -41,7 +41,8 @@ it.each([undefined,"thread_broadcast"])("wires %s recovery after bind and serves
   app.route("/api/gateway",gatewayRoutes({home}));
   const res=await app.request("/api/gateway/slack/status");expect(res.status).toBe(200);
   const body=await res.json();expect(body).toMatchObject({state:"active",connector:{inbound:{state:"connected"},recovery:{state:"scanned",acceptedThisProcess:1}}});
-  if(subtype)expect(body.connector.recovery.limits).toContain("configured-channel history, including broadcast replies; non-broadcast thread recovery deferred");
+  expect(body.connector.recovery.threads).toMatchObject({state:"scanned",trackedThreads:subtype?1:2});
+  if(subtype)expect(body.connector.recovery.limits).toContain("configured-channel history, including broadcast replies; tracked-thread coverage is reported separately");
   expect(calls).toHaveLength(before);expect(JSON.stringify(body)).not.toContain("fixture-bot");
 });
 

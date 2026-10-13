@@ -13,6 +13,7 @@
 // relay already delivered (the enable-time backlog rule survives the cutover by construction).
 
 import { ChannelRecovery } from "./channel-recovery.js";
+import { ThreadRecovery } from "./thread-recovery.js";
 import { channelStateDigest } from "../channel-operations.js";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -660,6 +661,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   const starts: Array<() => void> = [];
   let inboundHandle: SocketInboundHandle | undefined;
   let recovery: ChannelRecovery | undefined;
+  let threadRecovery: ThreadRecovery | undefined;
 
   if (outboundReady) {
     const driver = new SlackOutboundDriver({
@@ -734,16 +736,24 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       } : {}),
       log,
     });
-    recovery = new ChannelRecovery({ channel: cfg.channel, token: bot, stateDir: stateDir(opts.home), router, fetchImpl: opts.fetchImpl });
+    threadRecovery = new ThreadRecovery({ channel: cfg.channel, token: bot, stateDir: stateDir(opts.home), router,
+      fetchImpl: opts.fetchImpl, mappedRoots: () => cfg.channel ? threadMap.rootsInChannel(cfg.channel) : [] });
+    recovery = new ChannelRecovery({ channel: cfg.channel, token: bot, stateDir: stateDir(opts.home), router,
+      fetchImpl: opts.fetchImpl, observeMessage: ev => threadRecovery!.observe(ev) });
     starts.push(() => {
       recovery!.initialize(); // persist the once-only floor before any live events
+      threadRecovery!.initialize(recovery!.status().coverage?.coveredThrough);
       inboundHandle = startSocketInbound(app!, router, {
         fetchImpl: opts.fetchImpl,
         wsFactory: opts.wsFactory,
         retryIntervalMs: opts.inboundRetryIntervalMs,
         inboundMaxConnects: opts.inboundMaxConnects,
         receipts,
-        recovery,
+        recovery: {
+          run: async () => { await recovery!.run(); await threadRecovery!.run(); },
+          stop: () => { recovery!.stop(); threadRecovery!.stop(); },
+          observe: ev => threadRecovery!.observe(ev),
+        },
         log,
       });
       log("slack socket-mode inbound started (subsystem path)");
@@ -771,7 +781,8 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       platform: "slack", configurationDigest: channelStateDigest(cfg),
       outboundReady,
       inboundReady,
-      recovery: recovery?.status() ?? { state: "unavailable", reason: "inbound-not-configured" },
+      recovery: recovery ? { ...recovery.status(), threads: threadRecovery?.status() }
+        : { state: "unavailable", reason: "inbound-not-configured" },
       inbound: inboundHandle?.status() ?? { state: inboundReady ? "not-started" : "not-configured", generation: 0, reconnects: 0 },
       // The retry pass's durable custody, counted from both dead-letter files:
       // inbound events plus click answers. Records, not distinct messages — a

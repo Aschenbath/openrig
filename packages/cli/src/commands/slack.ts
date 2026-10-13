@@ -209,6 +209,9 @@ export function slackCommand(deps: SlackDeps = {}): Command {
           inbound?: InboundDeliveryStatus & { state?: string; generation?: number; lastEventAt?: string };
           recovery?: { state?: string; reason?: string; lastScanAt?: string; acceptedThisProcess?: number; deadLetteredThisProcess?: number;
             coverage?: { coverageStart: string; coveredThrough: string; pending?: { upper: string; nextLatest: string }; nextRetryAt?: number } | null;
+            threads?: { state?: string; reason?: string; coverageStart?: string; coveredThrough?: string;
+              trackedThreads?: number; pendingThreads?: number; failedThreads?: number; nextRetryAt?: number;
+              acceptedThisProcess?: number; deadLetteredThisProcess?: number; limits?: string[] };
             limits?: string[] } } | undefined;
         if (connector) {
           log(`  Socket: ${connector.inbound?.state ?? "unknown"}; generation ${connector.inbound?.generation ?? "unknown"}; last event ${connector.inbound?.lastEventAt ?? "unknown"}`);
@@ -222,6 +225,15 @@ export function slackCommand(deps: SlackDeps = {}): Command {
             if (coverage.nextRetryAt) log(`  Retry after: ${new Date(coverage.nextRetryAt).toISOString()}`);
           }
           log(`  Recovery counts since connector start: accepted ${recovery?.acceptedThisProcess ?? "unknown"}; dead-lettered ${recovery?.deadLetteredThisProcess ?? "unknown"} (custody, not delivery)`);
+          const threads = recovery?.threads;
+          if (threads) {
+            log(`  Thread recovery: ${threads.state ?? "unknown"}${threads.reason ? ` (${threads.reason})` : ""}; tracked ${threads.trackedThreads ?? "unknown"}; pending ${threads.pendingThreads ?? "unknown"}; failed ${threads.failedThreads ?? "unknown"}`);
+            if (threads.coverageStart) log(`  Thread recovery starts at: ${slackTime(threads.coverageStart)}; older unseen threads unknown`);
+            if (threads.coveredThrough) log(`  Least advanced thread scanned before: ${slackTime(threads.coveredThrough)}`);
+            if (threads.nextRetryAt) log(`  Thread retry after: ${new Date(threads.nextRetryAt).toISOString()}`);
+            log(`  Thread recovery counts since connector start: accepted ${threads.acceptedThisProcess ?? "unknown"}; dead-lettered ${threads.deadLetteredThisProcess ?? "unknown"} (custody, not delivery)`);
+            for (const limit of threads.limits ?? []) log(`  Thread limit: ${limit}`);
+          }
           if (connector.deadLetterBacklogState !== undefined) {
             const scope = "inbound messages, reactions and click answers";
             if (connector.deadLetterBacklogState === "unknown") {
@@ -235,7 +247,7 @@ export function slackCommand(deps: SlackDeps = {}): Command {
           if (connector.configurationDigest) log(`  Observed configuration digest: ${connector.configurationDigest} (local configuration above)`);
           for (const limit of recovery?.limits ?? []) log(`  Limit: ${limit}`);
         }
-        log("Connected/configured alone is not proof of delivery. Recovery covers available top-level channel history only.");
+        log("Connected/configured alone is not proof of delivery. Recovery covers available default-channel history and tracked thread replies; see the reported limits.");
         if (permWarn) log(`  ⚠ ${permWarn}`);
         if (next) log(`  ${next}`);
       }

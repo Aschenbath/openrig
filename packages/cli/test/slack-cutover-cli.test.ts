@@ -221,6 +221,25 @@ describe("Slack status separates local configuration from bounded daemon observa
 
 
 describe("Slack recovery status times", () => {
+  it("reports a blocked thread scan separately from completed channel coverage, without Slack I/O", async () => {
+    const threads = { state: "backoff", reason: "missing_scope", trackedThreads: 3, pendingThreads: 1, failedThreads: 1,
+      coverageStart: "1000.000000", coveredThrough: "1001.000000", nextRetryAt: 1_015_000,
+      acceptedThisProcess: 2, deadLetteredThisProcess: 1, limits: ["older unseen threads unknown"] };
+    const get = vi.fn(async <T>() => ({ status: 200, data: { state: "active", connector: { recovery: { state: "scanned", threads } } } as T }));
+    const fetchImpl = vi.fn(async () => { throw new Error("no Slack call"); });
+    const { deps, logs } = makeDeps({ fetchImpl, clientFactory: () => ({ get, post: vi.fn() }) });
+    await run(slackCommand(deps), ["status"]);
+    const text = logs.join("\n");
+    expect(text).toContain("Thread recovery: backoff (missing_scope); tracked 3; pending 1; failed 1");
+    expect(text).toContain("Thread retry after: 1970-01-01T00:16:55.000Z");
+    expect(text).toContain("Thread recovery counts since connector start: accepted 2; dead-lettered 1");
+    expect(text).toContain("older unseen threads unknown");
+    expect(text).not.toContain("top-level channel history only");
+    logs.length = 0; await run(slackCommand(deps), ["status", "--json"]);
+    expect(JSON.parse(logs[0]!).observation.connector.recovery.threads).toEqual(threads);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it("renders scanned and pending bounds as ISO times while preserving JSON timestamps", async () => {
     const coverage = { coverageStart: "1000.000000", coveredThrough: "1005.000000",
       pending: { upper: "1010.000000", nextLatest: "1008.123456" }, nextRetryAt: 1_015_000 };

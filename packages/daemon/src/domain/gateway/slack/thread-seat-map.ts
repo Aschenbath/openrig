@@ -82,6 +82,12 @@ export class ThreadSeatMap {
     return row ? project(row) : null;
   }
 
+  /** Recovery also watches closed and superseded roots: people can still reply to them. */
+  rootsInChannel(channel: string): string[] {
+    return (this.db.prepare(`SELECT thread_ts FROM thread_seat_map WHERE channel = ?`).all(channel) as Array<{ thread_ts: string }>)
+      .map(row => row.thread_ts);
+  }
+
   /** Outbound thread reuse: the OPEN conversation for (human, seat), newest first. */
   resolveOpenForPair(human: string, seat: string): ThreadMapping | null {
     const row = this.db

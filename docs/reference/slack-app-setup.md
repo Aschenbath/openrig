@@ -180,7 +180,12 @@ are not supported targets.
 
 The daemon scans available top-level messages and replies broadcast with **Also send to
 channel** in the configured default channel after a Socket Mode connection and on its
-existing five-minute retry cadence. Broadcast replies keep their thread's routing. Recovered
+existing five-minute retry cadence. It also reads ordinary replies with `conversations.replies`
+for mapped threads and roots observed live or in recovered channel history. Previously those
+ordinary replies were absent from the channel scan and could be lost during a disconnect.
+Closed and superseded roots remain watched; recovered replies use the same original seat
+and human-gate correlation rules as live replies. Human-started, unmapped threads continue
+to the configured inbound destination. Recovered
 tasks say **Recovered after a gap** and show the original Slack posting time.
 They use the same sender admission, routing, attachment handling, fixed identity
 and dead-letter path as live messages. A durable dead letter is custody of a
@@ -196,23 +201,45 @@ allow recent messages to become visible; larger clock skew or visibility lag is
 not covered by that margin. A corrupt or unreadable checkpoint leaves recovery unavailable
 and preserves the existing file; live inbound continues.
 
-Each pass admits at most four pages, 100 entries and 15 seconds of work, with a
-five-second history-request ceiling. Work already started on a message, such as
+Thread progress is separate, in `state/slack-thread-coverage.json`. Its adoption floor is
+the channel's durable boundary before the first scan, and is retained across restarts.
+New roots start at that floor or their posting time, whichever is later. An older live
+thread becomes known when observed, but newer live messages never advance its checkpoint.
+Each thread keeps a frozen interval and an oldest-first page boundary, saved only after
+every reply in the page has landed, been rejected by the existing admission rules, been
+confirmed as a duplicate, or entered durable retry custody. A live delivery still in flight
+leaves the page pending. Roots discovered while another page is running remain recorded.
+
+The channel scan and the following thread scan each admit at most four pages, 100 entries
+and 15 seconds of work, with a five-second API-request ceiling. Thread pages take turns
+using a saved position, so a busy or inaccessible thread cannot monopolize recovery.
+This adds up to four reply requests per retry pass and durable metadata per known root;
+closed roots are retained because people can still reply to them. Work already started on a message, such as
 an attachment transfer, is not cancelled by these limits or by a stop, and a new
 pass waits for it to finish. Rate limits retain Slack's Retry-After across restart.
+Large thread inventories need several passes; recovery does not promise a deadline for every root.
+For thread replies, a rate limit or authentication/scope failure pauses all thread scans,
+while a missing thread pauses only that root. A stopped scan admits no further messages
+or checkpoint writes; a later connector resumes from durable progress.
 Transport and server failures use a five-second backoff unless Slack supplies Retry-After.
 When Slack reports a plan history limit, recovery still lands the available page
 and advances normally, retaining an older-history limitation in status across restarts.
 Missing bot credentials, history scope, membership, retention limits and API
-failures appear as recovery limitations. No additional scope is required to keep
-live delivery working. Non-broadcast thread replies and other channels remain outside
-this recovery scope; global chronological order is not promised. This change does not
-replay intervals already checkpointed before broadcast-reply recovery was added.
+failures appear as recovery limitations. The existing bot token is used; if Slack refuses
+`conversations.replies` for its token type or grants, thread status names the refusal and
+keeps the interval pending. No additional scope is required to keep live delivery working.
+Other channels and older roots never observed or mapped in this install remain outside
+this recovery scope; global chronological order is not promised. Thread adoption does not
+replay replies before its saved floor, and channel recovery does not replay intervals
+already checkpointed before broadcast-reply recovery was added.
 
 `rig slack status` retains local configuration checks and adds a bounded daemon
 snapshot: socket state/generation, last event, recovery interval/state/reason,
 retry time and accepted/dead-lettered recovery counts since the connector last
 started (they reset when it is enabled or disabled, and when the daemon restarts).
+Channel and thread coverage are shown separately: a completed channel scan does not
+claim that thread replies have recovered. Thread status includes the tracked, pending
+and failed root counts, least advanced boundary, retry time and its own process counts.
 It also reports the durable dead-letter backlog: the retained records for inbound messages,
 reactions and click answers that await retry, counted from both dead-letter files so the number
 survives a restart, and shown as unknown with a reason (and no count) when a file cannot be read.
@@ -220,3 +247,10 @@ Human-readable coverage and pending bounds use ISO timestamps; JSON keeps Slack 
 The status read calls no Slack API and starts no scan. If the daemon cannot be
 observed, local configuration remains visible and live state is unknown. A
 connected socket or valid configuration alone does not prove end-to-end delivery.
+
+Regression coverage drives synthetic Socket Mode, channel-history and thread-reply
+responses through the production gateway and real SQLite queue. It covers mapped,
+closed, superseded and human-started threads, reconnect/restart boundaries, pagination,
+live duplicates, durable retries, storage failures, rate limits and stopping during I/O.
+These tests do not verify live Slack retention or permission behavior, real sleep/wake
+cycles, or whether a native agent consumes the recovered message.

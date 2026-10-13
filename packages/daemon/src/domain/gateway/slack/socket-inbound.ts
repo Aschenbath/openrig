@@ -18,7 +18,7 @@
 
 import dc from "node:diagnostics_channel";
 import { openSocketConnection, type FetchImpl } from "./slack-api.js";
-import { handleEnvelope, type InboundRouter, type SocketEnvelope } from "./inbound.js";
+import { handleEnvelope, type InboundRouter, type SocketEnvelope, type SlackEvent } from "./inbound.js";
 import type { InboundReceiptStore, InboundReceiptStatus } from "./state-store.js";
 
 export interface WsLike {
@@ -57,7 +57,7 @@ export interface SocketInboundDeps {
   /** How often liveness is checked (default 5s). */
   livenessCheckMs?: number;
   receipts?: InboundReceiptStore;
-  recovery?: { run(): Promise<void>; stop(): void };
+  recovery?: { run(): Promise<void>; stop(): void; observe?(ev: SlackEvent): void };
   log?: (msg: string) => void;
 }
 
@@ -414,14 +414,21 @@ export function startSocketInbound(appToken: string, router: InboundRouter, deps
           () => env.envelope_id && ws.send(JSON.stringify({ envelope_id: env.envelope_id })),
           router,
           log,
-          () => receipt({
-            generation: conn.generation,
-            status: "received",
-            envelopeId: env.envelope_id,
-            eventTs: ev?.ts,
-            channel: ev?.channel,
-            ...(typeof helloCount === "number" ? { connections: helloCount } : {}),
-          }),
+          () => {
+            receipt({
+              generation: conn.generation,
+              status: "received",
+              envelopeId: env.envelope_id,
+              eventTs: ev?.ts,
+              channel: ev?.channel,
+              ...(typeof helloCount === "number" ? { connections: helloCount } : {}),
+            });
+            // handleEnvelope has already ACKed. Tracking must never delay that ACK.
+            if (env.type === "events_api" && ev) {
+              try { deps.recovery?.observe?.(ev); }
+              catch { log("thread recovery could not retain an observed root; live inbound continues"); }
+            }
+          },
         )
           .then((disposition) => {
             status.lastDisposition = disposition.status;
