@@ -69,9 +69,9 @@ describe("topology-converge", () => {
     // reconcile_session (the no-launch adopt). Identity-migrating kinds stay
     // classified-deferred to the 0.4.0 identity theme. add_edge and remove_edge
     // change one typed edge and no seat identity.
-    it("supports exactly add_member, reconcile_session, add_edge and remove_edge", () => {
-      expect(SUPPORTED_OP_KINDS).toEqual(["add_member", "reconcile_session", "add_edge", "remove_edge"]);
-      for (const k of ["add_member", "reconcile_session", "add_edge", "remove_edge"] as const) {
+    it("supports member addition, session reconciliation and edge-only mutations", () => {
+      expect(SUPPORTED_OP_KINDS).toEqual(["add_member", "reconcile_session", "add_edge", "add_edges", "remove_edge"]);
+      for (const k of ["add_member", "reconcile_session", "add_edge", "add_edges", "remove_edge"] as const) {
         expect(isSupportedOpKind(k)).toBe(true);
       }
       for (const k of ["remove_member", "move_member", "fork_member", "change_runtime"] as const) {
