@@ -129,7 +129,7 @@ describe("POST /api/seat/{set-model,stop,clean}/:seatRef", () => {
       const summary = await setup.app.request("/api/rigs/summary");
       expect(summary.status).toBe(200);
       expect(await summary.json()).toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: stopped.rig.id, lifecycleState, nodeCount: 3, hasLiveAgents: true }),
+        expect.objectContaining({ id: stopped.rig.id, lifecycleState, restoreLifecycleState: "degraded", nodeCount: 3, hasLiveAgents: true }),
       ]));
     }
 

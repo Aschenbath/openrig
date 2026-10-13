@@ -301,7 +301,7 @@ export class SeatLifecycleService {
       };
     }
 
-    return this.stopManagedTmuxSeat(resolved, session, input.reason, input.operator);
+    return this.stopManagedTmuxSeat(resolved, session, input.reason, input.operator, true);
   }
 
   async cleanSeat(input: { seatRef: string; reason: string; operator?: string | null }): Promise<CleanSeatResult> {
@@ -706,6 +706,7 @@ export class SeatLifecycleService {
         currentSession,
         input.reason,
         input.operator,
+        false,
       );
       if (!stopped.ok) return stopped;
       // Stopping the server's last session ends tmux's server, and every probe
@@ -925,7 +926,8 @@ export class SeatLifecycleService {
     resolved: ResolvedSeat,
     session: LatestSessionRow,
     reason: string,
-    operator?: string | null,
+    operator: string | null | undefined,
+    recordStopIntent: boolean,
   ): Promise<StopSeatResult> {
     const seat = this.describe(resolved);
     const kill = await this.tmuxAdapter.killSession(session.session_name);
@@ -938,10 +940,10 @@ export class SeatLifecycleService {
     }
     let persisted: PersistedEvent | null = null;
     const tx = this.db.transaction(() => {
-      if (kill?.ok) {
+      if (recordStopIntent && kill?.ok) {
         this.sessionRegistry.markIntentionallyStopped(session.id);
       } else {
-        // The session disappeared after the live probe; do not hide that exit.
+        // An internal replacement stop or an unconfirmed kill must still affect health.
         this.sessionRegistry.updateStatus(session.id, "exited");
       }
       this.sessionRegistry.clearBinding(resolved.nodeId);

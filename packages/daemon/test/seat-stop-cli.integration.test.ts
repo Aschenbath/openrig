@@ -14,6 +14,7 @@ const worker = `dev-impl@${rigName}`;
 const reviewer = `dev-qa@${rigName}`;
 
 interface RigSummary {
+  rigId: string;
   rigName: string;
   lifecycleState: string;
   nodeCount: number;
@@ -79,8 +80,11 @@ describe("intentional seat stop CLI journey", () => {
   }, 60_000);
 
   it("persists an intentional stop across daemon restart, then detects a fresh occupant's crash", async () => {
-    expect(await summary()).toMatchObject({ lifecycleState: "running", nodeCount: 2, runningCount: 2 });
+    const initial = await summary();
+    expect(initial).toMatchObject({ lifecycleState: "running", nodeCount: 2, runningCount: 2 });
     expect(sessions()).toEqual([worker, reviewer].sort());
+    const snapshot = await runRig(["snapshot", initial.rigId], daemon!.readEnv, rigBin);
+    expect(snapshot.code, JSON.stringify(snapshot)).toBe(0);
 
     const stopped = await cli<{ sessionId: string }>([
       "seat", "stop", reviewer, "--reason", "review runs on demand", "--json",
@@ -90,6 +94,15 @@ describe("intentional seat stop CLI journey", () => {
       lifecycleState: "running", status: "partial", nodeCount: 2, runningCount: 1,
     });
     expect(await reviewerSummary()).toMatchObject({ sessionStatus: "exited", intentionallyStopped: true });
+
+    for (const selection of [["--last"], ["--rigs", rigName]]) {
+      const start = await runRig(["start", ...selection, "--json"], daemon!.readEnv, rigBin);
+      expect(start.code, JSON.stringify({ selection, ...start })).toBe(1);
+      const result = JSON.parse(start.stdout);
+      expect(result.candidates).toEqual([{ rigName, lifecycleState: "degraded" }]);
+      expect(result.restoredRigs).toEqual([{ rigName, status: "rig_not_stopped", nodes: [] }]);
+      expect(sessions()).toEqual([worker]);
+    }
 
     await daemon!.restart();
     expect(sessions()).toEqual([worker]);

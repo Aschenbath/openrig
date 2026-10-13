@@ -889,8 +889,15 @@ Stop intent survives daemon restarts and audit retention. It applies only to the
 latest exited session while the seat has no binding; a subsequent session status
 change clears it, and a new session starts without it. Existing exits are not
 backfilled as intentional stops. If the session disappears between the live
-probe and the stop, its unexplained exit still affects rig health. This changes
-the lifecycle rollup, not launch scheduling or restore policy.
+probe and the stop, its unexplained exit still affects rig health. The internal
+stop in `rig seat launch --fresh --stop` does not record final stop intent, so a
+refused replacement still degrades a rig with other healthy members running.
+
+`rig start --last` and `rig start --rigs <rig>` use the full per-seat lifecycle
+for restore selection. A partly running rig with an intentionally stopped member
+still appears as a `degraded` candidate and reports `rig_not_stopped` (exit 1)
+when restore is attempted. Launch scheduling and restore eligibility remain
+unchanged.
 
 ### handover
 
