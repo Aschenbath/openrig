@@ -1,13 +1,13 @@
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { homedir, hostname, networkInterfaces } from "node:os";
+import { homedir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import type { DaemonClient } from "./client.js";
 import { shellQuote } from "./cross-host-executor.js";
 import { prepareHerdrLaunchConfig } from "./herdr-launch-config.js";
-import { readTmuxServerArgs } from "./tmux-attachment.js";
+import { assertLocalTmux, readTmuxServerArgs } from "./tmux-attachment.js";
 import type { OpenViewResult } from "./commands/terminal.js";
 
 interface Pane { seat: string; label: string; paneCommand: string }
@@ -79,13 +79,6 @@ export function defaultWindowDeps(): WindowDeps {
       return undefined;
     },
   };
-}
-
-function localDaemon(url: string): boolean {
-  const host = new URL(url).hostname.replace(/^\[|\]$/g, "");
-  return ["localhost", "::1", "::", "0.0.0.0", hostname()].includes(host)
-    || /^127\./.test(host)
-    || Object.values(networkInterfaces()).flat().some(iface => iface?.address === host);
 }
 
 async function herdrBinary(deps: WindowDeps): Promise<string | null> {
@@ -265,7 +258,7 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
         : `No terminal window was opened. ${reason} On the daemon's desktop, run: ${recovery}`), windowAttempted });
   const windowNotes: string[] = [];
   try {
-    if (!localDaemon(client.baseUrl)) throw new Error("The window launcher must run on the daemon's own desktop; the configured daemon is remote.");
+    await assertLocalTmux(client, "The window launcher must run on the daemon's own desktop; its instance identity could not be confirmed locally.");
     if (requestedProvider && !["herdr", "tmux"].includes(requestedProvider)) throw new Error("--window supports herdr or tmux. Use cmux without --window.");
     const launchWindow = await windowLauncher(deps, windowNotes);
     const measured = typeof launchWindow !== "string" ? await deps.columns?.().catch(() => undefined) : undefined;

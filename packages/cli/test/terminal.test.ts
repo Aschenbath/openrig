@@ -29,6 +29,7 @@ function makeDeps(opts?: { routes?: Record<string, StubResponse> }): {
     deps: {
       lifecycleDeps: {} as TerminalDeps["lifecycleDeps"],
       clientFactory: () => ({
+        isLocalInstance: vi.fn(async () => true),
         get: vi.fn(async (path: string) => {
           calls.push({ method: "GET", path });
           return routes[`GET ${path}`] ?? { status: 200, data: {} };
@@ -97,7 +98,7 @@ describe("rig terminal CLI", () => {
   it("does not attach a local namesake for an HTTP remote daemon", async () => {
     const { deps, calls } = makeDeps();
     const factory = deps.clientFactory;
-    deps.clientFactory = url => Object.assign(factory(url), { baseUrl: "http://remote:7433" });
+    deps.clientFactory = url => Object.assign(factory(url), { baseUrl: "http://remote:7433", isLocalInstance: vi.fn(async () => false) });
     deps.attachTmux = vi.fn(async () => 0);
     await createProgram({ terminalDeps: deps }).parseAsync(["node", "rig", "terminal", "attach", "seat"]);
     expect(calls).toEqual([]);

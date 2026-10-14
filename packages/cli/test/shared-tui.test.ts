@@ -5,7 +5,7 @@ import { tuiCommand } from "../src/commands/tui.js";
 import { probeFrontDoor } from "../src/front-door.js";
 
 function client(rigs: unknown, nodes: unknown, status = 200) {
-  return { get: vi.fn(async <T>(path: string) => ({ status, data: (path === "/api/ps" ? rigs : nodes) as T })) };
+  return { isLocalInstance: vi.fn(async () => true), get: vi.fn(async <T>(path: string) => ({ status, data: (path === "/api/ps" ? rigs : nodes) as T })) };
 }
 const kernel = [{ rigId: "selected-instance-kernel", rigName: "kernel" }];
 const terminal = { podId: "database-pod-id", logicalId: "operator.human", runtime: "terminal", canonicalSessionName: "actual-terminal", tmuxAttachCommand: "tmux attach -t actual-terminal" };
@@ -36,7 +36,7 @@ describe("shared kernel TUI", () => {
     await expect(sharedTuiTarget(client([...kernel, ...kernel], [terminal]))).rejects.toThrow("Multiple kernels");
   });
   it("does not attach a local namesake for a remote daemon", async () => {
-    const c = { ...client(kernel, [terminal]), baseUrl: "http://other-machine:7433" };
+    const c = { ...client(kernel, [terminal]), baseUrl: "http://other-machine:7433", isLocalInstance: vi.fn(async () => false) };
     await expect(sharedTuiTarget(c)).rejects.toThrow("local tmux");
     expect(c.get).not.toHaveBeenCalled();
   });

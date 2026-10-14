@@ -1,13 +1,14 @@
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readRecordedTmuxServerArgs } from "../src/tmux-attachment.js";
+import { selectTmuxServer } from "../../daemon/src/domain/tmux-server-selection.js";
 
 describe("offline tmux server selection", () => {
   let home: string;
   let file: string;
-  beforeEach(() => { home = mkdtempSync(join(tmpdir(), "tmux-record-")); file = join(home, "tmux-server.json"); });
+  beforeEach(() => { home = mkdtempSync(join(tmpdir(), "t")); file = join(home, "tmux-server.json"); });
   afterEach(() => rmSync(home, { recursive: true, force: true }));
 
   it("uses the last effective socket even if a different isolated socket was used earlier", () => {
@@ -19,6 +20,14 @@ describe("offline tmux server selection", () => {
 
   it("keeps legacy behavior when no daemon has written a server record", () => {
     expect(readRecordedTmuxServerArgs(home)).toEqual([]);
+  });
+
+  it.each(["inherit", "isolated"] as const)("refuses a missing record after the daemon selected %s", async mode => {
+    const selected = await selectTmuxServer({ home, mode, registeredSessions: [], platform: "linux", uid: 1000,
+      env: { TMUX: `${join(home, "inherited.sock")},1,0`, TMUX_TMPDIR: home } });
+    expect(readRecordedTmuxServerArgs(home)).toEqual(selected.serverArgs);
+    unlinkSync(file);
+    expect(() => readRecordedTmuxServerArgs(home)).toThrow("Missing tmux server record");
   });
 
   it.each([

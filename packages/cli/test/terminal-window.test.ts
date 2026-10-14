@@ -9,7 +9,7 @@ function fixture(options: { herdr?: boolean; ghostty?: string; refusal?: number;
   const preview = { planId: "bound-plan", composed, status: { launch: { socketPath: "/daemon home/herdr.sock", session: "daemon-session" } } };
   const get = vi.fn(async (url: string): Promise<{ status: number; data: unknown }> => ({ status: 200, data: url.includes("preview") ? preview : { providers: [{ liveness: { alive: options.alive !== false } }] } }));
   const post = vi.fn(async (): Promise<{ status: number; data: unknown }> => options.refusal ? { status: options.refusal, data: { error: "view changed" } } : { status: 200, data: { provider: "herdr", ok: true, opened: panes.map(p => p.seat), absent: [], degraded: [], pages: 1 } });
-  const client = { baseUrl: "http://localhost:7433", get, post } as unknown as DaemonClient;
+  const client = { baseUrl: "http://localhost:7433", isLocalInstance: vi.fn(async () => true), get, post } as unknown as DaemonClient;
   let pane = 0;
   const exec = vi.fn(async (file: string, args: string[]) => {
     if (file === "/usr/bin/env" && args.at(-1) === "list") return JSON.stringify({ result: { workspaces: [] } });
@@ -329,7 +329,7 @@ describe("desktop terminal view", () => {
 
   it.each(["remote", "headless", "empty"])("%s makes no window or tmux mutations", async reason => {
     const f = fixture({ empty: reason === "empty" });
-    if (reason === "remote") Object.assign(f.client, { baseUrl: "http://192.0.2.2:7433" });
+    if (reason === "remote") Object.assign(f.client, { baseUrl: "http://192.0.2.2:7433", isLocalInstance: vi.fn(async () => false) });
     if (reason === "headless") Object.assign(f.deps, { platform: "linux", env: {} });
     const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
     expect(result.ok).toBe(false);

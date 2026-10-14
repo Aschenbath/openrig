@@ -37,9 +37,14 @@ different servers, and symlink aliases of one home share a server. Choose a shor
 exceed the platform's Unix socket path limit.
 
 The daemon records the effective socket in `OPENRIG_HOME/tmux-server.json` using
-an atomic, owner-only write. Keep this file with the instance state. A later shell
+an atomic, owner-only write. Keep this file and the durable
+`tmux-server.initialized` marker with the instance state. A later shell
 with different `TMUX` or `TMUX_TMPDIR` does not redirect an established isolated
 instance. An invalid or unreadable record is reported rather than overwritten.
+If the record disappears after selection, startup and `destroy --all` stop before
+touching sessions. Restore the record from an instance backup, or inspect the
+running daemon's `rig terminal status --json` to recover its effective selection.
+Only an instance without either file retains the pre-selection fallback.
 
 A newly started server loads tmux's normal system and user configuration,
 including `~/.tmux.conf`; OpenRig does not substitute an empty configuration.
@@ -86,7 +91,11 @@ rig terminal attach --read-only -- '<session>'
 
 These commands attach on the daemon's machine. They do not create a seat or
 switch somebody else's tmux client. A local CLI pointed at an HTTP remote daemon
-cannot attach a same-named local session. SSH view tiles run `rig terminal attach`
+cannot attach a same-named local session. Terminal attachment, shared TUI and
+desktop windows compare the daemon's instance identity with the local durable
+identity before using local terminal tools. A loopback URL through a port forward
+does not bypass this check; use the matching `OPENRIG_HOME` on the daemon's machine.
+SSH view tiles run `rig terminal attach`
 on the remote host, using that host's local instance and socket; both the remote
 CLI and daemon must support this command. The remote shell must select the right
 `OPENRIG_HOME` when using a custom home. Local socket paths are never sent to it.

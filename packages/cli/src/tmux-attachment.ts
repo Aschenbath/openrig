@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
+import type { DaemonClient } from "./client.js";
 
 export interface TmuxAttachment {
   session: string;
@@ -24,7 +25,14 @@ export function readRecordedTmuxServerArgs(home: string): string[] {
   let record: { version?: unknown; home?: unknown; mode?: unknown; socketPath?: unknown } | null;
   try { record = JSON.parse(readFileSync(path.join(home, "tmux-server.json"), "utf8")); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; // Pre-selection daemon.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      try { lstatSync(path.join(home, "tmux-server.initialized")); }
+      catch (markerError) {
+        if ((markerError as NodeJS.ErrnoException).code === "ENOENT") return []; // Pre-selection daemon.
+        throw markerError;
+      }
+      throw new Error("Missing tmux server record after server selection; restore it before destroying this instance's sessions.");
+    }
     throw new Error(`Cannot read the tmux server record: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (!record || record.version !== 1 || record.home !== realpathSync(home)
@@ -35,10 +43,11 @@ export function readRecordedTmuxServerArgs(home: string): string[] {
   return readTmuxServerArgs(["-S", record.socketPath]);
 }
 
-export function assertLocalTmux(baseUrl: string | undefined): void {
-  if (baseUrl && !["localhost", "127.0.0.1", "[::1]"].includes(new URL(baseUrl).hostname)) {
-    throw new Error("Terminal attachment uses local tmux. Run this command on the selected daemon's machine.");
-  }
+export async function assertLocalTmux(
+  client: Pick<DaemonClient, "isLocalInstance">,
+  message = "Terminal attachment uses local tmux. The selected daemon's instance identity could not be confirmed locally; run this command on that daemon's machine.",
+): Promise<void> {
+  if (!await client.isLocalInstance()) throw new Error(message);
 }
 
 /** Attach only; creating or retargeting somebody else's tmux client is not part of this operation. */

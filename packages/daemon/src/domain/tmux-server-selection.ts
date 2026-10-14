@@ -80,7 +80,14 @@ function readRecord(file: string, home: string): ServerRecord | null {
   let value: unknown;
   try { value = JSON.parse(fs.readFileSync(file, "utf8")); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      try { fs.lstatSync(path.join(home, "tmux-server.initialized")); }
+      catch (markerError) {
+        if ((markerError as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw markerError;
+      }
+      throw new Error(`Missing tmux server record ${file} after server selection; restore it before starting this instance.`);
+    }
     throw new Error(`Cannot read the tmux server record ${file}: ${error instanceof Error ? error.message : String(error)}`);
   }
   const record = value as Partial<ServerRecord> | null;
@@ -95,13 +102,18 @@ function readRecord(file: string, home: string): ServerRecord | null {
 }
 
 function writeRecord(file: string, record: ServerRecord): void {
+  // Monotone evidence of selection survives losing the mutable socket record.
+  // Persist it before the record or any session operations; partial writes fail closed.
+  try { fs.writeFileSync(path.join(record.home, "tmux-server.initialized"), "1\n", { mode: 0o600, flag: "wx" }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
   const temporary = `${file}.${randomUUID()}.tmp`;
   try {
     fs.writeFileSync(temporary, JSON.stringify(record, null, 2) + "\n", { mode: 0o600, flag: "wx" });
     fs.renameSync(temporary, file);
-  } finally {
+  } catch (error) {
     try { fs.unlinkSync(temporary); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    catch { /* Best effort: preserve the original persistence error. */ }
+    throw error;
   }
 }
 

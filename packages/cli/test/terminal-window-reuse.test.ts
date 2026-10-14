@@ -53,7 +53,7 @@ function fixture(tabs: Tab[] = [], id = "kernel") {
   };
   const deps: TerminalDeps = {
     lifecycleDeps: {} as TerminalDeps["lifecycleDeps"], windowDeps,
-    clientFactory: () => ({ baseUrl: "http://localhost:7433", get, post }) as unknown as ReturnType<TerminalDeps["clientFactory"]>,
+    clientFactory: () => ({ baseUrl: "http://localhost:7433", isLocalInstance: vi.fn(async () => true), get, post }) as unknown as ReturnType<TerminalDeps["clientFactory"]>,
   };
   return { tabs, composed, workspaces, list, focus, paneList, processInfo, clients, exec, post, windowDeps, run: (args: string[] = ["--json"]) => new Command().addCommand(terminalCommand(deps)).parseAsync(["terminal", "open", `saved:${id}`, ...args], { from: "user" }) };
 }

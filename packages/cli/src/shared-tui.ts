@@ -1,16 +1,15 @@
 import { DaemonClient } from "./client.js";
-import { attachTmux, readTmuxServerArgs, type TmuxAttachment } from "./tmux-attachment.js";
+import { assertLocalTmux, attachTmux, readTmuxServerArgs, type TmuxAttachment } from "./tmux-attachment.js";
 
 interface SharedTuiClient {
   readonly baseUrl?: string;
+  isLocalInstance(): Promise<boolean>;
   get<T>(path: string): Promise<{ status: number; data: T }>;
 }
 
 /** Resolve the terminal on the selected instance, not a remembered tmux name. */
 export async function sharedTuiTarget(client: SharedTuiClient = new DaemonClient()): Promise<TmuxAttachment> {
-  if (client.baseUrl && !["localhost", "127.0.0.1", "[::1]"].includes(new URL(client.baseUrl).hostname)) {
-    throw new Error("Shared attachment uses local tmux. Run rig tui --shared on the selected daemon's machine; standalone rig tui can use this remote connection.");
-  }
+  await assertLocalTmux(client, "Shared attachment uses local tmux. The selected daemon's instance identity could not be confirmed locally; run rig tui --shared on that daemon's machine. Standalone rig tui can use this remote connection.");
   const rigs = await client.get<Array<{ rigId: string; rigName?: string; name?: string }>>("/api/ps");
   if (rigs.status >= 400) throw new Error(`Cannot read rigs (HTTP ${rigs.status}); run rig status.`);
   const kernels = rigs.data.filter((r) => (r.rigName ?? r.name) === "kernel");

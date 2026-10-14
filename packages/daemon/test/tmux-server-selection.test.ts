@@ -125,6 +125,28 @@ describe("durable tmux server selection", () => {
     expect(fs.readFileSync(file, "utf8")).toBe(invalid);
   });
 
+  it.each(["inherit", "isolated"] as const)("does not guess a new server after a %s record disappears", async mode => {
+    await selectTmuxServer({ ...options(), mode });
+    const file = path.join(home, "tmux-server.json");
+    fs.unlinkSync(file);
+    const observer = vi.fn(async () => ({ state: "absent" as const }));
+    await expect(selectTmuxServer({ ...options(), mode, registeredSessions: ["owned"], inspect: observer }))
+      .rejects.toThrow("Missing tmux server record");
+    expect(fs.existsSync(file)).toBe(false);
+    expect(observer).not.toHaveBeenCalled();
+  });
+
+  it("preserves the persistence error when temporary-file cleanup also fails", async () => {
+    await selectTmuxServer(options());
+    const file = path.join(home, "tmux-server.json");
+    const original = fs.readFileSync(file, "utf8");
+    const failure = Object.assign(new Error("cannot replace server record"), { code: "EIO" });
+    vi.spyOn(fs, "renameSync").mockImplementation(() => { throw failure; });
+    vi.spyOn(fs, "unlinkSync").mockImplementation(() => { throw Object.assign(new Error("cannot remove temporary file"), { code: "EACCES" }); });
+    await expect(selectTmuxServer({ ...options(), mode: "isolated" })).rejects.toBe(failure);
+    expect(fs.readFileSync(file, "utf8")).toBe(original);
+  });
+
   it("reports the unsupported Windows selection without pretending to isolate psmux", async () => {
     expect(await selectTmuxServer({ ...options(), platform: "win32", mode: "isolated" })).toMatchObject({
       requestedMode: "isolated", mode: "inherit", serverArgs: [], migrationPending: true,

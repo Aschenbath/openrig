@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -145,9 +145,24 @@ describe.skipIf(!nativeAvailable)("daemon tmux server selection with a real stub
     expect(await status()).toMatchObject({ mode: "isolated", socketPath: selected.socketPath, migrationPending: false });
     expect(native(selected.socketPath!, ["display-message", "-p", "-t", `=${SEAT}:`, "#{pane_id}:#{pane_pid}"])).toBe(isolatedPane);
 
-    await rig(["destroy", "--all", "--yes", "--confirm", "destroy-openrig-state"], {
+    const destroyEnv = {
       ...active.readEnv, OPENRIG_PORT: String(active.port), OPENRIG_DB: join(scaffold.stateDir, "scenario.db"),
-    });
+    };
+    const recordFile = join(scaffold.openrigHome, "tmux-server.json");
+    const recorded = readFileSync(recordFile, "utf8");
+    unlinkSync(recordFile);
+    try {
+      const refused = await runRig(["destroy", "--all", "--yes", "--confirm", "destroy-openrig-state"], destroyEnv, RIG_BIN);
+      expect(refused.code, `${refused.stderr}\n${refused.stdout}`).toBe(1);
+      expect(`${refused.stderr}\n${refused.stdout}`).toContain("Missing tmux server record");
+      expect(existsSync(destroyEnv.OPENRIG_DB)).toBe(true);
+      expect(await status()).toMatchObject({ mode: "isolated", socketPath: selected.socketPath });
+      expect(native(selected.socketPath!, ["display-message", "-p", "-t", `=${SEAT}:`, "#{pane_id}:#{pane_pid}"])).toBe(isolatedPane);
+      expect(native(personal, ["capture-pane", "-p", "-t", `=${SEAT}:`])).toContain("PERSONAL_NAMESAKE");
+    } finally {
+      writeFileSync(recordFile, recorded, { mode: 0o600 });
+    }
+    await rig(["destroy", "--all", "--yes", "--confirm", "destroy-openrig-state"], destroyEnv);
     daemon = undefined;
     expect(() => native(selected.socketPath!, ["has-session", "-t", `=${SEAT}`])).toThrow();
     expect(native(personal, ["has-session", "-t", `=${SEAT}`])).toBe("");

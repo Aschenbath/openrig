@@ -175,7 +175,7 @@ export function terminalCommand(depsOverride?: TerminalDeps): Command {
       const deps = getDeps();
       await withClient(deps, async client => {
         try {
-          assertLocalTmux(client.baseUrl);
+          await assertLocalTmux(client);
           const response = await client.get<{ tmux?: { serverArgs?: unknown } }>("/api/terminal/status");
           if (response.status >= 400) throw new Error(`Cannot read the tmux server (HTTP ${response.status}).`);
           if (response.data.tmux?.serverArgs === undefined) {
