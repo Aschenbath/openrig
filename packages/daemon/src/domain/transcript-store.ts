@@ -162,7 +162,9 @@ function readTailChunked(filePath: string, rawLines: number): string | null {
       text = chunk + text;
 
       const newlineCount = countNewlines(text);
-      if (newlineCount >= rawLines) break;
+      // A trailing newline terminates the last line; it does not establish
+      // the start of the first requested line when this chunk starts mid-line.
+      if (newlineCount >= rawLines + (text.endsWith("\n") ? 1 : 0)) break;
     }
 
     const lines = text.split("\n");
@@ -358,7 +360,7 @@ export class TranscriptStore {
       .filter((line) => !isUiChromeLine(line))
       .filter((line) => !isSpinnerOnlyLine(line))
       .filter((line) => !isLikelyTuiFragment(line))
-      .filter((line, index) => !isPromptRedrawDuplicate(line, filtered[index + 1]));
+      .filter((line, index, lines) => !isPromptRedrawDuplicate(line, lines[index + 1]));
   }
 
   /**

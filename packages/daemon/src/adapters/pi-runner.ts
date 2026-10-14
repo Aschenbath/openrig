@@ -28,6 +28,7 @@ import { pathToFileURL } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { formatDaemonHostForUrl } from "./daemon-url.js";
 import { piCredentialNotice } from "./pi-readiness.js";
+import { extractPiUsageFacts, parsePiSessionHeader, tiesPiForkHeader, type PiSessionBoundary } from "../domain/pi-usage-facts.js";
 import {
   piSeatPaths, buildPiChildArgs, buildPiChildEnv, buildPendingRunnerState, parsePiRunnerState,
   PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, PI_RUNNER_ERROR_MARKER, PI_PROVIDER_ENV_VARS,
@@ -176,10 +177,11 @@ function piCredentialHint(message: string): string {
     : " For managed Pi, configure this provider in the seat's PI_CODING_AGENT_DIR (auth.json or models.json). Its key is not in OpenRig's Pi environment passthrough map; default Pi logins are not automatically shared.";
 }
 
-function errorNotice(detail: unknown, runtime: RunnerRuntime): string {
-  const text = typeof detail === "string"
+function errorNotice(details: unknown[], runtime: RunnerRuntime): string {
+  // Empty or control-only fields must not hide a later usable diagnostic.
+  const text = details.map(detail => typeof detail === "string"
     ? stripVTControlCharacters(detail).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").replace(/\s+/g, " ").trim()
-    : "";
+    : "").find(Boolean) ?? "";
   const marker = runtime === "omp" ? "[omp-runner] ERROR" : PI_RUNNER_ERROR_MARKER;
   return `${marker} ${text.slice(0, 400) || "request failed"}${runtime === "pi" ? piCredentialHint(text) : ""}`;
 }
@@ -191,11 +193,13 @@ function errorNotice(detail: unknown, runtime: RunnerRuntime): string {
  *  repeats into one notice per failure. */
 function modelErrorNotice(event: Record<string, unknown>, runtime: RunnerRuntime): { errorNotice?: string } {
   if (event.type === "auto_retry_end") {
-    return event.success === false ? { errorNotice: errorNotice(event.finalError, runtime) } : {};
+    return event.success === false ? { errorNotice: errorNotice([event.finalError, event.error], runtime) } : {};
   }
   const message = event.message as Record<string, unknown> | undefined;
-  return message?.role === "assistant" && message.stopReason === "error"
-    ? { errorNotice: errorNotice(message.errorMessage, runtime) } : {};
+  if (message?.role === "assistant" && message.stopReason === "error") {
+    return { errorNotice: errorNotice([message.errorMessage, message.error, event.error], runtime) };
+  }
+  return {};
 }
 
 export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntime = "pi"): MirrorAndActivity {
@@ -287,6 +291,13 @@ export interface RunnerIo {
   sessionFileExists?(path: string): boolean;
   /** Terminate OMP when get_state cannot establish a resumable seat. */
   stopChild?(): void;
+  /** OPR.0.7.0.2 (only with --usage-facts): POST usage facts from persisted entries to the daemon. Best-effort;
+   *  resolves true only when the daemon accepted them. */
+  postUsageFacts?(payload: Record<string, unknown>): Promise<boolean>;
+  /** The first line of a Pi session file (its header), or null when it can't be read. */
+  readFirstLine?(path: string): string | null;
+  /** The entry ids of a complete, valid Pi session file (a fork's parent); null when it isn't one. Never blocks. */
+  readSessionEntryIds?(path: string): Promise<ReadonlySet<string> | null>;
   now(): string;
 }
 
@@ -296,6 +307,65 @@ const CURSOR_REFRESH_ID = "pi-runner-cursor-refresh";
 /** RPC commands that carry operator input. Their failure means the seat
  *  cannot do the requested work; other command failures are not attention. */
 const INPUT_COMMANDS: Record<string, true> = { prompt: true, steer: true, follow_up: true };
+
+/** OPR.0.7.0.2: the largest fork parent read to decide a header tie; a larger parent leaves the tie unknown. */
+const PARENT_SESSION_READ_LIMIT_BYTES = 64 * 1024 * 1024;
+
+/**
+ * OPR.0.7.0.2: the entry ids of a fork's parent session file, read only to decide a tie with the fork header.
+ * Absence from the result is a claim that the parent doesn't have the entry, so only a complete, valid file
+ * answers: a regular file (checked on the opened handle, opened non-blocking so a FIFO or device can't stall the
+ * runner), at most `limitBytes` actually read from that handle, a session header first, every line a whole
+ * entry with an id, and no torn last line. Anything else is null (the tie stays unknown and is retried). Ids only.
+ */
+export async function readPiSessionEntryIds(
+  path: string,
+  limitBytes = PARENT_SESSION_READ_LIMIT_BYTES,
+  /** Test seam only: called after the stat and after the read, to change the file at those points. */
+  testHooks?: { afterStat?: () => void | Promise<void>; afterRead?: () => void | Promise<void> },
+): Promise<ReadonlySet<string> | null> {
+  let handle: fs.promises.FileHandle | undefined;
+  try {
+    handle = await fs.promises.open(path, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > limitBytes) return null;
+    await testHooks?.afterStat?.();
+    // Complete only with evidence: the read reaches end of file (a read returns 0 bytes) before filling a buffer
+    // one byte larger than the stat, it got exactly the stat's size, and the size is unchanged afterwards. A parent
+    // that grew, shrank or is still being written answers nothing (the tie stays unknown and is read again later).
+    const buffer = Buffer.alloc(stat.size + 1);
+    let length = 0;
+    let reachedEnd = false;
+    while (length < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+      if (bytesRead === 0) { reachedEnd = true; break; }
+      length += bytesRead;
+    }
+    if (!reachedEnd || length !== stat.size || length === 0) return null;
+    await testHooks?.afterRead?.();
+    if ((await handle.stat()).size !== length) return null;
+    const text = buffer.subarray(0, length).toString("utf8");
+    if (!text.endsWith("\n")) return null; // Pi ends every entry with a newline: a torn or partial write
+    const lines = text.slice(0, -1).split("\n");
+    const ids = new Set<string>();
+    for (const [index, line] of lines.entries()) {
+      const entry = JSON.parse(line) as unknown; // a malformed line throws: incomplete, so null
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return null;
+      const { type, id } = entry as { type?: unknown; id?: unknown };
+      if (index === 0) {
+        if (type !== "session") return null;
+        continue;
+      }
+      if (typeof id !== "string" || !id) return null;
+      ids.add(id);
+    }
+    return ids;
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
 
 export class RunnerCore {
   private streaming = false;
@@ -314,11 +384,20 @@ export class RunnerCore {
   /** Set once the daemon confirms it persisted the resume token. */
   private identityPersisted = false;
   private identityInFlight = false;
+  /** OPR.0.7.0.2: the session header boundary; null until it has been read (read again until it can be). */
+  private usageBoundary: PiSessionBoundary | null = null;
+  /** OPR.0.7.0.2: a fork parent read is under way (at most one at a time). */
+  private parentReadInFlight = false;
+  /** OPR.0.7.0.2: the last get_entries batch reported, replayed when a parent read completes. */
+  private latestUsageEntries: unknown[] = [];
+  /** Entry ids the daemon has accepted with a known origin. Anything else is sent again on the next refresh;
+   *  the daemon stores each (session, entry) once regardless. */
+  private readonly postedUsageEntryIds = new Set<string>();
 
   constructor(
     private io: RunnerIo,
     private identity: { sessionName: string; nodeId?: string; launchId?: string; generation?: string },
-    private opts: { catchUpSince?: string; runtime?: RunnerRuntime } = {},
+    private opts: { catchUpSince?: string; runtime?: RunnerRuntime; usageFacts?: boolean } = {},
   ) {
     // The durable cursor seeds from the carried-over value (FR-5) so this
     // instance's own sidecar writes never regress it to undefined before a
@@ -450,8 +529,54 @@ export class RunnerCore {
         this.lastEntryId = lastId;
         this.writeSidecar({});
       }
+      this.reportUsageFacts(entries);
       return;
     }
+  }
+
+  /** OPR.0.7.0.2: report usage from the persisted entries a get_entries response returned (catch-up after a
+   *  restart, or the refresh after each agent_end). Pi only, and only with --usage-facts. Never live updates. */
+  private reportUsageFacts(entries: unknown[]): void {
+    if (!this.opts.usageFacts || this.runtime !== "pi" || !this.io.postUsageFacts) return;
+    if (this.usageBoundary === null) {
+      const firstLine = this.sessionFile && this.io.readFirstLine ? this.io.readFirstLine(this.sessionFile) : null;
+      this.usageBoundary = firstLine ? parsePiSessionHeader(firstLine) : null;
+    }
+    this.latestUsageEntries = entries;
+    const { facts, malformed } = extractPiUsageFacts(entries, this.usageBoundary);
+    // A new entry often shares the fork header's millisecond, and so can a copied one: only the parent session's
+    // entry ids tell them apart. Read them in the background, only when such a tie needs deciding; meanwhile the
+    // tie goes as unknown. A complete answer is kept and these entries are reported again with it; anything
+    // else leaves the tie unknown, to be read again on a later refresh.
+    const boundary = this.usageBoundary;
+    if (boundary?.parentSession && !boundary.parentEntryIds && !this.parentReadInFlight && this.io.readSessionEntryIds
+      && facts.some((fact) => !this.postedUsageEntryIds.has(fact.entryId) && tiesPiForkHeader(fact.entryTimestamp, boundary))) {
+      this.parentReadInFlight = true;
+      void this.io.readSessionEntryIds(boundary.parentSession).then((parentEntryIds) => {
+        this.parentReadInFlight = false;
+        if (!parentEntryIds || this.usageBoundary !== boundary) return;
+        this.usageBoundary = { ...boundary, parentEntryIds };
+        // The latest batch, so a tie that arrived while the read was under way settles now too.
+        this.reportUsageFacts(this.latestUsageEntries);
+      }, () => { this.parentReadInFlight = false; });
+    }
+    const fresh = facts.filter((fact) => !this.postedUsageEntryIds.has(fact.entryId));
+    if (fresh.length === 0 && malformed === 0) return;
+    void this.io.postUsageFacts({
+      sessionName: this.identity.sessionName,
+      nodeId: this.identity.nodeId,
+      generation: this.identity.generation,
+      piSessionId: this.sessionId,
+      sessionCreatedAt: this.usageBoundary?.createdAt ?? null,
+      forked: this.usageBoundary ? this.usageBoundary.parentSession !== null : null,
+      facts: fresh,
+      malformed,
+    }).then((accepted) => {
+      // Only a stored fact with a known origin is done: a failed post, or an origin not settled yet (no readable
+      // header, or a tie with an unreadable parent), is sent again with the next refresh (the store upgrades an
+      // unknown origin once it is known).
+      if (accepted) for (const fact of fresh) if (fact.origin !== "unknown") this.postedUsageEntryIds.add(fact.entryId);
+    }, () => { /* best-effort: resent on the next refresh */ });
   }
 
   private raiseAttention(subtype: "runtime_error" | "permission_prompt"): void {
@@ -608,6 +733,8 @@ interface RunnerArgs {
   trust: "approve" | "no-approve";
   sessionFile?: string;
   forkRef?: string;
+  /** OPR.0.7.0.2: report usage facts from persisted entries (the daemon passes it when usage.pi_cost_facts is on). */
+  usageFacts?: boolean;
 }
 
 export function parseRunnerArgs(argv: string[]): RunnerArgs {
@@ -633,6 +760,7 @@ export function parseRunnerArgs(argv: string[]): RunnerArgs {
       case "--model": args.model = next(); break;
       case "--session": args.sessionFile = next(); break;
       case "--fork": args.forkRef = next(); break;
+      case "--usage-facts": args.usageFacts = true; break;
       case "--approve": args.trust = "approve"; break;
       case "--no-approve": args.trust = "no-approve"; break;
       case "--approval-mode": {
@@ -907,13 +1035,37 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     now: () => new Date().toISOString(),
     stopChild: () => { child.kill(); },
     sessionFileExists: (path) => fs.existsSync(path),
+    postUsageFacts: async (payload) => {
+      if (!endpoint || typeof fetch !== "function") return false;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      return fetch(new URL("/api/activity/pi-usage", endpoint.baseUrl).toString(), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${endpoint.token}` },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      }).then((res) => res.ok, () => false /* best-effort: a later refresh re-sends what wasn't stored */).finally(() => clearTimeout(timeout));
+    },
+    readFirstLine: (path) => {
+      try {
+        const fd = fs.openSync(path, "r");
+        try {
+          const buffer = Buffer.alloc(8192);
+          const read = fs.readSync(fd, buffer, 0, buffer.length, 0);
+          const text = buffer.subarray(0, read).toString("utf8");
+          const end = text.indexOf("\n");
+          return end >= 0 ? text.slice(0, end) : null;
+        } finally { fs.closeSync(fd); }
+      } catch { return null; }
+    },
+    readSessionEntryIds: (path) => readPiSessionEntryIds(path),
   };
 
   const core = new RunnerCore(io, {
     sessionName: args.sessionName, nodeId: process.env.OPENRIG_NODE_ID, launchId: args.launchId,
     // Carry the emitting tenure; never infer it from a later daemon read or Pi event.
     generation: process.env.OPENRIG_OCCUPANT_GENERATION,
-  }, { catchUpSince, runtime });
+  }, { catchUpSince, runtime, usageFacts: args.usageFacts === true });
 
   let transportUp = runtime === "pi";
   readline.createInterface({ input: child.stdout }).on("line", (line) => {

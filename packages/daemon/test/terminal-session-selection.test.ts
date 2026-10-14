@@ -72,13 +72,13 @@ async function fixture() {
     resolveProvider: name => name === "herdr" ? providers.defaultProvider : name === "cmux" ? cmux : null,
     resolveSessionProvider: (name, session) => name === "herdr" ? providers.sessionProvider(session) : null,
     viewsStore: { get: () => null, list: () => [] }, listRigNames: () => ["build", "prod", "stage"],
-    listRigSeats: name => ["build", "prod", "stage"].includes(name) ? rows(name) : null,
+    listRigSeats: name => name === "kernel" ? [] : ["build", "prod", "stage"].includes(name) ? rows(name) : null,
     listPodSeats: () => null, listScopeSeats: () => rows("build"), resolveHost: () => null, hasSession: () => true,
   });
   const app = new Hono(); app.use("*", async (c, next) => { c.set("terminalService" as never, service); await next(); });
   app.route("/api/terminal", terminalRoutes()); app.route("/api/rigs/:rigId/terminal", rigTerminalRoutes);
   const open = (body: unknown, route = "/api/terminal/open") => app.request(route, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-  return { app, service, paths, hits, env, cmux, open };
+  return { app, service, paths, hits, env, providers, cmux, open };
 }
 
 const layouts = (requests: Request[]) => requests.filter(request => request.method === "layout.apply");
@@ -113,8 +113,37 @@ describe.skipIf(process.platform === "win32")("per-request Herdr session selecti
     expect((await f.open({ view: "prod", session: "stage", expectedPlan: preview.planId })).status).toBe(409);
     expect(f.hits.stage).toEqual([]);
     expect((await f.open({ view: "prod", expectedPlan: preview.planId })).status).toBe(409);
-    expect(f.hits.configured).toEqual([]);
+    // Main now probes default-provider availability before comparing the plan.
+    expect(f.hits.configured.every(request => request.method === "ping")).toBe(true);
     expect(await (await f.open({ view: "prod", session: " prod ", expectedPlan: preview.planId })).json()).toMatchObject({ ok: true, session: "prod" });
+  });
+
+  it.each(["prod", "missing"])("a named %s session bypasses default-provider fallback even when default Herdr is down", async session => {
+    const f = await fixture();
+    const defaultStatus = vi.spyOn(f.providers.defaultProvider, "status").mockResolvedValue({ provider: "herdr", available: false, capabilities: {} });
+    const cmuxStatus = vi.spyOn(f.cmux, "status");
+    const preview = await (await f.app.request(`/api/terminal/preview?view=prod&session=${session}`)).json();
+    expect(preview).toMatchObject({ provider: "herdr", session });
+    const response = await f.open({ view: "prod", session, expectedPlan: preview.planId });
+    expect(await response.json()).toMatchObject({ provider: "herdr", session, ok: session === "prod",
+      ...(session === "missing" ? { code: "herdr_unavailable", opened: [] } : {}) });
+    expect(defaultStatus).not.toHaveBeenCalled();
+    expect(cmuxStatus).not.toHaveBeenCalled();
+    expect(f.cmux.openView).not.toHaveBeenCalled();
+    expect(f.hits.configured).toEqual([]);
+    expect(f.hits.default).toEqual([]);
+  });
+
+  it("keeps the selected session on a known empty-kernel refusal", async () => {
+    const f = await fixture();
+    const preview = await (await f.app.request("/api/terminal/preview?view=saved:kernel&session=prod")).json();
+    const response = await f.open({ view: "saved:kernel", session: "prod", expectedPlan: preview.planId });
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    expect(result).toMatchObject({ provider: "herdr", session: "prod", ok: false, code: "kernel_seats_unavailable", opened: [] });
+    expect(result.absent.map((member: { seat: string }) => member.seat)).toEqual(["operator.agent", "operator.human", "advisor.lead"]);
+    expect(f.hits.prod.every(request => request.method === "ping")).toBe(true);
+    expect(f.cmux.openView).not.toHaveBeenCalled();
   });
 
   it("explicit default overrides the daemon's custom endpoint and status inspects the selected socket", async () => {

@@ -2,6 +2,7 @@ import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { terminalCommand, type TerminalDeps } from "../src/commands/terminal.js";
 import type { WindowDeps } from "../src/terminal-window.js";
+import { shellQuote } from "../src/cross-host-executor.js";
 
 vi.mock("../src/daemon-lifecycle.js", async () => ({
   ...await vi.importActual<Record<string, unknown>>("../src/daemon-lifecycle.js"),
@@ -87,6 +88,42 @@ describe("terminal --session", () => {
     await f.run(["open", "prod", "--session", "prod", "--json"]);
     expect(process.exitCode).toBe(1); expect(f.post).not.toHaveBeenCalled(); expect(f.get).not.toHaveBeenCalled();
     expect(f.exec.mock.calls.some(([file]) => file === "/usr/bin/osascript")).toBe(false);
+  });
+
+  it.each([
+    { env: { HERDR_SESSION: "work", HERDR_SOCKET_PATH: "/fixture/.config/herdr/sessions/other/herdr.sock" }, session: "work" },
+    { env: { HERDR_SESSION: "work" }, session: "work" },
+    { env: { HERDR_SOCKET_PATH: "/fixture/.config/herdr/sessions/work/herdr.sock" }, session: "work" },
+    { env: { HERDR_SOCKET_PATH: "/fixture/.config/herdr/herdr.sock" }, session: "default" },
+    { env: {}, session: "default" },
+    { env: { HERDR_SESSION: "team's work" }, session: "team's work" },
+  ])("caller-session guidance names the current session on an endpoint mismatch: $env", async ({ env, session }) => {
+    const f = fixture();
+    f.windowDeps.env = { HOME: "/fixture", TERM_PROGRAM: "herdr", ...env };
+    const originalEnv = { ...f.windowDeps.env };
+    await f.run(["open", "prod", "--json"]);
+    const result = JSON.parse(logs[0]!);
+    expect(result).toMatchObject({ ok: false, windowAttempted: false, opened: [] });
+    expect(result.error).toContain(`You're in Herdr session ${JSON.stringify(session)}.`);
+    expect(result.error).toContain(`rig terminal open 'prod' --session ${shellQuote(session)}`);
+    expect(result.error).toContain("Use --provider herdr without --window to place a view in the selected session.");
+    expect(process.exitCode).toBe(1);
+    expect(f.post).not.toHaveBeenCalled();
+    expect(f.windowDeps.launch).not.toHaveBeenCalled();
+    expect(f.windowDeps.herdrConfig).not.toHaveBeenCalled();
+    expect(f.windowDeps.env).toEqual(originalEnv);
+  });
+
+  it.each(["/custom/herdr.sock", "/other-home/.config/herdr/sessions/work/herdr.sock"])("caller-session guidance keeps a custom socket unnamed: %s", async socket => {
+    const f = fixture();
+    f.windowDeps.env = { HOME: "/fixture", TERM_PROGRAM: "herdr", HERDR_SOCKET_PATH: socket };
+    await f.run(["open", "prod", "--json"]);
+    const result = JSON.parse(logs[0]!);
+    expect(result).toMatchObject({ ok: false, windowAttempted: false, opened: [] });
+    expect(result.error).toContain("Use --provider herdr without --window to place a view in the selected session.");
+    expect(result.error).not.toContain("--session");
+    expect(f.post).not.toHaveBeenCalled();
+    expect(f.windowDeps.launch).not.toHaveBeenCalled();
   });
 
   it("a changed endpoint after window launch is unconfirmed and never drives another session", async () => {

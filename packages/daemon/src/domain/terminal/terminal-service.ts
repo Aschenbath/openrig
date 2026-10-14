@@ -34,6 +34,7 @@ import { composeView, type ViewMemberInput } from "./view-composer.js";
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { buildGridRoot } from "./herdr-adapter.js";
+import { daemonTmuxServerArgs } from "../../adapters/tmux-server.js";
 // deriveViewMembers is a VALUE exported by the views store (not the composer).
 import { deriveViewMembers } from "./terminal-views-store.js";
 import type {
@@ -54,9 +55,11 @@ import type {
 /** The v1 provider name set (herdr = proof-gated primary; cmux = best-effort). */
 export type TerminalProviderName = "herdr" | "cmux";
 export const DEFAULT_PROVIDER: TerminalProviderName = "herdr";
+/** The order an omitted provider is chosen in: herdr if it's there, otherwise cmux. */
+const DEFAULT_PROVIDER_ORDER: readonly TerminalProviderName[] = ["herdr", "cmux"];
 
 export interface OpenViewRequest {
-  /** Provider name; defaults to herdr when omitted. */
+  /** Provider name. With no session, omission selects the first available, live provider: herdr, then cmux. */
   provider?: string;
   /** An explicit provider session; omission retains the daemon's configured endpoint. */
   session?: string;
@@ -191,11 +194,30 @@ export class TerminalService {
     return this.localTmux;
   }
 
+  /** An omitted provider takes the first in DEFAULT_PROVIDER_ORDER that is available and alive. With neither, it stays
+   *  herdr, whose honest failure carries the direct attach commands. A named provider is used as named, errors and all.
+   *  A named session stays on herdr without probing default-provider availability. */
+  private async providerNameFor(req: OpenViewRequest): Promise<{ name: string; fellBack: boolean }> {
+    const named = req.provider?.trim();
+    if (named || req.session !== undefined) return { name: named || DEFAULT_PROVIDER, fellBack: false };
+    for (const name of DEFAULT_PROVIDER_ORDER) {
+      const candidate = this.deps.resolveProvider(name);
+      if (!candidate) continue;
+      try {
+        if ((await candidate.status()).available && (await candidate.liveness()).alive) return { name, fellBack: name !== DEFAULT_PROVIDER };
+      } catch {
+        // A probe that throws is not an available provider; try the next.
+      }
+    }
+    return { name: DEFAULT_PROVIDER, fellBack: false };
+  }
+
   /** Open a view in the chosen provider. Always returns the one shared result shape. */
   async openView(req: OpenViewRequest): Promise<OpenViewResult> {
-    const selected = this.selectProvider(req);
+    const { name: providerName, fellBack } = await this.providerNameFor(req);
+    const selected = this.selectProvider({ ...req, provider: providerName });
     if ("ok" in selected) return selected;
-    const { name: providerName, provider, session } = selected;
+    const { provider, session } = selected;
 
     const composed = await this.resolveComposed(req.view, provider.panesPerPage, req.viewportColumns);
     if ("code" in composed) return errorResult(providerName, composed.code, composed.error);
@@ -204,9 +226,11 @@ export class TerminalService {
       return errorResult(providerName, "preview_changed", "View membership, layout or provider session changed. Refresh the preview before Open; nothing was launched.");
     }
     const notes = composed.kernelLayout ? [`Default kernel view: ${composed.kernelLayout}.`] : [];
+    if (fellBack) notes.push(`Herdr isn't available here (not installed or not answering), so this view uses ${providerName}.`);
     if (composed.kernelLayout && composed.opened.length === 0) {
       return {
         ...errorResult(providerName, "kernel_seats_unavailable", `No kernel conversations are attachable: ${composed.absent.map(member => `${member.seat} (${member.reason})`).join("; ")}`),
+        ...(session !== undefined ? { session } : {}),
         absent: composed.absent, degraded: composed.degraded, notes,
       };
     }
@@ -227,7 +251,7 @@ export class TerminalService {
     if (!view) return { code: "view_required", error: "a view argument is required" };
     const resolved = await this.resolveView(view);
     if ("code" in resolved) return resolved;
-    const composed = composeView(resolved.id, await this.refineLiveness(resolved.members), { resolveHost: (id) => this.deps.resolveHost(id), panesPerPage: resolved.panesPerPage ?? panesPerPage, localTmux: await this.resolveLocalTmux() });
+    const composed = composeView(resolved.id, await this.refineLiveness(resolved.members), { resolveHost: (id) => this.deps.resolveHost(id), panesPerPage: resolved.panesPerPage ?? panesPerPage, localTmux: await this.resolveLocalTmux(), localTmuxServer: daemonTmuxServerArgs() });
     if (resolved.kernelLayout && Number.isSafeInteger(viewportColumns) && viewportColumns! >= 120) {
       // The default's members are operator, dashboard, advisor. Keep the advisor separate
       // even when one of the other roles is unavailable; chunking two at a time would not.
@@ -244,9 +268,10 @@ export class TerminalService {
 
   /** Passive: inventory, local has-session and provider probe only. Never openView. */
   async previewView(req: OpenViewRequest): Promise<TerminalPreview | OpenViewResult> {
-    const selected = this.selectProvider(req);
+    const { name: providerName } = await this.providerNameFor(req);
+    const selected = this.selectProvider({ ...req, provider: providerName });
     if ("ok" in selected) return selected;
-    const { name: providerName, provider, session } = selected;
+    const { provider, session } = selected;
     const composed = await this.resolveComposed(req.view, provider.panesPerPage, req.viewportColumns);
     if ("code" in composed) return errorResult(providerName, composed.code, composed.error);
     return { provider: providerName, ...(session !== undefined ? { session } : {}), view: req.view, composed,
@@ -275,7 +300,7 @@ export class TerminalService {
       const inventory = await this.deps.listRigSeatsBatch?.(result.rigs);
       for (const entry of entries) {
         const rows = entry.kind === "derived" ? inventory?.get(entry.name) : undefined;
-        const plan = rows ? composeView(entry.view, await this.refineLiveness(deriveViewMembers(rows, { readOnly: false })), { resolveHost: id => this.deps.resolveHost(id), panesPerPage: this.deps.resolveProvider(DEFAULT_PROVIDER)?.panesPerPage, localTmux: await this.resolveLocalTmux() })
+        const plan = rows ? composeView(entry.view, await this.refineLiveness(deriveViewMembers(rows, { readOnly: false })), { resolveHost: id => this.deps.resolveHost(id), panesPerPage: this.deps.resolveProvider(DEFAULT_PROVIDER)?.panesPerPage, localTmux: await this.resolveLocalTmux(), localTmuxServer: daemonTmuxServerArgs() })
           : await this.resolveComposed(entry.view, this.deps.resolveProvider(DEFAULT_PROVIDER)?.panesPerPage);
         if ("code" in plan) continue;
         result.catalog.push({ ...entry, members: [...plan.opened, ...plan.absent, ...plan.degraded].map((m) => m.seat), ready: plan.opened.length, absent: plan.absent.length, degraded: plan.degraded.length, pages: plan.pages.length });

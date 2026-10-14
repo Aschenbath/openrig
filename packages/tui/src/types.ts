@@ -367,6 +367,8 @@ export interface FleetSnapshot {
   slackManifest?: import("./connections/connections-model.js").SlackManifestRead | null;
   daemonTarget?: string;
   launchingCli?: string;
+  /** Slice 01 — System → Usage: the served provider read model (usage windows, seat accounts). Absent until read. */
+  usage?: import("./usage/usage-model.js").UsageRead;
   /** Canonical daemon health records. Absent on old/demo snapshots. */
   health?: HealthSnapshot;
   /** SCOPES view (d64d2f5c): store-direct mission/slice projections; absent on old daemons (honest-empty). */
@@ -394,6 +396,9 @@ export interface FleetSnapshot {
   /** PULSE ▲ NEEDS YOU source — the shipped attention read (already the exact
    * human-facing set); empty array = the join ran and yielded zero (silence). */
   attention: QueueRead[];
+  /** Coverage of the four active queue lists, before filtering by rig/pod/seat.
+   * A cap is possible truncation; it does not prove an omitted row. */
+  queueCoverage?: "complete" | "partial" | "unavailable";
   /** PULSE ⧗ BLOCKED ON AGENTS source — the shipped state=blocked read (ALL
    * blocked qitems); the render filters to NON-human blockedOn. */
   blocked: QueueRead[];

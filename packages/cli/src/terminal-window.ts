@@ -110,7 +110,9 @@ async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((comm
   const host = !program || program === "tmux" ? deps.env["__CFBundleIdentifier"] ?? linuxHost : program;
   if (deps.env["CI"] && !["0", "false"].includes(deps.env["CI"])) return "This is a CI run.";
   if (deps.env["SSH_CONNECTION"] || deps.env["SSH_CLIENT"] || deps.env["SSH_TTY"]) return "This is an SSH session; no desktop window is opened over SSH.";
-  if (host === "herdr") return { currentHerdr: true };
+  // A tmux started inside a Herdr pane sets TERM_PROGRAM=tmux but inherits Herdr's pane markers, so read those too.
+  const inHerdrPane = deps.env["HERDR_ENV"] === "1" && !!deps.env["HERDR_PANE_ID"] && !!deps.env["HERDR_SOCKET_PATH"];
+  if (host === "herdr" || inHerdrPane) return { currentHerdr: true };
   if (deps.platform === "darwin") {
     const inGhostty = host === "ghostty" || host === "com.mitchellh.ghostty";
     const inTerminal = host === "Apple_Terminal" || host === "com.apple.Terminal";
@@ -315,7 +317,14 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
       const base = path.join(deps.env["HOME"] ?? homedir(), ".config", "herdr");
       const callerSocket = deps.env["HERDR_SOCKET_PATH"] ?? (deps.env["HERDR_SESSION"]
         ? path.join(base, "sessions", deps.env["HERDR_SESSION"], "herdr.sock") : path.join(base, "herdr.sock"));
-      if (!socket || path.resolve(socket) !== path.resolve(callerSocket)) return failed("The current Herdr endpoint differs from the selected endpoint; no space was opened in another session. Use --provider herdr without --window to place a view in the selected session.");
+      if (!socket || path.resolve(socket) !== path.resolve(callerSocket)) {
+        const socketParts = path.relative(base, path.resolve(callerSocket)).split(path.sep);
+        const callerSession = deps.env["HERDR_SESSION"] || (socketParts.length === 1 && socketParts[0] === "herdr.sock" ? "default"
+          : socketParts.length === 3 && socketParts[0] === "sessions" && socketParts[2] === "herdr.sock" ? socketParts[1] : undefined);
+        const here = callerSession
+          ? `You're in Herdr session ${JSON.stringify(callerSession)}. To place the view here, run: rig terminal open ${shellQuote(view)} --session ${shellQuote(callerSession)}. ` : "";
+        return failed(`The current Herdr endpoint differs from the selected endpoint; no space was opened in another session. ${here}Use --provider herdr without --window to place a view in the selected session.`);
+      }
       if (!herdr) return failed("The Herdr executable is unavailable; no space was opened.");
       // Set only once a space may open, so the refusals above read as "nothing was opened".
       currentHerdr = true;

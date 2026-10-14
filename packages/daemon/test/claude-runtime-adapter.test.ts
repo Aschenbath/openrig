@@ -90,7 +90,7 @@ describe("launchHarness — per-agent --model reaches the claude launch (51-07 A
   it("absent model → the resume command is exact bytes (no --model, posture intact)", async () => {
     const tmux = mockTmux();
     await adapterWith(tmux).launchHarness(withModel(undefined), { name: "seat", resumeToken: "tok-123" });
-    expect(lastCmd(tmux)).toBe(`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude ${POSTURE} --resume 'tok-123' --name seat`);
+    expect(lastCmd(tmux)).toBe(`OPENRIG_RESUME_LAUNCH='tok-123' CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude ${POSTURE} --resume 'tok-123' --name seat`);
   });
 
   // D1 pin — posture BYTE-UNCHANGED both directions: the ONLY delta with/without model is the
@@ -177,7 +177,7 @@ describe("launchHarness — classic-renderer env prefix (OPR.0.5.3.1 scrollback 
   it("RESUME launch carries the prefix", async () => {
     const tmux = mockTmux();
     await adapterWith(tmux).launchHarness(makeBinding(), { name: "seat", resumeToken: "tok-123" });
-    expect(lastCmd(tmux)).toBe(`${PREFIX}claude ${POSTURE} --resume 'tok-123' --name seat`);
+    expect(lastCmd(tmux)).toBe(`OPENRIG_RESUME_LAUNCH='tok-123' ${PREFIX}claude ${POSTURE} --resume 'tok-123' --name seat`);
   });
 
   it("FORK launch carries the prefix", async () => {
@@ -186,11 +186,11 @@ describe("launchHarness — classic-renderer env prefix (OPR.0.5.3.1 scrollback 
     expect(lastCmd(tmux).startsWith(PREFIX + "claude ")).toBe(true);
   });
 
-  it("override OPENRIG_CLAUDE_DISABLE_ALTERNATE_SCREEN=0 omits the prefix (byte-identical to pre-change)", async () => {
+  it("override OPENRIG_CLAUDE_DISABLE_ALTERNATE_SCREEN=0 omits the renderer prefix; the resume keeps its launch marker (#1077)", async () => {
     process.env.OPENRIG_CLAUDE_DISABLE_ALTERNATE_SCREEN = "0";
     const tmux = mockTmux();
     await adapterWith(tmux).launchHarness(makeBinding(), { name: "seat", resumeToken: "tok-123" });
-    expect(lastCmd(tmux)).toBe(`claude ${POSTURE} --resume 'tok-123' --name seat`);
+    expect(lastCmd(tmux)).toBe(`OPENRIG_RESUME_LAUNCH='tok-123' claude ${POSTURE} --resume 'tok-123' --name seat`);
   });
 });
 
@@ -589,7 +589,7 @@ describe("Claude Code runtime adapter", () => {
     const sendText = tmux.sendText as ReturnType<typeof vi.fn>;
     expect(sendText).toHaveBeenCalledWith(
       "r01-impl",
-      "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude --permission-mode acceptEdits --resume 'abc-123' --name dev-impl@test-rig"
+      "OPENRIG_RESUME_LAUNCH='abc-123' CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude --permission-mode acceptEdits --resume 'abc-123' --name dev-impl@test-rig"
     );
   });
 
@@ -606,6 +606,42 @@ describe("Claude Code runtime adapter", () => {
     expect(result).toEqual({
       ok: false,
       error: "Claude resume failed: no conversation found for the requested session",
+      recovery: "retry_fresh",
+      missingConversation: true,
+    });
+  });
+
+  it("launchHarness marks a missing conversation that first shows on the read after the wait", async () => {
+    const tmux = mockTmux();
+    (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue("zsh");
+    const capture = tmux.capturePaneContent as ReturnType<typeof vi.fn>;
+    // The wait reads the pane 16 times; the report first appears on the final read after it.
+    for (let read = 0; read < 16; read++) capture.mockResolvedValueOnce("claude --resume abc-123\nuser@example.test %");
+    capture.mockResolvedValue("No conversation found with session ID: abc-123\nuser@example.test %");
+    const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {} });
+
+    const result = await adapter.launchHarness(makeBinding(), { name: "dev-impl@test-rig", resumeToken: "abc-123" });
+
+    expect(capture).toHaveBeenCalledTimes(17);
+    expect(result).toEqual({
+      ok: false,
+      error: "Claude resume failed: no conversation found for the requested session",
+      recovery: "retry_fresh",
+      missingConversation: true,
+    });
+  });
+
+  it("launchHarness leaves a pane that is back at its shell unmarked", async () => {
+    const tmux = mockTmux();
+    (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue("zsh");
+    (tmux.capturePaneContent as ReturnType<typeof vi.fn>).mockResolvedValue("Error: Claude exited\nuser@example.test %");
+    const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {} });
+
+    const result = await adapter.launchHarness(makeBinding(), { name: "dev-impl@test-rig", resumeToken: "abc-123" });
+
+    expect(result).toEqual({
+      ok: false,
+      error: "Claude resume failed: pane returned to shell instead of entering Claude",
       recovery: "retry_fresh",
     });
   });

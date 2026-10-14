@@ -500,11 +500,12 @@ rig ps --active             # opt-in active-state filter (does NOT change the al
 ```bash
 rig whoami                  # compact: identity + peers names + edges + transcript path
 rig whoami --json           # compact JSON
+rig whoami --json --all-peers  # compact JSON with every peer, when output.compact bounds the list
 rig whoami --full           # complete payload (v0.3.4 default shape)
 rig whoami --verbose        # alias of --full
 ```
 
-The first command every agent runs on boot AND every compaction-restore. The compact default keeps identity-recovery essentials (`identity`, `peers` names + sessionNames, `edges` directional `kind` + `to.sessionName`, `transcriptPath`). `--full` adds `contextUsage`, `commands`, `peersNote`, `runtimeContext`. The compact-default is an ALLOWLIST projection — future payload fields default to `--full` and cannot silently re-bloat the every-boot path.
+The first command every agent runs on boot AND every compaction-restore. The compact default keeps identity-recovery essentials (`identity`, `peers` names + sessionNames, `peersNote`, `edges` directional `kind` + `to.sessionName`, the transcript path). `--full` adds `contextUsage`, `commands`, `runtimeContext` and `workspace`. With `output.compact` on, compact JSON lists at most `output.whoami_peers` peers (default 8): edge peers first, then your pod, then roster order. `peersNote` and `peersOmitted` then say how many were left out, and `--all-peers` lists every one; `edges` stays complete. The compact-default is an ALLOWLIST projection — future payload fields default to `--full` and cannot silently re-bloat the every-boot path.
 
 ### `rig queue list` — active-frontier + docker/kubectl grammar
 
@@ -1302,13 +1303,19 @@ Node-granular managed partial restore (v0.3.4+):
 ### Add a member to an existing pod — v0.3.3+
 
 ```bash
-rig add <rig-id> <pod-namespace> <member-fragment-path> [--json]
+rig add <rig> <pod-namespace> <member-fragment-path> [--json]
 ```
 
 `rig add` is the top-level verb for the `add_member` converge op. It adds a
 single member to an existing pod from a YAML/JSON member fragment file. The
 daemon resolves the named pod, validates the member, runs preflight, and
 launches the member in place.
+
+`<rig>` is the rig id or its exact name (the `rigName` that `rig whoami --json`
+reports). A name shared by more than one rig is refused before anything is
+added, with the matching ids listed (`rig_ambiguous` under `--json`). `rig add`
+always targets the local daemon: while a remote host is selected it refuses to
+resolve a name (`remote_host_selected`); an exact local id still works.
 
 HTTP outcomes:
 - `201` — member added; per-node launch state included in the response.

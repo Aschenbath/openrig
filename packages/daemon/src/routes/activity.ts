@@ -10,7 +10,9 @@ import type { AgentActivity } from "../domain/types.js";
 import * as parkedQuery from "../domain/parked-query.js";
 import { runtimeRungInventory } from "../domain/activity-taxonomy.js";
 import { validateResumeToken } from "../domain/resume-token-validation.js";
+import { claudeHookFromLaunchedProcess, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
 import { transportSenderSession } from "./require-sender-identity.js";
+import { PiUsageEntriesStore, hasPiUsageEntriesTable, validPiUsageFact } from "../domain/pi-usage-entries-store.js";
 
 // ── S19 A4 — the ingest half of the adapter seam: hook events reach the ONE oracle ──
 // (SeatActivityService) through this translation, so AgentActivityStore is reduced to a
@@ -57,6 +59,47 @@ function nextHookSeq(key: string): number {
 }
 
 export const activityRoutes = new Hono();
+
+// OPR.0.7.0.2 (cost reporting, Pi atom): a Pi runner started with --usage-facts (usage.pi_cost_facts on) posts the
+// usage facts of entries Pi has persisted. Same local hook token as /hooks. Each (Pi session, entry) is stored
+// once; facts for a seat that isn't a managed Pi seat are refused, never stored under another name.
+activityRoutes.post("/pi-usage", async (c) => {
+  const store = c.get("agentActivityStore" as never) as AgentActivityStore | undefined;
+  const expectedToken = c.get("activityHookToken" as never) as string | undefined;
+  const sessionRegistry = c.get("sessionRegistry" as never) as SessionRegistry | undefined;
+  if (!store || !expectedToken || !sessionRegistry || !hasPiUsageEntriesTable(sessionRegistry.db)) {
+    return c.json({ ok: false, code: "pi_usage_unconfigured", error: "Pi usage facts aren't accepted by this daemon." }, 503);
+  }
+  const authHeader = c.req.header("authorization");
+  const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : null;
+  if (bearerToken !== expectedToken && (c.req.header("x-openrig-activity-token") ?? null) !== expectedToken) {
+    return c.json({ ok: false, code: "activity_hook_unauthorized", error: "Pi usage facts require the configured local hook token." }, 401);
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = await c.req.json() as Record<string, unknown>;
+  } catch {
+    return c.json({ ok: false, code: "invalid_json", error: "Request body must be JSON." }, 400);
+  }
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return c.json({ ok: false, code: "invalid_pi_usage", error: "pi-usage requires a JSON object" }, 400);
+  }
+  const sessionName = stringOrNull(body.sessionName);
+  const piSessionId = stringOrNull(body.piSessionId);
+  if (!sessionName || !piSessionId || !Array.isArray(body.facts)) {
+    return c.json({ ok: false, code: "invalid_pi_usage", error: "pi-usage requires sessionName, piSessionId and facts[]" }, 400);
+  }
+  const resolved = store.resolveSession({ sessionName, nodeId: stringOrNull(body.nodeId), runtime: "pi" });
+  if (!resolved || resolved.runtime !== "pi") {
+    return c.json({ ok: false, code: "session_not_found", error: `No managed Pi seat named ${sessionName}` }, 404);
+  }
+  const facts = (body.facts as unknown[]).map(validPiUsageFact);
+  const valid = facts.filter((fact): fact is NonNullable<typeof fact> => fact !== null);
+  const result = new PiUsageEntriesStore(sessionRegistry.db).record({
+    seatSession: resolved.sessionName, nodeId: resolved.nodeId, generation: stringOrNull(body.generation), piSessionId, facts: valid,
+  }, new Date().toISOString());
+  return c.json({ ok: true, ...result, rejected: facts.length - valid.length });
+});
 
 activityRoutes.post("/hooks", async (c) => {
   const store = c.get("agentActivityStore" as never) as AgentActivityStore | undefined;
@@ -215,8 +258,38 @@ activityRoutes.post("/hooks", async (c) => {
     // tokenPersisted reports the stored state, not format validity: a higher-provenance token
     // (operator) refuses the hook write, which only counts as persisted when it already matches.
     const validation = validateResumeToken(runtime, sessionId);
+    // A Claude hook also says how the session began. That only counts as evidence about this
+    // seat's launch when the post carries the node's current occupant generation (#1077).
+    const generation = stringOrNull(body.generation);
+    let currentGeneration = false;
+    try {
+      currentGeneration = !!generation && sessionRegistry.currentOccupantTenure(resolved.nodeId)?.generationUuid === generation;
+    } catch { /* an unreadable ledger is no evidence */ }
+    const source = stringOrNull(body.source);
+    const resumeLaunch = stringOrNull(body.resumeLaunch);
+    // Only for a hook that could name the armed launch: was it the launch's first SessionStart (the
+    // relay records that locally, so a first hook lost in delivery still counts), and was it sent
+    // by the process OpenRig launched?
+    let launchedProcess: ClaudeLaunchedProcess | null = null;
+    const armed = runtime === "claude-code" && currentGeneration && source === "resume" && resumeLaunch
+      && body.resumeLaunchFirst === true ? sessionRegistry.armedResumeLaunch(resolved.sessionId) : null;
+    const hookPid = typeof body.hookPid === "number" && Number.isInteger(body.hookPid) && body.hookPid > 0 ? body.hookPid : null;
+    const tmux = c.get("tmuxAdapter" as never) as { getPanePid(target: string): Promise<number | null> } | undefined;
+    if (armed && armed === resumeLaunch?.trim() && hookPid && tmux) {
+      const binding = sessionRegistry.getBindingForNode(resolved.nodeId);
+      const target = binding?.tmuxPane ?? binding?.tmuxSession;
+      if (target) {
+        launchedProcess = await claudeHookFromLaunchedProcess({ target, tmux, launchToken: armed, hookPid,
+          listProcesses: c.get("listProcesses" as never) as NativeProcessLister | undefined });
+      }
+    }
+    const persistHook = (type: string, token: string): boolean => {
+      if (runtime !== "claude-code") return sessionRegistry.updateResumeToken(resolved.sessionId, type, token, "hook");
+      return sessionRegistry.recordHookSessionIdentity(resolved.sessionId, type, token,
+        { source, currentGeneration, resumeLaunch, launchedProcess });
+    };
     const tokenPersisted = validation.ok
-      && (sessionRegistry.updateResumeToken(resolved.sessionId, validation.resumeType, validation.token, "hook")
+      && (persistHook(validation.resumeType, validation.token)
         || sessionRegistry.resumeTokenMatches(resolved.sessionId, validation.resumeType, validation.token));
     eventBus.emit({
       type: "agent.session_identity",

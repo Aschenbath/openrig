@@ -21,10 +21,14 @@ socket path. `--session default` explicitly selects Herdr's default session.
 
 ## Default selection and scope
 
-With no `--session`, the daemon uses the Herdr endpoint selected when it started:
+When Herdr is selected with no `--session`, the daemon uses the endpoint selected when it started:
 its `HERDR_SOCKET_PATH`, then its `HERDR_SESSION`, then the default endpoint.
 Setting either variable only on a later `rig terminal open` command does not
 change that daemon configuration. Pass `--session` for a per-command selection.
+
+With neither a provider nor a session, the daemon's open and preview APIs try
+a live Herdr first, then a live cmux. An explicit session always selects Herdr
+and skips that fallback, including when the daemon's default Herdr endpoint is down.
 
 An explicit session resolves under the daemon user's Herdr session directory;
 it takes precedence over that daemon's default socket override. The selection
@@ -47,6 +51,14 @@ application use the selected endpoint. When launched inside Herdr, the current
 Herdr endpoint must match that selection to reuse the current terminal. To
 place a view in another existing session from such a caller, use the explicit
 `--provider herdr` form without `--window`.
+
+An endpoint-mismatch error also gives a command for the caller's own session,
+such as `rig terminal open future-rig --session work`. Previously it only
+explained how to place the view in the daemon's selected session. The caller's
+name comes from `HERDR_SESSION`, then a socket under
+`~/.config/herdr/sessions/<name>/herdr.sock`, or `default` for
+`~/.config/herdr/herdr.sock`. Other custom socket paths keep the existing
+guidance without guessing a session name. Reporting the mismatch opens nothing.
 
 Previews include the selected session in their fingerprint. A preview from one
 session cannot authorize an open in another; refresh the preview after changing
@@ -72,3 +84,5 @@ Malformed names and unsupported provider/session combinations return HTTP 400
 before socket calls. A changed preview returns HTTP 409. An unavailable Herdr
 session keeps the normal HTTP 200 provider result with `ok: false`, its selected
 `session`, an error code and direct-attach guidance.
+The `kernel_seats_unavailable` result also keeps the selected session, so the CLI
+reports that known failure instead of replacing it with an unconfirmed-session error.

@@ -26,6 +26,7 @@ import { EventBus } from "./domain/event-bus.js";
 import { NodeLauncher } from "./domain/node-launcher.js";
 import { TmuxOptionDefaultsApplier } from "./domain/tmux-option-defaults.js";
 import { TmuxAdapter } from "./adapters/tmux.js";
+import { setDaemonTmuxServer, tmuxServerArgs } from "./adapters/tmux-server.js";
 import { CmuxAdapter } from "./adapters/cmux.js";
 import { execArgvCommand, execCommand } from "./adapters/tmux-exec.js";
 import { execPreflightCommand } from "./adapters/preflight-exec.js";
@@ -39,6 +40,10 @@ import { ClaudeResumeAdapter } from "./adapters/claude-resume.js";
 import { CodexResumeAdapter } from "./adapters/codex-resume.js";
 import { codexDaemonSupportProbe } from "./domain/codex-daemon-support.js";
 import { codexNetworkDefaultReader } from "./domain/codex-network-default.js";
+import { codexUsageReader } from "./domain/provider/codex-usage-reader.js";
+import { CodexUsageWindows } from "./domain/provider/codex-usage-windows.js";
+import { claudeAuthStatusReader } from "./domain/provider/claude-auth-status-reader.js";
+import { ClaudeUsageWindows, latestClaudeWindowSamples } from "./domain/provider/claude-usage-windows.js";
 import { prepareCodexTeamWorkspace } from "./domain/codex-team-workspace.js";
 import { PiResumeAdapter } from "./adapters/pi-resume.js";
 import { OmpResumeAdapter } from "./adapters/omp-resume.js";
@@ -182,7 +187,7 @@ interface DaemonOptions {
    *  listeners by binding evidence. Absent (tests/legacy) = healthz body unchanged. */
   bindPlan?: import("./domain/bind-plan.js").BindPlan;
   tmuxExec?: ExecFn;
-  /** Optional shell-free tmux executor; selected by default on Windows. */
+  /** Optional shell-free tmux executor; the default unless tmuxExec is injected. */
   argvExec?: ArgvExecFn;
   cmuxExec?: ExecFn;
   cmuxFactory?: CmuxTransportFactory;
@@ -477,9 +482,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   watchdogAutoRegistration.assertLiveSeatCoverage();
   const watchdogHistoryLogInstance = new WatchdogHistoryLog(db);
 
+  // An injected string exec keeps the shell path, so its fake sees every command. OPENRIG_TMUX_SHELL=1 keeps it too.
   const argvExec = opts?.argvExec
-    ?? (opts?.tmuxExec ? undefined : process.platform === "win32" ? execArgvCommand : undefined);
+    ?? (opts?.tmuxExec || (process.env.OPENRIG_TMUX_SHELL === "1" && process.platform !== "win32") ? undefined : execArgvCommand);
   const tmuxAdapter = new TmuxAdapter(opts?.tmuxExec ?? execCommand, undefined, argvExec);
+  // The real tmux runs with this process's environment, so its server is the one $TMUX names.
+  // An injected exec has no server of its own: printed attach commands stay in the default form.
+  setDaemonTmuxServer(opts?.tmuxExec ? [] : tmuxServerArgs(process.env));
   const deliveryGuard = new SeatDeliveryGuard(db, target => resolveGuardTarget(db, target));
   deliveryGuard.recoverActivation();
   tmuxAdapter.deliveryGuard = deliveryGuard;
@@ -627,11 +636,16 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const piStateRoot = nodePath.join(OPENRIG_HOME, "state", "pi");
   const ompStateRoot = nodePath.join(OPENRIG_HOME, "state", "omp");
   const piRunnerEntryPath = nodePath.resolve(import.meta.dirname, "./adapters/pi-runner.js");
+  // OPR.0.7.0.2: Pi seats report cost facts from persisted entries only while usage.pi_cost_facts is on;
+  // read at each launch and resume, so the switch takes effect at the next one.
+  const piUsageFactsEnabled = (): boolean => {
+    try { return new ContextPackSettingsStore().resolveOne("usage.pi_cost_facts").value === true; } catch { return false; }
+  };
   const piResume = new PiResumeAdapter(
     tmuxAdapter,
     { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }) },
     { stateRoot: piStateRoot, runnerEntryPath: piRunnerEntryPath },
-    { seatLaunchEnvironment },
+    { seatLaunchEnvironment, usageFactsEnabled: piUsageFactsEnabled },
   );
   const ompResume = new OmpResumeAdapter(
     tmuxAdapter,
@@ -779,7 +793,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const codexAdapter = new CodexRuntimeAdapter({ prepareTeamWorkspace, tmux: tmuxAdapter, seatLaunchEnvironment, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; }, statMode: (p: string) => fs.statSync(p).mode, chmod: (p: string, m: number) => fs.chmodSync(p, m), homedir: daemonHome }, codexHome: configuredCodexHome, launchPath: process.env.PATH, detectDaemonSupport: codexDaemonSupportProbe(process.env.PATH, undefined, configuredCodexHome), readNetworkDefault: readCodexNetworkDefault, activityRelayPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs") });
   // OPR.0.4.6.PI1 — the RPC-first Pi adapter (runner-in-a-pane). Same fsOps
   // shape as the Codex adapter; seat isolation roots under piStateRoot.
-  const piAdapter = new PiRuntimeAdapter({ tmux: tmuxAdapter, seatLaunchEnvironment, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; }, statMode: (p: string) => fs.statSync(p).mode, chmod: (p: string, m: number) => fs.chmodSync(p, m) }, stateRoot: piStateRoot, runnerEntryPath: piRunnerEntryPath });
+  const piAdapter = new PiRuntimeAdapter({ tmux: tmuxAdapter, seatLaunchEnvironment, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; }, statMode: (p: string) => fs.statSync(p).mode, chmod: (p: string, m: number) => fs.chmodSync(p, m) }, stateRoot: piStateRoot, runnerEntryPath: piRunnerEntryPath, usageFactsEnabled: piUsageFactsEnabled });
   const ompAdapter = new OmpRuntimeAdapter({ tmux: tmuxAdapter, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; } }, stateRoot: ompStateRoot, runnerEntryPath: piRunnerEntryPath });
   // OPR.0.5.1.1 — the stub runtime adapter (Pi-shaped node-script runner in a pane).
   // Same fsOps shape as Pi; the compiled runner entry lives in the daemon dist.
@@ -1168,6 +1182,22 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     isRegisteredOccupantGeneration: (nodeId, generation) =>
       sessionRegistry.isOccupantGenerationRegistered(nodeId, generation),
   });
+  // #763 — Codex usage-limit banner detector. The reactive tap only accepts a
+  // typed at_limit hook row and no hook producer emits one for Codex, so the
+  // structural sweep reports what the seat itself shows. Attached late (rather
+  // than constructed with) so service construction order is untouched.
+  {
+    const { recordCodexLimitBanner } = await import("./domain/provider/codex-limit-banner.js");
+    seatStructuralActivityService.attachCodexLimitBanner((sessionName, banner, observedAt) => {
+      recordCodexLimitBanner({
+        store: agentActivityStore,
+        resolveGeneration: (s) => sessionRegistry.currentOccupantGenerationForSession(s),
+        sessionName,
+        banner,
+        now: () => observedAt,
+      });
+    });
+  }
   const { SeatAttentionReconciler } = await import("./domain/seat-attention-reconciler.js");
   const seatAttentionReconciler = new SeatAttentionReconciler({
     sessionRegistry, eventBus, agentActivityStore, db, tmux: tmuxAdapter,
@@ -1216,6 +1246,18 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         legacyProviderUsageDirectory(OPENRIG_HOME),
       ),
       agentActivityStore,
+      // Slice 01: Codex and Claude usage windows, off unless provider.usage_windows is on (read per call). The native
+      // readers (Codex's app-server; Claude's auth status, for identity) run only on an explicit refresh, with the
+      // PATH, HOME, CODEX_HOME and CLAUDE_CONFIG_DIR a seat session gets. Claude's windows are the seats' status-line
+      // samples (usage_samples), read on every view.
+      usageWindows: {
+        enabled: () => new ContextPackSettingsStore().resolveOne("provider.usage_windows").value === true,
+        windows: new CodexUsageWindows({ read: codexUsageReader({ launchPath: process.env.PATH, home: daemonHome, codexHome }) }),
+        claude: new ClaudeUsageWindows({
+          readIdentity: claudeAuthStatusReader({ launchPath: process.env.PATH, home: daemonHome, claudeConfigDir: process.env.CLAUDE_CONFIG_DIR }),
+          listSamples: () => latestClaudeWindowSamples(db),
+        }),
+      },
     }),
     restoreOrchestrator,
     resumeMetadataRefresher, // OPR.0.4.3.20 FR-4 — manual snapshot refresh-before-serialize
@@ -2079,7 +2121,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
             listTransitions: (qitemId: string) =>
               queueRepoInstance
                 .listTransitions(qitemId)
-                .map((t) => ({ ts: t.ts, transitionNote: t.transitionNote ?? null })),
+                .map((t) => ({ ts: t.ts, transitionNote: t.transitionNote ?? null, actorSession: t.actorSession, state: t.state, transitionId: t.transitionId })),
             appendNote: (qitemId: string, note: string) => {
               const row = queueRepoInstance.getById(qitemId);
               if (!row || !isBlockerLive(row.state)) return { ok: false };
@@ -2097,6 +2139,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
                 .list({ destinationSession, state: ["pending", "in-progress", "blocked"], limit: 500 })
                 .map((r) => r.qitemId),
           },
+          occupantGeneration: (sessionName) => sessionRegistry.currentOccupantGenerationForSession(sessionName),
         }),
         // OPR.0.5.6.1 AM-F1 — the delivery engine's two timing legs on THIS
         // substrate. The gateway dispatch binds late (the subsystem is built
