@@ -49,6 +49,43 @@ describe("private tmux environment file lifetime", () => {
       expect(f.commands.some(argv => argv.includes("source-file") || argv.includes("new-session") || argv.includes("respawn-pane"))).toBe(false);
       expect(f.files.unlink).not.toHaveBeenCalled();
     });
+
+    it(`${action}: retries a transient cleanup failure without reporting a leftover file`, async () => {
+      const f = fixture();
+      vi.mocked(f.files.unlink).mockRejectedValueOnce(new Error("temporarily busy"));
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect(await launch(f.adapter, action)).toEqual({ ok: true });
+        expect(f.files.unlink).toHaveBeenCalledTimes(2);
+        expect(warning).not.toHaveBeenCalled();
+      } finally { warning.mockRestore(); }
+    });
+
+    it(`${action}: an already removed file needs no retry or warning`, async () => {
+      const f = fixture();
+      vi.mocked(f.files.unlink).mockRejectedValueOnce(Object.assign(new Error("gone"), { code: "ENOENT" }));
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect(await launch(f.adapter, action)).toEqual({ ok: true });
+        expect(f.files.unlink).toHaveBeenCalledTimes(1);
+        expect(warning).not.toHaveBeenCalled();
+      } finally { warning.mockRestore(); }
+    });
+
+    it.each([false, true])(`${action}: persistent cleanup failure reports only the path and preserves the command result (tmux fails: %s)`, async tmuxFails => {
+      const f = fixture(async () => {
+        if (tmuxFails) throw new Error("can't find session: seat");
+        return "%1\n";
+      });
+      vi.mocked(f.files.unlink).mockRejectedValue(new Error(ENV.OPENRIG_ACTIVITY_HOOK_TOKEN));
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect(await launch(f.adapter, action)).toMatchObject(tmuxFails ? { ok: false, code: "session_not_found" } : { ok: true });
+        expect(f.files.unlink).toHaveBeenCalledTimes(2);
+        expect(warning).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("/private/fixture.conf"));
+        expect(warning.mock.calls.flat().join(" ")).not.toContain(ENV.OPENRIG_ACTIVITY_HOOK_TOKEN);
+      } finally { warning.mockRestore(); }
+    });
   }
 
   it("rejects a NUL argument before writing a truncated tmux command", async () => {

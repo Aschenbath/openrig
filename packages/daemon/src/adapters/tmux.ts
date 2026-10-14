@@ -489,11 +489,24 @@ export class TmuxAdapter {
       created = true;
       // source-file alone cannot start a cold server. Queue both commands in
       // one client so the server does not exit before new-session is parsed.
-      const source = ["tmux", ...(argv[1] === "new-session" ? ["start-server", ";"] : []), "source-file", file];
+      // source-file expands globs even when its path is a single argv entry.
+      const sourcePath = file.replace(/[\\*?[\]]/g, "\\$&");
+      const source = ["tmux", ...(argv[1] === "new-session" ? ["start-server", ";"] : []), "source-file", sourcePath];
       return await this.run(source);
     } finally {
       if (created) {
-        try { await this.fileOps.unlink(file); } catch { /* best-effort cleanup */ }
+        let removed = false;
+        for (let attempt = 0; attempt < 2 && !removed; attempt++) {
+          try {
+            await this.fileOps.unlink(file);
+            removed = true;
+          } catch (err) {
+            removed = (err as NodeJS.ErrnoException | null)?.code === "ENOENT";
+          }
+        }
+        if (!removed) {
+          console.warn(`[tmux] Could not remove private seat environment file ${JSON.stringify(file)}.`);
+        }
       }
     }
   }

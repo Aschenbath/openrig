@@ -29,7 +29,7 @@ async function readReport(file: string): Promise<{ cwd: string; env: Record<stri
   return report;
 }
 
-async function fixture(mode: "shell" | "argv") {
+async function fixture(mode: "shell" | "argv", stagingDirectory?: string) {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "private-env-")));
   const socket = path.join(home, "s");
   const env = {
@@ -42,11 +42,14 @@ async function fixture(mode: "shell" | "argv") {
   const staged: string[] = [];
   const modes: number[] = [];
   const files = defaultTmuxFileOps();
+  const directory = stagingDirectory ? path.join(home, stagingDirectory) : undefined;
+  if (directory) fs.mkdirSync(directory);
   const adapter = new TmuxAdapter(async command => {
     commands.push(command);
     return (await run(`tmux -S ${shellQuote(socket)} -f /dev/null ${command.slice(5)}`, { env })).stdout;
   }, {
     ...files,
+    ...(directory ? { tmpName: () => path.join(directory, path.basename(files.tmpName())) } : {}),
     async writeFile(file, content, options) {
       await files.writeFile(file, content, options);
       staged.push(file);
@@ -101,16 +104,30 @@ describe.skipIf(process.platform === "win32")("private seat environment with nat
     it(`${mode}: gives a successor its private environment in the same pane without clearing predecessor history`, async () => {
       const f = await fixture(mode);
       try {
-        const pane = (await f.tmux(["new-session", "-d", "-s", "seat", "-P", "-F", "#{pane_id}"])).trim();
+        // Seed deep scrollback before exit; a respawn may redraw the visible screen.
+        const predecessor = "i=0; while [ \"$i\" -lt 40 ]; do printf 'predecessor-history-%s\\n' \"$i\"; i=$((i + 1)); done; exec cat";
+        const pane = (await f.tmux(["new-session", "-d", "-s", "seat", "-x", "110", "-y", "24", "-P", "-F", "#{pane_id}", predecessor])).trim();
         await f.tmux(["set-option", "-p", "-t", pane, "remain-on-exit", "on"]);
-        await f.tmux(["send-keys", "-t", pane, "-l", "printf 'predecessor-history\\n'; exit"]);
-        await f.tmux(["send-keys", "-t", pane, "Enter"]);
+        await expect.poll(async () => {
+          const history = await f.tmux(["capture-pane", "-p", "-J", "-t", pane, "-S", "-"]);
+          return history.includes("predecessor-history-0") && history.includes("predecessor-history-39");
+        }, { timeout: 10000 }).toBe(true);
+        process.kill(Number((await f.tmux(["display-message", "-p", "-t", pane, "#{pane_pid}"])).trim()), "SIGTERM");
         await expect.poll(async () => (await f.tmux(["display-message", "-p", "-t", pane, "#{pane_dead}"])).trim(), { timeout: 10000 }).toBe("1");
         const output = path.join(f.home, "successor.json");
         expect(await f.adapter.respawnPane(pane, `${f.reportCommand(output)}; exec /bin/sh`, { cwd: f.home, env: ENV })).toEqual({ ok: true });
         expect(await readReport(output)).toEqual({ cwd: f.home, env: { ...ENV, OPENRIG_TRANSCRIPTS_LINES: "777", OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS: "44" } });
         expect((await f.tmux(["list-panes", "-t", "=seat:", "-F", "#{pane_id}"])).trim()).toBe(pane);
-        expect(await f.tmux(["capture-pane", "-p", "-t", pane, "-S", "-"])).toContain("predecessor-history");
+        expect(await f.tmux(["capture-pane", "-p", "-J", "-t", pane, "-S", "-"])).toContain("predecessor-history-0");
+        f.privateCommands();
+      } finally { await f.close(); }
+    });
+
+    it(`${mode}: reads a literal private path containing glob metacharacters`, async () => {
+      const f = await fixture(mode, "staged [literal]*?\\");
+      try {
+        expect(await f.adapter.createSession("literal", f.home, ENV)).toEqual({ ok: true });
+        expect((await f.report("=literal:", path.join(f.home, "literal.json"))).env).toMatchObject(ENV);
         f.privateCommands();
       } finally { await f.close(); }
     });
