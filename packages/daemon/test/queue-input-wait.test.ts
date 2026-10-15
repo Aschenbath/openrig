@@ -63,8 +63,8 @@ describe("claimed work waiting on human input (#331)", () => {
     if (evidence) activity.reportEvidence(evidence);
   }
 
-  async function claimed() {
-    const row = await queue.create({ sourceSession: "sender@input-wait", destinationSession: SESSION, body: "Work awaiting approval", nudge: false });
+  async function claimed(tags?: string[]) {
+    const row = await queue.create({ sourceSession: "sender@input-wait", destinationSession: SESSION, body: "Work awaiting approval", nudge: false, tags });
     queue.claim({ qitemId: row.qitemId, destinationSession: SESSION });
     advance(240);
     return row.qitemId;
@@ -80,7 +80,7 @@ describe("claimed work waiting on human input (#331)", () => {
   });
 
   it("keeps a long unanswered prompt visible across queue, pickup, execution and attention reads without a stall finding", async () => {
-    const id = await claimed();
+    const id = await claimed(["slice:OPR.9.9.331"]);
     const transitions = queue.transitionLog.listForQitem(id);
     hook("Notification", "permission_prompt");
     advance(24 * 3600);
@@ -91,6 +91,7 @@ describe("claimed work waiting on human input (#331)", () => {
     expect(queue.list({ destinationSession: SESSION }).find(row => row.qitemId === id)?.pickup).toEqual(receipt);
     expect(projector.show("pickup").rows.find(row => row.qitem_id === id)).toMatchObject({ pickup_state: "needs-input", pickup_evidence: receipt.evidence });
     const execution = await buildExecutionView({ db, slicesRoot: () => null, seatActivity: activity });
+    expect(execution.q1_lanes).toContainEqual(expect.objectContaining({ qitem_id: id, pickup: receipt }));
     expect(execution.q5_park).toContainEqual(expect.objectContaining({ qitem_id: id, pickup_state: "needs-input", pickup_evidence: receipt.evidence, park_kind: "indeterminate" }));
     expect(queue.waitingView(id)!.nextBackstop).toMatchObject({ dueAt: null, intervalSeconds: null });
     expect(attention()).toBe(1);
