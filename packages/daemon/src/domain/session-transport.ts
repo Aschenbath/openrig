@@ -21,7 +21,7 @@ import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import { claudeResumeRotation, type SessionRegistry } from "./session-registry.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
-import { latestHookWaitsOnPerson, type AgentActivityStore } from "./agent-activity-store.js";
+import { latestHookPermissionPending, latestHookWaitsOnPerson, type AgentActivityStore } from "./agent-activity-store.js";
 import type { EventBus } from "./event-bus.js";
 import type { AgentActivity } from "./types.js";
 import type { GuardTarget, SeatDeliveryGuard } from "./seat-delivery-guard.js";
@@ -2870,6 +2870,10 @@ export class SessionTransport {
       sessionName: input.sessionName,
       now,
     });
+    const permissionPending = latestHookPermissionPending(hookActivity, input.runtime);
+    if (hookActivity && permissionPending && this.hookFreshForSend(hookActivity, now)) {
+      return { ...hookActivity, state: "needs_input" };
+    }
     // Pane-only readiness never lets a hook authorise a send, but a fresh hook showing work or a
     // waiting person still refuses one, as it does for every other send.
     if (
@@ -2889,7 +2893,9 @@ export class SessionTransport {
       !input.readinessFromPaneOnly &&
       hookActivity &&
       hookActivity.evidenceSource === "runtime_hook" &&
-      hookActivity.stale !== true
+      hookActivity.stale !== true &&
+      hookActivity.reason !== "permission_request_pending" &&
+      hookActivity.reason !== "permission_prompt_cleared"
     ) {
       // Fresh hook (within the 15s send window): authoritative for any state.
       if (this.hookFreshForSend(hookActivity, now)) {
@@ -2950,6 +2956,9 @@ export class SessionTransport {
       (hookActivity.state === "running" || hookActivity.state === "needs_input")
     ) {
       return hookActivity;
+    }
+    if (probe.state === "unknown" && permissionPending) {
+      return { ...probe, state: "needs_input", reason: "permission_request_unverified" };
     }
     // A latest hook saying the seat waits on a person (approval, picker or elicitation) stays positive
     // picker evidence past the send window, and past the store's freshness window: nothing newer was

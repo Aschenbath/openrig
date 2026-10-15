@@ -3,7 +3,7 @@ import Database from "better-sqlite3";
 import { readClaudeSelfReportEvidence } from "../src/adapters/claude-code-adapter.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { migrate } from "../src/db/migrate.js";
-import { CLAUDE_ACTIVITY_RUNG_INVENTORY } from "../src/domain/activity-taxonomy.js";
+import { CLAUDE_ACTIVITY_RUNG_INVENTORY, CODEX_ACTIVITY_RUNG_INVENTORY } from "../src/domain/activity-taxonomy.js";
 import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { buildExecutionView } from "../src/domain/execution-view.js";
@@ -56,10 +56,10 @@ describe("claimed work waiting on human input (#331)", () => {
 
   afterEach(() => { db.close(); vi.useRealTimers(); vi.unstubAllEnvs(); });
 
-  function hook(hookEvent: string, subtype: string | null = null) {
-    const recorded = hooks.recordHookEvent({ runtime: "claude-code", sessionName: SESSION, nodeId: NODE, hookEvent, subtype, occurredAt: new Date().toISOString() });
+  function hook(hookEvent: string, subtype: string | null = null, runtime = "claude-code") {
+    const recorded = hooks.recordHookEvent({ runtime, sessionName: SESSION, nodeId: NODE, hookEvent, subtype, occurredAt: new Date().toISOString() });
     if (!recorded.ok) throw new Error(recorded.code);
-    const evidence = evidenceFromHookActivity({ seatNodeId: NODE, sessionName: SESSION, runtime: "claude-code", activity: recorded.activity, seq: ++seq });
+    const evidence = evidenceFromHookActivity({ seatNodeId: NODE, sessionName: SESSION, runtime, activity: recorded.activity, seq: ++seq });
     if (evidence) activity.reportEvidence(evidence);
   }
 
@@ -113,6 +113,29 @@ describe("claimed work waiting on human input (#331)", () => {
     status = "busy";
     report();
     expect(queue.getByIdOrThrow(id).pickup?.state).toBe("working");
+  });
+
+  it("keeps a confirmed Codex request out of pickup stalls until a fresh pane clear", async () => {
+    const id = await claimed();
+    db.prepare("UPDATE nodes SET runtime = 'codex' WHERE id = ?").run(NODE);
+    let visible = true;
+    activity = new SeatActivityService({ tmux: { readPaneLastActivity: async () => null }, defaultWindowSeconds: 3,
+      permissionPromptReader: async () => visible });
+    activity.declareRungInventory({ seatNodeId: NODE, sessionName: SESSION }, CODEX_ACTIVITY_RUNG_INVENTORY);
+    ps = new PsProjectionService({ db, seatActivity: activity, agentActivity: hooks });
+    hook("PermissionRequest", null, "codex");
+    advance(4); // Codex's confirmation probe waits for automatic review to settle.
+    await activity.observeSeat(SESSION);
+    expect(queue.getByIdOrThrow(id).pickup?.state).toBe("needs-input");
+    expect(attention()).toBe(1);
+    expect((await sweep()).outcome).toBe("clean");
+
+    visible = false;
+    advance(1);
+    await activity.observeSeat(SESSION);
+    expect(queue.getByIdOrThrow(id).pickup?.state).toBe("stalled-after-claim");
+    expect(attention()).toBe(0);
+    expect((await sweep()).findings).toContainEqual(expect.objectContaining({ kind: "stalled-after-claim", qitemId: id, action: "created" }));
   });
 
   it.each([false, true])("closes a false stall and detects recurrence without fabricated queue progress (archived=%s)", async archived => {
