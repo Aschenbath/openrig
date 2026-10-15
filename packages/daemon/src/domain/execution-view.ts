@@ -1167,6 +1167,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
       const pickup = derivePickup({
         lastMeaningfulAt: lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
         activity: activity?.activity, needsInput: activity?.needsInput.count,
+        needsInputReason: activity?.needsInput.reason,
         state: r.state,
         claimedAt: r.claimed_at,
         lastHeartbeat: r.last_heartbeat,

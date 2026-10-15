@@ -129,6 +129,20 @@ and the row records `failed:wake not retained: <reason>`. Startup reconciles
 and drains intents left pending by a crash once (`startup.ts:2361`–`2362`).
 `maybeNudge` remains only as the path for a repository with no outbox.
 
+Pickup receipts are derived by `queue-pickup.ts` for queue reads, the pickup
+view and the execution view. A claimed item in progress whose owner's activity oracle
+reports outstanding input reads `needs-input`, with the reason in
+`pickup.evidence`, regardless of working/idle activity or claim age. This does
+not change the stored queue state or count as task progress. The pickup stall
+check resumes when the oracle clears the input; unanswered prompts do not age
+out. The waiting view suspends the pickup backstop while retaining any explicit
+closure deadline, and attention surfaces still show the outstanding prompt.
+Unclaimed, blocked and terminal items retain their existing receipt semantics.
+The sweep retires an existing stall finding with a specific input-wait receipt;
+that automatic closure does not suppress a later genuine stall. Manual recovery
+dispositions remain authoritative. New findings use the retirement transition
+as part of their deterministic ID, without adding progress to the work item.
+
 The standing detector in `queue-stuck-sweep.ts` creates findings through the
 queue repository, with `evidenceRef: rig queue show <source-qitem-id>`
 (`queue-stuck-sweep.ts:605`) pointing to the underlying durable work row. This
