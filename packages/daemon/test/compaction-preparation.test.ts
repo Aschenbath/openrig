@@ -19,7 +19,7 @@ function fixture(manualPrepWaitMs=1000){
  let onSleep:(()=>Promise<void>)|undefined;
  const db={prepare:()=>({get:()=>undefined,all:()=>[]})} as any;
  const writes:string[]=[],keys:string[][]=[];
- const policy={enabled:true,thresholdPercent:80,preCompactInstruction:'Write a restore map.',compactInstruction:'',messageInline:'',messageFilePath:'',postRestoreAuditInstruction:''};
+ const policy={preparationRoot:'',enabled:true,thresholdPercent:80,preCompactInstruction:'Write a restore map.',compactInstruction:'',messageInline:'',messageFilePath:'',postRestoreAuditInstruction:''};
  const tmux={probeSession:vi.fn(async()=>({state:'present'})),sendText:vi.fn(async(_:string,text:string)=>{writes.push(text);return{ok:true};}),sendKeys:vi.fn(async(_:string,k:string[])=>{keys.push(k);return{ok:true};})};
  const guard=new SeatDeliveryGuard(db,()=>({nodeId:'node-one',session:seat,pane:'%1',occupant:generation}));
  Object.assign(tmux,{deliveryGuard:guard});
@@ -456,4 +456,64 @@ it('legacy fallback parent is created before asking the seat to edit its temp fi
  expect(statSync(dirname(a.mapPath)).isDirectory()).toBe(true);
  writeFileSync(a.mapPath+'.tmp',`# legacy map\n${a.marker}\n`);
  await f.e.maybeAutoCompact(input);expect(compacts(f)).toHaveLength(1);
+});
+
+
+for (const mode of ['manual', 'automatic'] as const) it(`configured preparation root: ${mode} publishes outside the launch workspace`, async () => {
+ const f=fixture(),cwd=join(f.home,'denied launch directory'),root=join(f.home,'allowed maps');
+ mkdirSync(cwd);f.policy.preparationRoot=root;
+ // A writable cwd is still selected away from: POSIX writability cannot prove Claude permission.
+ mkdirSync(join(cwd,'.claude'));writeFileSync(join(cwd,'.claude','settings.json'),JSON.stringify({permissions:{deny:[`Edit(${cwd}/**)`]}}));
+ if(mode==='manual'){
+  f.onSleep(async()=>{stageMap(f);});
+  expect((await routeFixture(f,cwd)()).status).toBe(200);
+ }else{
+  await f.e.maybeAutoCompact({...input,cwd});stageMap(f);
+  await f.e.maybeAutoCompact({...input,cwd});
+ }
+ const a=f.e.getPreparationState(seat)!;
+ expect(a.mapPath).toBe(join(root,seat,a.attemptId,'RESTORE-MAP.md'));
+ expect(readFileSync(join(root,'.gitignore'),'utf8')).toBe('*\n');
+ expect(existsSync(join(cwd,'.openrig'))).toBe(false);
+ expect(readFileSync(a.mapPath,'utf8')).toContain(a.marker);
+ expect(existsSync(a.mapPath+'.tmp')).toBe(false);
+ expect(compacts(f)).toHaveLength(1);
+ expect(f.writes[0]).toContain(JSON.stringify(a.mapPath+'.tmp'));
+});
+
+it('configured preparation root: stays bound to the attempt while later seats use new settings',async()=>{
+ const f=fixture(),root=join(f.home,'maps');f.policy.preparationRoot=root;
+ await f.e.maybeAutoCompact(input);const first=f.e.getPreparationState(seat)!;
+ f.policy.preparationRoot=join(f.home,'new maps');
+ await f.e.maybeAutoCompact({...input,sessionName:'sibling@demo'});
+ expect(f.e.getPreparationState('sibling@demo')!.mapPath).toContain(join(f.policy.preparationRoot,'sibling@demo'));
+ expect(f.e.getPreparationState(seat)!.mapPath).toBe(first.mapPath);
+ stageMap(f);await f.e.maybeAutoCompact(input);
+ expect(readFileSync(first.mapPath,'utf8')).toContain(first.marker);
+});
+
+for(const kind of ['file','ignore','symlink'] as const) it(`configured preparation root: ${kind} conflict stops without fallback or rewriting`,async()=>{
+ const f=fixture(),root=join(f.home,'maps'),cwd=join(f.home,'cwd');mkdirSync(cwd);
+ f.policy.preparationRoot=root;
+ if(kind==='file')writeFileSync(root,'keep');
+ else{
+  mkdirSync(root);
+  if(kind==='ignore')writeFileSync(join(root,'.gitignore'),'keep');
+  else{writeFileSync(join(f.home,'outside'),'keep');symlinkSync(join(f.home,'outside'),join(root,'.gitignore'));}
+ }
+ expect(await f.e.maybeAutoCompact({...input,cwd})).toEqual({triggered:false,reason:'preparation_directory_unavailable'});
+ expect(f.e.getPreparationState(seat)).toMatchObject({status:'stopped',reason:'preparation_directory_unavailable'});
+ expect(f.e.getPreparationState(seat)!.mapPath).toContain(root);
+ expect(f.writes).toHaveLength(0);
+ expect(existsSync(join(cwd,'.openrig'))).toBe(false);
+ expect(existsSync(join(f.home,'compaction'))).toBe(false);
+ expect(readFileSync(kind==='file'?root:join(root,'.gitignore'),'utf8')).toBe('keep');
+});
+
+it('configured preparation root: manual reports directory failure; explicit skip-map still works',async()=>{
+ const f=fixture(),root=join(f.home,'maps');writeFileSync(root,'keep');f.policy.preparationRoot=root;
+ expect(await f.e.triggerManualCompact(input,{operatorInitiated:true})).toMatchObject({triggered:false,reason:'preparation_directory_unavailable'});
+ expect(f.writes).toHaveLength(0);
+ expect((await f.e.triggerManualCompact(input,{operatorInitiated:true,skipMap:true})).triggered).toBe(true);
+ expect(readFileSync(root,'utf8')).toBe('keep');
 });

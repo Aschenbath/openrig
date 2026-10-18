@@ -455,6 +455,33 @@ remain shared.
 
 **Terminal seats** (`builtin:terminal`) get no agent or profile layers and no startup proof.
 
+### Claude compaction preparation directory
+
+Managed Claude compaction asks the seat to write a restore map before `/compact`. By default,
+OpenRig uses `<cwd>/.openrig/compaction/preparation/`, falling back to its instance home when
+that directory cannot be prepared. A filesystem write check cannot establish whether Claude's
+file-edit permissions allow the seat to write there.
+
+If the launch workspace is denied by Claude's permissions, select an absolute preparation root:
+
+```sh
+rig config set policies.claude_compaction.preparation_root /absolute/path/to/restore-maps
+```
+
+Grant the seat file-edit access to that root in its Claude configuration. OpenRig does not change
+Claude permissions; choose a directory outside any matching deny rule. The corresponding environment
+variable is `OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT`.
+
+New manual and automatic attempts use `<root>/<session>/<attempt-id>/RESTORE-MAP.md`; an in-flight
+attempt keeps its original path. The root gets an exclusive `.gitignore` containing `*`, and the
+daemon publishes the marked `.tmp` file with an atomic rename. Use a dedicated root: a conflicting
+ignore file or an unwritable configured directory stops preparation with
+`preparation_directory_unavailable`, visible in `rig compact <session> --state`, without choosing
+another location. Fix the directory and explicitly retry. `--skip-map` still skips the map once.
+
+Reset with `rig config reset policies.claude_compaction.preparation_root` to restore the default.
+The setting applies to new attempts without restarting the daemon.
+
 ### Codex compaction and sizing
 
 OpenRig's managed compaction is for Claude Code seats only, by design. That covers `rig compact`, the

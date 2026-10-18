@@ -126,6 +126,7 @@ export type EnforcerSkipReason =
   | "preparation_pending"
   | "preparation_incomplete"
   | "preparation_stopped"
+  | "preparation_directory_unavailable"
   | "occupant_generation_unavailable"
   | "no_pending_stage";
 
@@ -654,7 +655,7 @@ export class ClaudeCompactionEnforcer {
     if (attempt?.status === "stopped") return { triggered: false, reason: "preparation_stopped" };
     if (!attempt) {
       attempt = this.beginPreparation(input, "automatic");
-      if (attempt.status === "stopped") return { triggered: false, reason: "occupant_generation_unavailable" };
+      if (attempt.status === "stopped") return { triggered: false, reason: attempt.reason === "preparation_directory_unavailable" ? attempt.reason : "occupant_generation_unavailable" };
     }
     if (attempt.status === "sending") {
       await this.deliverPreparation(input, attempt);
@@ -707,7 +708,7 @@ export class ClaudeCompactionEnforcer {
     if (input.runtime !== "claude-code") return this.recordManualFailure(input.sessionName, "runtime_filter");
     if (input.usedPercentage == null) return this.recordManualFailure(input.sessionName, "no_usage_data");
     const attempt = this.beginPreparation(input, "manual", opts.skipMap === true);
-    if (attempt.status === "stopped") return this.recordManualFailure(input.sessionName, "occupant_generation_unavailable");
+    if (attempt.status === "stopped") return this.recordManualFailure(input.sessionName, attempt.reason ?? "occupant_generation_unavailable");
     const failed = (reason: string): ManualCompactionOutcome => {
       // A cancelled request may settle after an explicit retry. Its receipt must
       // not stop or overwrite the successor attempt's state.
@@ -749,25 +750,29 @@ export class ClaudeCompactionEnforcer {
 
   private beginPreparation(input: EnforcerInput, mode: "automatic" | "manual", skipMap = false): PreparationAttempt {
     const attemptId = randomUUID();
+    const startedAt = this.now();
+    const policy = this.settingsStore.resolveClaudeCompactionPolicy();
+    const preparationRoot = policy.preparationRoot || null;
     const fallbackMapPath = path.join(this.openrigHome, "compaction", "preparation", sanitizeSessionKey(input.sessionName), attemptId, "RESTORE-MAP.md");
     const occupantGeneration = this.resolveOccupantGeneration?.(input.sessionName)
       ?? this.sessionTransport.deliveryGuard?.maybeTarget(input.sessionName)?.occupant ?? null;
     const attempt: PreparationAttempt = {
       attemptId, occupantGeneration, mode, status: "sending", delivery: "pending", sends: 0,
-      deadlineAt: mode === "manual" ? this.now() + this.manualPrepWaitMs : null,
-      mapPath: fallbackMapPath,
+      deadlineAt: mode === "manual" ? startedAt + this.manualPrepWaitMs : null,
+      mapPath: preparationRoot ? path.join(preparationRoot, sanitizeSessionKey(input.sessionName), attemptId, "RESTORE-MAP.md") : fallbackMapPath,
       marker: `<!-- openrig-compaction-complete ${JSON.stringify({ attemptId, session: input.sessionName, occupantGeneration })} -->`,
-      policyWasEnabled: this.settingsStore.resolveClaudeCompactionPolicy().enabled,
+      policyWasEnabled: policy.enabled,
       controller: new AbortController(),
     };
     this.pendingPreCompactPrep.set(input.sessionName, attempt);
     // A map cannot satisfy an unknown occupant. Keep the failed attempt visible and
     // disarmed; explicit skip-map still bypasses only the artifact prerequisite.
     if (occupantGeneration === null && !skipMap) this.stopPreparation(input.sessionName, "occupant_generation_unavailable");
-    if (attempt.status !== "stopped" && input.cwd && path.isAbsolute(input.cwd)) {
-      // Keep writes inside Claude's existing edit workspace, without adding permissions.
-      // This folder holds private working context; ignore its entire contents in Git.
-      const root = path.join(input.cwd, ".openrig", "compaction");
+    if (skipMap) return attempt;
+    if (attempt.status !== "stopped" && (preparationRoot || (input.cwd && path.isAbsolute(input.cwd)))) {
+      // An explicit root can be outside a workspace denied by Claude file permissions.
+      // The daemon cannot prove those permissions; the operator grants access to this root.
+      const root = preparationRoot ?? path.join(input.cwd!, ".openrig", "compaction");
       try {
         fs.mkdirSync(root, { recursive: true });
         const ignorePath = path.join(root, ".gitignore");
@@ -786,11 +791,15 @@ export class ClaudeCompactionEnforcer {
             }
           } finally { fs.closeSync(fd); }
         }
-        const parent = path.join(root, "preparation", sanitizeSessionKey(input.sessionName), attemptId);
+        const parent = path.join(preparationRoot ?? path.join(root, "preparation"), sanitizeSessionKey(input.sessionName), attemptId);
         fs.mkdirSync(parent, { recursive: true });
         fs.accessSync(parent, fs.constants.W_OK | fs.constants.X_OK);
         attempt.mapPath = path.join(parent, "RESTORE-MAP.md");
-      } catch { /* Preserve the existing instance-home path for legacy or unwritable workspaces. */ }
+      } catch {
+        // An explicit location is a permission choice: never silently move it back into
+        // the denied workspace or instance home. Keep the selected path visible in --state.
+        if (preparationRoot) this.stopPreparation(input.sessionName, "preparation_directory_unavailable");
+      }
     }
     if (attempt.status !== "stopped" && attempt.mapPath === fallbackMapPath) {
       // The cwd path already creates its parent. Prepare the legacy fallback too;
