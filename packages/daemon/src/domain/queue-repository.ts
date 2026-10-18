@@ -3915,7 +3915,9 @@ export class QueueRepository {
     this.receiptNotesStatement ??= this.db.prepare(
       `SELECT qitem_id, transition_note FROM queue_transitions
         WHERE qitem_id IN (SELECT value FROM json_each(?)) AND (transition_note LIKE 'slack-owner-notification-posted %'
-                             OR transition_note LIKE 'slack-owner-notification-transport-failed %')
+                             OR transition_note LIKE 'slack-owner-notification-transport-failed %'
+                             OR transition_note LIKE 'matrix-owner-notification-posted %'
+                             OR transition_note LIKE 'matrix-owner-notification-transport-failed %')
         ORDER BY transition_id DESC`,
     );
     const notes = new Map<string, string[]>();
@@ -3932,9 +3934,9 @@ export class QueueRepository {
     const currentNotes = episode
       ? notes.filter((note) => note.split(/\s+/).includes(`notification_key=${episode.notificationKey}`))
       : notes;
-    const posted = currentNotes.find((note) => note.startsWith("slack-owner-notification-posted "));
+    const posted = currentNotes.find((note) => note.startsWith("slack-owner-notification-posted ") || note.startsWith("matrix-owner-notification-posted "));
     if (posted) return { outcome: "posted", detail: posted, episode };
-    const failed = currentNotes.find((note) => note.startsWith("slack-owner-notification-transport-failed "));
+    const failed = currentNotes.find((note) => note.startsWith("slack-owner-notification-transport-failed ") || note.startsWith("matrix-owner-notification-transport-failed "));
     if (failed) return { outcome: "transport-failed", detail: failed, episode };
     const startedAt = episode?.startedAt ?? item.tsCreated;
     const gatewayRouted = episode !== null || item.lastNudgeResult?.startsWith("gateway-owned") === true;
