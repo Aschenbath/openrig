@@ -1,7 +1,7 @@
 # Matrix interactive chat
 
 OpenRig connects as a bot user with an access token, using Matrix client-server v3 APIs and
-outbound `/sync` long polling. No public callback URL or Application Service is required.
+inbound `/sync` long polling. No public callback URL or Application Service is required.
 Use an **unencrypted** room: this connector does not implement end-to-end encryption.
 
 Create a bot account and obtain its access token on your homeserver. Then configure it:
@@ -37,17 +37,20 @@ conversation's thread. Each structured question gets its own message in the thre
 1️⃣–4️⃣ options. React on that question message to answer. The exact event ID, room and asked
 human determine which answer is recorded; other reactions are ignored. Completed answers
 return through the existing queue and human reply resolver.
+Clients using ordinary reply relations can reply to a root, question or later thread message;
+Matrix's quoted reply fallback is removed before the reply reaches the seat.
 
 Enable seeds existing alerts as history, matching Slack's enable behavior. First sync establishes
 an initial floor, so old room messages are not imported. Later pages commit their `since` token
 only after admitted events land. Failed pages retry with backoff; invalid tokens stop polling
-and appear in status. A limited incremental timeline reports a gap and retains the cursor:
-history backfill is not implemented yet. Ask the maintainer to investigate such a gap rather
-than deleting the cursor and silently discarding unread events.
+and appear in status. Limited incremental timelines backfill the gap through paginated
+`/messages` calls before importing the live timeline. A failed backfill or stalled pagination
+retains the cursor for retry. Automatic outbound alerts start after the initial sync floor is
+persisted, so a quick reply to a newly posted alert is not mistaken for room history.
 
-This MVP supports text, notice and emote messages, threads and structured reaction answers.
-It does not support encrypted rooms, attachments, edits, redactions, reaction removal or history
-backfill. Matrix readiness is passive and reports external verification as indeterminate;
+The connector supports text, notice and emote messages, threads and structured reaction answers.
+It does not support encrypted rooms, attachments, edits, redactions or reaction removal.
+Matrix readiness is passive and reports external verification as indeterminate;
 `rig matrix verify` explicitly checks identity and can exercise room membership and sending.
 Slack delivery preference deferrals/digests are not implemented in the Matrix polling driver.
 Thread maps, per-part sends and sync cursors are atomic JSON files under `$OPENRIG_HOME/state`;

@@ -40,12 +40,13 @@ export function parseMatrixBinding(spec: string): {
 export function validateConfig(cfg: MatrixConnectorConfig): void {
   if (typeof cfg.enabled !== "boolean") throw new Error("Matrix enabled must be a boolean");
   if (cfg.homeserverUrl !== null) {
+    if (typeof cfg.homeserverUrl !== "string" || !cfg.homeserverUrl.trim()) throw new Error("Matrix homeserver URL must be a non-empty string or null");
     const url = new URL(cfg.homeserverUrl);
     if (!["https:", "http:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
       throw new Error("Matrix homeserver URL must be an HTTP(S) URL without credentials, query or fragment");
     }
   }
-  if (cfg.defaultRoom !== null && !ROOM_PATTERN.test(cfg.defaultRoom)) throw new Error("Matrix default room must be !room:server or #alias:server");
+  if (cfg.defaultRoom !== null && (typeof cfg.defaultRoom !== "string" || !ROOM_PATTERN.test(cfg.defaultRoom))) throw new Error("Matrix default room must be !room:server or #alias:server");
   for (const key of ["deviceId", "secretsEnvFile"] as const) {
     if (cfg[key] !== null && (typeof cfg[key] !== "string" || !cfg[key]!.trim())) throw new Error(`Matrix ${key} must be a non-empty string or null`);
   }

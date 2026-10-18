@@ -46,25 +46,30 @@ function buildConfiguredMatrixWire(opts: MatrixWireOpts): GatewayWire {
   let inbound: MatrixInbound | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let live = false;
+  let syncEstablished = false;
   const seen = new SeenStore(path.join(opts.home, "state", "matrix-outbound-seen.jsonl"));
   const map = new ThreadSeatMap(opts.home);
   const ports = makeQueuePorts(opts.queueRepo, { loadHumanRegistry: () => loadHumanRegistry(opts.home), connectorKind: "matrix" });
   const client = ready ? new MatrixClient({ homeserverUrl: cfg.homeserverUrl!, accessToken: token!, deviceId: cfg.deviceId ?? undefined }, { fetchImpl: opts.fetchImpl }) : undefined;
   const rooms = new Map<string, string>();
   const resolvingRooms = new Map<string, Promise<string>>();
+  const checkRoom = async (roomId: string): Promise<string> => {
+    const state = await client!.getRoomState(roomId, signal.signal);
+    if (state.some((event) => event.type === "m.room.encryption")) throw new Error("Matrix encrypted rooms are unsupported; use an unencrypted bot room");
+    return roomId;
+  };
   const joinRoom = async (room: string): Promise<string> => {
     const cached = rooms.get(room);
     if (cached) return cached;
     const joined = await client!.joinRoom(room, signal.signal);
     if (!joined.room_id) throw new Error("Matrix join response is missing room_id");
-    const state = await client!.getRoomState(joined.room_id, signal.signal);
-    if (state.some((event) => event.type === "m.room.encryption")) throw new Error("Matrix encrypted rooms are unsupported; use an unencrypted bot room");
+    await checkRoom(joined.room_id);
     rooms.set(room, joined.room_id);
     return joined.room_id;
   };
   const resolveRoom = (room: string): Promise<string> => {
     const cached = rooms.get(room);
-    if (cached) return Promise.resolve(cached);
+    if (cached) return checkRoom(cached); // Encryption can be enabled after the initial join.
     const pending = resolvingRooms.get(room);
     if (pending) return pending;
     const task = joinRoom(room).finally(() => resolvingRooms.delete(room));
@@ -79,6 +84,20 @@ function buildConfiguredMatrixWire(opts: MatrixWireOpts): GatewayWire {
   };
   const outbound = client ? new MatrixOutboundDriver({
     home: opts.home, client, map, signal: signal.signal,
+    shouldDeliver: (payload) => {
+      // Check inside the driver's serial delivery lane: replay and the sweep
+      // may enqueue the same episode before the first post writes its receipt.
+      const key = payload.notificationKey ?? payload.qitemId;
+      if (payload.qitemId) {
+        const row = opts.queueRepo.getById(payload.qitemId);
+        if (opts.queueRepo.transitionLog.hasOwnerNotificationReceipt(payload.qitemId, key)
+          || (row && !["pending", "in-progress", "blocked"].includes(row.state) && payload.ownerNotificationKind !== "human-decision-resolved")) {
+          seen.mark(key, "already-delivered-or-closed");
+          return false;
+        }
+      }
+      return true;
+    },
     roomFor: async (ref) => {
       const registry = loadHumanRegistry(opts.home);
       const human = registry.ok ? registry.entities.find((h) => h.address === ref || h.entityId === ref) : undefined;
@@ -101,16 +120,6 @@ function buildConfiguredMatrixWire(opts: MatrixWireOpts): GatewayWire {
     deliver: outbound ? async (decision) => {
       const payload = decision.payload as import("./outbound-driver.js").MatrixPostPayload;
       const key = payload?.notificationKey ?? payload?.qitemId;
-      // A second producer for the same notification episode must not post a
-      // second ask, and replaying a closed ask must not revive its human gate.
-      if (payload?.qitemId) {
-        const row = opts.queueRepo.getById(payload.qitemId);
-        if (opts.queueRepo.transitionLog.hasOwnerNotificationReceipt(payload.qitemId, key)
-          || (row && !["pending", "in-progress", "blocked"].includes(row.state) && payload.ownerNotificationKind !== "human-decision-resolved")) {
-          seen.mark(key, "already-delivered-or-closed");
-          return { ok: true };
-        }
-      }
       try { return await outbound.deliver(decision); }
       catch (error) {
         if (payload?.qitemId && opts.queueRepo.getById(payload.qitemId)) {
@@ -143,6 +152,7 @@ function buildConfiguredMatrixWire(opts: MatrixWireOpts): GatewayWire {
   };
   if (client) inbound = new MatrixInbound({
     home: opts.home, client, map, queue: ports, destination: cfg.inboundDestination, resolveSender: sender,
+    onSync: () => { if (!syncEstablished) { syncEstablished = true; void sweep(); } },
     recordHumanAnswer: (input) => opts.queueRepo.recordHumanAnswer(input), resolveHumanReply: opts.resolveHumanReply,
     prepareRooms: async () => {
       const registry = loadHumanRegistry(opts.home);
@@ -157,15 +167,13 @@ function buildConfiguredMatrixWire(opts: MatrixWireOpts): GatewayWire {
     startServices: () => {
       if (live || !ready) return;
       live = true;
-      wire.startServices?.();
       inbound?.start();
-      void sweep();
-      timer = setInterval(() => void sweep(), opts.intervalMs ?? 30000);
+      timer = setInterval(() => { if (syncEstablished) void sweep(); }, opts.intervalMs ?? 30000);
       timer.unref();
     },
     stop: () => { signal.abort(); if (timer) clearInterval(timer); void inbound?.stop(); wire.stop(); },
     status: () => ({ platform: "matrix", configured: !!token && !!cfg.homeserverUrl, enabled: cfg.enabled,
-      outboundReady: ready, inboundReady: ready, inbound: inbound?.status() ?? { state: "not-configured" },
+      outboundReady: ready && !signal.signal.aborted, inboundReady: inbound?.status().state === "connected", inbound: inbound?.status() ?? { state: "not-configured" },
       pendingDispatches: new DispatchBuffer(opts.home).pending().filter((d) => accepts(d.entityBindingRef)).length }),
   };
 }

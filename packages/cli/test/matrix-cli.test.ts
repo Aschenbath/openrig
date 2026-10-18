@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { matrixCommand, type MatrixDeps } from "../src/commands/matrix.js";
@@ -49,5 +49,44 @@ describe("rig matrix", () => {
     await run(["disable", "--actor", "operator@kernel", "--reason", "maintenance"], deps);
     expect(post.mock.calls.map((call) => call[0])).toEqual(["/api/gateway/matrix/enable", "/api/gateway/matrix/disable"]);
     expect(post.mock.calls[1][1]).toMatchObject({ reason: "maintenance" });
+  });
+  it("reads a token file and preserves configuration on incremental setup", async () => {
+    const tokenFile = path.join(home, "bot-token");
+    writeFileSync(tokenFile, "file-token\n");
+    await run(["setup", "--homeserver-url", "https://matrix.example.org", "--access-token-file", tokenFile]);
+    await run(["setup", "--default-room", "!room:example.org"]);
+    expect(process.exitCode).toBe(0);
+    const cfg = surface.loadConfig(home);
+    expect(cfg).toMatchObject({ homeserverUrl: "https://matrix.example.org", defaultRoom: "!room:example.org" });
+    expect(surface.resolveAccessToken({ envFile: cfg.secretsEnvFile, env: {} })).toBe("file-token");
+    expect(logs.join("\n")).not.toContain("file-token");
+  });
+  it("rejects conflicting credentials and an empty token without saving configuration", async () => {
+    await run(["setup", "--access-token", "token", "--access-token-file", "unused"]);
+    expect(process.exitCode).toBe(1);
+    expect(logs.join("\n")).toContain("Choose --access-token or --access-token-file");
+    logs = []; process.exitCode = 0;
+    await run(["setup", "--access-token", ""]);
+    expect(process.exitCode).toBe(1);
+    expect(surface.loadConfig(home)).toEqual(surface.DEFAULT_CONFIG);
+  });
+  it("refuses an encrypted room on join-only verification without sending a test", async () => {
+    surface.saveConfig({ ...surface.DEFAULT_CONFIG, homeserverUrl: "https://matrix.example.org", defaultRoom: "!room:example.org", secretsEnvFile: surface.saveAccessToken("test-token", home) }, home);
+    const fetchImpl = vi.fn().mockImplementation(async (url: string) => url.endsWith("whoami") ? json({ user_id: "@bot:example.org" })
+      : url.includes("/join/") ? json({ room_id: "!room:example.org" }) : json([{ type: "m.room.encryption", state_key: "", content: {} }]));
+    await run(["verify", "--join"], { fetchImpl });
+    expect(process.exitCode).toBe(1);
+    expect(logs.join("\n")).toContain("encrypted rooms are unsupported");
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+  it("surfaces token expiry and daemon refusals as failed commands", async () => {
+    surface.saveConfig({ ...surface.DEFAULT_CONFIG, homeserverUrl: "https://matrix.example.org", secretsEnvFile: surface.saveAccessToken("test-token", home) }, home);
+    await run(["verify"], { fetchImpl: async () => new Response(JSON.stringify({ errcode: "M_UNKNOWN_TOKEN", error: "expired" }), { status: 401 }) });
+    expect(process.exitCode).toBe(1);
+    expect(logs.join("\n")).toContain("rig matrix setup");
+    logs = []; process.exitCode = 0;
+    await run(["enable"], { clientFactory: () => ({ get: vi.fn(), post: vi.fn().mockResolvedValue({ status: 503, data: { ok: false } }) }) });
+    expect(process.exitCode).toBe(1);
+    expect(logs.join("\n")).toContain("HTTP 503");
   });
 });

@@ -15,6 +15,7 @@ export interface SyncResponse {
   next_batch: string;
   rooms?: { join?: Record<string, { timeline?: { events?: MatrixEvent[]; limited?: boolean; prev_batch?: string } }> };
 }
+export interface MessagesResponse { chunk: MatrixEvent[]; end?: string }
 export class MatrixApiError extends Error {
   constructor(public readonly status: number, public readonly errcode: string, detail: string, public readonly retryAfterMs?: number) {
     super(`Matrix ${errcode} (HTTP ${status}): ${detail}`);
@@ -47,6 +48,7 @@ export class MatrixClient {
   }
   private async request<T>(method: string, endpoint: string, body?: unknown, signal?: AbortSignal, timeoutMs = 15000): Promise<T> {
     for (let attempt = 0; ; attempt++) {
+      signal?.throwIfAborted();
       const timeout = AbortSignal.timeout(timeoutMs);
       const res = await (this.deps.fetchImpl ?? fetch)(this.baseUrl + endpoint, {
         method, headers: { Authorization: `Bearer ${this.config.accessToken}`, "Content-Type": "application/json" },
@@ -54,10 +56,16 @@ export class MatrixClient {
         signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
         redirect: "error", // Never forward the bot token to another origin via a redirect.
       });
-      let json: Record<string, unknown>;
+      let json: Record<string, unknown> | unknown[];
       try { json = await res.json() as Record<string, unknown>; }
       catch { throw new MatrixApiError(res.status, "M_INVALID_RESPONSE", "homeserver returned a non-JSON response"); }
-      if (!json || typeof json !== "object" || Array.isArray(json)) throw new MatrixApiError(res.status, "M_INVALID_RESPONSE", "homeserver returned an invalid JSON response");
+      if (!json || typeof json !== "object") throw new MatrixApiError(res.status, "M_INVALID_RESPONSE", "homeserver returned an invalid JSON response");
+      // /rooms/{roomId}/state returns an array; errors and other endpoints
+      // return objects. Validate each successful endpoint's shape below.
+      if (Array.isArray(json)) {
+        if (res.ok) return json as T;
+        throw new MatrixApiError(res.status, "M_INVALID_RESPONSE", "homeserver returned an invalid error response");
+      }
       if (res.ok && !json.errcode) return json as T;
       const code = typeof json.errcode === "string" ? json.errcode : "M_HTTP_ERROR";
       if (res.status === 401 || code === "M_UNKNOWN_TOKEN" || code === "M_MISSING_TOKEN") throw new MatrixTokenError(res.status, code);
@@ -100,13 +108,25 @@ export class MatrixClient {
     if (typeof result.user_id !== "string" || !result.user_id) throw new Error("Matrix whoami response is missing user_id");
     return result;
   }
-  joinRoom(roomIdOrAlias: string, signal?: AbortSignal): Promise<{ room_id: string }> {
-    return this.request("POST", `/join/${encodeURIComponent(roomIdOrAlias)}`, {}, signal);
+  async joinRoom(roomIdOrAlias: string, signal?: AbortSignal): Promise<{ room_id: string }> {
+    const result = await this.request<{ room_id: string }>("POST", `/join/${encodeURIComponent(roomIdOrAlias)}`, {}, signal);
+    if (typeof result.room_id !== "string" || !result.room_id.startsWith("!")) throw new Error("Matrix join response is missing room_id");
+    return result;
   }
-  getJoinedRooms(signal?: AbortSignal): Promise<{ joined_rooms: string[] }> {
-    return this.request("GET", "/joined_rooms", undefined, signal);
+  async getJoinedRooms(signal?: AbortSignal): Promise<{ joined_rooms: string[] }> {
+    const result = await this.request<{ joined_rooms: string[] }>("GET", "/joined_rooms", undefined, signal);
+    if (!Array.isArray(result.joined_rooms) || result.joined_rooms.some((room) => typeof room !== "string")) throw new Error("Matrix joined_rooms response is invalid");
+    return result;
   }
-  getRoomState(roomId: string, signal?: AbortSignal): Promise<Array<{ type: string; state_key: string; content: Record<string, unknown> }>> {
-    return this.request("GET", `/rooms/${encodeURIComponent(roomId)}/state`, undefined, signal);
+  async getRoomState(roomId: string, signal?: AbortSignal): Promise<Array<{ type: string; state_key: string; content: Record<string, unknown> }>> {
+    const result = await this.request<Array<{ type: string; state_key: string; content: Record<string, unknown> }>>("GET", `/rooms/${encodeURIComponent(roomId)}/state`, undefined, signal);
+    if (!Array.isArray(result) || result.some((event) => !event || typeof event.type !== "string" || !event.content || typeof event.content !== "object")) throw new Error("Matrix room state response is invalid");
+    return result;
+  }
+  async messages(roomId: string, opts: { from: string; to: string; signal?: AbortSignal }): Promise<MessagesResponse> {
+    const query = new URLSearchParams({ from: opts.from, to: opts.to, dir: "f", limit: "100" });
+    const result = await this.request<MessagesResponse>("GET", `/rooms/${encodeURIComponent(roomId)}/messages?${query}`, undefined, opts.signal);
+    if (!Array.isArray(result.chunk) || (result.end !== undefined && typeof result.end !== "string")) throw new Error("Matrix history response is invalid");
+    return result;
   }
 }

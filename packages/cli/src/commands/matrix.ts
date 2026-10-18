@@ -36,13 +36,13 @@ export function matrixCommand(deps: MatrixDeps = {}): Command {
           deviceId: opts.deviceId ?? current.deviceId, defaultRoom: opts.defaultRoom ?? current.defaultRoom,
           inboundDestination: opts.inboundDestination ?? current.inboundDestination, secretsEnvFile: opts.secretsEnvFile ?? current.secretsEnvFile };
         surface.validateConfig(next);
-        if (opts.accessToken && opts.accessTokenFile) throw new Error("Choose --access-token or --access-token-file");
+        if (opts.accessToken !== undefined && opts.accessTokenFile !== undefined) throw new Error("Choose --access-token or --access-token-file");
         const token = opts.accessTokenFile ? (await import("node:fs/promises")).readFile(opts.accessTokenFile, "utf8").then((text) => text.trim()) : opts.accessToken;
         const accessToken = await token;
         const result = await surface.runChannelOperation({ actor: resolveSenderSession() ?? opts.actor ?? SENDER_FALLBACK,
           provenance: "claimed:v1", reason: opts.reason, action: "configure", subject: "matrix", before: { digest: surface.channelStateDigest(current) },
           run: async () => {
-            if (accessToken) next.secretsEnvFile = surface.saveAccessToken(accessToken, deps.home, next.secretsEnvFile ?? undefined);
+            if (accessToken !== undefined) next.secretsEnvFile = surface.saveAccessToken(accessToken, deps.home, next.secretsEnvFile ?? undefined);
             const file = surface.saveConfig(next, deps.home);
             return { value: file, after: { digest: surface.channelStateDigest(next) }, effect: "applied" };
           } }, deps.home);
@@ -88,11 +88,12 @@ export function matrixCommand(deps: MatrixDeps = {}): Command {
             const identity = await api.whoami();
             let room = opts.room ?? cfg.defaultRoom;
             if ((opts.join || opts.sendTest) && !room) throw new Error("Set --room or configure --default-room");
+            if (room) surface.validateConfig({ ...cfg, defaultRoom: room });
             if (opts.join || (opts.sendTest && room.startsWith("#"))) room = (await api.joinRoom(room)).room_id;
-            if (opts.sendTest) {
+            if (opts.join || opts.sendTest) {
               const state = await api.getRoomState(room);
               if (state.some((event) => event.type === "m.room.encryption")) throw new Error("Matrix encrypted rooms are unsupported");
-              await api.sendMessage(room, "OpenRig Matrix connector verification.");
+              if (opts.sendTest) await api.sendMessage(room, "OpenRig Matrix connector verification.");
             }
             return { value: { ok: true, ...identity, room, testSent: !!opts.sendTest }, after: { ready: true }, effect: "observed" };
           } }, deps.home);

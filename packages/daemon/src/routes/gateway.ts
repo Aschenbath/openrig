@@ -83,7 +83,7 @@ export function gatewayRoutes(opts: {
           let seeded = 0;
           if (enabled && !cfg.enabled) {
             const registry = loadHumanRegistry(home);
-            if (!registry.ok) throw new HTTPException(503, { message: "Cannot seed Matrix delivery backlog: human registry unavailable" });
+            if (!registry.ok) throw new HTTPException(503, { res: c.json({ error: "human_registry_unavailable", message: `Cannot seed Matrix delivery backlog: ${registry.error}` }, 503) });
             const ports = makeQueuePorts(queueRepo!, { loadHumanRegistry: () => registry, connectorKind: "matrix" });
             const alerts = await ports.listHumanAlerts({ minimumLevel: "NOTICE" });
             const seen = new SeenStore(path.join(home, "state", "matrix-outbound-seen.jsonl"));

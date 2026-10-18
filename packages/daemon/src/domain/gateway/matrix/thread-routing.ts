@@ -5,8 +5,8 @@ export function routeMessage(map: ThreadSeatMap, roomId: string, event: MatrixEv
   destination: string; tags: string[]; conversationId?: string; human?: string;
 } {
   const relation = event.content["m.relates_to"];
-  const root = relation?.rel_type === "m.thread" ? relation.event_id : undefined;
-  const mapping = root ? map.resolveByThread(roomId, root) : null;
+  const root = relation?.rel_type === "m.thread" ? relation.event_id : relation?.["m.in_reply_to"]?.event_id;
+  const mapping = root ? map.resolveByEvent(roomId, root) : null;
   const tags = ["matrix", "inbound"];
   if (mapping) return { destination: mapping.seat, human: mapping.human, conversationId: mapping.conversationId, tags: [...tags, "thread", `reply-to:${mapping.conversationId}`] };
   return { destination: fallback, tags: [...tags, "unrouted-signal"] };

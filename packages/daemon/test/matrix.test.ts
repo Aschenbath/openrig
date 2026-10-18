@@ -2,17 +2,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { MatrixClient, MatrixApiError, MatrixTokenError, type FetchImpl, type MatrixEvent } from "./matrix-api.js";
-import { MatrixOutboundDriver, splitMessage, MESSAGE_CHUNK_BYTES } from "./outbound-driver.js";
-import { MatrixInbound } from "./inbound.js";
-import { ThreadSeatMap } from "./thread-seat-map.js";
-import { renderQuestion, reactionAnswer, OPTION_EMOJI } from "./reactions.js";
-import { routeMessage } from "./thread-routing.js";
-import { DEFAULT_CONFIG, loadConfig, saveConfig, parseMatrixBinding } from "./config.js";
-import { resolveAccessToken, saveAccessToken } from "./secrets.js";
-import { JsonStore } from "./state-store.js";
-import { parseBindingSpec, validateHumanFragment } from "../human-registry.js";
-import type { OutboundDecision } from "../protocol.js";
+import { MatrixClient, MatrixApiError, MatrixTokenError, type FetchImpl, type MatrixEvent } from "../src/domain/gateway/matrix/matrix-api.js";
+import { MatrixOutboundDriver, splitMessage, MESSAGE_CHUNK_BYTES } from "../src/domain/gateway/matrix/outbound-driver.js";
+import { MatrixInbound } from "../src/domain/gateway/matrix/inbound.js";
+import { ThreadSeatMap } from "../src/domain/gateway/matrix/thread-seat-map.js";
+import { renderQuestion, reactionAnswer, OPTION_EMOJI } from "../src/domain/gateway/matrix/reactions.js";
+import { routeMessage } from "../src/domain/gateway/matrix/thread-routing.js";
+import { DEFAULT_CONFIG, loadConfig, saveConfig, parseMatrixBinding } from "../src/domain/gateway/matrix/config.js";
+import { resolveAccessToken, saveAccessToken } from "../src/domain/gateway/matrix/secrets.js";
+import { JsonStore } from "../src/domain/gateway/matrix/state-store.js";
+import { parseBindingSpec, validateHumanFragment } from "../src/domain/gateway/human-registry.js";
+import type { OutboundDecision } from "../src/domain/gateway/protocol.js";
 
 let home: string;
 beforeEach(() => { home = mkdtempSync(path.join(tmpdir(), "matrix-test-")); });
@@ -80,6 +80,7 @@ describe("Matrix v3 client (hermetic fetch)", () => {
       if (url.endsWith("/account/whoami")) return response({ user_id: bot });
       if (url.endsWith("/joined_rooms")) return response({ joined_rooms: [room] });
       if (url.endsWith("/state")) return response([]);
+      if (url.includes("/send/")) return response({ event_id: "$sent" });
       return response({ room_id: room });
     });
     const client = api(fetchImpl);
@@ -91,6 +92,30 @@ describe("Matrix v3 client (hermetic fetch)", () => {
     expect(fetchImpl.mock.calls.at(-1)![0]).toContain("/sync?timeout=30000&since=token%26more");
     await client.sendReaction(room, "$event", "1️⃣");
     expect(JSON.parse(fetchImpl.mock.calls.at(-1)![1].body)).toEqual({ "m.relates_to": { rel_type: "m.annotation", event_id: "$event", key: "1️⃣" } });
+  });
+  it("rejects malformed endpoint responses before they can enter connector state", async () => {
+    const client = api(async () => response({}));
+    await expect(client.sendMessage(room, "hello")).rejects.toThrow("missing event_id");
+    await expect(client.whoami()).rejects.toThrow("missing user_id");
+    await expect(client.joinRoom(room)).rejects.toThrow("missing room_id");
+    await expect(client.getJoinedRooms()).rejects.toThrow("response is invalid");
+    await expect(client.getRoomState(room)).rejects.toThrow("response is invalid");
+    await expect(client.sync({ timeoutMs: 0 })).rejects.toThrow("missing next_batch");
+    await expect(client.messages(room, { from: "a", to: "b" })).rejects.toThrow("response is invalid");
+    await expect(api(async () => new Response("not JSON")).whoami()).rejects.toThrow("non-JSON response");
+  });
+  it("does not send when already aborted and interrupts rate-limit sleep on stop", async () => {
+    const fetchImpl = vi.fn(async () => response({ errcode: "M_LIMIT_EXCEEDED", retry_after_ms: 30000 }, 429));
+    const client = api(fetchImpl);
+    await expect(client.sendMessage(room, "hello", { signal: AbortSignal.abort(new Error("stopped")) })).rejects.toThrow("stopped");
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const controller = new AbortController();
+    const pending = client.sendMessage(room, "hello", { signal: controller.signal });
+    const rejection = expect(pending).rejects.toThrow("stopped");
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
+    controller.abort(new Error("stopped"));
+    await rejection;
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -149,6 +174,13 @@ describe("Matrix outbound and thread/reaction mapping", () => {
     expect(reactionAnswer(map, room, reaction(), "other@external")).toBeNull();
     expect(reactionAnswer(map, room, reaction("$r", "👍"), human)).toBeNull();
     expect(OPTION_EMOJI).toHaveLength(4);
+  });
+  it("uses the same per-part transaction across producers of one notification episode", async () => {
+    const fetchImpl = vi.fn(async () => response({ event_id: "$posted" }));
+    const payload = { qitemId: "ask", notificationKey: "ask:episode", summary: "One alert", humanQuestions: [question] };
+    await new MatrixOutboundDriver({ home, client: api(fetchImpl), map: new ThreadSeatMap(home), roomFor: async () => room }).deliver(decision(payload, "producer-1"));
+    await new MatrixOutboundDriver({ home, client: api(fetchImpl), map: new ThreadSeatMap(home), roomFor: async () => room }).deliver(decision(payload, "producer-2"));
+    expect(fetchImpl).toHaveBeenCalledTimes(2); // root + question, recovered from the posted-part store on replay
   });
 });
 
@@ -220,8 +252,59 @@ describe("Matrix sync custody and pipeline", () => {
   it("reports limited incremental timelines without advancing the cursor", async () => {
     seedSync();
     const sync = inbound(api(async () => response({ next_batch: "gap", rooms: { join: { [room]: { timeline: { limited: true, events: [] } } } } })));
-    await expect(sync.syncOnce(bot)).rejects.toThrow("timeline gap");
+    await expect(sync.syncOnce(bot)).rejects.toThrow("missing prev_batch");
     expect(JSON.parse(readFileSync(path.join(home, "state", "matrix-sync.json"), "utf8")).since).toBe("page-0");
+  });
+  it("backfills a limited timeline in order, retaining custody through a failed history page", async () => {
+    seedSync();
+    const landed: string[] = [];
+    let fail = true;
+    const fetchImpl = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes("/sync?")) return response({ next_batch: "next", rooms: { join: { [room]: { timeline: { limited: true, prev_batch: "start", events: [message("$three", "three")] } } } } });
+      if (url.includes("from=page-0")) return response({ chunk: [message("$one", "one")], end: "middle" });
+      if (fail) { fail = false; throw new Error("history offline"); }
+      return response({ chunk: [message("$two", "two")], end: "start" });
+    });
+    const opts = { queue: { createQitem: vi.fn(async (input) => { landed.push(input.body); return input.qitemId; }) } };
+    await expect(inbound(api(fetchImpl), opts).syncOnce(bot)).rejects.toThrow("history offline");
+    expect(JSON.parse(readFileSync(path.join(home, "state", "matrix-sync.json"), "utf8")).since).toBe("page-0");
+    await inbound(api(fetchImpl), opts).syncOnce(bot);
+    expect(landed).toEqual(["one", "two", "three"]);
+    expect(fetchImpl.mock.calls.find(([url]) => url.includes("/messages?"))![0]).toContain("to=start&dir=f&limit=100");
+  });
+  it("rejects stalled history pagination without advancing the cursor", async () => {
+    seedSync();
+    const client = api(async (url) => response(url.includes("/sync?")
+      ? { next_batch: "next", rooms: { join: { [room]: { timeline: { limited: true, prev_batch: "start" } } } } }
+      : { chunk: [], end: "page-0" }));
+    await expect(inbound(client).syncOnce(bot)).rejects.toThrow("pagination stalled");
+    expect(JSON.parse(readFileSync(path.join(home, "state", "matrix-sync.json"), "utf8")).since).toBe("page-0");
+  });
+  it("routes ordinary replies to a posted question and removes the quoted fallback", async () => {
+    seedSync();
+    const map = new ThreadSeatMap(home);
+    map.open({ roomId: room, threadRootEventId: "$root", human, seat: "seat@rig", conversationId: "ask" });
+    map.recordQuestion({ roomId: room, threadRootEventId: "$root", eventId: "$question", human, seat: "seat@rig", conversationId: "ask", questionId: "choice", emojiOptions: {} });
+    const reply = { ...message("$reply"), content: { msgtype: "m.text", body: "> <@bot:example.org> Choose\n> Red or blue\n\nBlue please", "m.relates_to": { "m.in_reply_to": { event_id: "$question" } } } };
+    const createQitem = vi.fn().mockResolvedValue("reply");
+    const resolveHumanReply = vi.fn().mockResolvedValue("resolved");
+    await inbound(api(async () => response({ next_batch: "next", rooms: { join: { [room]: { timeline: { events: [reply] } } } } })), { map, queue: { createQitem }, resolveHumanReply }).syncOnce(bot);
+    expect(createQitem).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ destination: "seat@rig", body: "Blue please", inReplyTo: "ask" }));
+    expect(resolveHumanReply).toHaveBeenCalledWith({ qitemId: "ask", actorSession: human, decision: "Blue please" });
+  });
+  it("retries answer continuation with the same queue identity after a resolver failure", async () => {
+    seedSync();
+    const map = new ThreadSeatMap(home);
+    map.recordQuestion({ roomId: room, threadRootEventId: "$root", eventId: "$question", human, seat: "seat@rig", conversationId: "ask", questionId: "choice", emojiOptions: renderQuestion(question).emojiOptions });
+    const createQitem = vi.fn().mockResolvedValue("reply");
+    const recordHumanAnswer = vi.fn().mockReturnValue({ status: "recorded", complete: true, questions: [question], answers: { choice: "blue" } });
+    const resolveHumanReply = vi.fn().mockRejectedValueOnce(new Error("resolve offline")).mockResolvedValue("resolved");
+    const client = api(async () => response({ next_batch: "next", rooms: { join: { [room]: { timeline: { events: [reaction()] } } } } }));
+    const opts = { map, queue: { createQitem }, recordHumanAnswer, resolveHumanReply };
+    await expect(inbound(client, opts).syncOnce(bot)).rejects.toThrow("resolve offline");
+    await inbound(client, opts).syncOnce(bot);
+    expect(createQitem.mock.calls[0][0]).toEqual(createQitem.mock.calls[1][0]);
+    expect(resolveHumanReply).toHaveBeenCalledTimes(2);
   });
 });
 

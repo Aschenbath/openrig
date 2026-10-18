@@ -35,6 +35,7 @@ export class MatrixOutboundDriver {
   constructor(private readonly opts: {
     home: string; client: MatrixClient; map: ThreadSeatMap;
     roomFor: (ref: string) => Promise<string>; signal?: AbortSignal;
+    shouldDeliver?: (payload: MatrixPostPayload) => boolean;
     onDelivered?: (payload: MatrixPostPayload, root: string, roomId: string) => void;
   }) { this.delivered = new JsonStore(path.join(opts.home, "state", "matrix-delivered.json"), []);
     this.posted = new JsonStore(path.join(opts.home, "state", "matrix-posted-parts.json"), {}); }
@@ -52,6 +53,7 @@ export class MatrixOutboundDriver {
     if (this.delivered.read().includes(decision.decisionId)) return { ok: true };
     const payload = decision.payload as MatrixPostPayload;
     if (!payload || typeof payload !== "object") return { ok: false, class: "matrix-invalid-payload" };
+    if (this.opts.shouldDeliver?.(payload) === false) return { ok: true };
     const roomId = await this.opts.roomFor(decision.entityBindingRef);
     const human = payload.destinationSession ?? decision.entityBindingRef;
     const seat = payload.sourceSession ?? "operator-agent@kernel";
@@ -64,7 +66,7 @@ export class MatrixOutboundDriver {
     let root = payload.threadRootEventId ?? existing?.threadRootEventId ?? referenced?.threadRootEventId;
     const text = payload.text ?? [payload.summary, payload.humanDetail ?? payload.body, payload.evidenceRef].filter(Boolean).join("\n\n");
     const chunks = splitMessage(text || "OpenRig conversation");
-    const transaction = (part: string) => createHash("sha256").update(`${decision.decisionId}:${part}`).digest("hex");
+    const transaction = (part: string) => createHash("sha256").update(`${payload.notificationKey ?? decision.decisionId}:${part}`).digest("hex");
     const send = async (part: string, body: string, formattedBody: string, threadRootEventId?: string) => {
       const key = transaction(part);
       const posted = this.posted.read()[key];
@@ -83,13 +85,15 @@ export class MatrixOutboundDriver {
         root = result.event_id;
         this.opts.map.open({ roomId, threadRootEventId: root, human, seat, conversationId });
       }
+      this.opts.map.recordEvent(roomId, result.event_id, root);
     }
-    for (const question of payload.humanQuestions ?? []) {
+    for (const question of payload.ownerNotificationKind === "human-decision-resolved" ? [] : payload.humanQuestions ?? []) {
       const rendered = renderQuestion(question);
       const result = await send(`question-${question.id}`, rendered.text, htmlBody(rendered.text), root);
       this.opts.map.recordQuestion({ roomId, eventId: result.event_id, threadRootEventId: root!, human, seat, conversationId,
         questionId: question.id, emojiOptions: rendered.emojiOptions });
     }
+    this.opts.map.open({ roomId, threadRootEventId: root!, human, seat, conversationId });
     this.opts.onDelivered?.(payload, root!, roomId);
     this.delivered.write([...this.delivered.read(), decision.decisionId]);
     return { ok: true };

@@ -19,6 +19,7 @@ export class MatrixInbound {
     home: string; client: MatrixClient; map: ThreadSeatMap; queue: InboundQueuePort;
     destination: string; resolveSender: (sender: string, roomId: string) => string | null;
     prepareRooms?: (signal: AbortSignal) => Promise<void>;
+    onSync?: () => void;
     recordHumanAnswer?: (input: { qitemId: string; actorSession: string; questionId: string; optionId: string }) => RecordHumanAnswerResult;
     resolveHumanReply?: (input: { qitemId: string; actorSession: string; decision: string }) => Promise<"resolved" | "already-resolved" | "not-applicable">;
     sleep?: typeof abortableSleep; timeoutMs?: number; log?: (message: string) => void;
@@ -62,21 +63,35 @@ export class MatrixInbound {
     const page = await this.opts.client.sync({ since: state.since, timeoutMs: this.opts.timeoutMs ?? 30000, signal });
     for (const [roomId, room] of Object.entries(page.rooms?.join ?? {})) {
       // The first sync establishes a floor instead of replaying room history.
-      // A limited incremental timeline is a visible gap: keep the old token
-      // until the operator can repair it; silently advancing would lose events.
-      if (state.since && room.timeline?.limited) throw new Error(`Matrix timeline gap in ${roomId}; retained since token; history backfill is not supported in this MVP`);
       if (!state.since) continue;
-      for (const event of room.timeline?.events ?? []) {
-        if (signal?.aborted) throw signal.reason;
-        if (!event.event_id || this.store.read().seen.includes(event.event_id)) continue;
-        await this.ingest(roomId, event, botUserId);
-        // Mark each landed event before committing the page token. On a partial
-        // failure the same page retries and deterministic queue IDs absorb crashes.
-        const current = this.store.read();
-        this.store.write({ ...current, seen: [...current.seen, event.event_id].slice(-10000) });
+      if (room.timeline?.limited) {
+        const to = room.timeline.prev_batch;
+        if (!to) throw new Error(`Matrix timeline gap in ${roomId}: missing prev_batch; retained since token`);
+        let from = state.since;
+        const cursors = new Set<string>();
+        while (from !== to) {
+          if (cursors.has(from)) throw new Error(`Matrix history pagination stalled in ${roomId}; retained since token`);
+          cursors.add(from);
+          const history = await this.opts.client.messages(roomId, { from, to, signal });
+          for (const event of history.chunk) await this.land(roomId, event, botUserId, signal);
+          if (!history.end) break; // Homeserver reports the end of available history.
+          from = history.end;
+        }
       }
+      for (const event of room.timeline?.events ?? []) await this.land(roomId, event, botUserId, signal);
     }
+    signal?.throwIfAborted();
     this.store.write({ ...this.store.read(), since: page.next_batch, lastSync: new Date().toISOString() });
+    this.opts.onSync?.();
+  }
+  private async land(roomId: string, event: MatrixEvent, botUserId: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    if (!event?.event_id || this.store.read().seen.includes(event.event_id)) return;
+    await this.ingest(roomId, event, botUserId);
+    // Mark each landed event before committing the page token. On a partial
+    // failure the same page retries and deterministic queue IDs absorb crashes.
+    const current = this.store.read();
+    this.store.write({ ...current, seen: [...current.seen, event.event_id].slice(-10000) });
   }
   private async ingest(roomId: string, event: MatrixEvent, botUserId: string): Promise<void> {
     if (event.sender === botUserId || !event.sender || !event.content) return;
@@ -100,13 +115,18 @@ export class MatrixInbound {
     }
     const relation = event.content["m.relates_to"];
     if (relation?.rel_type === "m.replace" || !["m.text", "m.notice", "m.emote"].includes(event.content.msgtype ?? "") || !event.content.body?.trim()) return;
+    const text = relation?.["m.in_reply_to"] ? event.content.body.replace(/^>[^\n]*(?:\n>[^\n]*)*\n\n/, "") : event.content.body;
+    if (!text.trim()) return;
     const route = routeMessage(this.opts.map, roomId, event, this.opts.destination);
     if (route.human && route.human !== human) return;
     await this.opts.queue.createQitem({
       qitemId: id("inbound", event.event_id), source: human, destination: route.destination,
-      summary: `Human via Matrix: ${event.content.body.slice(0, 90)}`, body: event.content.body,
+      summary: `Human via Matrix: ${text.slice(0, 90)}`, body: text,
       tags: route.tags, ...(route.conversationId ? { inReplyTo: route.conversationId } : {}),
     });
-    if (route.conversationId) await this.opts.resolveHumanReply?.({ qitemId: route.conversationId, actorSession: human, decision: event.content.body });
+    const root = relation?.rel_type === "m.thread" ? relation.event_id : relation?.["m.in_reply_to"]?.event_id;
+    const mapping = root ? this.opts.map.resolveByEvent(roomId, root) : null;
+    if (mapping) this.opts.map.recordEvent(roomId, event.event_id, mapping.threadRootEventId);
+    if (route.conversationId) await this.opts.resolveHumanReply?.({ qitemId: route.conversationId, actorSession: human, decision: text });
   }
 }
