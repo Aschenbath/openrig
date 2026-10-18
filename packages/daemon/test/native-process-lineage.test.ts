@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { findExactNativeResumeProcess, observeClaudePaneStartedAt, observeClaudeDelivery, verifyClaudePaneProcess, verifyCodexPaneProcess, type NativeProcessRow } from "../src/domain/native-process-lineage.js";
+import { codexCommandResumeToken, findExactNativeResumeProcess, observeClaudePaneStartedAt, observeClaudeDelivery, observeCodexForkProcess, verifyClaudePaneProcess, verifyCodexPaneProcess, type NativeProcessRow } from "../src/domain/native-process-lineage.js";
 
 import { operationalLaunchArgs } from "../src/adapters/kernel-authority.js";
 
@@ -16,6 +16,64 @@ function rows(): NativeProcessRow[] {
 }
 const check = (listProcesses: () => NativeProcessRow[] | Promise<NativeProcessRow[]>, overrides = {}) => verifyCodexPaneProcess({
   target: "%1", tmux: { getPanePid: async () => 10 }, listProcesses, expectedToken: token, requireResume: true, ...overrides,
+});
+
+describe("Codex resume options (#1400)", () => {
+  const options = [
+    "-m gpt-5", "--model gpt-5", "-c model_reasoning_effort=high", "--config model_reasoning_effort=high",
+    "-p work", "--profile work", "-C /project", "--cd /project", "--add-dir /extra",
+    "-a on-request", "--ask-for-approval on-request", "-s workspace-write", "--sandbox workspace-write",
+    "--enable feature", "--disable feature", "--local-provider ollama", "-i image.png", "--image image.png",
+    "--remote ws://localhost:9000", "--remote-auth-token-env CODEX_REMOTE_TOKEN",
+  ];
+  it.each(options)("skips option values on either side of resume: %s", option => {
+    expect(codexCommandResumeToken(`codex ${option} resume ${token}`)).toBe(token);
+    expect(codexCommandResumeToken(`codex resume ${option} ${token}`)).toBe(token);
+    expect(codexCommandResumeToken(`codex ${option}`)).toBeUndefined();
+    expect(codexCommandResumeToken(`codex resume ${option}`)).toBeNull();
+  });
+  it.each([
+    `-C /project resume -m gpt-5 -c model_reasoning_effort=high ${token}`,
+    `--profile=work resume --cd=/project --model=gpt-5 ${token}`,
+    `-C/project resume -mgpt-5 ${token} continue`,
+    `--profile resume resume --add-dir resume ${token}`,
+    `--search resume --no-alt-screen ${token}`,
+    `resume -- ${token}`,
+  ])("proves the named conversation through both lineage paths: %s", args => {
+    const command = `/opt/native/codex ${args}`;
+    const process = { ...rows()[3]!, pid: 10, ppid: 1, command };
+    expect(codexCommandResumeToken(command)).toBe(token);
+    expect(findExactNativeResumeProcess([process], 10, "codex", token)?.pid).toBe(10);
+    expect(findExactNativeResumeProcess([process], 10, "codex", "gpt-5")).toBeNull();
+  });
+  it.each(["resume", "resume --last", "resume --all", "resume -m", "resume --cd"])("keeps unnamed resumes distinct from fresh launches: %s", args => {
+    expect(codexCommandResumeToken(`codex ${args}`)).toBeNull();
+  });
+  it.each(["-C /project", "--cd /project", "-m resume", "--profile resume", "exec resume", "-- resume"])("does not invent a resume from an option value or prompt: %s", args => {
+    expect(codexCommandResumeToken(`codex ${args}`)).toBeUndefined();
+  });
+  it("does not mistake an option value for the stored conversation", async () => {
+    const list = () => rows().map(row => row.pid === 13
+      ? { ...row, command: `/opt/native/codex resume -m ${token} other` } : row);
+    expect(await check(list)).toBeNull();
+    expect(findExactNativeResumeProcess(list(), 10, "codex", token)).toBeNull();
+  });
+  it("accepts matching wrapper and native resumes with options on different sides", async () => {
+    const list = () => rows().map(row => row.pid === 12
+      ? { ...row, command: `node /opt/bin/codex --cd /project resume ${token}` }
+      : row.pid === 13 ? { ...row, command: `/opt/native/codex resume -m gpt-5 -C /project ${token}` } : row);
+    expect((await check(list))?.process.pid).toBe(13);
+    expect(await check(list, { expectedToken: "gpt-5" })).toBeNull();
+  });
+  it.each([`-C /project fork ${token}`, `fork -m gpt-5 ${token}`, `--profile work fork --cd /project ${token}`])("keeps the shared fork reader aligned: %s", async args => {
+    const input = {
+      target: "%1", tmux: { getPanePid: async () => 10 }, parentToken: token,
+      listProcesses: () => [{ ...rows()[3]!, pid: 10, ppid: 1, command: `codex ${args}` }],
+    };
+    expect((await observeCodexForkProcess(input))?.process.pid).toBe(10);
+    expect(await observeCodexForkProcess({ ...input, parentToken: "gpt-5" })).toBeNull();
+    expect(codexCommandResumeToken(`codex ${args}`)).toBeUndefined();
+  });
 });
 
 describe("joined native Codex identity", () => {

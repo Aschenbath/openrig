@@ -128,16 +128,22 @@ function commandUsesExpectedToken(command: string, runtime: NativeRuntime, expec
   return codexConversationToken(args, "resume") === expectedToken;
 }
 
+// Interactive options can appear before or after `resume`/`fork`. Their values
+// (including a model or directory named "resume") are never positionals.
+const CODEX_OPTIONS_WITH_VALUES = new Set([
+  "-a", "--ask-for-approval", "-c", "--config", "-m", "--model",
+  "-p", "--profile", "-s", "--sandbox", "-C", "--cd", "--add-dir",
+  "-i", "--image", "--enable", "--disable", "--local-provider",
+  "--remote", "--remote-auth-token-env",
+]);
+
 // undefined is another command; null is the requested command without an exact token.
 function codexConversationToken(args: string[], subcommand: "resume" | "fork"): string | null | undefined {
-  const topLevelOptionsWithValues = new Set([
-    "-a", "--ask-for-approval", "-c", "--config", "-m", "--model",
-    "-p", "--profile", "-s", "--sandbox",
-  ]);
   let resumeIndex = -1;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
-    if (topLevelOptionsWithValues.has(arg)) { index += 1; continue; }
+    if (arg === "--") break; // Everything after this is the fresh launch's prompt.
+    if (CODEX_OPTIONS_WITH_VALUES.has(arg)) { index += 1; continue; }
     if (arg.startsWith("-")) continue;
     if (arg === subcommand) resumeIndex = index;
     break;
@@ -147,7 +153,8 @@ function codexConversationToken(args: string[], subcommand: "resume" | "fork"): 
   let index = 0;
   while (index < resumeArgs.length) {
     const arg = resumeArgs[index]!;
-    if (arg === "--add-dir") { index += 2; continue; }
+    if (arg === "--") return resumeArgs[index + 1] ?? null;
+    if (CODEX_OPTIONS_WITH_VALUES.has(arg)) { index += 2; continue; }
     if (arg.startsWith("-")) { index += 1; continue; }
     return arg;
   }
