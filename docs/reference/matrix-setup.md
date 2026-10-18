@@ -20,8 +20,10 @@ rig matrix status --json
 `--device-id` describes an existing bot device; it does not register a new device or enable
 cryptography. The token is stored in a separate 0600 env file, never in connector JSON.
 `OPENRIG_MATRIX_ACCESS_TOKEN` or `MATRIX_ACCESS_TOKEN` can override the file at runtime.
-Setup accepts incremental flags, like Slack setup. Rewire after configuration changes with
-`rig matrix disable --reason 'reconfigure'` followed by `rig matrix enable`.
+Setup accepts incremental flags, like Slack setup. Apply configuration changes to a running
+connector with `rig matrix enable`; this reloads it without seeding pending alerts as history.
+Custom `--secrets-env-file` paths are saved as absolute paths, and updating the Matrix token
+preserves other entries in a shared env file.
 
 Bindings use `matrix:!room:server` or `matrix:#alias:server`, optionally followed by
 `;role=primary|secondary` and then `;handle=@user:server`. A server may include a port.
@@ -40,7 +42,8 @@ return through the existing queue and human reply resolver.
 Clients using ordinary reply relations can reply to a root, question or later thread message;
 Matrix's quoted reply fallback is removed before the reply reaches the seat.
 
-Enable seeds existing alerts as history, matching Slack's enable behavior. First sync establishes
+Enabling a disabled connector seeds existing alerts as history, matching Slack's enable behavior.
+Enabling an already enabled connector only reloads its configuration. First sync establishes
 an initial floor, so old room messages are not imported. Later pages commit their `since` token
 only after admitted events land. Failed pages retry with backoff; invalid tokens stop polling
 and appear in status. Limited incremental timelines backfill the gap through paginated

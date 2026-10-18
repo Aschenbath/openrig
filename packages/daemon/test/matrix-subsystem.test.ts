@@ -108,6 +108,14 @@ describe("Matrix queue and subsystem integration", () => {
     expect(repo.getById(item.qitemId)?.deliveryOutcome).toBe("posted");
     expect(posted).toHaveBeenCalledTimes(2);
   });
+  it("keeps a delivered Matrix update in history after closing it", async () => {
+    const item = await ask({ humanIntent: "update", humanQuestions: undefined });
+    wire(fixtureFetch()).startServices!();
+    await vi.waitFor(() => expect(repo.getById(item.qitemId)?.state).toBe("done"));
+    expect(repo.listDeliveredHumanUpdates()).toEqual([expect.objectContaining({
+      qitemId: item.qitemId, deliveryOutcome: "posted", deliveryReceipt: expect.stringContaining("matrix-owner-notification-posted "),
+    })]);
+  });
   it("drains a retained closed ask and leaves another connector's pending decisions alone", async () => {
     const item = await ask();
     repo.update({ qitemId: item.qitemId, actorSession: human, state: "done", closureReason: "no-follow-on" });
@@ -189,7 +197,7 @@ describe("Matrix channel administration", () => {
     const post = (op: string, body: object = {}) => app.request(`/matrix/${op}`, { method: "POST", headers: { "content-type": "application/json", "x-openrig-session": "operator@rig" }, body: JSON.stringify(body) });
     return { app, post, restart };
   }
-  it("seeds only Matrix backlog before enable and records no-op and disable receipts", async () => {
+  it("seeds only Matrix backlog on first enable, reloads without seeding, and records disable receipts", async () => {
     const item = await ask();
     expect(addHumanFragment({ entityId: "bob", class: "human", displayName: "Bob", address: "bob@external",
       connectorBindings: [{ kind: "slack", connectorRef: "main", secretsRef: "slack-config", role: "primary" }], prefs: { deliveryClass: "B" } }, home).ok).toBe(true);
@@ -202,12 +210,18 @@ describe("Matrix channel administration", () => {
     expect([...new SeenStore(path.join(home, "state", "matrix-outbound-seen.jsonl")).load()]).toEqual([expect.stringContaining(item.qitemId)]);
     expect(loadConfig(home).enabled).toBe(true);
     expect(f.restart).toHaveBeenCalledTimes(1);
-    expect((await f.post("enable")).status).toBe(200);
-    expect(f.restart).toHaveBeenCalledTimes(1);
+    const pending = await ask();
+    const reloaded = await f.post("enable");
+    expect(reloaded.status).toBe(200);
+    expect(await reloaded.json()).toMatchObject({ seeded: 0, receipt: { effect: "applied" } });
+    expect([...new SeenStore(path.join(home, "state", "matrix-outbound-seen.jsonl")).load()].some((key) => key.includes(pending.qitemId))).toBe(false);
+    expect(f.restart).toHaveBeenCalledTimes(2);
     expect((await f.post("disable")).status).toBe(400);
     expect((await f.post("disable", { reason: "maintenance" })).status).toBe(200);
     expect(loadConfig(home).enabled).toBe(false);
-    expect(f.restart).toHaveBeenCalledTimes(2);
+    expect(f.restart).toHaveBeenCalledTimes(3);
+    expect(await (await f.post("disable", { reason: "still in maintenance" })).json()).toMatchObject({ receipt: { effect: "no-op" } });
+    expect(f.restart).toHaveBeenCalledTimes(3);
     const status = await f.app.request("/matrix/status");
     expect(await status.json()).toMatchObject({ state: "active", connector: { inboundReady: true } });
   });
@@ -229,5 +243,13 @@ describe("Matrix channel administration", () => {
     expect(await result.json()).toMatchObject({ error: "human_registry_unavailable" });
     expect(loadConfig(home).enabled).toBe(false);
     expect(f.restart).not.toHaveBeenCalled();
+  });
+  it.each(["config", "secret"])("reports unreadable %s as not-ready through the human route", async (kind) => {
+    if (kind === "config") writeFileSync(path.join(home, "matrix-connector.json"), "broken JSON");
+    else saveConfig({ ...loadConfig(home), secretsEnvFile: home }, home);
+    const result = await routes().app.request("/human/alice/readiness");
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({ ok: true, readiness: { state: "not-ready", ready: false,
+      configured: false, reason: expect.stringContaining("Matrix configuration unreadable:"), nextAction: "rig matrix status" } });
   });
 });

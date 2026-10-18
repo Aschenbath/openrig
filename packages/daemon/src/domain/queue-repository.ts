@@ -3522,10 +3522,20 @@ export class QueueRepository {
       SELECT q.*, r.ts AS delivered_at, r.transition_note AS delivery_receipt
       FROM queue_items q JOIN (${receipts}) r ON r.qitem_id = q.qitem_id
       WHERE q.human_intent = 'update' AND is_human_seat_session(q.destination_session) = 1
-        AND r.transition_note LIKE 'slack-owner-notification-posted %'
+        AND (r.transition_note LIKE 'slack-owner-notification-posted %'
+          OR r.transition_note LIKE 'matrix-owner-notification-posted %')
       ORDER BY r.ts DESC, q.qitem_id DESC LIMIT ?
     `).all(limit) as Array<QueueItemRow & { delivered_at: string; delivery_receipt: string }>;
-    return rows.map((row) => ({ ...this.rowToItem(row), deliveredAt: row.delivered_at, deliveryReceipt: row.delivery_receipt }));
+    const ledgers = this.deliveryOutcomesFor(rows);
+    return rows.map((row) => {
+      const ledger = ledgers.get(row.qitem_id);
+      return {
+        ...this.rowToItem(row),
+        deliveryOutcome: ledger?.outcome ?? null,
+        deliveredAt: row.delivered_at,
+        deliveryReceipt: row.delivery_receipt,
+      };
+    });
   }
 
   listAttention(opts?: {

@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import path from "node:path";
 import { DaemonClient } from "../client.js";
 import { resolveSenderSession, SENDER_FALLBACK } from "../sender-identity.js";
 import type { FetchImpl } from "@openrig/daemon/gateway-matrix";
@@ -34,7 +35,8 @@ export function matrixCommand(deps: MatrixDeps = {}): Command {
         const current = surface.loadConfig(deps.home);
         const next = { ...current, homeserverUrl: opts.homeserverUrl ?? current.homeserverUrl,
           deviceId: opts.deviceId ?? current.deviceId, defaultRoom: opts.defaultRoom ?? current.defaultRoom,
-          inboundDestination: opts.inboundDestination ?? current.inboundDestination, secretsEnvFile: opts.secretsEnvFile ?? current.secretsEnvFile };
+          inboundDestination: opts.inboundDestination ?? current.inboundDestination,
+          secretsEnvFile: opts.secretsEnvFile ? path.resolve(opts.secretsEnvFile) : current.secretsEnvFile };
         surface.validateConfig(next);
         if (opts.accessToken !== undefined && opts.accessTokenFile !== undefined) throw new Error("Choose --access-token or --access-token-file");
         const token = opts.accessTokenFile ? (await import("node:fs/promises")).readFile(opts.accessTokenFile, "utf8").then((text) => text.trim()) : opts.accessToken;

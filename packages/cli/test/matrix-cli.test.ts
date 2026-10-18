@@ -33,6 +33,16 @@ describe("rig matrix", () => {
     await run(["status", "--json"], { clientFactory: () => ({ get: vi.fn().mockRejectedValue(new Error("offline")), post: vi.fn() }) });
     expect(JSON.parse(logs[0])).toMatchObject({ configured: false, enabled: false, running: { state: "unavailable" } });
   });
+  it("stores a relative secrets path absolutely so another working directory can read it", async () => {
+    const file = path.join(home, "shared.env");
+    writeFileSync(file, "SLACK_BOT_TOKEN=slack-test-token\n");
+    await run(["setup", "--homeserver-url", "https://matrix.example.org", "--secrets-env-file", path.relative(process.cwd(), file), "--access-token", "matrix-test-token"]);
+    expect(process.exitCode).toBe(0);
+    const cfg = surface.loadConfig(home);
+    expect(cfg.secretsEnvFile).toBe(file);
+    expect(surface.resolveAccessToken({ envFile: cfg.secretsEnvFile, env: {} })).toBe("matrix-test-token");
+    expect(readFileSync(file, "utf8")).toContain("SLACK_BOT_TOKEN=slack-test-token\n");
+  });
   it("verifies identity, optionally joins an alias, and sends the test via mocked fetch", async () => {
     surface.saveConfig({ ...surface.DEFAULT_CONFIG, homeserverUrl: "https://matrix.example.org", defaultRoom: "#room:example.org", secretsEnvFile: surface.saveAccessToken("test-token", home) }, home);
     const fetchImpl = vi.fn().mockImplementation(async (url: string) => url.endsWith("whoami") ? json({ user_id: "@bot:example.org" })

@@ -18,7 +18,12 @@ export function saveAccessToken(token: string, home = getOpenRigHome(), envFile 
   // Tokens are opaque, single-line values; never interpolate them into shell code.
   if (!token.trim() || token !== token.trim() || /[\r\n]/.test(token)) throw new Error("Matrix access token must be a non-empty single-line value without surrounding whitespace");
   fs.mkdirSync(path.dirname(envFile), { recursive: true });
-  fs.writeFileSync(`${envFile}.tmp`, `MATRIX_ACCESS_TOKEN=${token}\n`, { mode: 0o600 });
+  let existing = "";
+  try { existing = fs.readFileSync(envFile, "utf8"); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  const kept = existing.split("\n").filter((line) => !/^\s*MATRIX_ACCESS_TOKEN\s*=/.test(line)).join("\n");
+  const prefix = kept && !kept.endsWith("\n") ? `${kept}\n` : kept;
+  fs.writeFileSync(`${envFile}.tmp`, `${prefix}MATRIX_ACCESS_TOKEN=${token}\n`, { mode: 0o600 });
   fs.chmodSync(`${envFile}.tmp`, 0o600);
   fs.renameSync(`${envFile}.tmp`, envFile);
   return envFile;

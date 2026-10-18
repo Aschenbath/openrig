@@ -89,9 +89,12 @@ export function gatewayRoutes(opts: {
             const seen = new SeenStore(path.join(home, "state", "matrix-outbound-seen.jsonl"));
             seeded = seen.seed(alerts.map((a) => a.notificationKey ?? a.qitemId), "seeded-at-enable");
           }
-          if (cfg.enabled !== enabled) { saveMatrixConfig({ ...cfg, enabled }, home); subsystem.restart(); }
+          if (cfg.enabled !== enabled) saveMatrixConfig({ ...cfg, enabled }, home);
+          // Re-enabling reloads setup changes without marking undelivered alerts as history.
+          const rewired = enabled || cfg.enabled !== enabled;
+          if (rewired) subsystem.restart();
           return { value: { seeded, onlineStatus: `matrix connector ${enabled ? "enabled" : "disabled"}; ${seeded} existing alert(s) seeded as history` },
-            after: { enabled, active: subsystem.status().state === "active" }, effect: cfg.enabled === enabled ? "no-op" : "applied" };
+            after: { enabled, active: subsystem.status().state === "active" }, effect: rewired ? "applied" : "no-op" };
         } }, home);
     });
     adminTail = pending.catch(() => undefined);

@@ -337,4 +337,17 @@ describe("Matrix configuration, credentials and human bindings", () => {
     writeFileSync(configFile, "broken");
     expect(() => loadConfig(home)).toThrow();
   });
+  it("rotates only the Matrix entry in a shared secrets file, preserving comments and blank lines", () => {
+    const file = path.join(home, "shared.env");
+    const other = "# Shared connector credentials\nSLACK_BOT_TOKEN=slack-bot\n\nSLACK_APP_TOKEN=slack-app";
+    writeFileSync(file, `MATRIX_ACCESS_TOKEN=old\n${other}\n MATRIX_ACCESS_TOKEN = duplicate\n`);
+    saveAccessToken("new-token", home, file);
+    expect(readFileSync(file, "utf8")).toBe(`${other}\nMATRIX_ACCESS_TOKEN=new-token\n`);
+    expect(resolveAccessToken({ envFile: file, env: {} })).toBe("new-token");
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    writeFileSync(file, other);
+    saveAccessToken("next-token", home, file);
+    expect(readFileSync(file, "utf8")).toBe(`${other}\nMATRIX_ACCESS_TOKEN=next-token\n`);
+    expect(() => saveAccessToken("unused", home, home)).toThrow();
+  });
 });
