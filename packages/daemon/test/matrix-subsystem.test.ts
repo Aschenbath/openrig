@@ -8,6 +8,7 @@ import { migrate } from "../src/db/migrate.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
+import { archiveAgedTerminalTransitions } from "../src/domain/queue-retention.js";
 import { addHumanFragment, loadHumanRegistry } from "../src/domain/gateway/human-registry.js";
 import { buildMatrixGatewayWire } from "../src/domain/gateway/matrix/matrix-subsystem.js";
 import type { FetchImpl } from "../src/domain/gateway/matrix/matrix-api.js";
@@ -112,6 +113,11 @@ describe("Matrix queue and subsystem integration", () => {
     const item = await ask({ humanIntent: "update", humanQuestions: undefined });
     wire(fixtureFetch()).startServices!();
     await vi.waitFor(() => expect(repo.getById(item.qitemId)?.state).toBe("done"));
+    expect(repo.listDeliveredHumanUpdates()).toEqual([expect.objectContaining({
+      qitemId: item.qitemId, deliveryOutcome: "posted", deliveryReceipt: expect.stringContaining("matrix-owner-notification-posted "),
+    })]);
+    archiveAgedTerminalTransitions(db, { nowIso: "2099-01-02T00:00:00Z", batchSize: 100 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM queue_transitions WHERE qitem_id = ?").get(item.qitemId)).toEqual({ count: 0 });
     expect(repo.listDeliveredHumanUpdates()).toEqual([expect.objectContaining({
       qitemId: item.qitemId, deliveryOutcome: "posted", deliveryReceipt: expect.stringContaining("matrix-owner-notification-posted "),
     })]);

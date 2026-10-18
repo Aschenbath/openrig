@@ -3526,12 +3526,12 @@ export class QueueRepository {
           OR r.transition_note LIKE 'matrix-owner-notification-posted %')
       ORDER BY r.ts DESC, q.qitem_id DESC LIMIT ?
     `).all(limit) as Array<QueueItemRow & { delivered_at: string; delivery_receipt: string }>;
-    const ledgers = this.deliveryOutcomesFor(rows);
     return rows.map((row) => {
-      const ledger = ledgers.get(row.qitem_id);
       return {
         ...this.rowToItem(row),
-        deliveryOutcome: ledger?.outcome ?? null,
+        // This historical entry is selected by its posted receipt, including
+        // archived receipts. A current-episode ledger cannot describe it.
+        deliveryOutcome: "posted" as const,
         deliveredAt: row.delivered_at,
         deliveryReceipt: row.delivery_receipt,
       };
