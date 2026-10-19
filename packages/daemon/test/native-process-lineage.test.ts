@@ -23,7 +23,7 @@ describe("Codex resume options (#1400)", () => {
     "-m gpt-5", "--model gpt-5", "-c model_reasoning_effort=high", "--config model_reasoning_effort=high",
     "-p work", "--profile work", "-C /project", "--cd /project", "--add-dir /extra",
     "-a on-request", "--ask-for-approval on-request", "-s workspace-write", "--sandbox workspace-write",
-    "--enable feature", "--disable feature", "--local-provider ollama", "-i image.png", "--image image.png",
+    "--enable feature", "--disable feature", "--local-provider ollama",
     "--remote ws://localhost:9000", "--remote-auth-token-env CODEX_REMOTE_TOKEN",
   ];
   it.each(options)("skips option values on either side of resume: %s", option => {
@@ -73,6 +73,66 @@ describe("Codex resume options (#1400)", () => {
     expect((await observeCodexForkProcess(input))?.process.pid).toBe(10);
     expect(await observeCodexForkProcess({ ...input, parentToken: "gpt-5" })).toBeNull();
     expect(codexCommandResumeToken(`codex ${args}`)).toBeUndefined();
+  });
+
+  // Codex rust-v0.162.1: SharedCliOptions.images has num_args = 1..;
+  // finalize_{resume,fork}_interactive reinterprets --last's positional as a prompt.
+  // These expectations come from that grammar, independently of our option table.
+  const imageCases: [string, string | null][] = [
+    [`-i a.png ${token} -- ${parent}`, parent],
+    [`-i ${token} a.png -- ${token}`, token],
+    [`-i a.png b.png c.png -- ${token}`, token],
+    [`--image a.png ${token} b.png -- ${parent}`, parent],
+    [`-i a.png -- ${token}`, token],
+    [`-i image.png ${token}`, null],
+    [`--image ${token} a.png`, null],
+    [`-i a.png b.png -m model ${token}`, token],
+    [`-i a.png -i b.png ${parent} -- ${token}`, token],
+    [`${token} -i a.png b.png`, token],
+    [`--image=a.png,b.png ${token}`, token],
+    [`-ia.png ${token}`, token],
+    [`-i=a.png ${token}`, token],
+  ];
+  it.each(imageCases)("keeps every image separate from the resumed conversation: %s", async (args, expected) => {
+    const command = `codex resume ${args}`;
+    const list = () => [{ ...rows()[3]!, pid: 10, ppid: 1, command }];
+    expect(codexCommandResumeToken(command)).toBe(expected);
+    expect(Boolean(await check(list))).toBe(expected === token);
+    expect(Boolean(findExactNativeResumeProcess(list(), 10, "codex", token))).toBe(expected === token);
+  });
+  it.each(imageCases)("keeps every image separate from a fork's parent: %s", async (args, expected) => {
+    const input = {
+      target: "%1", tmux: { getPanePid: async () => 10 }, parentToken: token,
+      listProcesses: () => [{ ...rows()[3]!, pid: 10, ppid: 1, command: `codex fork ${args}` }],
+    };
+    expect(Boolean(await observeCodexForkProcess(input))).toBe(expected === token);
+  });
+  it.each(["-i", "--image"])("consumes root-level image values before looking for a command: %s", option => {
+    expect(codexCommandResumeToken(`codex ${option} a.png resume ${token}`)).toBeUndefined();
+    expect(codexCommandResumeToken(`codex ${option} a.png b.png -m model resume ${token}`)).toBe(token);
+    expect(codexCommandResumeToken(`codex ${option} ${token} b.png -- resume ${token}`)).toBeUndefined();
+  });
+  const lastCases = [
+    `--last ${token}`, `-m model --last ${token}`, `--last -C /project ${token}`,
+    `--last -- ${token}`, `${token} --last`, `${token} -m model --last`,
+  ];
+  it.each(lastCases)("never proves a --last prompt as a resumed conversation: %s", async args => {
+    const command = `codex -p work resume ${args}`;
+    const list = () => [{ ...rows()[3]!, pid: 10, ppid: 1, command }];
+    expect(codexCommandResumeToken(command)).toBeNull();
+    expect(await check(list)).toBeNull();
+    expect(findExactNativeResumeProcess(list(), 10, "codex", token)).toBeNull();
+  });
+  it.each(lastCases)("never proves a --last prompt as a fork's parent: %s", async args => {
+    expect(await observeCodexForkProcess({
+      target: "%1", tmux: { getPanePid: async () => 10 }, parentToken: token,
+      listProcesses: () => [{ ...rows()[3]!, pid: 10, ppid: 1, command: `codex -C /project fork ${args}` }],
+    })).toBeNull();
+  });
+  it.each([`resume ${token}`, `resume -- ${token}`, `resume ${token} -- --last`])("still proves explicit resumes with a positional or escaped --last: %s", async args => {
+    const command = `codex ${args}`;
+    expect(codexCommandResumeToken(command)).toBe(token);
+    expect(await check(() => [{ ...rows()[3]!, pid: 10, ppid: 1, command }])).not.toBeNull();
   });
 });
 

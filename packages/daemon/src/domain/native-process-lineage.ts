@@ -133,32 +133,49 @@ function commandUsesExpectedToken(command: string, runtime: NativeRuntime, expec
 const CODEX_OPTIONS_WITH_VALUES = new Set([
   "-a", "--ask-for-approval", "-c", "--config", "-m", "--model",
   "-p", "--profile", "-s", "--sandbox", "-C", "--cd", "--add-dir",
-  "-i", "--image", "--enable", "--disable", "--local-provider",
+  "--enable", "--disable", "--local-provider",
   "--remote", "--remote-auth-token-env",
 ]);
+
+// Unlike the single-value options, --image/-i consumes consecutive values until
+// another option or `--` (Codex SharedCliOptions.images: num_args = 1..).
+function codexOptionEnd(args: string[], index: number): number {
+  const arg = args[index]!;
+  if (arg === "-i" || arg === "--image") {
+    let end = index + 1;
+    while (end < args.length && !args[end]!.startsWith("-")) end += 1;
+    return end;
+  }
+  return index + (CODEX_OPTIONS_WITH_VALUES.has(arg) ? 2 : 1);
+}
 
 // undefined is another command; null is the requested command without an exact token.
 function codexConversationToken(args: string[], subcommand: "resume" | "fork"): string | null | undefined {
   let resumeIndex = -1;
-  for (let index = 0; index < args.length; index += 1) {
+  for (let index = 0; index < args.length;) {
     const arg = args[index]!;
     if (arg === "--") break; // Everything after this is the fresh launch's prompt.
-    if (CODEX_OPTIONS_WITH_VALUES.has(arg)) { index += 1; continue; }
-    if (arg.startsWith("-")) continue;
+    if (arg.startsWith("-")) { index = codexOptionEnd(args, index); continue; }
     if (arg === subcommand) resumeIndex = index;
     break;
   }
   if (resumeIndex < 0) return undefined;
   const resumeArgs = args.slice(resumeIndex + 1);
   let index = 0;
+  let conversation: string | null = null;
+  let last = false;
   while (index < resumeArgs.length) {
     const arg = resumeArgs[index]!;
-    if (arg === "--") return resumeArgs[index + 1] ?? null;
-    if (CODEX_OPTIONS_WITH_VALUES.has(arg)) { index += 2; continue; }
-    if (arg.startsWith("-")) { index += 1; continue; }
-    return arg;
+    if (arg === "--") { conversation ??= resumeArgs[index + 1] ?? null; break; }
+    if (arg === "--last") last = true;
+    if (arg.startsWith("-")) { index = codexOptionEnd(resumeArgs, index); continue; }
+    conversation ??= arg;
+    index += 1;
   }
-  return null;
+  // Both Codex finalizers treat --last's positional as the prompt. A second
+  // positional conflicts with --last, so it cannot establish an exact identity
+  // either. Scan past the first positional because --last may follow it.
+  return last ? null : conversation;
 }
 
 /** A `ps` command line split the way identity proof splits it. */
