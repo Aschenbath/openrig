@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -9,6 +10,11 @@ import type { ProjectionPlan, ProjectionEntry } from "../src/domain/projection-p
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import { claudePostureFlag } from "../src/adapters/yolo-mode.js";
 import { resolveReadinessTimeoutMs } from "../src/domain/readiness-timeout.js";
+
+const probeEvidence = expect.objectContaining({
+  status: expect.any(String), code: expect.any(String),
+  capture: { lines: expect.any(Number), bytes: expect.any(Number), sha256: expect.stringMatching(/^[a-f0-9]{64}$/), columns: null, rows: null },
+});
 
 function mockTmux(): TmuxAdapter {
   return {
@@ -642,6 +648,21 @@ describe("Claude Code runtime adapter", () => {
     );
   });
 
+  it("returns diagnostics from the captured login refusal without changing the timeout outcome", async () => {
+    const tmux = mockTmux();
+    const content = "❯ fixture-private-prompt\n● Login expired · Please run /login\n\n❯";
+    vi.mocked(tmux.capturePaneContent).mockResolvedValue(content);
+    vi.mocked(tmux.listPanes).mockResolvedValue([{ id: "%1", index: 0, cwd: "/project", width: 100, height: 30, active: true }]);
+    const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {} });
+    const result = await adapter.launchHarness(makeBinding(), { name: "dev-impl@test-rig", resumeToken: "abc-123" });
+    expect(result).toEqual({
+      ok: false, error: "Claude resume failed: timed out waiting for Claude to become active",
+      probe: { status: "failed", code: "login_required", loginRefusal: { message: "Login expired · Please run /login", row: "response" },
+        capture: { lines: 4, bytes: Buffer.byteLength(content), sha256: createHash("sha256").update(content).digest("hex"), columns: 100, rows: 30 } },
+    });
+    expect(JSON.stringify(result)).not.toContain("fixture-private-prompt");
+  });
+
   it("launchHarness returns retry_fresh when Claude reports no conversation found for the requested resume token", async () => {
     const tmux = mockTmux();
     (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue("zsh");
@@ -654,6 +675,7 @@ describe("Claude Code runtime adapter", () => {
 
     expect(result).toEqual({
       ok: false,
+      probe: probeEvidence,
       error: "Claude resume failed: no conversation found for the requested session",
       recovery: "retry_fresh",
       missingConversation: true,
@@ -674,6 +696,7 @@ describe("Claude Code runtime adapter", () => {
     expect(capture).toHaveBeenCalledTimes(17);
     expect(result).toEqual({
       ok: false,
+      probe: probeEvidence,
       error: "Claude resume failed: no conversation found for the requested session",
       recovery: "retry_fresh",
       missingConversation: true,
@@ -690,6 +713,7 @@ describe("Claude Code runtime adapter", () => {
 
     expect(result).toEqual({
       ok: false,
+      probe: probeEvidence,
       error: "Claude resume failed: pane returned to shell instead of entering Claude",
       recovery: "retry_fresh",
     });
@@ -735,6 +759,7 @@ describe("Claude Code runtime adapter", () => {
       const { result, reads } = await run({ screen: () => "something Claude draws that no probe knows" });
       expect(result).toEqual({
         ok: false,
+        probe: probeEvidence,
         error: "Claude resume did not finish within 6s; Claude may still be starting, so the launch was kept",
         recovery: "attention_required",
         evidence: "something Claude draws that no probe knows",
@@ -769,6 +794,7 @@ describe("Claude Code runtime adapter", () => {
       const { result } = await run({ screen: (read) => (read < 22 ? "" : "No conversation found with session ID: abc-123") });
       expect(result).toEqual({
         ok: false,
+        probe: probeEvidence,
         error: "Claude resume failed: no conversation found for the requested session",
         recovery: "retry_fresh",
         missingConversation: true,
@@ -788,6 +814,7 @@ describe("Claude Code runtime adapter", () => {
       const { result } = await run({ rows: (read) => (read < 25 ? occupied : [pane]) });
       expect(result).toEqual({
         ok: false,
+        probe: probeEvidence,
         error: "Claude resume failed: pane returned to shell instead of entering Claude",
         recovery: "retry_fresh",
       });
@@ -798,6 +825,7 @@ describe("Claude Code runtime adapter", () => {
       const { result, reads } = await run({ rows: (read) => (read < 19 ? occupied : [pane]) });
       expect(result).toEqual({
         ok: false,
+        probe: probeEvidence,
         error: "Claude resume failed: pane returned to shell instead of entering Claude",
         recovery: "retry_fresh",
       });
@@ -832,9 +860,9 @@ describe("Claude Code runtime adapter", () => {
         expect((await run({ readinessTimeoutMs, rows: () => [pane] })).result).toMatchObject({ ok: false, recovery: "retry_fresh" });
         const other = { ...claude, command: "claude --permission-mode acceptEdits --resume some-other-session --name other" };
         expect((await run({ readinessTimeoutMs, rows: () => [{ ...pane, tpgid: 11 }, launchScript, other] })).result)
-          .toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+          .toEqual({ ok: false, probe: probeEvidence, error: "Claude resume failed: timed out waiting for Claude to become active" });
         expect((await run({ readinessTimeoutMs, rows: () => stuck, screen: () => "● Not logged in · Please run /login" })).result)
-          .toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+          .toEqual({ ok: false, probe: probeEvidence, error: "Claude resume failed: timed out waiting for Claude to become active" });
       });
     });
 
@@ -851,7 +879,7 @@ describe("Claude Code runtime adapter", () => {
     });
 
     describe("a different occupant keeps main's result (timed out, no token): only unknown observations get attention", () => {
-      const timedOut = { ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" };
+      const timedOut = { ok: false, probe: probeEvidence, error: "Claude resume failed: timed out waiting for Claude to become active" };
       const codex = { pid: 13, ppid: 11, pgid: 11, tpgid: 11, executableName: "codex", startedAt, command: "codex resume some-codex-session" };
       const otherClaude = { ...claude, command: "claude --permission-mode acceptEdits --resume some-other-session --name other" };
       const booting = [{ ...pane, tpgid: 11 }, launchScript];
@@ -958,7 +986,7 @@ describe("Claude Code runtime adapter", () => {
     it("does not wait for a Claude that names another conversation: another occupant, timed out as before", async () => {
       const other = { ...claude, command: "claude --permission-mode acceptEdits --resume some-other-session --name other" };
       const { result, reads } = await run({ rows: () => [{ ...pane, tpgid: 11 }, launchScript, other] });
-      expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+      expect(result).toEqual({ ok: false, probe: probeEvidence, error: "Claude resume failed: timed out waiting for Claude to become active" });
       expect(reads).toBe(17);
     });
 
@@ -967,7 +995,7 @@ describe("Claude Code runtime adapter", () => {
       const lookAlike = { ...claude, executableName: "printf" };
       const ready = "Restored conversation\n❯\u00a0\n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
       const { result, reads } = await run({ rows: () => [{ ...pane, tpgid: 11 }, launchScript, lookAlike], screen: () => ready });
-      expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+      expect(result).toEqual({ ok: false, probe: probeEvidence, error: "Claude resume failed: timed out waiting for Claude to become active" });
       expect(reads).toBe(17);
     });
 
@@ -979,13 +1007,13 @@ describe("Claude Code runtime adapter", () => {
         rows: (read) => (read < 20 ? [{ ...pane, tpgid: 11 }, launchScript] : [{ ...pane, tpgid: 11 }, launchScript, lookAlike]),
         screen: (read) => (read < 20 ? "" : ready),
       });
-      expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+      expect(result).toEqual({ ok: false, probe: probeEvidence, error: "Claude resume failed: timed out waiting for Claude to become active" });
       expect(reads).toBeLessThan(25);
     });
 
     it("does not wait for a Claude that says it needs a login: timed out as before", async () => {
       const { result, reads } = await run({ screen: () => "● Not logged in · Please run /login" });
-      expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+      expect(result).toEqual({ ok: false, probe: probeEvidence, error: "Claude resume failed: timed out waiting for Claude to become active" });
       expect(reads).toBe(17);
     });
 
@@ -993,7 +1021,7 @@ describe("Claude Code runtime adapter", () => {
       // A trust prompt that shows up at read 22 ends the wait there; it is not a start in progress.
       const gate = ["Accessing workspace:", "/project", "❯ 1. Yes, I trust this folder", "  2. No, exit"].join("\n");
       const { result, reads } = await run({ screen: (read) => (read < 22 ? "" : gate) });
-      expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+      expect(result).toEqual({ ok: false, probe: probeEvidence, error: "Claude resume failed: timed out waiting for Claude to become active" });
       expect(reads).toBeLessThan(26);
     });
 
