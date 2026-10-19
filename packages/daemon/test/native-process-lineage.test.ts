@@ -134,6 +134,32 @@ describe("Codex resume options (#1400)", () => {
     expect(codexCommandResumeToken(command)).toBe(token);
     expect(await check(() => [{ ...rows()[3]!, pid: 10, ppid: 1, command }])).not.toBeNull();
   });
+  it.each([
+    [`codex resume ${token}`, true],
+    [`codex resume ${token} explain --last selection`, true],
+    [`codex resume ${token} --last`, false],
+  ] as const)("requires an exact resume even with a late --last: %s", async (command, expected) => {
+    const list = () => [{ ...rows()[3]!, pid: 10, ppid: 1, command }];
+    expect(Boolean(await check(list))).toBe(expected);
+  });
+  const promptCases = [
+    `${token}`, `${token} explain --last selection`, `${token} explain --last`,
+    `${token} -m model explain --last selection`, `-m model ${token} explain --last selection`,
+    `${token} -- explain --last selection`,
+  ];
+  it.each(promptCases)("keeps prompt words from turning an explicit resume into --last: %s", async args => {
+    const command = `codex -C /project resume ${args}`;
+    const list = () => [{ ...rows()[3]!, pid: 10, ppid: 1, command }];
+    expect(codexCommandResumeToken(command)).toBe(token);
+    expect((await check(list))?.process.pid).toBe(10);
+    expect(findExactNativeResumeProcess(list(), 10, "codex", token)?.pid).toBe(10);
+  });
+  it.each(promptCases)("keeps prompt words from turning an explicit fork into --last: %s", async args => {
+    expect((await observeCodexForkProcess({
+      target: "%1", tmux: { getPanePid: async () => 10 }, parentToken: token,
+      listProcesses: () => [{ ...rows()[3]!, pid: 10, ppid: 1, command: `codex -C /project fork ${args}` }],
+    }))?.process.pid).toBe(10);
+  });
 });
 
 describe("joined native Codex identity", () => {

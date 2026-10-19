@@ -169,12 +169,15 @@ function codexConversationToken(args: string[], subcommand: "resume" | "fork"): 
     if (arg === "--") { conversation ??= resumeArgs[index + 1] ?? null; break; }
     if (arg === "--last") last = true;
     if (arg.startsWith("-")) { index = codexOptionEnd(resumeArgs, index); continue; }
-    conversation ??= arg;
+    // ps has lost argv boundaries: after a session and the first prompt word,
+    // later option-looking words belong to the prompt. A real --last conflicts
+    // with a session plus a prompt in Codex's interactive grammar.
+    if (conversation !== null) break;
+    conversation = arg;
     index += 1;
   }
-  // Both Codex finalizers treat --last's positional as the prompt. A second
-  // positional conflicts with --last, so it cannot establish an exact identity
-  // either. Scan past the first positional because --last may follow it.
+  // Both Codex finalizers treat --last's positional as the prompt. Scan past
+  // the first positional because a real --last may follow the session id.
   return last ? null : conversation;
 }
 
