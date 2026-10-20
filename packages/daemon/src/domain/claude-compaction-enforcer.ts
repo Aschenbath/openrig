@@ -260,6 +260,7 @@ function resolvePostCompactExtra(
 export function buildPostCompactRestorePrompt(input: {
   sessionName: string;
   openrigHome: string;
+  restoreMapPath?: string;
   transcriptPath?: string | null;
   sessionId?: string | null;
   postCompactInstruction?: string | null;
@@ -279,6 +280,9 @@ export function buildPostCompactRestorePrompt(input: {
     "If you did not compact (your earlier context is still present), say so and skip the restore reading.",
     `First, look for the pending restore marker at ${markerPath}.`,
   ];
+  if (input.restoreMapPath) {
+    pieces.push(`Read this preparation attempt's restore map at ${JSON.stringify(input.restoreMapPath)}. Use this exact map rather than selecting another preparation directory or attempt.`);
+  }
   if (input.transcriptPath) {
     pieces.push(`If the marker is missing and you have no restore map, rebuild a packet from this Claude JSONL transcript: ${input.transcriptPath}.`);
   } else if (input.sessionId) {
@@ -298,7 +302,8 @@ export function buildPostCompactRestorePrompt(input: {
     // refused at the source. Tell the seat NOT to seek it out (it is not its state).
     pieces.push("A post-compaction instruction file declaring a DIFFERENT seat was present and has been IGNORED — it is not yours; do NOT read or follow it. Rely on the per-seat marker and the JSONL transcript for restore.");
   }
-  pieces.push("Load/read the claude-compaction-restore skill, follow the marker's restoreInstruction and postCompactInstruction when present, read your newest restore map and use the restore packet as a lookup, then reply with: restored from packet at <path>; resumed at step <X>.");
+  const restoreMap = input.restoreMapPath ? "this preparation attempt's restore map" : "your newest restore map";
+  pieces.push(`Load/read the claude-compaction-restore skill, follow the marker's restoreInstruction and postCompactInstruction when present, read ${restoreMap} and use the restore packet as a lookup, then reply with: restored from packet at <path>; resumed at step <X>.`);
   pieces.push(`During this restore, read ${path.join(input.openrigHome, "plugins", "openrig-core", "skills", "refocusing", "SKILL.md")} and consume the current topology and work traces delivered with this restore request, if present; do not rerun Python just to duplicate a delivered trace. Missing trace delivery is a named gap. Read required notes and full sources with the native file-read tool; a pointer, compact summary or truncated extract is not a full source read. Name any missing source, the current user outcome, and your next action from the files you actually read, not from the compact summary.`);
   return pieces.join(" ");
 }
@@ -344,6 +349,7 @@ export interface PreparationState {
 interface PreparationAttempt extends PreparationState {
   sends: number;
   policyWasEnabled: boolean;
+  skipMap: boolean;
   controller: AbortController;
 }
 
@@ -527,11 +533,13 @@ export class ClaudeCompactionEnforcer {
       // OPR.0.4.1.09: resolve the extra FOR THIS SEAT (per-seat preferred; the legacy
       // global is refused if it declares a different seat) - never inject wrong-seat state.
       const extra = resolvePostCompactExtra(input.sessionName, this.openrigHome, policy.messageFilePath);
+      const preparation = this.pendingPreCompactPrep.get(input.sessionName);
       const restore = await this.sessionTransport.send(
         input.sessionName,
         buildPostCompactRestorePrompt({
           sessionName: input.sessionName,
           openrigHome: this.openrigHome,
+          restoreMapPath: preparation?.status === "compact-sent" && !preparation.skipMap ? preparation.mapPath : undefined,
           transcriptPath: input.transcriptPath,
           sessionId: input.sessionId,
           postCompactInstruction: policy.messageInline,
@@ -762,6 +770,7 @@ export class ClaudeCompactionEnforcer {
       mapPath: preparationRoot ? path.join(preparationRoot, sanitizeSessionKey(input.sessionName), attemptId, "RESTORE-MAP.md") : fallbackMapPath,
       marker: `<!-- openrig-compaction-complete ${JSON.stringify({ attemptId, session: input.sessionName, occupantGeneration })} -->`,
       policyWasEnabled: policy.enabled,
+      skipMap,
       controller: new AbortController(),
     };
     this.pendingPreCompactPrep.set(input.sessionName, attempt);
@@ -925,7 +934,7 @@ export class ClaudeCompactionEnforcer {
     this.reconcilePreparations();
     const attempt = this.pendingPreCompactPrep.get(session);
     if (!attempt) return null;
-    const { controller: _controller, sends: _sends, policyWasEnabled: _enabled, ...state } = attempt;
+    const { controller: _controller, sends: _sends, policyWasEnabled: _enabled, skipMap: _skipMap, ...state } = attempt;
     return state;
   }
 

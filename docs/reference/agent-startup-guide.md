@@ -473,8 +473,9 @@ Claude permissions; choose a directory outside any matching deny rule. The corre
 variable is `OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT`.
 
 New manual and automatic attempts use `<root>/<session>/<attempt-id>/RESTORE-MAP.md`; an in-flight
-attempt keeps its original path. The root gets an exclusive `.gitignore` containing `*`, and the
-daemon publishes the marked `.tmp` file with an atomic rename. Use a dedicated root: a conflicting
+attempt keeps its original path through the post-compaction restore request. The root gets an
+exclusive `.gitignore` containing `*`, and the daemon publishes the marked `.tmp` file with an
+atomic rename. Use a dedicated root: a conflicting
 ignore file or an unwritable configured directory stops preparation with
 `preparation_directory_unavailable`, visible in `rig compact <session> --state`, without choosing
 another location. Fix the directory and explicitly retry. `--skip-map` still skips the map once.

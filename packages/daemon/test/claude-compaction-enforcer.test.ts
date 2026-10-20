@@ -793,7 +793,7 @@ describe("ClaudeCompactionEnforcer", () => {
     expect(send.mock.calls[4]![1]).toContain("the session JSONL stay lookup-only");
     expect(send.mock.calls[4]![1]).toContain("Read every required item that is not FULL in full now");
     expect(send.mock.calls[4]![1]).not.toContain("Do not optimize for token conservation");
-    expect(send.mock.calls[3]![1]).toContain("read your newest restore map and use the restore packet as a lookup");
+    expect(send.mock.calls[3]![1]).toContain("read this preparation attempt's restore map and use the restore packet as a lookup");
     expect(send.mock.calls[3]![1]).not.toContain("read the restore packet files");
     expect(send.mock.calls[2]![1]).not.toContain("refocusing");
     expect(send.mock.calls[3]![1]).toContain("/tmp/openrig-test-home/plugins/openrig-core/skills/refocusing/SKILL.md");
