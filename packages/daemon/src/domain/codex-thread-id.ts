@@ -175,7 +175,7 @@ export class CodexThreadIdResolver {
     const readFromLogs = injected
       ? (p: number, home: string, report?: CodexCaptureReporter) => injected(p, home, report, startSecond)
       : (p: number, home: string, report?: CodexCaptureReporter) => readCodexThreadIdFromLogs(p, home, undefined, minTs, undefined, report, startSecond);
-    const defaultHome = this.opts.defaultHome ?? safeUserHomeDir() ?? os.homedir();
+    const defaultHome = this.opts.defaultHome ?? os.homedir();
     const now = this.opts.now ?? Date.now;
     const ttl = this.opts.homeTtlMs ?? 60_000;
 
@@ -257,17 +257,9 @@ void _resolveRequiresIdentityPin;
 
 function uniqueHomes(candidateHomes: Array<string | undefined>): string[] {
   const homes = candidateHomes.filter((home): home is string => Boolean(home));
-  const userHome = safeUserHomeDir();
-  if (userHome) homes.push(userHome);
+  // os.homedir() honors HOME. The passwd home must not bypass an explicit provider/test home.
+  homes.push(os.homedir());
   return [...new Set(homes)];
-}
-
-function safeUserHomeDir(): string | undefined {
-  try {
-    return os.userInfo().homedir;
-  } catch {
-    return undefined;
-  }
 }
 
 /** How a gated read treats rows logged inside the identity's own start second (see {@link lstartToMinTs}). */

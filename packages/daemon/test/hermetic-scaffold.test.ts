@@ -88,6 +88,20 @@ describe("prepareHermeticEnv scaffold", () => {
     expect(s.env).not.toBe(base);
   });
 
+  it("scrubs inherited provider roots and the native opt-in from scenario children", () => {
+    const base = {
+      HOME: "/synthetic-host-home", CODEX_HOME: "/synthetic-host-codex",
+      CLAUDE_CONFIG_DIR: "/synthetic-host-claude", OPENRIG_E2E_REAL_CODEX: "1",
+    };
+    const s = make(base);
+    expect(s.env.HOME).toBe(s.home);
+    for (const key of ["CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENRIG_E2E_REAL_CODEX"]) {
+      expect(s.env[key]).toBeUndefined();
+    }
+    expect(base.CLAUDE_CONFIG_DIR).toBe("/synthetic-host-claude");
+    expect(base.OPENRIG_E2E_REAL_CODEX).toBe("1");
+  });
+
   it("cleanup removes the scaffold root", () => {
     const s = prepareHermeticEnv({ baseEnv: { HOME: "/real-home" } });
     const root = s.root;
