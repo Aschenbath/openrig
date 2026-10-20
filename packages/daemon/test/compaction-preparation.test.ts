@@ -497,6 +497,33 @@ it('configured preparation root: stays bound to the attempt while later seats us
  expect(readFileSync(first.mapPath,'utf8')).toContain(first.marker);
 });
 
+for(const mode of ['manual','automatic'] as const)it(`configured preparation root: ${mode} restore without a usage sample retains the published map until audit`,async()=>{
+ const f=fixture();f.policy.preparationRoot=join(f.home,'original maps');
+ if(mode==='manual'){
+  f.onSleep(async()=>{stageMap(f);});
+  expect((await f.e.triggerManualCompact(input,{operatorInitiated:true})).triggered).toBe(true);
+ }else{
+  await f.e.maybeAutoCompact(input);stageMap(f);await f.e.maybeAutoCompact(input);
+ }
+ const a=f.e.getPreparationState(seat)!;
+ f.policy.preparationRoot=join(f.home,'later maps');
+ const send=vi.spyOn(f.transport,'send');
+ const unsampled={sessionName:seat,runtime:'claude-code'};
+ expect((await f.e.drainPendingPostCompactStage(unsampled)).triggered).toBe(true);
+ expect(f.e.getPreparationState(seat)?.mapPath).toBe(a.mapPath);
+ expect((await f.e.drainPendingPostCompactStage(unsampled)).triggered).toBe(true);
+ expect(f.writes.at(-1)).toContain(`Read this preparation attempt's restore map at ${JSON.stringify(a.mapPath)}`);
+ expect(f.writes.at(-1)).not.toContain(f.policy.preparationRoot);
+ expect(f.e.getPreparationState(seat)?.mapPath).toBe(a.mapPath);
+ expect((await f.e.drainPendingPostCompactStage(unsampled)).triggered).toBe(true);
+ expect(send.mock.calls).toHaveLength(3);
+ for(const call of send.mock.calls)expect(call[2]).toMatchObject({readinessFromPaneOnly:true});
+ expect(f.e.getPreparationState(seat)).toBeNull();
+ expect(f.e.hasPendingPostCompactStage(seat)).toBe(false);
+ expect(readFileSync(a.mapPath,'utf8')).toContain(a.marker);
+ expect(compacts(f)).toHaveLength(1);
+});
+
 for(const kind of ['file','ignore','symlink'] as const) it(`configured preparation root: ${kind} conflict stops without fallback or rewriting`,async()=>{
  const f=fixture(),root=join(f.home,'maps'),cwd=join(f.home,'cwd');mkdirSync(cwd);
  f.policy.preparationRoot=root;
