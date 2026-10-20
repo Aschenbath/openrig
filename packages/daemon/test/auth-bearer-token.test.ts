@@ -11,6 +11,7 @@ import {
   findTailscaleIpInInterfaces,
 } from "../src/middleware/auth-bearer-token.js";
 import type { NetworkInterfaceInfo } from "node:os";
+import dns from "node:dns/promises";
 
 describe("auth-bearer-token middleware (PL-005 Phase B)", () => {
   it("constantTimeEqual returns true for equal strings", () => {
@@ -140,8 +141,11 @@ describe("auth-bearer-token middleware (PL-005 Phase B)", () => {
     });
 
     it("returns null for an intentionally-unresolvable hostname (HG-4)", async () => {
-      const ip = await resolveToIpOrNull("this-host-does-not-exist.invalid");
-      expect(ip).toBeNull();
+      const lookup = vi.spyOn(dns, "lookup").mockRejectedValueOnce(Object.assign(new Error("fixture NXDOMAIN"), { code: "ENOTFOUND" }));
+      try {
+        const ip = await resolveToIpOrNull("this-host-does-not-exist.invalid");
+        expect(ip).toBeNull();
+      } finally { lookup.mockRestore(); }
     });
   });
 
