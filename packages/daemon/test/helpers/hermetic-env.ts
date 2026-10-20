@@ -280,7 +280,7 @@ export interface HermeticScaffold {
 }
 
 export interface PrepareHermeticEnvOptions {
-  /** Base environment to derive the clean child env from. Defaults to process.env. */
+  /** Base environment to derive the clean child env from. Explicit provider roots are preserved; defaults to process.env. */
   baseEnv?: EnvLike;
   /**
    * The A3-R3 injected clock. When set, the scaffold's child env carries
@@ -358,7 +358,11 @@ process.exit(result.status ?? 1);
   const env: Record<string, string | undefined> = { ...baseEnv };
   for (const name of DAEMON_TARGET_ENV_VARS) delete env[name];
   for (const name of CREDENTIAL_ENV_VARS) delete env[name];
-  for (const name of ["CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENRIG_E2E_REAL_CODEX"]) delete env[name];
+  // Inherited provider roots belong to the runner; explicit ones are test inputs.
+  if (opts.baseEnv === undefined) {
+    for (const name of ["CODEX_HOME", "CLAUDE_CONFIG_DIR"]) delete env[name];
+  }
+  delete env.OPENRIG_E2E_REAL_CODEX;
   // Scrub any injected-clock var (defense in depth behind the fail-closed guard) so
   // only an explicit injectClockNow can set it below — never an inherited value.
   for (const name of TEST_CLOCK_ENV_VARS) delete env[name];

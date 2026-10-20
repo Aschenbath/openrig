@@ -75,6 +75,8 @@ are not yet runnable checks.
   `CLAUDE_CONFIG_DIR`. `OPENRIG_E2E_REAL_CODEX=1` keeps native homes and binaries only for
   `seat-handover-model-fidelity-e2e.test.ts` and `seat-lifecycle-set-model-resume-e2e.test.ts`;
   all other files remain isolated. The scenario scaffold always uses fixture homes and runtime stubs.
+  The two native files rely on Vitest's default per-file isolation; runs without it are unsupported.
+  Scenario scaffolds scrub inherited provider roots but preserve those passed in an explicit `baseEnv`.
   A test can still set its own
   overrides after setup. The UI suite (jsdom) uses its own `packages/ui/test/setup.ts`.
 
