@@ -13,6 +13,7 @@
 //   - delivered-ok additionally marks the qitemId seen (slice-11: seen ONLY after success) and
 //     releases the driver's in-flight guard.
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { postChatMessage, getUploadURLExternal, uploadBytesExternal, completeUploadExternal, fetchRecentMessageTexts, type FetchImpl } from "./slack-api.js";
@@ -99,6 +100,7 @@ const LOCAL_ATTACHMENT_EXT = new Set([...LOCAL_IMAGE_EXT, ".mp4", ".webm", ".mov
 export const LOCAL_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 export type LocalAttachment = { bytes: Uint8Array; filename: string } | { skipped: string };
 const TRANSPORT_FAILURE_RECEIPT_PREFIX = "::transport-failure-receipt::";
+const INVALID_BLOCKS_CLASS = "slack-invalid-blocks";
 /** #192: `<decisionId>::channel::<channel>` in the attempted store = the channel this post's first
  *  attempt was decided for (see pinChannel). Keyed like the transport-failure receipt. */
 const CHANNEL_DECIDED_PREFIX = "::channel::";
@@ -118,8 +120,8 @@ function firstAttemptChannel(opts: SubsystemSlackDeliveryOpts, attempted: Set<st
 }
 const TRANSPORT_FAILURE_RECEIPT_REPAIRED = "::repaired";
 
-function transportFailureReceiptKey(decisionId: string, failureClass: string, detail: string): string {
-  const encoded = Buffer.from(JSON.stringify([failureClass, detail]), "utf8").toString("base64url");
+function transportFailureReceiptKey(decisionId: string, failureClass: string, detail: string, payloadHash?: string): string {
+  const encoded = Buffer.from(JSON.stringify(payloadHash ? [failureClass, detail, payloadHash] : [failureClass, detail]), "utf8").toString("base64url");
   return `${decisionId}${TRANSPORT_FAILURE_RECEIPT_PREFIX}${encoded}`;
 }
 
@@ -261,8 +263,10 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
         return { ok: false, class: "receipt-failed", detail: pendingFailure.error };
       }
       try {
-        if (!opts.onTransportFailed) throw new Error("transport-failure receipt hook is unavailable");
-        opts.onTransportFailed(q, pendingFailure.failureClass, pendingFailure.detail);
+        if (!opts.onTransportFailed && pendingFailure.failureClass !== INVALID_BLOCKS_CLASS) {
+          throw new Error("transport-failure receipt hook is unavailable");
+        }
+        opts.onTransportFailed?.(q, pendingFailure.failureClass, pendingFailure.detail);
         opts.attempted.mark(
           `${pendingFailure.key}${TRANSPORT_FAILURE_RECEIPT_REPAIRED}`,
           "transport-failure-receipt-repaired",
@@ -271,6 +275,57 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
         log(`transport-failed receipt repair FAILED for ${q.qitemId ?? decision.decisionId}: ${(e as Error).message} — retained, no resend`);
         return { ok: false, class: "receipt-failed", detail: (e as Error).message };
       }
+    }
+
+    // Only render before reconciliation when comparing a known rejection. Other
+    // attempts still reconcile first, including a landed message that no longer renders (#899).
+    let rendered: ReturnType<typeof buildOutboundMessage> | undefined;
+    const render = () => {
+      if (rendered) return rendered;
+      const { mediaRefs, evidenceLink } = evidenceAttachment(q.media, q.evidenceRef, q.summary);
+      return rendered = buildOutboundMessage(
+        {
+          qitemId: q.qitemId ?? decision.decisionId,
+          ownerNotificationKind: q.ownerNotificationKind,
+          summary: q.summary,
+          body: q.body,
+          humanQuestions: q.humanQuestions,
+          destinationSession: q.destinationSession ?? decision.entityBindingRef,
+          // #1013 — a gate parked on a human seat renders the question, not the agent packet.
+          state: q.state,
+          tags: q.tags,
+          evidenceRef: q.evidenceRef,
+        },
+        {
+          sourceLabel: opts.sourceLabel,
+          bodyExcerpt: opts.bodyExcerpt,
+          mediaRefs,
+          evidenceLink,
+          // A1.2 — attribution rides every post; identity stays the app's own (postChatMessage
+          // structurally cannot carry username/icon overrides — the customize-absence rail).
+          attribution: attributionFromSession(q.sourceSession),
+          machine: opts.machine?.() ?? undefined,
+          mentionUserId: opts.resolveMentionUserId?.(q),
+          // fix-r3 — the reconcile identity, reserved outside the clamp budget (same function
+          // the scan above matches: one identity, same bytes, both sides).
+          reconcileMarker: reconcileToken(decision.decisionId),
+        },
+      );
+    };
+    const postInput = () => ({ channel, text: render().text, blocks: render().blocks, thread_ts: threadTs });
+    const payloadHash = () => createHash("sha256").update(JSON.stringify(postInput())).digest("hex");
+    const failurePrefix = `${decision.decisionId}${TRANSPORT_FAILURE_RECEIPT_PREFIX}`;
+    const hasRejection = [...attempted].some((key) => {
+      if (!key.startsWith(failurePrefix) || key.endsWith(TRANSPORT_FAILURE_RECEIPT_REPAIRED)) return false;
+      try { return JSON.parse(Buffer.from(key.slice(failurePrefix.length), "base64url").toString("utf8"))[0] === INVALID_BLOCKS_CLASS; }
+      catch { return false; }
+    });
+    if (hasRejection && attempted.has(transportFailureReceiptKey(decision.decisionId, INVALID_BLOCKS_CLASS, "invalid_blocks", payloadHash()))) {
+      // Keep the receipt after repair, but block only the exact rejected wire payload.
+      // A correction is eligible for a fresh post; ambiguous attempts still reconcile below.
+      try { opts.onTransportFailed?.(q, INVALID_BLOCKS_CLASS, "invalid_blocks"); }
+      catch (error) { return { ok: false, class: "receipt-failed", detail: (error as Error).message }; }
+      return { ok: false, class: INVALID_BLOCKS_CLASS, detail: "invalid_blocks" };
     }
 
     // H — RECONCILE-BY-MARKER before any RESEND: if this decision was attempted before, the
@@ -333,59 +388,26 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
       }
     }
 
-    // Rendered only when a post is about to happen: a message already found by its marker above is
-    // acknowledged even if it would no longer render (#899: a changed sender label after it landed).
-    // M1 A5b (carried over from the retired sweep): an alert's evidenceRef IS the artifact the
-    // human judges. #47 — it rides as a Block Kit image ONLY when it looks like an image;
-    // a non-image https ref rides as a plain link instead (Slack's invalid_blocks rejects
-    // the whole message when an image block's URL is not a real image).
-    const { mediaRefs, evidenceLink } = evidenceAttachment(q.media, q.evidenceRef, q.summary);
-    const payload = buildOutboundMessage(
-      {
-        qitemId: q.qitemId ?? decision.decisionId,
-        ownerNotificationKind: q.ownerNotificationKind,
-        summary: q.summary,
-        body: q.body,
-        humanQuestions: q.humanQuestions,
-        destinationSession: q.destinationSession ?? decision.entityBindingRef,
-        // #1013 — a gate parked on a human seat renders the question, not the agent packet.
-        state: q.state,
-        tags: q.tags,
-        evidenceRef: q.evidenceRef,
-      },
-      {
-        sourceLabel: opts.sourceLabel,
-        bodyExcerpt: opts.bodyExcerpt,
-        mediaRefs,
-        evidenceLink,
-        // A1.2 — attribution rides every post; identity stays the app's own (postChatMessage
-        // structurally cannot carry username/icon overrides — the customize-absence rail).
-        attribution: attributionFromSession(q.sourceSession),
-        machine: opts.machine?.() ?? undefined,
-        mentionUserId: opts.resolveMentionUserId?.(q),
-        // fix-r3 — the reconcile identity, reserved outside the clamp budget (same function
-        // the scan above matches: one identity, same bytes, both sides).
-        reconcileMarker: reconcileToken(decision.decisionId),
-      },
-    );
-
+    const input = postInput();
     // Marked ATTEMPTED durably BEFORE the post: from here any outcome is ambiguous until 2xx.
     opts.attempted.mark(decision.decisionId, "attempted");
     const stopSignal = opts.stopSignal;
     const res = await postChatMessage(
       opts.botToken,
-      { channel, text: payload.text, blocks: payload.blocks, thread_ts: threadTs },
+      input,
       opts.fetchImpl,
       undefined,
       stopSignal ? (ms: number) => abortableSleep(ms, stopSignal) : undefined,
     );
     if (!res.ok) {
-      const failureClass = res.status === 0 ? "transport" : `http-${res.status}`;
+      const permanent = res.status === 200 && res.error === "invalid_blocks";
+      const failureClass = permanent ? INVALID_BLOCKS_CLASS : res.status === 0 ? "transport" : `http-${res.status}`;
+      if (permanent) log(`Slack rejected ${q.qitemId ?? decision.decisionId}: invalid_blocks — permanent failure; this payload will not be reposted`);
       // Persist the receipt input before the row write. A throwing row write
       // stays repairable across restart and blocks any later resend until the
       // authoritative transition lands.
-      if (opts.onTransportFailed) {
-        const receiptKey = transportFailureReceiptKey(decision.decisionId, failureClass, res.error ?? "");
+      if (opts.onTransportFailed || permanent) {
+        const receiptKey = transportFailureReceiptKey(decision.decisionId, failureClass, res.error ?? "", permanent ? payloadHash() : undefined);
         let receiptRetained = false;
         let retentionError: string | undefined;
         try {
@@ -396,13 +418,16 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
           log(`transport-failed receipt backup FAILED for ${q.qitemId ?? decision.decisionId}: ${retentionError} — authoritative row write still attempted`);
         }
         try {
-          opts.onTransportFailed(q, failureClass, res.error ?? "");
+          opts.onTransportFailed?.(q, failureClass, res.error ?? "");
         } catch (e) {
           const disposition = receiptRetained
             ? "retained for repair before resend"
             : `NOT retained; backup failed first: ${retentionError}`;
           log(`transport-failed receipt write FAILED for ${q.qitemId ?? decision.decisionId}: ${(e as Error).message} — ${disposition}`);
           return { ok: false, class: "receipt-failed", detail: (e as Error).message };
+        }
+        if (permanent && !receiptRetained) {
+          return { ok: false, class: "receipt-failed", detail: `permanent Slack rejection could not be retained: ${retentionError}` };
         }
         if (receiptRetained) {
           try {
@@ -717,6 +742,9 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
       }
       const outcome = await deliverSinglePart({
         ...planned,
+        onTransportFailed: opts.onTransportFailed
+          ? (_part, failureClass, detail) => opts.onTransportFailed!(q, failureClass, detail, index > 0)
+          : undefined,
         resolveMentionUserId: index === 0 ? planned.resolveMentionUserId : undefined,
         resolveThreadTs: index === 0 ? opts.resolveThreadTs : () => primary!.threadTs ?? primary!.messageTs,
         // #192: a supplemental part goes where the primary went (its recorded channel), never to a

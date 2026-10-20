@@ -378,3 +378,20 @@ Human-readable coverage and pending bounds use ISO timestamps; JSON keeps Slack 
 The status read calls no Slack API and starts no scan. If the daemon cannot be
 observed, local configuration remains visible and live state is unknown. A
 connected socket or valid configuration alone does not prove end-to-end delivery.
+
+### Slack rejects a message with `invalid_blocks`
+
+`rig queue show <qitemId> --json` records the failure as
+`class=slack-invalid-blocks error=invalid_blocks` in the delivery transition.
+Slack rejected that message's blocks, so OpenRig retains the notification as
+undelivered and does not post the same payload again, including after a daemon
+restart. The rejection is tied to the rendered payload: corrected content can
+make a new attempt. Network failures, server errors and rate limits still retry
+as before; a timed-out request remains uncertain until reconciliation.
+
+The source seat gets a `slack-undeliverable` queue item explaining the failure.
+Check the evidence links and message content, then send a corrected ask as a new
+queue item. Close the original when you have handled it. If a long ask was split
+into several messages, earlier parts may already be in Slack; the notice says
+when only part of the ask was posted. A failed part never counts as delivery of
+the whole ask.

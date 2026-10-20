@@ -331,7 +331,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   // sees it. Tell the seat that asked, once: the notice's id derives from the ask's, so a replay
   // returns the same row instead of a second one.
   // A retry that can't post the rest of an ask some of which may already be in Slack says so.
-  const notifySourceUndeliverable = (p: OutboundPostPayload, detail: string, partlyPosted = false): void => {
+  const notifySourceUndeliverable = (p: OutboundPostPayload, detail: string, partlyPosted = false, invalidBlocks = false): void => {
     const seat = p.sourceSession;
     if (!p.qitemId || !seat) return;
     const human = p.destinationSession ?? "the person";
@@ -347,7 +347,9 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
         "",
         `Reason: ${detail}`,
         "",
-        partlyPosted
+        invalidBlocks
+          ? "Slack rejected the message blocks. OpenRig will not retry this payload. Check its evidence links and message content, then send a corrected ask as a new queue item. The original row remains undelivered; close it when you have handled it."
+          : partlyPosted
           ? "Check the thread in Slack and send what's missing as a new ask. The original row stays open until you close it."
           : "Shorten it and send it as a new ask. The original row stays open until you close it.",
       ].join("\n"),
@@ -358,11 +360,17 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
 
   const recordTransportFailed = (p: OutboundPostPayload, failureClass: string, detail: string, partlyPosted?: boolean): void => {
     if (!p.qitemId) return;
-    if (failureClass === "human-message-unrenderable") notifySourceUndeliverable(p, detail, partlyPosted);
+    if (failureClass === "human-message-unrenderable" || failureClass === "slack-invalid-blocks") {
+      notifySourceUndeliverable(p, detail, partlyPosted, failureClass === "slack-invalid-blocks");
+    }
     const key = p.notificationKey ?? p.qitemId;
-    const alreadyRecorded = opts.queueRepo.transitionLog.listForQitem(p.qitemId).some((transition) =>
+    const previousFailure = opts.queueRepo.transitionLog.listForQitem(p.qitemId).filter((transition) =>
       transition.transitionNote?.startsWith("slack-owner-notification-transport-failed ")
-        && transition.transitionNote.split(/\s+/).includes(`notification_key=${key}`));
+        && transition.transitionNote.split(/\s+/).includes(`notification_key=${key}`)).at(-1);
+    // A corrected attempt can fail transiently after a permanent rejection, and a
+    // transient failure can be followed by a definite rejection. Preserve both changes.
+    const alreadyRecorded = previousFailure &&
+      previousFailure.transitionNote!.includes("class=slack-invalid-blocks ") === (failureClass === "slack-invalid-blocks");
     if (alreadyRecorded) return;
     opts.queueRepo.update({
       qitemId: p.qitemId,
