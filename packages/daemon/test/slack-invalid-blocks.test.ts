@@ -84,6 +84,52 @@ describe("Slack invalid_blocks is a permanent rejection (#47)", () => {
     expect(stores().delivered.load().has(decision.decisionId)).toBe(true);
   });
 
+  it.each(["corrected", "reverted", "unrenderable"])("reconciles a corrected attempt's lost response despite an older rejection (replay=%s)", async (rendering) => {
+    let posts = 0;
+    let readable = true;
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith("chat.postMessage")) {
+        if (++posts === 1) return reply({ ok: false, error: "invalid_blocks" });
+        throw new Error("corrected message landed but its response was lost");
+      }
+      return readable
+        ? reply({ ok: true, messages: posts === 2 ? [{ ts: "2.1", text: reconcileToken(decision.decisionId) }] : [] })
+        : reply({ ok: false, error: "service_unavailable" }, 503);
+    });
+    const onTransportFailed = vi.fn();
+    const rejected = { ...decision, payload: { ...decision.payload as object, evidenceRef: "https://example.com/page.png" } };
+    const corrected = { ...rejected, payload: { ...rejected.payload, evidenceRef: "https://example.com/proof.md" } };
+    expect(await subsystemSlackDeliver({ ...opts(), fetchImpl, onTransportFailed })(rejected)).toMatchObject({ class: "slack-invalid-blocks" });
+    expect(await subsystemSlackDeliver({ ...opts(), fetchImpl, onTransportFailed })(corrected)).toMatchObject({ class: "transport" });
+    const replay = rendering === "reverted" ? rejected : corrected;
+    const replayOpts = () => ({ ...opts(), fetchImpl, onTransportFailed, ...(rendering === "unrenderable" ? { machine: () => "x".repeat(4000) } : {}) });
+    readable = false;
+    onTransportFailed.mockClear();
+    expect(await subsystemSlackDeliver(replayOpts())(replay)).toMatchObject({ class: "reconcile-unreadable" });
+    expect(onTransportFailed).not.toHaveBeenCalled();
+    expect(stores().delivered.load().size).toBe(0);
+    readable = true;
+    expect(await subsystemSlackDeliver(replayOpts())(replay)).toEqual({ ok: true });
+    expect(posts).toBe(2);
+    expect(stores().delivered.load().has(decision.decisionId)).toBe(true);
+  });
+
+  it("does not repost rejected blocks after reconciling an absent corrected attempt", async () => {
+    let posts = 0;
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (!url.endsWith("chat.postMessage")) return reply({ ok: true, messages: [] });
+      if (++posts === 1) return reply({ ok: false, error: "invalid_blocks" });
+      throw new Error("corrected request timed out");
+    });
+    const corrected = { ...decision, payload: { ...decision.payload as object, body: "Corrected content." } };
+    expect(await subsystemSlackDeliver({ ...opts(), fetchImpl })(decision)).toMatchObject({ class: "slack-invalid-blocks" });
+    expect(await subsystemSlackDeliver({ ...opts(), fetchImpl })(corrected)).toMatchObject({ class: "transport" });
+    expect(await subsystemSlackDeliver({ ...opts(), fetchImpl })(decision)).toMatchObject({ class: "slack-invalid-blocks" });
+    expect(posts).toBe(2);
+    expect(fetchImpl.mock.calls.filter(([url]) => !url.endsWith("chat.postMessage"))).toHaveLength(2);
+    expect(stores().delivered.load().size).toBe(0);
+  });
+
   it("repairs a failed queue receipt after restart without retrying the rejected post", async () => {
     const fetchImpl = vi.fn(async () => reply({ ok: false, error: "invalid_blocks" }));
     const onTransportFailed = vi.fn(() => { throw new Error("database unavailable"); });

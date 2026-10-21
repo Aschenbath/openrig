@@ -13,7 +13,7 @@
 //   - delivered-ok additionally marks the qitemId seen (slice-11: seen ONLY after success) and
 //     releases the driver's in-flight guard.
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { postChatMessage, getUploadURLExternal, uploadBytesExternal, completeUploadExternal, fetchRecentMessageTexts, type FetchImpl } from "./slack-api.js";
@@ -101,6 +101,7 @@ export const LOCAL_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 export type LocalAttachment = { bytes: Uint8Array; filename: string } | { skipped: string };
 const TRANSPORT_FAILURE_RECEIPT_PREFIX = "::transport-failure-receipt::";
 const INVALID_BLOCKS_CLASS = "slack-invalid-blocks";
+const PAYLOAD_ATTEMPT_PREFIX = "::payload-attempt::";
 /** #192: `<decisionId>::channel::<channel>` in the attempted store = the channel this post's first
  *  attempt was decided for (see pinChannel). Keyed like the transport-failure receipt. */
 const CHANNEL_DECIDED_PREFIX = "::channel::";
@@ -320,12 +321,21 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
       try { return JSON.parse(Buffer.from(key.slice(failurePrefix.length), "base64url").toString("utf8"))[0] === INVALID_BLOCKS_CLASS; }
       catch { return false; }
     });
-    if (hasRejection && attempted.has(transportFailureReceiptKey(decision.decisionId, INVALID_BLOCKS_CLASS, "invalid_blocks", payloadHash()))) {
+    const rejectedHash = (hash: string) => attempted.has(transportFailureReceiptKey(decision.decisionId, INVALID_BLOCKS_CLASS, "invalid_blocks", hash));
+    const rejected = () => hasRejection && rejectedHash(payloadHash());
+    const reject = (): SubsystemDeliveryOutcome => {
       // Keep the receipt after repair, but block only the exact rejected wire payload.
-      // A correction is eligible for a fresh post; ambiguous attempts still reconcile below.
       try { opts.onTransportFailed?.(q, INVALID_BLOCKS_CLASS, "invalid_blocks"); }
       catch (error) { return { ok: false, class: "receipt-failed", detail: (error as Error).message }; }
       return { ok: false, class: INVALID_BLOCKS_CLASS, detail: "invalid_blocks" };
+    };
+    const attemptPrefix = `${decision.decisionId}${PAYLOAD_ATTEMPT_PREFIX}`;
+    if (hasRejection) {
+      const lastAttempt = [...attempted.keys()].reverse().find((key) => key.startsWith(attemptPrefix));
+      const lastHash = lastAttempt?.slice(attemptPrefix.length).split("::")[0];
+      // A newer correction may have landed despite a lost response. An older
+      // rejection cannot settle that ambiguity, even if rendering reverts.
+      if ((!lastHash || rejectedHash(lastHash)) && rejected()) return reject();
     }
 
     // H — RECONCILE-BY-MARKER before any RESEND: if this decision was attempted before, the
@@ -388,9 +398,16 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
       }
     }
 
+    if (rejected()) return reject();
+
     const input = postInput();
     // Marked ATTEMPTED durably BEFORE the post: from here any outcome is ambiguous until 2xx.
     opts.attempted.mark(decision.decisionId, "attempted");
+    if (hasRejection) {
+      // Unique ids preserve attempt order in the store's Set, including retries
+      // of the same correction. Ordinary posts need no extra record.
+      opts.attempted.mark(`${attemptPrefix}${payloadHash()}::${randomUUID()}`, "payload-attempted");
+    }
     const stopSignal = opts.stopSignal;
     const res = await postChatMessage(
       opts.botToken,
