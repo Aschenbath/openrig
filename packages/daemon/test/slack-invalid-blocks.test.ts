@@ -142,13 +142,18 @@ describe("Slack invalid_blocks is a permanent rejection (#47)", () => {
     expect(stores().outboundSeen.load().size).toBe(0);
   });
 
-  it.each([false, true])("records the rejection and tells the source once across wire restarts (partial=%s)", async (multipart) => {
+  it.each([false, true])("records the rejection and tells the source once despite an older notice, across wire restarts (partial=%s)", async (multipart) => {
     const db = createDb(); migrate(db, ALL_MIGRATIONS);
     const repo = new QueueRepository(db, new EventBus(db), { loadHumanRegistry: () => registry });
     const secrets = join(home, "fake.env"); writeFileSync(secrets, "SLACK_BOT_TOKEN=xoxb-EXAMPLE-fake\n");
     saveConfig({ ...DEFAULT_CONFIG, enabled: true, channel: "C-TEST", secretsEnvFile: secrets }, home);
     const item = await repo.create({ ...request, ...(multipart ? { humanDetail: "Supplemental evidence." } : {}) });
     const [alert] = await makeQueuePorts(repo, { loadHumanRegistry: () => registry }).listHumanAlerts({});
+    const olderNotice = await repo.create({
+      qitemId: `${item.qitemId}-undeliverable`, sourceSession: request.sourceSession, destinationSession: request.sourceSession,
+      body: "An earlier ask could not be rendered.", tags: ["slack-undeliverable"], nudge: false,
+    });
+    const noticeId = `${alert!.notificationKey ?? item.qitemId}-invalid-blocks-undeliverable`;
     repo.update({ qitemId: item.qitemId, actorSession: "daemon@kernel", transitionNote: `slack-owner-notification-transport-failed notification_key=${alert!.notificationKey} class=transport error=timeout` });
     let posts = 0;
     const fetchImpl = vi.fn(async () => multipart && ++posts === 1
@@ -159,18 +164,19 @@ describe("Slack invalid_blocks is a permanent rejection (#47)", () => {
     let wire = makeWire();
     try {
       wire.dispatcher.dispatch("post_message", request.destinationSession, alert);
-      await vi.waitFor(() => expect(repo.getById(`${item.qitemId}-undeliverable`)).toBeTruthy());
+      await vi.waitFor(() => expect(repo.getById(noticeId)).toBeTruthy());
       expect(repo.getById(item.qitemId)).toMatchObject({ state: "pending", deliveryOutcome: "transport-failed" });
       expect(repo.listTransitions(item.qitemId).some((t) => t.transitionNote?.includes("class=slack-invalid-blocks error=invalid_blocks"))).toBe(true);
-      expect(repo.getById(`${item.qitemId}-undeliverable`)).toMatchObject({ destinationSession: request.sourceSession, body: expect.stringContaining("will not retry this payload") });
-      expect(repo.getById(`${item.qitemId}-undeliverable`)!.body).toContain(multipart ? "Part of your ask" : "has not seen it");
+      expect(repo.getById(noticeId)).toMatchObject({ destinationSession: request.sourceSession, body: expect.stringContaining("will not retry this payload") });
+      expect(repo.getById(noticeId)!.body).toContain(multipart ? "Part of your ask" : "has not seen it");
+      expect(repo.getById(olderNotice.qitemId)!.body).toBe(olderNotice.body);
       expect(new DispatchBuffer(home).pending()).toHaveLength(1);
       wire.stop();
       wire = makeWire();
       wire.startServices?.();
       await vi.waitFor(() => expect(logs.filter((s) => s.includes("slack-invalid-blocks")).length).toBeGreaterThanOrEqual(2));
       expect(fetchImpl).toHaveBeenCalledTimes(multipart ? 2 : 1);
-      expect(repo.list({ destinationSession: request.sourceSession }).filter((q) => q.tags.includes("slack-undeliverable"))).toHaveLength(1);
+      expect(repo.list({ destinationSession: request.sourceSession }).filter((q) => q.tags.includes("slack-undeliverable"))).toHaveLength(2);
       expect(new DispatchBuffer(home).pending()).toHaveLength(1);
     } finally { wire.stop(); db.close(); }
   });

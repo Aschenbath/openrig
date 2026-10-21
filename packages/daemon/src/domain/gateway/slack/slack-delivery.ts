@@ -315,7 +315,7 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
     const postInput = () => ({ channel, text: render().text, blocks: render().blocks, thread_ts: threadTs });
     const payloadHash = () => createHash("sha256").update(JSON.stringify(postInput())).digest("hex");
     const failurePrefix = `${decision.decisionId}${TRANSPORT_FAILURE_RECEIPT_PREFIX}`;
-    const hasRejection = [...attempted].some((key) => {
+    const hasRejection = [...attempted.keys()].some((key) => {
       if (!key.startsWith(failurePrefix) || key.endsWith(TRANSPORT_FAILURE_RECEIPT_REPAIRED)) return false;
       try { return JSON.parse(Buffer.from(key.slice(failurePrefix.length), "base64url").toString("utf8"))[0] === INVALID_BLOCKS_CLASS; }
       catch { return false; }

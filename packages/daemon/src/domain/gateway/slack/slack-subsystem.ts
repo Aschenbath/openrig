@@ -335,8 +335,12 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     const seat = p.sourceSession;
     if (!p.qitemId || !seat) return;
     const human = p.destinationSession ?? "the person";
+    // A prior episode's notice must not hide this explicit Slack rejection.
+    const noticeId = invalidBlocks
+      ? `${p.notificationKey ?? p.qitemId}-invalid-blocks-undeliverable`
+      : `${p.qitemId}-undeliverable`;
     opts.queueRepo.create({
-      qitemId: `${p.qitemId}-undeliverable`,
+      qitemId: noticeId,
       sourceSession: seat,
       destinationSession: seat,
       summary: `Not delivered to ${human}: ${p.summary ?? p.qitemId}`,
