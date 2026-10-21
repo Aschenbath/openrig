@@ -206,15 +206,17 @@ contract. `validateClosure` (`hot-potato-enforcer.ts:59`) checks a transition
 against `CLOSURE_REASONS` (`:18`; **7** values:
 `sed -n '/^export const CLOSURE_REASONS/,/] as const/p' packages/daemon/src/domain/hot-potato-enforcer.ts | grep -c '^  "'`):
 
-`state=done` requires `closure_reason ∈ {handed_off_to, blocked_on, denied,
+`state=done` requires `closure_reason ∈ {handed_off_to, denied,
 canceled, no-follow-on, escalation, superseded}`. The reasons
-`handed_off_to | blocked_on | escalation` additionally require
+`handed_off_to | escalation` additionally require
 `closure_target` (`:86`):
 
 - `handed_off_to` — work continues with a different seat (`closure_target` =
   new owner).
-- `blocked_on` — work is parked pending another qitem (`closure_target` =
-  blocker `qitem_id`).
+- `blocked_on` — an active `state=blocked` park record, rejected with `state=done`.
+  To wait for a qitem, use `rig queue block <id> --on <child>` or
+  `rig queue update <id> --state blocked --blocked-on <child>`; the item returns
+  to pending when its blocker completes.
 - `denied` — receiver rejected the work (`closure_target` = reason text).
 - `canceled` — sender or receiver withdrew (`closure_target` = note).
 - `no-follow-on` — terminal completion, nothing else needed.

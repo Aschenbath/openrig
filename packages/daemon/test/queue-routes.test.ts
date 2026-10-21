@@ -22,7 +22,7 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { InboxHandler } from "../src/domain/inbox-handler.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
-import { CLOSURE_REASONS } from "../src/domain/hot-potato-enforcer.js";
+import { DONE_CLOSURE_REASONS } from "../src/domain/hot-potato-enforcer.js";
 import { queueRoutes } from "../src/routes/queue.js";
 import { setSelfHostId, getSelfHostId } from "../src/domain/hosts/fanout-contract.js";
 import { expectLimitParsing } from "./helpers/limit-query-cases.js";
@@ -1414,11 +1414,11 @@ describe("queue routes", () => {
     expect(update.status).toBe(400);
     const data = (await update.json()) as { error: string; validReasons: string[] };
     expect(data.error).toBe("missing_closure_reason");
-    expect(data.validReasons).toEqual(CLOSURE_REASONS);
+    expect(data.validReasons).toEqual(DONE_CLOSURE_REASONS);
   });
 
   it("POST /api/queue/:id/update accepts each valid closure reason", async () => {
-    for (const reason of CLOSURE_REASONS) {
+    for (const reason of DONE_CLOSURE_REASONS) {
       const create = await app.request("/api/queue/create", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-OpenRig-Session": "a@r" },
@@ -1426,7 +1426,7 @@ describe("queue routes", () => {
       });
       const item = (await create.json()) as { qitemId: string };
 
-      const requiresTarget = reason === "handed_off_to" || reason === "blocked_on" || reason === "escalation";
+      const requiresTarget = reason === "handed_off_to" || reason === "escalation";
       const closureTarget = reason === "handed_off_to" ? "c@r" : "downstream-target";
       if (reason === "handed_off_to") await queueRepo.create({
         sourceSession: "b@r", destinationSession: closureTarget,
@@ -1447,6 +1447,22 @@ describe("queue routes", () => {
       expect(data.state).toBe("done");
       expect(data.closureReason).toBe(reason);
     }
+  });
+
+  it("POST /api/queue/:id/update rejects done + blocked_on as a client error", async () => {
+    const item = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "wait for work", nudge: false });
+    const update = await app.request(`/api/queue/${item.qitemId}/update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+      body: JSON.stringify({ state: "done", closureReason: "blocked_on", closureTarget: "qitem-child" }),
+    });
+    expect(update.status).toBe(400);
+    const data = (await update.json()) as { error: string; message: string; validReasons: string[] };
+    expect(data.error).toBe("invalid_closure_reason");
+    expect(data.message).toContain("state=done is terminal");
+    expect(data.message).toContain("rig queue block <id> --on <child>");
+    expect(data.validReasons).not.toContain("blocked_on");
+    expect(queueRepo.getByIdOrThrow(item.qitemId).state).toBe("pending");
   });
 
   it("POST /api/queue/:id/handoff returns closed + created in one transaction", async () => {

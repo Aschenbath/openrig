@@ -627,7 +627,8 @@ export function queueRoutes(): Hono {
   // Closure vocabulary:
   //   - handed_off_to    delivered to next stage; acceptance pending
   //                      that stage's verdict on its own qitem
-  //   - blocked_on       waiting on a named blocker (closureTarget)
+  //   - blocked_on       active state=blocked park record, never state=done;
+  //                      rig queue block <id> --on <child> waits on a qitem
   //   - denied           the source seat refuses the work
   //   - canceled         work no longer needed (no follow-on)
   //   - no-follow-on     completed in place; no further routing

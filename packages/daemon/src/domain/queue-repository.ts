@@ -2603,6 +2603,19 @@ export class QueueRepository {
         || (input.state !== undefined && input.summary != null)
         || (input.summary != null && !hasValidSummary);
       if (disallowed) {
+        // Keep the terminal-park correction visible even when the row is already done.
+        if (input.state === "done" && input.closureReason === "blocked_on") {
+          const validation = validateClosure({
+            state: input.state,
+            closureReason: input.closureReason,
+            closureTarget: input.closureTarget,
+          });
+          if (!validation.ok) {
+            throw new QueueRepositoryError(validation.code, validation.message, {
+              validReasons: validation.validReasons,
+            });
+          }
+        }
         throw new QueueRepositoryError(
           "note_append_fields_not_admitted",
           "a state-preserving note append accepts only --note (and an optional same --state); state-write fields were supplied, so nothing was written",

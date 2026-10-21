@@ -1560,8 +1560,9 @@ export function reconcileExplicitOwnerHarness(
  * queue closure shape (state + closure_reason + closure_target +
  * handed_off_to / blocked_on metadata). Phase A's hot-potato closure
  * validation enforces the rules:
- *   - state=done requires closure_reason from CLOSURE_REASONS
- *   - handed_off_to / blocked_on / escalation also require closure_target
+ *   - state=done requires closure_reason from DONE_CLOSURE_REASONS
+ *   - handed_off_to / escalation also require closure_target
+ *   - blocked_on records an active state=blocked park, never a done closure
  *
  * Mappings:
  *   handoff → state=handed-off, closure_reason=handed_off_to,

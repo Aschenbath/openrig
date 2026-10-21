@@ -1117,8 +1117,8 @@ describe("rig queue CLI", () => {
           status: 400,
           data: {
             error: "missing_closure_reason",
-            message: "state=done requires closure_reason; valid values: handed_off_to, blocked_on, denied, canceled, no-follow-on, escalation",
-            validReasons: ["handed_off_to", "blocked_on", "denied", "canceled", "no-follow-on", "escalation"],
+            message: "state=done requires closure_reason; valid values: handed_off_to, denied, canceled, no-follow-on, escalation, superseded",
+            validReasons: ["handed_off_to", "denied", "canceled", "no-follow-on", "escalation", "superseded"],
           },
         },
       },
