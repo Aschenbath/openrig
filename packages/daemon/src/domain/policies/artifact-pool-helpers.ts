@@ -227,7 +227,7 @@ export async function scanArtifactPools(
  * Expand the convenience input shape (single object, array of objects,
  * or `paths: [...]` shorthand) into a flat array of single-path pools.
  */
-function expandPools(
+export function expandPools(
   pools: ArtifactPoolSpec | ArtifactPoolSpec[] | undefined,
 ): ArtifactPoolSpec[] {
   if (!pools) return [];

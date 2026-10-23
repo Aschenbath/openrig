@@ -489,6 +489,7 @@ the sections that were not read are `null`.
 | `rig watchdog show <jobId>` | — | `--json` |
 | `rig watchdog status <jobId>` | — | `--json` |
 | `rig watchdog stop <jobId>` | — | `--reason <text>`<br>`--json` |
+| `rig watchdog update <jobId>` | — | `--interval-seconds <n>`<br>`--message <text>`<br>`--spec <path>`<br>`--json` |
 
 ### workflow
 

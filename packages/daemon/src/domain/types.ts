@@ -299,6 +299,7 @@ export type RigEvent =
   | { type: "watchdog.evaluation_terminal"; jobId: string; policy: string; terminalReason: string }
   | { type: "watchdog.job_registered"; jobId: string; policy: string; targetSession: string; registeredBy: string }
   | { type: "watchdog.job_stopped"; jobId: string; reason: string }
+  | { type: "watchdog.job_updated"; jobId: string; changed: string[] }
   // PL-004 Phase D: daemon-native Workflow Runtime events. Step closure
   // and next-qitem projection are emitted within the SAME daemon
   // transaction (transactional-scribe contract). Subscribers see the

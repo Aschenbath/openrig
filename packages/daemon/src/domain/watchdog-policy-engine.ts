@@ -797,8 +797,7 @@ export class WatchdogPolicyEngine {
     // The history above audits the actual attempt. A newer park/blocker change
     // must not receive its receipt or be backed off as though we sent for it.
     const current = this.jobsRepo.getByIdOrThrow(job.jobId);
-    if (current.state === "active" && current.specYaml === deliverySchedule.specYaml
-      && current.intervalSeconds === deliverySchedule.intervalSeconds
+    if (current.state === "active" && this.jobsRepo.scheduleUnchanged(current, deliverySchedule)
       && (isContextUsageThreshold || current.lastEvaluationAt === evaluatedAt)) {
       this.onWakeAttempt?.({ jobId: job.jobId, deliveryStatus: delivery.status });
     }
