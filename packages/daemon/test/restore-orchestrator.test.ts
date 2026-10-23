@@ -2846,6 +2846,8 @@ describe("RestoreOrchestrator", () => {
       "resume-original", "awaiting-decision", 1, { t: null, p: null }],
     ["the saved token is a former runtime's", "codex_id", { ok: true }, "awaiting-decision", "awaiting-decision", 0, { t: "codex-thread-1", p: null }],
     ["its launcher never reported a conversation", "none", { ok: true }, "awaiting-decision", "awaiting-decision", 0, { t: null, p: null }],
+    ["OpenRig named the conversation", "named", { ok: true, resumeToken: "chat-123", resumeType: "community:synth-harness", resumeProvenance: "passed" },
+      "resume-original", "resumed", 1, { t: "chat-123", p: "passed" }],
   ] as const)("a community harness whose preset declares resume, when %s: the preview and restore agree on the seat's outcome", async (_case, tokenType, launch, forecast, status, calls, current) => {
     const saved = process.env["OPENRIG_HOME"];
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "restore-community-resume-"));
@@ -2853,13 +2855,14 @@ describe("RestoreOrchestrator", () => {
       process.env["OPENRIG_HOME"] = home;
       fs.mkdirSync(path.join(home, "community-harnesses"));
       fs.writeFileSync(path.join(home, "community-harnesses", "synth-harness.yaml"),
-        "format: 1\nname: synth-harness\ncommand: synth-launch\nmaintainer: Example\nlimits: []\nlaunch_result: true\nresume: true\n");
+        `format: 1\nname: synth-harness\ncommand: synth-launch\nmaintainer: Example\nlimits: []\n${tokenType === "named" ? "names_conversation" : "launch_result"}: true\nresume: true\n`);
       const rig = rigRepo.createRig("test-rig");
       db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-community-resume", rig.id, "Dev");
       const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "synth-harness", podId: "pod-community-resume" });
       const session = sessionRegistry.registerSession(node.id, "dev-impl@test-rig");
       sessionRegistry.updateStatus(session.id, "running");
       if (tokenType === "codex_id") sessionRegistry.updateResumeToken(session.id, "codex_id", "codex-thread-1");
+      else if (tokenType === "named") sessionRegistry.recordLauncherReportedToken(session.id, "community:synth-harness", "chat-123", "passed");
       else if (tokenType !== "none") sessionRegistry.recordLauncherReportedToken(session.id, tokenType, "chat-123");
       sessionRegistry.recordCommunityHarnessSelection(session.id, "synth-harness");
       db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)").run(node.id, "[]", "[]", "[]", "synth-harness");
@@ -2884,8 +2887,9 @@ describe("RestoreOrchestrator", () => {
       // this launch's launcher reported it: a resume that needed attention keeps chat-123 as attempted, not reported.
       expect(db.prepare("SELECT resume_token AS t, resume_provenance AS p FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1").get(node.id)).toEqual(current);
       const label = getNodeInventory(db, rig.id)[0]!.communityHarness;
-      expect(label?.identity).toBe(current.p === "launcher" ? "reported by its launcher, not observed" : "not confirmed");
+      expect(label?.identity).toBe(current.p === "launcher" ? "reported by its launcher, not observed" : current.p === "passed" ? "named by OpenRig, not observed" : "not confirmed");
       expect(label?.reportedConversation).toBe(current.p === "launcher" ? "chat-123" : undefined);
+      expect(label?.namedConversation).toBe(current.p === "passed" ? "chat-123" : undefined);
     } finally {
       if (saved === undefined) delete process.env["OPENRIG_HOME"]; else process.env["OPENRIG_HOME"] = saved;
       fs.rmSync(home, { recursive: true, force: true });

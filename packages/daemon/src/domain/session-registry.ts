@@ -539,17 +539,18 @@ export class SessionRegistry {
     return true;
   }
 
-  /** A community harness's launcher reported the conversation this launch created: record it with provenance
-   *  `launcher` and no verification stamp. A report isn't a verification, so the session doesn't read as resumable. */
-  recordLauncherReportedToken(sessionId: string, type: string, token: string): boolean {
+  /** A community harness's conversation for this launch: one its launcher reported (`launcher`), or one OpenRig named and
+   *  passed to it (`passed`). Recorded with no verification stamp: neither is a verification, so the session doesn't read
+   *  as resumable. */
+  recordLauncherReportedToken(sessionId: string, type: string, token: string, provenance: "launcher" | "passed" = "launcher"): boolean {
     if (typeof token !== "string" || token.trim().length === 0) return false;
     this.db
       .prepare(
-        "UPDATE sessions SET resume_type = ?, resume_token = ?, resume_provenance = 'launcher', " +
+        "UPDATE sessions SET resume_type = ?, resume_token = ?, resume_provenance = ?, " +
           "resume_last_verified = NULL, resume_last_probe_status = NULL, " +
           `${CLEAR_ROTATION_ON_TOKEN_CHANGE} WHERE id = ?`,
       )
-      .run(type, token, token, token, sessionId);
+      .run(type, token, provenance, token, token, sessionId);
     return true;
   }
 

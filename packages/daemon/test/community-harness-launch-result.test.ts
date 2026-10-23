@@ -149,9 +149,9 @@ describe("a community harness whose launcher can reopen a reported conversation"
     expect(sendShellCommand).not.toHaveBeenCalled();
   });
 
-  it("needs launch_result for resume, so the launcher can say which conversation it reopened", () => {
+  it("needs launch_result or names_conversation for resume, so the conversation to reopen is one OpenRig knows", () => {
     const presets = scratch("harness-presets-");
     writeFileSync(join(presets, "synth.yaml"), `${PRESET.replace("launch_result: true\n", "")}resume: true\n`);
-    expect(loadCommunityHarnessPreset("synth", presets)).toMatchObject({ ok: false, message: expect.stringContaining("resume needs launch_result: true") });
+    expect(loadCommunityHarnessPreset("synth", presets)).toMatchObject({ ok: false, message: expect.stringContaining("resume needs launch_result: true or names_conversation: true") });
   });
 });

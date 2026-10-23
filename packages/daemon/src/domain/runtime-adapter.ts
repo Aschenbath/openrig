@@ -119,7 +119,7 @@ export type HarnessLaunchRecovery = "retry_fresh" | "attention_required";
 export type HarnessLaunchResult =
   | { ok: true; resumeToken?: string; resumeType?: string; appliedLaunch?: import("./permission-drift.js").AppliedLaunchObservation;
     /** Where resumeToken came from, when not a pane scrape: a community harness's launcher reported it. */
-    resumeProvenance?: "launcher";
+    resumeProvenance?: "launcher" | "passed";
     /** Launch notes for the person, such as a community harness whose launch identity is unavailable. */
     warnings?: string[];
     launchedProcess?: import("./native-process-lineage.js").ClaudeLaunchedProcess;
