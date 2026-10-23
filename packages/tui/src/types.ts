@@ -4,6 +4,10 @@
 // it introduces no new data model.
 
 export interface AgentRow {
+  /** Served attention and its needs-input provenance. Null is unavailable, never clear. */
+  needsAttention?: boolean | null;
+  arbitratedNeedsInput?: boolean | null;
+  needsInputEvidence?: { rung: string; observedAt: string } | null;
   /** Stable daemon node identity used by canonical seat-scoped records. */
   nodeId?: string;
   name: string;
@@ -38,6 +42,7 @@ export interface AgentRow {
     needsInput: { count: number; reason: string | null } | null;
     decidedBy: string | null;
     signalReason: string | null;
+    signalState?: string | null;
     signalSource: string | null;
     eventAt: string | null;
   };
