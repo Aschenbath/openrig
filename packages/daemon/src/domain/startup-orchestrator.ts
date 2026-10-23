@@ -5,7 +5,7 @@ import type { SessionRegistry } from "./session-registry.js";
 import type { EventBus } from "./event-bus.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import { isClaudeResumeType } from "../adapters/claude-resume.js";
-import type { StartupAction, StartupProofSelection } from "./types.js";
+import type { StartupAction, StartupProofSelection, StartupFailureStage } from "./types.js";
 import type {
   RuntimeAdapter, NodeBinding, ResolvedStartupFile,
   ProjectionResult, StartupDeliveryResult, ForkSource,
@@ -18,12 +18,17 @@ import { AppliedLaunchObservationStore } from "./applied-launch-observation-stor
 import { NativePermissionStore } from "./native-permission-store.js";
 import { RigRepository } from "./rig-repository.js";
 import { SessionTransport, inspectStartupStagedText } from "./session-transport.js";
-import { startupOwnCollapsedPaste, startupSubmissionEvidence, type StartupSubmissionDiagnostic } from "./startup-submission-evidence.js";
+import { claudeInputBoxDrawn, startupNoInputLine, startupOwnCollapsedPaste, startupSubmissionEvidence, type StartupSubmissionDiagnostic } from "./startup-submission-evidence.js";
 import type { AppliedLaunchObservation } from "./permission-drift.js";
 import { resolveReadinessTimeoutMs } from "./readiness-timeout.js";
 import { SettingsStore } from "./user-settings/settings-store.js";
 import { shellQuote } from "../adapters/shell-quote.js";
 import { observeClaudeResumeLaunch, type ClaudeLaunchedProcess, type NativeProcessLister } from "./native-process-lineage.js";
+import { CommunityHarnessRuntimeAdapter } from "../adapters/community-harness-runtime-adapter.js";
+import { join } from "node:path";
+import { readFootprintAnswer, routerLineSkipReason, type FootprintAnswer, type RouterLineWriteResult } from "./footprint-choice.js";
+import { describeSkillRouterFootprint, refusedSeatSkillsRootForNode, seatCatalogKeptNote, seatRouterKeptNote, seatSkillPathsForNode, seatSkillPluginDirForNode, writeSeatSkillCatalog, writeSeatSkillRouter } from "./seat-skill-storage.js";
+import { recordConversationPromptForNode, recordForkConversationPromptForNode, seatLaunchAdditionsForLaunch, systemPromptPendingNoteForNode } from "./seat-launch-additions.js";
 
 // Expanded startup text can put the current input marker above 50 scrollback lines.
 const STARTUP_SUBMIT_CAPTURE_LINES = 200;
@@ -31,16 +36,136 @@ const STARTUP_SUBMIT_CAPTURE_LINES = 200;
 // still showed that paste collapsed. Only that transient is looked at again, 200 ms apart, up to this many
 // times: about 5 s of waiting per send, plus capture time. Nothing is typed meanwhile.
 const STARTUP_SUBMIT_SETTLE_LOOKS = 25;
+// A prompt still staged after a guarded retry is retried again, up to this many retries in all, each after
+// the 200 ms look. Every retry is guarded: Enter goes in only while the composer holds exactly the text we typed.
+const STARTUP_SUBMIT_RETRIES = 2;
+
+// Why a startup prompt's submission could not be confirmed, as told to the operator when the
+// proof line is held back.
+const UNCONFIRMED_STAGED = "the prompt still looked staged in the input box";
+const UNCONFIRMED_UNOBSERVABLE = "the input box could not be observed";
+const UNCONFIRMED_UNCLEAR = "the input box did not clearly show the prompt as submitted";
+const UNCONFIRMED_RETRY_REFUSED = "the guarded Enter retry did not go through";
+
+/**
+ * The proof line is held back on purpose when the startup prompt isn't confirmed submitted. Say that
+ * only this one line was skipped, so it doesn't read as the agent or the rig failing to start.
+ */
+export function startupProofHeldBackWarning(reason: string | undefined): string {
+  return "Startup proof instruction held back: only the extra line asking the agent to run its startup check "
+    + "was not sent, so nothing is typed over input that may still be in the box. The startup prompt itself was "
+    + `sent, but its submission could not be confirmed: ${reason ?? "it was not observed submitted"}.`;
+}
+
+type PendingForkContext = { parentToken: string; isRestore: boolean };
+export type PendingStartupContext = { eventSeq: number } & (
+  | { mode: "fresh" }
+  | ({ mode: "fork" } & PendingForkContext)
+);
 
 /** Pending context belongs to this occupant and is consumed before delivery starts. */
-export function hasPendingFreshStartup(db: Database.Database, nodeId: string, sessionId: string): boolean {
-  const row = db.prepare("SELECT payload FROM events WHERE node_id = ? AND type IN ('node.startup_pending', 'node.startup_ready', 'node.startup_failed') ORDER BY seq DESC LIMIT 1").get(nodeId) as { payload: string } | undefined;
-  if (!row) return false;
+export function readPendingStartupContext(db: Database.Database, nodeId: string, sessionId: string): PendingStartupContext | null {
+  const row = db.prepare("SELECT seq, payload FROM events WHERE node_id = ? AND type IN ('node.startup_pending', 'node.startup_ready', 'node.startup_failed') ORDER BY seq DESC LIMIT 1").get(nodeId) as { seq: number; payload: string } | undefined;
+  if (!row) return null;
   const event = JSON.parse(row.payload);
-  return event.type === "node.startup_failed" && event.sessionId === sessionId && event.freshContextPending === true;
+  if (event.type !== "node.startup_failed" || event.sessionId !== sessionId) return null;
+  if (event.freshContextPending === true) return { eventSeq: row.seq, mode: "fresh" };
+  const fork = event.forkContextPending;
+  if (typeof fork?.parentToken === "string" && fork.parentToken.trim() && typeof fork.isRestore === "boolean") {
+    return { eventSeq: row.seq, mode: "fork", parentToken: fork.parentToken, isRestore: fork.isRestore };
+  }
+  return null;
+}
+
+export function hasClaudeResumeIdentityWork(
+  sessionRegistry: SessionRegistry,
+  sessionId: string,
+  runtime: string | undefined,
+  resumeToken: string | undefined | null,
+  resumeType: string | undefined | null,
+  skipHarnessLaunch?: boolean,
+  continuityOutcome?: string,
+): boolean {
+  if (skipHarnessLaunch || runtime !== "claude-code" || !resumeToken) {
+    return false;
+  }
+  if (continuityOutcome !== undefined && continuityOutcome !== "resumed") {
+    return false;
+  }
+  if (resumeType !== undefined && resumeType !== null && !isClaudeResumeType(resumeType)) {
+    return true;
+  }
+  const matches = sessionRegistry.resumeTokenMatches(sessionId, "claude_id", resumeToken.trim())
+    || sessionRegistry.claudeResumeRotatedFrom(sessionId, resumeToken);
+  return !matches;
+}
+
+export function hasPendingStartupWork(db: Database.Database, nodeId: string, sessionId: string): boolean {
+  const row = db.prepare(
+    "SELECT payload FROM events WHERE node_id = ? AND type IN ('node.startup_pending', 'node.startup_ready', 'node.startup_failed') ORDER BY seq DESC LIMIT 1",
+  ).get(nodeId) as { payload: string } | undefined;
+  if (!row) return true;
+  try {
+    const event = JSON.parse(row.payload);
+    if (event.type !== "node.startup_failed") return true;
+    if (event.sessionId !== sessionId) return true;
+    if (event.freshContextPending === true || event.forkContextPending) return true;
+    if (event.hasPendingWork !== false) return true;
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+export function getLatestStartupFailedEvent(db: Database.Database, nodeId: string, sessionId: string): {
+  type: string;
+  sessionId?: string;
+  freshContextPending?: boolean;
+  forkContextPending?: { parentToken: string; isRestore: boolean };
+  hasPendingWork?: boolean;
+  stage?: StartupFailureStage;
+  requestedResumeToken?: string | null;
+  requestedResumeType?: string | null;
+} | null {
+  const row = db.prepare(
+    "SELECT payload FROM events WHERE node_id = ? AND type IN ('node.startup_pending', 'node.startup_ready', 'node.startup_failed') ORDER BY seq DESC LIMIT 1",
+  ).get(nodeId) as { payload: string } | undefined;
+  if (!row) return null;
+  try {
+    const event = JSON.parse(row.payload);
+    if (event.type !== "node.startup_failed") return null;
+    if (!event.sessionId || event.sessionId !== sessionId) return null;
+    return event;
+  } catch {
+    return null;
+  }
+}
+
+export function isRecoverableStartupFailure(db: Database.Database, nodeId: string, sessionId: string): boolean {
+  if (readPendingStartupContext(db, nodeId, sessionId)) return false;
+  if (hasPendingStartupWork(db, nodeId, sessionId)) return false;
+
+  const sess = db.prepare("SELECT resume_type, resume_token FROM sessions WHERE id = ?").get(sessionId) as { resume_type?: string | null; resume_token?: string | null } | undefined;
+  if (sess?.resume_token && sess.resume_type !== null && sess.resume_type !== undefined && !isClaudeResumeType(sess.resume_type)) {
+    const node = db.prepare("SELECT runtime FROM nodes WHERE id = ?").get(nodeId) as { runtime?: string } | undefined;
+    if (node?.runtime === "claude-code") return false;
+  }
+
+  const event = getLatestStartupFailedEvent(db, nodeId, sessionId);
+  if (!event) return false;
+  if (event.freshContextPending === true || event.forkContextPending) return false;
+  if (event.hasPendingWork !== false) return false;
+  if (event.stage !== "post_delivery_readiness" && event.stage !== "readiness_check") return false;
+  return true;
 }
 
 // -- Types --
+
+/** The seat-skills bootstrap line among a seat's startup files: the built-in guidance merged into its managed block
+ *  (never the Codex catalog, which shares the logical name but is sent as text). */
+export function isSeatSkillsBootstrapLine(file: Pick<ResolvedStartupFile, "path" | "deliveryHint">): boolean {
+  return file.path === "openrig-seat-skills.md" && file.deliveryHint === "guidance_merge";
+}
 
 export interface StartupInput {
   rigId: string;
@@ -52,6 +177,11 @@ export interface StartupInput {
   resolvedStartupFiles: ResolvedStartupFile[];
   startupActions: StartupAction[];
   isRestore: boolean;
+  /**
+   * OPR.0.7.0.13: a fresh relaunch's decisions about the seat's own skills (seatSkillReplay): saved skill entries and
+   * startup skill files that this start must not project or install again. They stay in the saved startup context.
+   */
+  replaySkip?: { entryIds: ReadonlySet<string>; files: ReadonlySet<string> };
   /** Session name for harness launch (used as --name flag). */
   sessionName?: string;
   /** Resume token for restore path. Mutually exclusive with forkSource. */
@@ -96,10 +226,16 @@ type StartupDeliveryInput = StartupInput & {
   startupAttemptId: string; sendOrder: number; submissionDiagnostics: StartupSubmissionDiagnostic[];
   /** Claude only: whether the latest interactive send was observed submitted (a clear composer). */
   lastSubmissionConfirmed?: boolean;
+  /** Claude only: why the latest interactive send was not confirmed, in words for the operator. */
+  lastSubmissionUnconfirmedReason?: string;
 };
 
 export type StartupResult = { warnings?: string[] } & (
-  | { ok: true; startupStatus: "ready"; continuityOutcome: "resumed" | "fresh" | "forked" | "rebuilt"; submission?: { status: "unverified" | "staged"; reasons: string[]; warning?: string; diagnostics?: StartupSubmissionDiagnostic[] } }
+  | { ok: true; startupStatus: "ready"; continuityOutcome: "resumed" | "fresh" | "forked" | "rebuilt"; submission?: { status: "unverified" | "staged"; reasons: string[]; warning?: string; diagnostics?: StartupSubmissionDiagnostic[] };
+    /** OPR.0.7.0.13 (router): what happened to the one-line bootstrap at this start, when the seat has one. */
+    routerLine?: RouterLineWriteResult;
+    /** Codex (#1524): the native process the managed resume was proven on, carried to restore's join. */
+    resumedProcess?: { pid: number; startedAt: string } }
   // `evidence` carries the last-N pane lines for `attention_required`
   // outcomes so restore-orchestrator's per-node mapping can populate
   // `attentionEvidence` on the RestoreNodeResult. Internal type only;
@@ -204,7 +340,7 @@ export class StartupOrchestrator {
     try {
       input = { ...input, binding: new NativePermissionStore(this.db).apply(input.binding, input.adapter.runtime) };
     } catch (error) {
-      return this.fail(input, "failed", [`Permission selection: ${(error as Error).message}`]);
+      return this.fail(input, "failed", [`Permission selection: ${(error as Error).message}`], undefined, false, undefined, false, "permission_selection", true);
     }
     // #25: launch, restore replay, relaunch, continue and added members deliver
     // guidance through here, so the rig's managed-block destination is bound once
@@ -214,6 +350,30 @@ export class StartupOrchestrator {
     input = { ...input, binding: { ...input.binding, nonInterruptive: rigRepo.getRigNonInterruptive(input.rigId) } };
     const claudeManagedBlockFile = rigRepo.getRigClaudeManagedBlockFile(input.rigId);
     if (claudeManagedBlockFile) input = { ...input, binding: { ...input.binding, claudeManagedBlockFile } };
+    // OPR.0.7.0.13: a Claude seat whose plugin OpenRig keeps (already on its CLAUDE_CODE_PLUGIN_DIRS) gets every skill
+    // there, profile resources and startup skill files too. A seat without one keeps the project, as before, so a
+    // skill never lands where nothing points.
+    if (input.adapter.runtime === "claude-code" && !input.binding.seatSkillsRoot) {
+      const seatPlugin = seatSkillPluginDirForNode(this.db, input.nodeId);
+      if (seatPlugin) input = { ...input, binding: { ...input.binding, seatSkillsRoot: join(seatPlugin, "skills") } };
+    }
+    // OPR.0.7.0.13 (Codex C2): a Codex seat with its own storage gets its skills there, and its catalog, rebuilt after
+    // this launch's projection, is what its per-seat startup text delivers.
+    const codexSeatSkills = input.adapter.runtime === "codex" ? seatSkillPathsForNode(this.db, input.nodeId) : undefined;
+    if (codexSeatSkills && !input.binding.seatSkillsRoot) input = { ...input, binding: { ...input.binding, seatSkillsRoot: codexSeatSkills.skillsRoot } };
+    // A seat whose storage a link refused keeps its skills' target there, where each is refused and named; they never
+    // fall back into the project.
+    if (!input.binding.seatSkillsRoot && (input.adapter.runtime === "claude-code" || input.adapter.runtime === "codex")) {
+      const refused = refusedSeatSkillsRootForNode(this.db, input.nodeId);
+      if (refused) input = { ...input, binding: { ...input.binding, seatSkillsRoot: refused.skillsRoot, seatSkillsRefused: refused.reason } };
+    }
+    // OPR.0.7.0.9: a Claude seat's own launch additions, the copies present in its seat storage; a missing copy is named.
+    if (input.adapter.runtime === "claude-code" && !input.binding.launchAdditions) {
+      const { additions, missing, refused } = seatLaunchAdditionsForLaunch(this.db, input.nodeId);
+      if (additions) input = { ...input, binding: { ...input.binding, launchAdditions: additions } };
+      for (const file of missing) warnings.push(`${input.sessionName ?? input.nodeId}: seat_launch_addition_missing: ${file} is not in this seat's storage; launched without it`);
+      for (const reason of refused) warnings.push(`${input.sessionName ?? input.nodeId}: seat_launch_addition_refused: ${reason}; launched without it`);
+    }
     const deliveryInput: StartupDeliveryInput = { ...input, warnings, submissionWarnings: [], startupAttemptId: randomUUID(), sendOrder: 0, submissionDiagnostics: [] };
     const errors: string[] = [];
     let continuityOutcome: "resumed" | "fresh" | "forked" | "rebuilt" = input.resumeToken
@@ -224,6 +384,10 @@ export class StartupOrchestrator {
           ? "rebuilt"
           : "fresh";
     let appliedLaunch: AppliedLaunchObservation | undefined;
+    let resumedProcess: { pid: number; startedAt: string } | undefined;
+    const forkContext: PendingForkContext | undefined = input.adapter.runtime === "codex"
+      && input.forkSource?.kind === "native_id" && input.forkSource.value?.trim()
+      ? { parentToken: input.forkSource.value.trim(), isRestore: input.isRestore } : undefined;
     const launchGeneration = this.sessionRegistry.currentOccupantTenure(input.nodeId)?.generationUuid;
 
     // 1. Mark pending
@@ -233,7 +397,7 @@ export class StartupOrchestrator {
     try {
       startupProof = resolveStartupProof(input.startupActions, context);
     } catch (err) {
-      return this.fail(input, "failed", [`Startup proof selection: ${(err as Error).message}`]);
+      return this.fail(input, "failed", [`Startup proof selection: ${(err as Error).message}`], undefined, false, undefined, false, "proof_selection", true);
     }
     this.eventBus.emit({ type: "node.startup_pending", rigId: input.rigId, nodeId: input.nodeId, startupProof });
 
@@ -243,17 +407,21 @@ export class StartupOrchestrator {
     // native resume. Fresh launches still project empty plans to support removal.
     let projectionResult: ProjectionResult;
     if (!(input.preserveStartupContext && input.adapter.runtime === "claude-code" && input.plan.entries.length === 0)) try {
-      projectionResult = await input.adapter.project(input.plan, input.binding);
+      const skip = input.replaySkip;
+      const projectedPlan = skip && skip.entryIds.size > 0
+        ? { ...input.plan, entries: input.plan.entries.filter((e) => !(e.category === "skill" && skip.entryIds.has(e.effectiveId))) }
+        : input.plan;
+      projectionResult = await input.adapter.project(projectedPlan, input.binding);
       warnings.push(...(projectionResult.warnings ?? []));
       if (projectionResult.failed.length > 0) {
         for (const f of projectionResult.failed) {
           errors.push(`Projection failed for ${f.effectiveId}: ${f.error}`);
         }
-        return this.fail(input, "failed", errors);
+        return this.fail(input, "failed", errors, undefined, false, undefined, false, "projection", true);
       }
     } catch (err) {
       errors.push(`Projection error: ${(err as Error).message}`);
-      return this.fail(input, "failed", errors);
+      return this.fail(input, "failed", errors, undefined, false, undefined, false, "projection", true);
     }
 
     // 3. Partition startup files by concrete hint: pre-launch (filesystem) vs post-launch (TUI)
@@ -267,7 +435,13 @@ export class StartupOrchestrator {
     const sourceFiles = input.rebuildArtifacts && input.rebuildArtifacts.length > 0
       ? [...input.rebuildArtifacts, ...input.resolvedStartupFiles]
       : input.resolvedStartupFiles;
-    const applicableFiles = sourceFiles.filter((f) => f.appliesOn.includes(context));
+    // OPR.0.7.0.13 (router, R1.1): the one-line bootstrap is delivered on its own (below), only with a yes, and never
+    // stops the launch. Every start reads the answer, so a saved context from before the line was opt-in (or from while
+    // it was on) delivers it only while the yes stands. Nothing already written is removed.
+    const bootstrapLine = sourceFiles.filter((f) => f.appliesOn.includes(context) && !input.replaySkip?.files.has(f.absolutePath)
+      && isSeatSkillsBootstrapLine(f));
+    const applicableFiles = sourceFiles.filter((f) => f.appliesOn.includes(context) && !input.replaySkip?.files.has(f.absolutePath)
+      && !isSeatSkillsBootstrapLine(f));
     const preLaunchFiles: ResolvedStartupFile[] = [];
     let postLaunchFiles: ResolvedStartupFile[] = [];
     for (const f of applicableFiles) {
@@ -290,11 +464,58 @@ export class StartupOrchestrator {
         for (const f of deliveryResult.failed) {
           errors.push(`Pre-launch file delivery failed: ${f.path}: ${f.error}`);
         }
-        return this.fail(input, "failed", errors);
+        return this.fail(input, "failed", errors, undefined, false, undefined, false, "pre_launch_files", true);
       }
     } catch (err) {
       errors.push(`Pre-launch delivery error: ${(err as Error).message}`);
-      return this.fail(input, "failed", errors);
+      return this.fail(input, "failed", errors, undefined, false, undefined, false, "pre_launch_files", true);
+    }
+
+    // OPR.0.7.0.13 (router, R1.1): the bootstrap line, on its own: with a yes it is delivered into the seat's guidance file;
+    // otherwise it is skipped with the answer's reason. A line that can't be written is this start's named result (from
+    // the delivery's own error), never a failed launch.
+    let routerLine: RouterLineWriteResult | undefined;
+    if (bootstrapLine.length > 0) {
+      let answer: FootprintAnswer | null = null;
+      try { answer = readFootprintAnswer(this.readinessSettings); } catch { /* unreadable: reported as such */ }
+      const target = describeSkillRouterFootprint([{ seat: input.sessionName ?? input.nodeId, runtime: input.adapter.runtime,
+        cwd: input.binding.cwd ?? ".", claudeManagedBlockFile: input.binding.claudeManagedBlockFile ?? null }]).files[0]?.path;
+      if (target) {
+        const skip = routerLineSkipReason(answer);
+        if (skip) routerLine = { answer, files: [{ path: target, outcome: "skipped", reason: skip }] };
+        else {
+          try {
+            // The saved line is optional, and the adapters swallow an optional file's write error; for this one isolated
+            // call, mark it required so the adapter reports the real error, which is handled here without failing the start.
+            const delivered = await input.adapter.deliverStartup(bootstrapLine.map((f) => ({ ...f, required: true })), input.binding);
+            const failed = delivered.failed.find((f) => f.path === bootstrapLine[0]!.path) ?? delivered.failed[0];
+            routerLine = { answer, files: [failed ? { path: target, outcome: "unwritable", error: failed.error } : { path: target, outcome: "delivered" }] };
+          } catch (err) {
+            routerLine = { answer, files: [{ path: target, outcome: "unwritable", error: (err as Error).message }] };
+          }
+          const unwritable = routerLine.files.find((f) => f.outcome === "unwritable");
+          if (unwritable && unwritable.outcome === "unwritable") warnings.push(`seat_skills_line_unwritable: ${unwritable.path}: ${unwritable.error}; the seat started without it`);
+        }
+      }
+    }
+
+    // OPR.0.7.0.13 (router): the seat's one generated router skill, after every pre-launch skill writer, so it lists
+    // every skill the seat starts with. A router that can't be written is this seat's named result; the launch goes on.
+    const routerSeatSkills = input.adapter.runtime === "claude-code" ? seatSkillPathsForNode(this.db, input.nodeId) : codexSeatSkills;
+    if (routerSeatSkills) {
+      try {
+        const router = writeSeatSkillRouter(routerSeatSkills);
+        if (router.kept) warnings.push(seatRouterKeptNote(router));
+      } catch (err) { warnings.push(`seat_router_not_written: ${(err as Error).message}`); }
+    }
+
+    // OPR.0.7.0.13 (Codex C2): the seat's catalog, built after every pre-launch skill writer (projection and startup
+    // skill files) and before the post-launch text that sends it, so it lists every skill the seat starts with.
+    if (codexSeatSkills) {
+      try {
+        const catalog = writeSeatSkillCatalog(codexSeatSkills);
+        if (catalog.kept) warnings.push(`${seatCatalogKeptNote(catalog)}${catalog.reason === "edited" ? ", and that file is what the seat's startup text sends" : ""}`);
+      } catch (err) { warnings.push(`seat skill catalog not written: ${(err as Error).message}`); }
     }
 
     // 7. Persist startup context for restore replay
@@ -309,10 +530,17 @@ export class StartupOrchestrator {
         input.adapter.runtime,
       );
     } catch (error) {
-      return this.fail(input, "failed", [`Startup context persistence failed: ${String(error)}`]);
+      return this.fail(input, "failed", [`Startup context persistence failed: ${String(error)}`], undefined, false, undefined, false, "persistence", true);
     }
 
     // 5. Launch harness (unless skipped for legacy nodes)
+    // A community harness's seat: record the selection on this session before the app starts. It's provenance for
+    // later reads (identity, activity, labels, restore), not launch success or identity proof.
+    if (input.adapter instanceof CommunityHarnessRuntimeAdapter) {
+      try { this.sessionRegistry.recordCommunityHarnessSelection(input.sessionId, input.adapter.runtime); }
+      catch (err) { errors.push(`Couldn't record the community harness selection: ${(err as Error).message}`); return this.fail(input, "failed", errors); }
+    }
+
     if (!input.skipHarnessLaunch) {
       try {
         let launchResumeToken = input.resumeToken;
@@ -332,6 +560,7 @@ export class StartupOrchestrator {
           });
           if (launchResult.ok) {
             appliedLaunch = launchResult.appliedLaunch;
+            resumedProcess = launchResult.resumedProcess;
             if (input.adapter.runtime === "claude-code" && launchResumeToken?.trim()) {
               await this.recordClaudeResumeLaunch(input.sessionId, input.binding.tmuxPane ?? input.binding.tmuxSession, launchResumeToken.trim(), launchResult.launchedProcess);
             }
@@ -342,6 +571,20 @@ export class StartupOrchestrator {
               try {
                 this.sessionRegistry.updateResumeToken(input.sessionId, launchResult.resumeType ?? "", normalizedResumeToken, "scrape");
               } catch { /* best-effort */ }
+            }
+            // OPR.0.7.0.9: the prompt a new conversation starts with; on a resume, a changed prompt is pending.
+            if (input.adapter.runtime === "claude-code" && input.binding.launchAdditions?.appendSystemPromptFile) {
+              const resumed = launchResumeToken?.trim();
+              if (resumed) {
+                const pending = systemPromptPendingNoteForNode(this.db, input.nodeId, resumed);
+                if (pending) warnings.push(`${input.sessionName ?? input.nodeId}: ${pending}`);
+              } else if (normalizedResumeToken) {
+                // A fork starts from its parent's conversation: it takes the parent's recorded start (or none).
+                try {
+                  if (input.forkSource?.value) recordForkConversationPromptForNode(this.db, input.nodeId, normalizedResumeToken, input.forkSource.value);
+                  else recordConversationPromptForNode(this.db, input.nodeId, normalizedResumeToken);
+                } catch { /* best-effort */ }
+              }
             }
             break;
           }
@@ -387,16 +630,19 @@ export class StartupOrchestrator {
             }
             errors.push(`Harness launch requires attention: ${launchResult.error}`);
             // isRestore selects context, not native continuity: pod-aware exact
-            // resume also uses false. Only an actual fresh launch may re-prime.
-            return this.fail(input, "attention_required", errors, launchResult.evidence, continuityOutcome === "fresh");
+            // resume also uses false. Only an actual fresh launch may re-prime; an
+            // unverified fork keeps its unsent context for a verified continuation.
+            return this.fail(input, "attention_required", errors, launchResult.evidence,
+              launchResult.forkIdentityPending ? forkContext ?? false : continuityOutcome === "fresh",
+              undefined, false, "harness_launch", true);
           }
 
           errors.push(`Harness launch failed: ${launchResult.error}`);
-          return this.fail(input, "failed", errors, undefined, false, launchResult.recovery, launchResult.missingConversation === true);
+          return this.fail(input, "failed", errors, undefined, false, launchResult.recovery, launchResult.missingConversation === true, "harness_launch", true);
         }
       } catch (err) {
         errors.push(`Harness launch error: ${(err as Error).message}`);
-        return this.fail(input, "failed", errors);
+        return this.fail(input, "failed", errors, undefined, false, undefined, false, "harness_launch", true);
       }
     }
 
@@ -413,20 +659,71 @@ export class StartupOrchestrator {
     }
 
     // 6. Wait for harness readiness within the configured launch window.
+    const getPendingReadinessWork = () => {
+      const hasRemainingIdentityWork = hasClaudeResumeIdentityWork(
+        this.sessionRegistry,
+        input.sessionId,
+        input.adapter.runtime,
+        input.resumeToken,
+        input.resumeType,
+        input.skipHarnessLaunch,
+        continuityOutcome,
+      );
+      return postLaunchFiles.length > 0 || (input.startupActions ?? []).some(
+        (a) => a.phase === "after_files" || a.phase === "after_ready" || isSessionIdentityAction(a) || a.type === "send_text",
+      ) || hasRemainingIdentityWork;
+    };
     try {
       const readinessTimeoutMs = resolveReadinessTimeoutMs(input.readinessTimeoutMs, this.readinessSettings);
       const readiness = await this.waitForReady(input.adapter, input.binding, readinessTimeoutMs);
       if (!readiness.ready) {
+        const hasPendingReadinessWork = getPendingReadinessWork();
         if (isAttentionRequiredReadinessCode(readiness.code)) {
           errors.push(`Startup requires attention: ${readiness.reason ?? "unknown"}`);
-          return this.fail(input, "attention_required", errors, undefined, isFreshLaunch);
+          return this.fail(input, "attention_required", errors, undefined, isFreshLaunch || (forkContext ?? false), undefined, false, "readiness_check", hasPendingReadinessWork);
         }
         errors.push(`Readiness timeout after ${readinessTimeoutMs / 1000}s — harness did not become interactive: ${readiness.reason ?? "unknown"}`);
-        return this.fail(input, "failed", errors);
+        return this.fail(input, forkContext ? "attention_required" : "failed", errors, undefined, forkContext ?? false, undefined, false, "readiness_check", hasPendingReadinessWork);
       }
     } catch (err) {
       errors.push(`Readiness check error: ${(err as Error).message}`);
-      return this.fail(input, "failed", errors);
+      return this.fail(input, "failed", errors, undefined, false, undefined, false, "readiness_check", getPendingReadinessWork());
+    }
+
+    if (input.skipHarnessLaunch && forkContext) {
+      // Continuing a fork is a read-only identity check, never another fork or
+      // a resume of its parent. Do this after readiness, before any prompt.
+      let identity: { resumeToken: string; resumeType: string } | null | undefined;
+      let captureError: string | undefined;
+      try {
+        identity = await input.adapter.captureForkIdentity?.(input.binding, forkContext.parentToken);
+      } catch (error) { captureError = String(error); }
+      // Check even a missing/failed observation before publishing a failure.
+      const current = this.db.prepare("SELECT id FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1").get(input.nodeId) as { id: string } | undefined;
+      const binding = this.sessionRegistry.getBindingForNode(input.nodeId);
+      if (current?.id !== input.sessionId) {
+        // The newer occupant owns the node's startup event stream. Update only
+        // the previous session: a late event here could hide the new pending context.
+        this.sessionRegistry.updateStartupStatus(input.sessionId, "attention_required");
+        return { ok: false, startupStatus: "attention_required", errors: ["The occupant changed during fork verification; no startup context was sent."] };
+      }
+      if (binding?.tmuxPane !== input.binding.tmuxPane || binding?.tmuxSession !== input.binding.tmuxSession) {
+        return this.fail(input, "attention_required", ["The terminal binding changed during fork verification; no startup context was sent."]);
+      }
+      if (captureError !== undefined) {
+        return this.fail(input, "attention_required", [`Fork identity verification failed: ${captureError}; no startup context was sent.`], undefined, forkContext);
+      }
+      if (!identity?.resumeToken || identity.resumeToken === forkContext.parentToken || identity.resumeType !== "codex_id") {
+        return this.fail(input, "attention_required", ["The fork's child identity is not verified yet; no startup context was sent."], undefined, forkContext);
+      }
+      try {
+        this.sessionRegistry.updateResumeToken(input.sessionId, identity.resumeType, identity.resumeToken, "scrape");
+        if (!this.sessionRegistry.resumeTokenMatches(input.sessionId, identity.resumeType, identity.resumeToken)) {
+          return this.fail(input, "attention_required", ["The verified fork child conflicts with protected session metadata; no startup context was sent."], undefined, forkContext);
+        }
+      } catch (error) {
+        return this.fail(input, "attention_required", [`Fork identity verification failed: ${String(error)}; no startup context was sent.`], undefined, forkContext);
+      }
     }
 
     // The adapter returned the exact enforcing value it inserted, and readiness
@@ -455,7 +752,7 @@ export class StartupOrchestrator {
       const initialPrompt = await this.deliverInitialSessionPrompt(deliveryInput, identityAction, postLaunchFiles, challenge?.promptBlock ?? null, input.includeDurableObligations);
       if (!initialPrompt.ok) {
         errors.push(initialPrompt.error);
-        return this.fail(input, "failed", errors);
+        return this.fail(input, "failed", errors, undefined, false, undefined, false, "initial_prompt", true);
       }
       postLaunchFiles = initialPrompt.remainingFiles;
       if (challenge) await this.sendProofInstruction(deliveryInput);
@@ -488,7 +785,7 @@ export class StartupOrchestrator {
         const preload = await this.deliverRestorePreloadPrompt(deliveryInput, preloadActions, postLaunchFiles);
         if (!preload.ok) {
           errors.push(preload.error);
-          return this.fail(input, "failed", errors);
+          return this.fail(input, "failed", errors, undefined, false, undefined, false, "restore_preload", true);
         }
         postLaunchFiles = preload.remainingFiles;
         for (const a of preloadActions) consumedActions.add(a);
@@ -510,11 +807,11 @@ export class StartupOrchestrator {
           for (const f of deliveryResult.failed) {
             errors.push(`Post-launch file delivery failed: ${f.path}: ${f.error}`);
           }
-          return this.fail(deliveryInput, "failed", errors);
+          return this.fail(deliveryInput, "failed", errors, undefined, false, undefined, false, "post_launch_files", true);
         }
       } catch (err) {
         errors.push(`Post-launch delivery error: ${(err as Error).message}`);
-        return this.fail(deliveryInput, "failed", errors);
+        return this.fail(deliveryInput, "failed", errors, undefined, false, undefined, false, "post_launch_files", true);
       }
     }
 
@@ -528,14 +825,14 @@ export class StartupOrchestrator {
     // 8. Execute after_files actions
     const afterFilesResult = await this.executeActions(deliveryInput, "after_files");
     if (!afterFilesResult.ok) {
-      return this.fail(deliveryInput, "failed", afterFilesResult.errors);
+      return this.fail(deliveryInput, "failed", afterFilesResult.errors, undefined, false, undefined, false, "after_files", true);
     }
 
     // 9. Execute after_ready actions (skipping any preload actions already
     // delivered ahead of role.md by the restore-order bundling above).
     const afterReadyResult = await this.executeActions(deliveryInput, "after_ready", consumedActions);
     if (!afterReadyResult.ok) {
-      return this.fail(deliveryInput, "failed", afterReadyResult.errors);
+      return this.fail(deliveryInput, "failed", afterReadyResult.errors, undefined, false, undefined, false, "after_ready", true);
     }
 
     // Delivering the first native prompt can reveal a provider refusal or
@@ -545,7 +842,16 @@ export class StartupOrchestrator {
       try {
         const readiness = await input.adapter.checkReady(input.binding);
         if (!readiness.ready && isAttentionRequiredReadinessCode(readiness.code)) {
-          return this.fail(deliveryInput, "attention_required", [readiness.reason ?? "The native provider prerequisite failed after context delivery."]);
+          const hasRemainingIdentityWork = hasClaudeResumeIdentityWork(
+            this.sessionRegistry,
+            input.sessionId,
+            input.adapter.runtime,
+            input.resumeToken,
+            input.resumeType,
+            input.skipHarnessLaunch,
+            continuityOutcome,
+          );
+          return this.fail(deliveryInput, "attention_required", [readiness.reason ?? "The native provider prerequisite failed after context delivery."], undefined, false, undefined, false, "post_delivery_readiness", hasRemainingIdentityWork);
         }
       } catch (error) {
         // An unavailable observation is not a positive provider prerequisite.
@@ -559,15 +865,18 @@ export class StartupOrchestrator {
     // Check after readiness/actions so a concurrent protected update is included.
     // Omitted type is inferred; claude_name may normalize to a proved claude_id.
     // An explicit type for another runtime is not that supported normalization.
-    if (!input.skipHarnessLaunch && input.adapter.runtime === "claude-code"
-      && continuityOutcome === "resumed" && input.resumeToken
-      && ((input.resumeType !== undefined && !isClaudeResumeType(input.resumeType))
-        || !(this.sessionRegistry.resumeTokenMatches(input.sessionId, "claude_id", input.resumeToken.trim())
-          // Claude continued this resume under a new id; its current-generation hook said so.
-          || this.sessionRegistry.claudeResumeRotatedFrom(input.sessionId, input.resumeToken)))) {
+    if (hasClaudeResumeIdentityWork(
+      this.sessionRegistry,
+      input.sessionId,
+      input.adapter.runtime,
+      input.resumeToken,
+      input.resumeType,
+      input.skipHarnessLaunch,
+      continuityOutcome,
+    )) {
       return this.fail(deliveryInput, "attention_required", [
         "Native resume was observed but its requested type or current session metadata conflicts or could not be retained; session preserved.",
-      ]);
+      ], undefined, false, undefined, false, "identity_verification", false);
     }
 
     // 8. Mark ready
@@ -580,15 +889,19 @@ export class StartupOrchestrator {
       : undefined;
     this.eventBus.emit({ type: "node.startup_ready", rigId: input.rigId, nodeId: input.nodeId, ...(submission ? { submission } : {}) });
 
-    return { ok: true, startupStatus: "ready", continuityOutcome, ...(submission ? { submission } : {}) };
+    return { ok: true, startupStatus: "ready", continuityOutcome, ...(submission ? { submission } : {}), ...(routerLine ? { routerLine } : {}), ...(resumedProcess ? { resumedProcess } : {}) };
   }
 
   /** A failed attempt can continue only when it stopped before sending context.
    * Any newer pending/ready/failure event consumes that permission, including a
    * daemon loss during delivery: uncertain delivery is never blindly replayed.
    */
-  canContinueFresh(nodeId: string, sessionId: string): boolean {
-    return hasPendingFreshStartup(this.db, nodeId, sessionId);
+  canContinueStartup(nodeId: string, sessionId: string): boolean {
+    return this.pendingStartupContext(nodeId, sessionId) !== null;
+  }
+
+  pendingStartupContext(nodeId: string, sessionId: string): PendingStartupContext | null {
+    return readPendingStartupContext(this.db, nodeId, sessionId);
   }
 
   /**
@@ -630,11 +943,17 @@ export class StartupOrchestrator {
     status: "attention_required" | "failed",
     errors: string[],
     evidence?: string,
-    freshContextPending = false,
+    pendingContext: boolean | PendingForkContext = false,
     recovery?: string,
     missingConversation = false,
+    stage?: StartupFailureStage,
+    hasPendingWork?: boolean,
   ): StartupResult {
-    if (status === "attention_required" && freshContextPending && input.binding.tmuxSession) {
+    if (status === "attention_required" && typeof pendingContext === "object") {
+      // The reasons above stay visible; this only says what the status means for the fork.
+      errors.push("The fork's startup context is waiting to be sent: this attention status doesn't mean the forked conversation is healthy");
+    }
+    if (status === "attention_required" && pendingContext && input.binding.tmuxSession) {
       errors.push(`After resolving it in ${input.binding.tmuxSession}, run: rig seat continue ${shellQuote(input.binding.tmuxSession)}`);
     }
     this.sessionRegistry.updateStartupStatus(input.sessionId, status);
@@ -644,8 +963,13 @@ export class StartupOrchestrator {
       nodeId: input.nodeId,
       error: errors.join("; "),
       sessionId: input.sessionId,
-      ...(freshContextPending ? { freshContextPending: true } : {}),
+      ...(pendingContext === true ? { freshContextPending: true }
+        : pendingContext ? { forkContextPending: pendingContext } : {}),
       ...(input.submissionDiagnostics?.length ? { submissionDiagnostics: input.submissionDiagnostics } : {}),
+      ...(stage ? { stage } : {}),
+      ...(hasPendingWork !== undefined ? { hasPendingWork } : {}),
+      requestedResumeToken: input.resumeToken ?? null,
+      requestedResumeType: input.resumeType ?? null,
     });
     return { ok: false, startupStatus: status, errors, evidence, ...(recovery ? { recovery } : {}),
       ...(missingConversation ? { missingConversation: true as const } : {}) };
@@ -712,7 +1036,8 @@ export class StartupOrchestrator {
     }
 
     const firstSendTextIndex = postLaunchFiles.findIndex((file) => file.deliveryHint === "send_text");
-    let prompt = identityAction.value;
+    const identityContext = `OpenRig-generated identity context (not a project task):\n${identityAction.value}\nEnd of generated identity context.`;
+    let prompt = identityContext;
     let remainingFiles = postLaunchFiles;
 
     if (firstSendTextIndex !== -1) {
@@ -720,13 +1045,17 @@ export class StartupOrchestrator {
       try {
         const content = this.readFile(firstSendText.absolutePath);
         if (content.length > 0) {
-          prompt = `${identityAction.value}\n\n${content}`;
+          prompt = `${identityContext}\n\n${content}`;
           remainingFiles = postLaunchFiles.filter((_, index) => index !== firstSendTextIndex);
         }
       } catch {
         // Fall back to a standalone identity prompt and let the adapter handle
         // the original startup file using its normal failure semantics.
       }
+    }
+
+    if (firstSendTextIndex === -1 && !input.isRestore && !includeDurableObligations && !challengeBlock) {
+      prompt += "\n\nFor this identity-only startup, run rig whoami --json and reply with your identity and readiness for an assignment. Repository history, tool descriptions and your own replies are not assignments.";
     }
 
     if (includeDurableObligations) prompt += `\n\nThis is a fresh conversation. Before choosing work, derive your identity with rig whoami --json and read durable obligations with rig queue list --destination ${binding.tmuxSession} --state pending,in-progress,blocked --limit 10000 --full --json. Report truncation at the limit; a destination row is not permission to claim unrelated work.`;
@@ -799,7 +1128,7 @@ export class StartupOrchestrator {
   private async sendProofInstruction(input: StartupDeliveryInput): Promise<void> {
     if (input.adapter.runtime !== "claude-code" || !input.binding.tmuxSession) return;
     if (!input.lastSubmissionConfirmed) {
-      this.recordSubmissionWarning(input, "Startup proof instruction was not sent: the startup prompt was not confirmed submitted.");
+      this.recordSubmissionWarning(input, startupProofHeldBackWarning(input.lastSubmissionUnconfirmedReason));
       return;
     }
     const failure = await this.sendInteractiveText(input, STARTUP_PROOF_INSTRUCTION_LINE, "startup_proof_instruction");
@@ -817,6 +1146,8 @@ export class StartupOrchestrator {
     const sendOrder = ++input.sendOrder;
     const tmuxSession = input.binding.tmuxSession!;
     input.lastSubmissionConfirmed = false;
+    input.lastSubmissionUnconfirmedReason = undefined;
+    if (input.adapter.runtime === "claude-code" && sendOrder === 1 && !input.isRestore) await this.awaitClaudeInputBox(input.binding.tmuxPane);
     const textResult = await this.tmuxAdapter.sendText(tmuxSession, text);
     if (!textResult.ok) {
       return { error: (textResult as { message?: string }).message ?? "unknown" };
@@ -838,7 +1169,8 @@ export class StartupOrchestrator {
       if (evidence) diagnostic.observations.push({ ...evidence, phase, ...(look === undefined ? {} : { look }) });
       return evidence;
     };
-    const unverified = (reason: string): null => {
+    const unverified = (reason: string, operatorReason: string): null => {
+      input.lastSubmissionUnconfirmedReason = operatorReason;
       this.recordSubmissionWarning(input, reason);
       return null; // An unavailable observation is not a failed delivery.
     };
@@ -847,7 +1179,7 @@ export class StartupOrchestrator {
     try {
       await this.sleep(200);
       const first = await this.tmuxAdapter.capturePaneContent(tmuxSession, STARTUP_SUBMIT_CAPTURE_LINES);
-      if (!first?.trim()) { record(first); return unverified("Startup submission capture is unavailable after Enter."); }
+      if (!first?.trim()) { record(first); return unverified("Startup submission capture is unavailable after Enter.", UNCONFIRMED_UNOBSERVABLE); }
       const { pane, state: before, looks } = await this.settleOwnPaste(tmuxSession, first, text, input.adapter.runtime);
       if (before === "clear") { input.lastSubmissionConfirmed = true; return null; }
       if (before === "unverified") {
@@ -855,26 +1187,36 @@ export class StartupOrchestrator {
         const evidence = record(pane, looks || undefined);
         return unverified(evidence?.reason === "unrecognized_composer_boundary"
           ? "Startup submission is unverified: the current composer boundary was not recognized."
-          : "Startup submission is unverified: the current composer does not positively match the complete prompt.");
+          : "Startup submission is unverified: the current composer does not positively match the complete prompt.",
+        UNCONFIRMED_UNCLEAR);
       }
-      phase = "guarded_retry";
-      diagnostic.retry = "threw"; // Replaced when the transport returns normally.
-      const retry = await this.sessionTransport.send(tmuxSession, "", {
-        submitOnly: true,
-        expectedStagedText: text,
-        submitOnlyCaptureLines: STARTUP_SUBMIT_CAPTURE_LINES,
-        requireFullStagedText: true,
-        onStartupMismatch: (evidence) => { diagnostic.observations.push({ ...evidence, phase: "guarded_retry" }); },
-      });
-      diagnostic.retry = retry.ok ? "ok" : "refused_or_failed";
-      phase = "after_retry";
-      await this.sleep(200);
-      const after = await this.tmuxAdapter.capturePaneContent(tmuxSession, STARTUP_SUBMIT_CAPTURE_LINES);
-      if (!after?.trim()) { record(after); return unverified("Startup submission capture is unavailable after the guarded retry."); }
-      const observed = inspectStartupStagedText(after, text, input.adapter.runtime);
+      let retry: Awaited<ReturnType<SessionTransport["send"]>>;
+      let after: string | null;
+      let observed: ReturnType<typeof inspectStartupStagedText>;
+      let retries = 0;
+      do {
+        phase = "guarded_retry";
+        diagnostic.retry = "threw"; // Replaced when the transport returns normally.
+        retry = await this.sessionTransport.send(tmuxSession, "", {
+          openrigNotice: true,
+          submitOnly: true,
+          expectedStagedText: text,
+          submitOnlyCaptureLines: STARTUP_SUBMIT_CAPTURE_LINES,
+          requireFullStagedText: true,
+          onStartupMismatch: (evidence) => { diagnostic.observations.push({ ...evidence, phase: "guarded_retry" }); },
+        });
+        diagnostic.retry = retry.ok ? "ok" : "refused_or_failed";
+        phase = "after_retry";
+        await this.sleep(200);
+        after = await this.tmuxAdapter.capturePaneContent(tmuxSession, STARTUP_SUBMIT_CAPTURE_LINES);
+        if (!after?.trim()) { record(after); return unverified("Startup submission capture is unavailable after the guarded retry.", UNCONFIRMED_UNOBSERVABLE); }
+        observed = inspectStartupStagedText(after, text, input.adapter.runtime);
+        // A refused retry is not repeated; only a retry whose Enter went in and was lost again is.
+      } while (observed === "staged" && retry.ok && ++retries < STARTUP_SUBMIT_RETRIES);
       if (observed === "staged") {
         const warning = `Startup prompt still staged in ${tmuxSession}; press Enter in that pane.`;
         input.stagedSubmissionWarning = warning;
+        input.lastSubmissionUnconfirmedReason = UNCONFIRMED_STAGED;
         this.recordSubmissionWarning(input, warning);
         if (!retry.ok) this.recordSubmissionWarning(input, `Guarded retry did not submit: ${retry.error ?? retry.reason}`);
         return null;
@@ -883,30 +1225,49 @@ export class StartupOrchestrator {
         const evidence = record(after);
         return unverified(evidence?.reason === "unrecognized_composer_boundary"
           ? "Startup submission is unverified after the guarded retry: the current composer boundary was not recognized."
-          : "Startup submission is unverified after the guarded retry: the current composer is ambiguous.");
+          : "Startup submission is unverified after the guarded retry: the current composer is ambiguous.",
+        UNCONFIRMED_UNCLEAR);
       }
-      if (!retry.ok) return unverified(`Guarded startup retry did not submit: ${retry.error ?? retry.reason}; matching staged text is no longer visible.`);
+      if (!retry.ok) return unverified(`Guarded startup retry did not submit: ${retry.error ?? retry.reason}; matching staged text is no longer visible.`, UNCONFIRMED_RETRY_REFUSED);
       input.lastSubmissionConfirmed = true;
       return null;
     } catch (error) {
       if (!diagnostic.observations.some(observation => observation.phase === phase)) record(null);
-      return unverified(`Startup submission observation is unavailable: ${(error as Error).message}`);
+      return unverified(`Startup submission observation is unavailable: ${(error as Error).message}`, UNCONFIRMED_UNOBSERVABLE);
     } finally {
       if (diagnostic.observations.length) input.submissionDiagnostics.push(diagnostic);
     }
   }
 
   /**
-   * Claude can take the startup Enter after the first look while the composer still shows our paste collapsed.
-   * Only that transient is looked at again, until the composer reads clear or staged, shows anything else, or
-   * the looks run out. A draft, ghost text or any other mismatch keeps its first-look verdict. Observation only.
+   * A fresh launch can read ready before Claude has drawn its input box: on Linux the pane names `claude` the moment
+   * Claude starts, and startup text pasted then sat unsent. Before a fresh start's first send, look at the visible
+   * screen until the input box the startup check reads is drawn, at most STARTUP_SUBMIT_SETTLE_LOOKS looks 200 ms
+   * apart. A screen that never shows one within that, or can't be read, is sent to as before. Observation only.
+   */
+  private async awaitClaudeInputBox(pane: string | null | undefined): Promise<void> {
+    if (!pane) return;
+    for (let look = 0; look < STARTUP_SUBMIT_SETTLE_LOOKS; look++) {
+      let screen: string | null;
+      try { screen = await this.tmuxAdapter.capturePaneScreen(pane); } catch { return; }
+      if (screen === null || claudeInputBoxDrawn(screen)) return;
+      await this.sleep(200);
+    }
+  }
+
+  /**
+   * Claude can take the startup Enter after the first look while the composer still shows our paste collapsed, and a
+   * fresh Claude can still be drawing its screen, with no input line at all, when the first look comes. Only those
+   * two transients are looked at again, until the composer reads clear or staged, shows anything else, or the looks
+   * run out. A draft, ghost text, a dialog or any other mismatch keeps its verdict. Observation only.
    * Remaining ambiguity: a person who clears a collapsed paste with the same line count inside the window reads
    * as submitted.
    */
   private async settleOwnPaste(tmuxSession: string, pane: string, text: string, runtime: string | null): Promise<{ pane: string; state: ReturnType<typeof inspectStartupStagedText>; looks: number }> {
     let state = inspectStartupStagedText(pane, text, runtime);
     let looks = 0;
-    while (state === "unverified" && looks < STARTUP_SUBMIT_SETTLE_LOOKS && startupOwnCollapsedPaste(pane, text, runtime)) {
+    while (state === "unverified" && looks < STARTUP_SUBMIT_SETTLE_LOOKS
+      && (startupOwnCollapsedPaste(pane, text, runtime) || startupNoInputLine(pane, runtime))) {
       await this.sleep(200);
       // A failed re-look adds nothing; the last usable observation stands.
       const next = await this.tmuxAdapter.capturePaneContent(tmuxSession, STARTUP_SUBMIT_CAPTURE_LINES).catch(() => null);

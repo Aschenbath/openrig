@@ -10,7 +10,7 @@ import type {
 import type { ResolvedAgentSpec, ResourceCollision } from "./agent-resolver.js";
 import { resolveAuthoredCwd } from "./cwd-resolution.js";
 import { resolveStartup } from "./startup-resolver.js";
-import { discoverSkillsForRuntime, parseSkillFrontmatter, type SkillRuntime } from "./skill-discovery.js";
+import { discoverSkillsForRuntime, findNamedSkillsForRuntime, parseSkillFrontmatter, type SkillRuntime } from "./skill-discovery.js";
 import { inspectSkillDirectory, resolvePluginSkills, resolveSkillLoadout, type SkillLoadout } from "./skill-catalog.js";
 import { resolvePluginPath } from "./projection-planner.js";
 
@@ -31,10 +31,17 @@ export interface ResolvedResources {
   runtimeResources: QualifiedResource[];
 }
 
+/** Where each selected plugin resolved to, as the projection and the plugin-skill loadout see it. */
+export function selectedPluginPaths(resources: ResolvedResources): string[] {
+  return resources.plugins.map((plugin) =>
+    resolvePluginPath((plugin.resource as PluginResource).source.path, plugin.sourcePath));
+}
+
 export interface ResolvedNodeConfig {
   runtime: string;
   model: string | undefined;
   effort: string | undefined;
+  advisor?: string;
   cwd: string;
   restorePolicy: string;
   /** OPR.0.5.6.20 — resolved continuity mode (canonical vocabulary; most-specific-wins). */
@@ -90,6 +97,19 @@ export type ResolutionResult =
   | { ok: true; config: ResolvedNodeConfig }
   | { ok: false; errors: string[] };
 
+/** Inspect only the authored runtime-resource selection: no skill discovery, projection or startup resolution. */
+export function resolveProfileRuntimeResources(
+  base: ResolvedAgentSpec, imports: ResolvedAgentSpec[], profileName: string,
+): { ok: true; resources: QualifiedResource[] } | { ok: false; errors: string[] } {
+  const profile = base.spec.profiles[profileName];
+  if (!profile) return { ok: false, errors: [`Profile "${profileName}" not found in spec "${base.spec.name}"`] };
+  const errors: string[] = [];
+  const selected = resolveProfileUses({ ...profile, uses: {
+    skills: [], guidance: [], subagents: [], plugins: [], runtimeResources: profile.uses.runtimeResources,
+  } }, buildResourcePool(base, imports), base.spec.name, errors);
+  return selected ? { ok: true, resources: selected.runtimeResources } : { ok: false, errors };
+}
+
 // -- Constants --
 
 const RESOURCE_CATEGORIES = ["skills", "guidance", "subagents", "plugins", "runtimeResources"] as const;
@@ -111,6 +131,14 @@ const RESTORE_POLICY_LEVEL: Record<string, number> = {
 };
 
 // -- Public API --
+
+/** Resolve member > profile > agent Advisor preferences, skipping blank or non-string candidates. */
+export function resolveAdvisorModel(member: unknown, profile?: unknown, defaults?: unknown): string | undefined {
+  for (const candidate of [member, profile, defaults]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return undefined;
+}
 
 /**
  * Resolve effective node configuration from agent spec, profile, and rig context.
@@ -153,6 +181,8 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
     ? rawEffort.trim()
     : undefined;
 
+  const advisor = resolveAdvisorModel(member.advisor, profile.preferences?.advisor, spec.defaults?.advisor);
+
   const cwd = ctx.cwdOverride
     ? nodePath.resolve(ctx.cwdOverride)
     : resolveAuthoredCwd(member.cwd, ctx.specRoot || null);
@@ -167,13 +197,18 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
   // rig-local declarations are not overwritten by discovery.
   let rejectedSkillsByBasename: Map<string, { path: string; reason: string }> = new Map();
   if (runtime === "claude-code" || runtime === "codex" || runtime === "pi") {
-    const discovery = discoverSkillsForRuntime({
+    const discoveryPaths = {
       runtime: runtime as SkillRuntime,
       homedir: ctx.homedir ?? osHomedir(),
       cwd,
       specInstallDir: ctx.specRoot,
       ...(ctx.skillsRoot ? { skillsRoot: ctx.skillsRoot } : {}),
-    });
+    };
+    // #1653: only skills the profile names can be selected, so look those up by folder. Scanning every skill on the
+    // machine, once per member, froze the daemon on a large user folder; it now runs only for a name not found that way.
+    const wanted = new Set(profile.uses.skills.filter((ref) => !pool.skills.has(ref)));
+    const named = findNamedSkillsForRuntime(discoveryPaths, wanted);
+    const discovery = named.length === wanted.size ? { skills: named, rejected: [] } : discoverSkillsForRuntime(discoveryPaths);
     for (const discovered of discovery.skills) {
       if (pool.skills.has(discovered.id)) continue; // rig-local-wins
       pool.skills.set(discovered.id, [{
@@ -364,6 +399,7 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
       runtime,
       model,
       effort,
+      advisor,
       cwd,
       restorePolicy: restorePolicyResult.policy,
       compactionStrategy: compactionResult.strategy,

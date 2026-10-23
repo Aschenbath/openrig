@@ -157,6 +157,14 @@ const SESSION_FILE = "/state/pi/devpi-a@rig/sessions/2026_0197.jsonl";
 const HEADER = (parentSession?: string) => JSON.stringify({ type: "session", version: 3, id: "0197a2f0", timestamp: at(8), cwd: "/w", ...(parentSession ? { parentSession } : {}) });
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+/** Retry an assertion until it holds or `ms` pass (then its last failure is thrown). */
+async function eventually(assertion: () => void, ms = 3000): Promise<void> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    try { assertion(); return; } catch (error) { if (Date.now() > deadline) throw error; }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 function runner(opts: { usageFacts?: boolean; runtime?: "pi" | "omp"; header?: string | null | (() => string | null); accept?: () => boolean } = {}) {
   const posted: Record<string, any>[] = [];
@@ -461,13 +469,22 @@ describe("runner → authenticated route → SQLite → cost view", () => {
         ...ENTRIES.slice(0, 7).map((e) => JSON.stringify(e)), ""].join("\n");
       for (const broken of ["", "{not json\n", valid.slice(0, -40), valid.replace(/"id":"t2"/, '"id":7')]) {
         writeFileSync(file, broken);
-        const p = pipeline(() => forkHeader(at(7), file), () => readPiSessionEntryIds(file));
+        // Count the runner's real parent reads, so the test knows when one has answered (it runs in the background).
+        const reads = { started: 0, finished: 0, lastAnswered: false };
+        const p = pipeline(() => forkHeader(at(7), file), () => {
+          reads.started += 1;
+          return readPiSessionEntryIds(file).then((ids) => { reads.finished += 1; reads.lastAnswered = ids !== null; return ids; });
+        });
         await p.refresh(forkEntries);
         await p.refresh(forkEntries);
-        expect(p.view()).toMatchObject({ entries: { own: 2, unknownOrigin: { count: 2 } } }); // b1 and n7: never charged
+        // The broken parent has been read (no read still in flight), and its unknown ties are stored: b1 and n7, never charged.
+        await eventually(() => expect(reads.started >= 1 && reads.finished === reads.started).toBe(true));
+        expect(reads.lastAnswered).toBe(false);
+        await eventually(() => expect(p.view()).toMatchObject({ entries: { own: 2, unknownOrigin: { count: 2 } } }));
         writeFileSync(file, valid);
-        await p.refresh(forkEntries);
-        expect(p.view()).toMatchObject({ entries: { own: 3, inherited: { count: 5 }, unknownOrigin: { count: 0 } } });
+        await p.refresh(forkEntries); // starts a new read, of the valid file
+        await eventually(() => expect(p.view()).toMatchObject({ entries: { own: 3, inherited: { count: 5 }, unknownOrigin: { count: 0 } } }));
+        expect(reads.lastAnswered).toBe(true);
         expect(p.view().costUsd).toBeCloseTo(0.55, 10);
         expect(p.d.prepare("SELECT origin FROM pi_usage_entries WHERE entry_id = 'b1'").get()).toEqual({ origin: "inherited" });
       }
@@ -509,7 +526,8 @@ describe("runner → authenticated route → SQLite → cost view", () => {
       expect(p.view()).toMatchObject({ entries: { own: 2, unknownOrigin: { count: 2 } } });
       expect(p.view().costUsd).toBeCloseTo(0.05, 10); // the copied b1 is not charged
       await p.refresh(forkEntries);
-      expect(p.view()).toMatchObject({ entries: { own: 3, inherited: { count: 5 }, unknownOrigin: { count: 0 } } });
+      // The parent read is real file I/O; wait for its outcome to reach the store, not for a number of ticks.
+      await eventually(() => expect(p.view()).toMatchObject({ entries: { own: 3, inherited: { count: 5 }, unknownOrigin: { count: 0 } } }));
       expect(p.d.prepare("SELECT origin FROM pi_usage_entries WHERE entry_id = 'b1'").get()).toEqual({ origin: "inherited" });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

@@ -64,6 +64,11 @@ const TOP_PAYLOAD = {
   totalRankedSeats: 1,
 };
 const SERIES_PAYLOAD = { rows: [{ id: 1, lane: "context", seatSession: "a@r", capturedAt: "t1", totalInputTokens: 5 }] };
+// What the route serves for since=garbage: main's (empty) rows plus the advisory.
+const ADVISED_PAYLOAD = {
+  rows: [],
+  advisories: ['since "garbage" was not recognised as a date or time; the existing text comparison against captured_at was used'],
+};
 
 describe("rig usage CLI grammar (daemon-backed)", () => {
   let server: http.Server;
@@ -83,6 +88,7 @@ describe("rig usage CLI grammar (daemon-backed)", () => {
         return;
       }
       if ((req.url ?? "").includes("/usage/top")) res.end(JSON.stringify(TOP_PAYLOAD));
+      else if ((req.url ?? "").includes("since=garbage")) res.end(JSON.stringify(ADVISED_PAYLOAD));
       else res.end(JSON.stringify(SERIES_PAYLOAD));
     });
     await new Promise<void>((resolve) => server.listen(0, () => resolve()));
@@ -115,6 +121,29 @@ describe("rig usage CLI grammar (daemon-backed)", () => {
     expect(seen[0]!.url).toContain("/api/telemetry/usage/series");
     expect(seen[0]!.url).toContain("seat=a%40r");
     expect(JSON.parse(logs.join("\n"))).toEqual(SERIES_PAYLOAD);
+  });
+
+  it("usage series --since garbage prints the advisory on stderr and keeps the empty series on stdout", async () => {
+    const { logs, errors, exitCode } = await run(["series", "--since", "garbage"], runningDeps(port));
+    expect(errors).toEqual([`note: ${ADVISED_PAYLOAD.advisories[0]}`]);
+    expect(logs).toEqual(["no samples match — the series is empty for this filter"]);
+    expect(exitCode).toBeUndefined();
+  });
+
+  it("usage series --since garbage --json stays one payload carrying the advisory, nothing on stderr", async () => {
+    const { logs, errors, exitCode } = await run(["series", "--since", "garbage", "--json"], runningDeps(port));
+    expect(logs).toHaveLength(1);
+    expect(JSON.parse(logs[0]!)).toEqual(ADVISED_PAYLOAD);
+    expect(errors).toEqual([]);
+    expect(exitCode).toBeUndefined();
+  });
+
+  it("usage series with no advisory prints rows and nothing on stderr", async () => {
+    const { logs, errors, exitCode } = await run(["series", "--since", "2026-08-07T11"], runningDeps(port));
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("a@r");
+    expect(errors).toEqual([]);
+    expect(exitCode).toBeUndefined();
   });
 
   it("an unparseable --window is a teaching error, exit 1, no request fired", async () => {
@@ -196,5 +225,27 @@ describe("rig usage cost: Pi seats (OPR.0.7.0.2)", () => {
       window: { piSessionId: "s" }, entries: { own: 1, ownWithoutCost: 1 }, tokens: { input: 1, output: 1 } });
     expect(absent).toContain("cost: not reported (Pi recorded no cost on this session's own entries)");
     expect(absent).not.toContain("$0.00");
+  });
+});
+
+describe("rig usage cost: OpenRouter charge beside the Pi estimate (OPR.0.7.0.2 K4)", () => {
+  const seat = (providerCharge: Record<string, unknown>) => ({ seatSession: "devpi@r", runtime: "pi", status: "reported", costUsd: 0.18,
+    window: { piSessionId: "s1" }, entries: { own: 4 }, tokens: { input: 1, output: 1 }, providerCharge });
+  it("names the provider charge, its coverage and account context, apart from the estimate", async () => {
+    const { costLine } = await import("../src/commands/usage.js");
+    const line = costLine(seat({ status: "partial", costUsd: 0.042, estimateForChargedUsd: 0.03,
+      requests: { covered: 3, charged: 2, pending: 0, unavailable: { count: 1, reasons: { "not available after 5 lookups (last: HTTP 404)": 1 } }, notCovered: { count: 1 } },
+      accountContext: { credentialSources: ["OPENROUTER_API_KEY (forwarded by OpenRig)"] } }));
+    expect(line).toContain("$0.18 model-priced estimate");
+    expect(line).toContain("OpenRouter charge $0.04 USD for 2 of 3 requests via OPENROUTER_API_KEY (forwarded by OpenRig), Pi estimate for them $0.03");
+    expect(line).toContain("1 unavailable (not available after 5 lookups (last: HTTP 404)), 1 not covered (provider-reported, not added to the estimate)");
+  });
+  it("says unavailable or not looked up, never a $0 charge", async () => {
+    const { costLine } = await import("../src/commands/usage.js");
+    const unavailable = costLine(seat({ status: "unavailable", requests: { covered: 1, unavailable: { count: 1, reasons: { "HTTP 401": 1 } }, notCovered: { count: 0 } } }));
+    expect(unavailable).toContain("OpenRouter charge unavailable (HTTP 401)");
+    expect(unavailable).not.toContain("$0.00");
+    expect(costLine(seat({ status: "none", requests: { covered: 2, notCovered: { count: 0 } } }))).toContain("OpenRouter charge not looked up");
+    expect(costLine(seat({ status: "not-applicable", requests: { covered: 0, notCovered: { count: 0 } } }))).not.toContain("OpenRouter");
   });
 });

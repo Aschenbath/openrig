@@ -27,8 +27,10 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { formatDaemonHostForUrl } from "./daemon-url.js";
-import { piCredentialNotice } from "./pi-readiness.js";
-import { extractPiUsageFacts, parsePiSessionHeader, tiesPiForkHeader, type PiSessionBoundary } from "../domain/pi-usage-facts.js";
+import { credentialTaint, judgeChargeProvenance, piCredentialEvidence, piCredentialNotice, type PiCredentialEvidence } from "./pi-readiness.js";
+import { extractPiUsageFacts, parsePiSessionHeader, tiesPiForkHeader, type PiSessionBoundary, type PiUsageFact } from "../domain/pi-usage-facts.js";
+import { OpenRouterChargeLookup, openRouterGenerationFetcher, type ChargeProvenance } from "./pi-openrouter-charge.js";
+import { OMP_MAX_FRAME_BYTES, OmpFrameDecoder, ompProtocolV2Limit } from "./omp-rpc-frame.js";
 import {
   piSeatPaths, buildPiChildArgs, buildPiChildEnv, buildPendingRunnerState, parsePiRunnerState,
   PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, PI_RUNNER_ERROR_MARKER, PI_PROVIDER_ENV_VARS,
@@ -216,6 +218,8 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
       // Pi keeps main's mapping: turn_end carries no notice.
       return runtime === "omp" ? { mirrorLines: [], ...modelErrorNotice(event, runtime) } : { mirrorLines: [] };
     case "turn_start":
+      // Some turn paths omit agent_start; turn_start still opens a turn, so it reports the seat working.
+      return { mirrorLines: [], activity: { hookEvent: "active", subtype: "turn_start" } };
     case "message_start":
       return { mirrorLines: [] };
     case "message_update": {
@@ -225,8 +229,11 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
       // same deltas, so appending it repeated the growing text. Thinking and
       // tool-call argument deltas stay out of the pane; tool calls get their
       // own one-line summaries from tool_execution_*.
+      // OMP and Pi both provide text_delta frames. The enclosing message is a
+      // cumulative snapshot, not another delta: appending it duplicates replies.
       const update = event.assistantMessageEvent as Record<string, unknown> | undefined;
-      const delta = update?.type === "text_delta" && typeof update.delta === "string" ? update.delta : "";
+      const hasDelta = update?.type === "text_delta" && typeof update.delta === "string";
+      const delta = hasDelta ? update.delta as string : "";
       return delta ? { mirrorLines: [], mirrorAppend: delta } : { mirrorLines: [] };
     }
     case "message_end":
@@ -293,7 +300,12 @@ export interface RunnerIo {
   stopChild?(): void;
   /** OPR.0.7.0.2 (only with --usage-facts): POST usage facts from persisted entries to the daemon. Best-effort;
    *  resolves true only when the daemon accepted them. */
-  postUsageFacts?(payload: Record<string, unknown>): Promise<boolean>;
+  postUsageFacts?(payload: Record<string, unknown>): Promise<boolean | { charged: string[] }>;
+  /** OPR.0.7.0.2 K4 (only with --openrouter-charge): queue OpenRouter charge lookups for facts the daemon stored;
+   *  `charged` already have a charge there. */
+  enqueueChargeLookups?(piSessionId: string, items: Array<{ fact: PiUsageFact; provenance: ChargeProvenance }>, charged: ReadonlySet<string>): void;
+  /** OPR.0.7.0.2 K4: Pi's OpenRouter credential metadata now (taken at start and at every refresh). */
+  credentialEvidence?(): PiCredentialEvidence;
   /** The first line of a Pi session file (its header), or null when it can't be read. */
   readFirstLine?(path: string): string | null;
   /** The entry ids of a complete, valid Pi session file (a fork's parent); null when it isn't one. Never blocks. */
@@ -304,6 +316,7 @@ export interface RunnerIo {
 const GET_STATE_ID = "pi-runner-get-state";
 const CATCH_UP_ID = "pi-runner-catch-up";
 const CURSOR_REFRESH_ID = "pi-runner-cursor-refresh";
+const NEGOTIATE_ID = "omp-runner-negotiate";
 /** RPC commands that carry operator input. Their failure means the seat
  *  cannot do the requested work; other command failures are not attention. */
 const INPUT_COMMANDS: Record<string, true> = { prompt: true, steer: true, follow_up: true };
@@ -373,19 +386,32 @@ export class RunnerCore {
   private sessionId: string | undefined;
   private lastEntryId: string | undefined;
   private ready = false;
+  private lastHeartbeatMs: number | null = null;
+  /** Hook event of the last activity this runner posted; null until it posts one. */
+  private lastPostedHook: string | null = null;
   private assistantErrorShown = false;
   private started = false;
-  /** OMP attention (runtime_error | permission_prompt) that must survive the
-   *  end of the turn; cleared by the next agent_start. */
-  private attention: "runtime_error" | "permission_prompt" | null = null;
+  /** OMP failures/approvals survive the turn until agent_start, except typed
+   *  transient assistant failures, released only when agent_end completes. */
+  private attention: "runtime_error" | "permission_prompt" | "transient_turn_error" | null = null;
   /** Whether the last activity posted is that attention. Later activity in
    *  the same turn (a tool call after a denied approval) replaces it. */
   private attentionIsLatest = false;
+  // Native OMP retry summaries have no message/status. Correlate only within
+  // the announced attempt, using the latest typed assistant failure's exact
+  // diagnostic as an identity check, never as a transient-error classifier.
+  private retryAttempt: number | null = null;
+  private retryFailure: string | null = null;
   /** Set once the daemon confirms it persisted the resume token. */
   private identityPersisted = false;
   private identityInFlight = false;
   /** OPR.0.7.0.2: the session header boundary; null until it has been read (read again until it can be). */
   private usageBoundary: PiSessionBoundary | null = null;
+  /** OPR.0.7.0.2 K4: the last credential observation, and each entry's provenance judged when first observed. */
+  private lastCredentialEvidence: PiCredentialEvidence | null = null;
+  /** Sticky for this process: what an observation showed Pi may have loaded (see credentialTaint). */
+  private credentialTainted: string | null = null;
+  private readonly chargeProvenance = new Map<string, ChargeProvenance>();
   /** OPR.0.7.0.2: a fork parent read is under way (at most one at a time). */
   private parentReadInFlight = false;
   /** OPR.0.7.0.2: the last get_entries batch reported, replayed when a parent read completes. */
@@ -393,11 +419,16 @@ export class RunnerCore {
   /** Entry ids the daemon has accepted with a known origin. Anything else is sent again on the next refresh;
    *  the daemon stores each (session, entry) once regardless. */
   private readonly postedUsageEntryIds = new Set<string>();
+  /** #1275: OMP protocol v2. The limit offered while negotiating, then the decoder once OMP accepts. */
+  private v2Limit: number | null = null;
+  private frameDecoder: OmpFrameDecoder | null = null;
 
   constructor(
     private io: RunnerIo,
     private identity: { sessionName: string; nodeId?: string; launchId?: string; generation?: string },
-    private opts: { catchUpSince?: string; runtime?: RunnerRuntime; usageFacts?: boolean } = {},
+    private opts: { catchUpSince?: string; runtime?: RunnerRuntime; usageFacts?: boolean; openRouterCharge?: boolean;
+      /** K4: the credential observation taken before Pi was spawned. */
+      launchCredentialEvidence?: PiCredentialEvidence } = {},
   ) {
     // The durable cursor seeds from the carried-over value (FR-5) so this
     // instance's own sidecar writes never regress it to undefined before a
@@ -407,13 +438,23 @@ export class RunnerCore {
   /** Runner readiness is the sidecar's acknowledged get_state, not RPC transport ready. */
   isReady(): boolean { return this.ready; }
 
-  /** Kick off identity capture. Called once pi's RPC stream is up. */
-  start(): void {
+  /** Kick off identity capture. Called once pi's RPC stream is up; for OMP, with its `ready` frame. */
+  start(ready?: Record<string, unknown>): void {
+    // K4: the first credential observation, before Pi can make any request of this runner's.
+    if (this.opts.openRouterCharge && this.runtime === "pi" && this.io.credentialEvidence) {
+      // The production runner observes before it spawns Pi (launchCredentialEvidence), so Pi loads after it.
+      this.lastCredentialEvidence = this.opts.launchCredentialEvidence ?? this.io.credentialEvidence();
+      this.noteTaint(this.lastCredentialEvidence);
+    }
     // OMP's start is driven by the transport `ready` frame and must run once;
     // Pi keeps main's unconditional start.
     if (this.runtime === "omp") {
       if (this.started) return;
       this.started = true;
+      // #1275: v1 caps a stdout line at 1 MiB, so a longer history fails get_entries. When OMP advertises
+      // protocol v2, negotiate it first: OMP runs commands in order, so the replies below can then arrive chunked.
+      this.v2Limit = ready ? ompProtocolV2Limit(ready) : null;
+      if (this.v2Limit !== null) this.io.sendRpc({ type: "negotiate_protocol", protocolVersion: 2, id: NEGOTIATE_ID });
     }
     this.io.sendRpc({ type: "get_state", id: GET_STATE_ID });
     if (this.opts.catchUpSince) {
@@ -426,17 +467,43 @@ export class RunnerCore {
 
   /** One LF-delimited JSONL record from pi stdout. */
   handlePiLine(rawLine: string): void {
+    // #1275: under OMP's protocol v2 no stdout line may exceed the 1 MiB physical frame (its LF included); a longer
+    // one is refused before it is parsed. Its chunkId, if any, is read from the line's start only, so the rest of
+    // its sequence isn't reported again.
+    if (this.frameDecoder) {
+      const bytes = Buffer.byteLength(rawLine, "utf8") + 1;
+      if (bytes > OMP_MAX_FRAME_BYTES) {
+        const chunkId = /^\{"type":"rpc_chunk","chunkId":"([^"\\]{1,128})"/.exec(rawLine.slice(0, 200))?.[1];
+        this.reportDroppedFrame(this.frameDecoder.rejectLine(`a ${bytes}-byte line exceeds OMP's ${OMP_MAX_FRAME_BYTES}-byte frame limit`, chunkId));
+        return;
+      }
+    }
     const line = rawLine.trim();
-    if (!line) return;
+    if (!line) {
+      // Ignored as before, but a blank line still interrupts a pending v2 sequence: OMP never writes one inside it.
+      this.reportDroppedFrame(this.frameDecoder?.interrupt("a blank line"));
+      return;
+    }
     let record: Record<string, unknown>;
     try {
       const parsed = JSON.parse(line);
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return;
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        // Not a frame: ignored as before, but it still interrupts a pending v2 sequence.
+        this.reportDroppedFrame(this.frameDecoder?.interrupt(`a ${parsed === null ? "null" : Array.isArray(parsed) ? "array" : typeof parsed} line`));
+        return;
+      }
       record = parsed as Record<string, unknown>;
     } catch {
+      this.reportDroppedFrame(this.frameDecoder?.interrupt("a non-JSON line"));
       // Non-JSON noise on pi stdout — mirror it verbatim so nothing hides.
       this.io.mirrorLine(line);
       return;
+    }
+    if (this.frameDecoder) {
+      const result = this.frameDecoder.push(record);
+      if ("dropped" in result) this.reportDroppedFrame(result.dropped);
+      if (!("frame" in result)) return;
+      record = result.frame;
     }
 
     if (record.type === "response") {
@@ -444,6 +511,11 @@ export class RunnerCore {
       return;
     }
     this.handleEvent(record);
+  }
+
+  /** A frame that can't be reassembled is lost, and said so. If it was a get_entries reply, the cursor stays where it was. */
+  private reportDroppedFrame(reason: string | null | undefined): void {
+    if (reason) this.io.mirrorLine(`[omp-runner] ERROR rpc frame: ${reason}; the chunked frame was dropped`);
   }
 
   private get runtime(): RunnerRuntime { return this.opts.runtime ?? "pi"; }
@@ -475,12 +547,23 @@ export class RunnerCore {
   /** Child process exit — honest, loud, durable. */
   handlePiExit(code: number | null): void {
     this.ready = false;
+    this.reportDroppedFrame(this.frameDecoder?.incomplete());
     this.io.mirrorLine(`[${this.runtime}-runner] EXITED ${this.runtime} exited (code ${code ?? "unknown"})`);
     this.writeSidecar({ exited: { code, at: this.io.now() } });
     this.io.postActivity(this.activityPayload("Stop", `${this.runtime}_exited`));
   }
 
   private handleResponse(record: Record<string, unknown>): void {
+    if (record.id === NEGOTIATE_ID && this.v2Limit !== null) {
+      if (record.success === true) {
+        this.frameDecoder = new OmpFrameDecoder(this.v2Limit);
+      } else {
+        // Advertised but refused: v1 as before, so a reply over 1 MiB still fails, visibly.
+        const detail = typeof record.error === "string" ? record.error : "refused";
+        this.io.mirrorLine(`[omp-runner] RPC protocol v2 not negotiated (${detail}); replies over 1 MiB will fail`);
+      }
+      return;
+    }
     if (record.success === false || record.error != null) {
       const detail = typeof record.error === "string" ? record.error : "request failed";
       const message = detail + (this.runtime === "pi" ? piCredentialHint(detail) : "");
@@ -507,6 +590,7 @@ export class RunnerCore {
       const sessionId = typeof data.sessionId === "string" ? data.sessionId : undefined;
       this.sessionFile = sessionFile ?? this.sessionFile;
       this.sessionId = sessionId ?? this.sessionId;
+      const wasReady = this.ready;
       this.ready = this.runtime === "pi" || !!this.sessionFile;
       if (!this.ready) {
         this.io.mirrorLine("[omp-runner] ERROR rpc get_state returned no session file; cannot provide a resume token");
@@ -514,7 +598,14 @@ export class RunnerCore {
         return;
       }
       this.writeSidecar({});
-      this.io.mirrorLine(`${this.runtime === "omp" ? "[omp-runner] READY" : PI_RUNNER_READY_MARKER} session=${this.sessionFile ?? "unknown"}`);
+      if (!wasReady) {
+        // Only the initial transition to ready announces READY in the pane.
+        // Subsequent get_state evaluations confirm liveness silently to avoid
+        // terminal output spam while preserving state updates.
+        this.io.mirrorLine(`${this.runtime === "omp" ? "[omp-runner] READY" : PI_RUNNER_READY_MARKER} session=${this.sessionFile ?? "unknown"}`);
+      }
+      // Re-post session identity on every successful get_state reply so the
+      // daemon can discover replacement runners and keep session records current.
       this.postSessionIdentity();
       return;
     }
@@ -536,6 +627,12 @@ export class RunnerCore {
 
   /** OPR.0.7.0.2: report usage from the persisted entries a get_entries response returned (catch-up after a
    *  restart, or the refresh after each agent_end). Pi only, and only with --usage-facts. Never live updates. */
+  /** K4: what an observation shows Pi may hold for the rest of the process (an extension, a credential-bearing
+   *  models.json entry, or a reading that couldn't be made) is sticky at once. */
+  private noteTaint(e: PiCredentialEvidence): void {
+    this.credentialTainted ??= credentialTaint(e)?.sticky ?? null;
+  }
+
   private reportUsageFacts(entries: unknown[]): void {
     if (!this.opts.usageFacts || this.runtime !== "pi" || !this.io.postUsageFacts) return;
     if (this.usageBoundary === null) {
@@ -544,6 +641,19 @@ export class RunnerCore {
     }
     this.latestUsageEntries = entries;
     const { facts, malformed } = extractPiUsageFacts(entries, this.usageBoundary);
+    if (this.opts.openRouterCharge && this.io.credentialEvidence) {
+      // Each entry's credential is judged once, from the observations before and after it was first seen.
+      const now = this.io.credentialEvidence();
+      this.noteTaint(now);
+      for (const fact of facts) {
+        if (!this.chargeProvenance.has(fact.entryId)) {
+          this.chargeProvenance.set(fact.entryId, this.credentialTainted
+            ? { ok: false, reason: this.credentialTainted }
+            : judgeChargeProvenance(this.lastCredentialEvidence, now, fact.entryTimestamp));
+        }
+      }
+      this.lastCredentialEvidence = now;
+    }
     // A new entry often shares the fork header's millisecond, and so can a copied one: only the parent session's
     // entry ids tell them apart. Read them in the background, only when such a tie needs deciding; meanwhile the
     // tie goes as unknown. A complete answer is kept and these entries are reported again with it; anything
@@ -571,22 +681,46 @@ export class RunnerCore {
       forked: this.usageBoundary ? this.usageBoundary.parentSession !== null : null,
       facts: fresh,
       malformed,
-    }).then((accepted) => {
+      ...(this.opts.openRouterCharge ? { wantCharged: true } : {}),
+    }).then((result) => {
       // Only a stored fact with a known origin is done: a failed post, or an origin not settled yet (no readable
       // header, or a tie with an unreadable parent), is sent again with the next refresh (the store upgrades an
       // unknown origin once it is known).
-      if (accepted) for (const fact of fresh) if (fact.origin !== "unknown") this.postedUsageEntryIds.add(fact.entryId);
+      if (result === false) return;
+      for (const fact of fresh) if (fact.origin !== "unknown") this.postedUsageEntryIds.add(fact.entryId);
+      // K4: the charge is looked up only for facts the daemon has stored, never for one it already has.
+      if (this.opts.openRouterCharge && this.sessionId && this.io.enqueueChargeLookups) {
+        this.io.enqueueChargeLookups(this.sessionId, fresh.map((fact) => ({
+          fact, provenance: this.chargeProvenance.get(fact.entryId) ?? { ok: false, reason: "its credential wasn't observed" },
+        })), new Set(typeof result === "object" ? result.charged : []));
+      }
     }, () => { /* best-effort: resent on the next refresh */ });
   }
 
-  private raiseAttention(subtype: "runtime_error" | "permission_prompt"): void {
-    // Runtime failures outrank denied approvals. Only emit when the visible
-    // attention changes or intervening activity replaced it.
-    const next = this.attention === "runtime_error" ? this.attention : subtype;
+  private raiseAttention(subtype: "runtime_error" | "permission_prompt" | "transient_turn_error"): void {
+    // Persistent failures and denied approvals outrank transient failures.
+    // Only emit when attention changes or intervening activity replaced it.
+    const next = this.attention === "runtime_error" ? this.attention
+      : this.attention === "permission_prompt" && subtype === "transient_turn_error" ? this.attention : subtype;
     if (this.attention === next && this.attentionIsLatest) return;
     this.attention = next;
     this.attentionIsLatest = true;
-    this.io.postActivity(this.activityPayload("Notification", next));
+    this.io.postActivity(this.activityPayload("Notification", next === "transient_turn_error" ? "runtime_error" : next));
+  }
+
+  /** Idle heartbeat. A Pi runner only reports when something happens, and the daemon reads any hook older than
+   *  its freshness window as `unknown` (`stale_runtime_hook`), so an idle seat read `unknown` five minutes after
+   *  its last turn, and a restored seat read `unknown` (`generation_mismatch`) until its first turn. Re-asserting
+   *  idle while ready, not mid-turn and not waiting on the operator keeps the verdict honest: a runner that dies
+   *  stops beating and the seat goes back to `unknown`. Pi only; the OMP identity handshake has its own retry. */
+  heartbeat(): void {
+    if (this.runtime !== "pi" || !this.ready || this.streaming || this.attention) return;
+    // `streaming` follows only agent_start/agent_end; turn_start, compaction and auto-retry also report the agent
+    // working. Beat only when the last thing posted was a Stop (or nothing yet), so a beat never lands mid-turn.
+    if (this.lastPostedHook !== null && this.lastPostedHook !== "Stop") return;
+    const now = Date.parse(this.io.now());
+    if (this.lastHeartbeatMs !== null && now - this.lastHeartbeatMs < IDLE_HEARTBEAT_MS) return;
+    this.io.postActivity(this.activityPayload("Stop", "idle_heartbeat"));
   }
 
   private clearAttention(): void {
@@ -621,8 +755,16 @@ export class RunnerCore {
 
     if (this.runtime === "omp") {
       if (event.type === "agent_start") this.clearAttention();
+      if (event.type === "agent_start" || event.type === "turn_start"
+        || (event.type === "message_start" && message?.role === "assistant")
+        || ((event.type === "message_end" || event.type === "turn_end")
+          && message?.role === "assistant" && message.stopReason !== "error")) this.retryFailure = null;
+      if (event.type === "auto_retry_start") {
+        this.retryAttempt = Number.isInteger(event.attempt) && (event.attempt as number) > 0 ? event.attempt as number : null;
+        this.retryFailure = null;
+      }
       // A successful automatic retry supersedes the failed attempt.
-      if (event.type === "auto_retry_start" && this.attention === "runtime_error") this.clearAttention();
+      if (event.type === "auto_retry_start" && (this.attention === "runtime_error" || this.attention === "transient_turn_error")) this.clearAttention();
       // Some paths omit agent_start; turn_start still opens a new turn.
       if (event.type === "turn_start") this.assistantErrorShown = false;
     }
@@ -650,11 +792,34 @@ export class RunnerCore {
         this.io.mirrorLine(mapped.errorNotice);
       }
       this.assistantErrorShown = true;
-      // OMP still ends the turn normally after a model failure; the operator
-      // has to act, so the seat shows attention rather than idle.
-      if (this.runtime === "omp") this.raiseAttention("runtime_error");
+      // Only typed, explicitly transient HTTP failures may release the send
+      // guard at agent_end. Unknown/auth/configuration failures stay attention;
+      // diagnostic prose is never used to decide whether a retry is safe.
+      const status = message?.errorStatus;
+      const transient = (event.type === "message_end" || event.type === "turn_end")
+        && message?.role === "assistant" && message.stopReason === "error"
+        && typeof status === "number" && [408, 429, 500, 502, 503, 504, 529].includes(status);
+      if (this.runtime === "omp") {
+        const retrySummary = event.type === "auto_retry_end" && event.success === false
+          && this.retryAttempt !== null && event.attempt === this.retryAttempt
+          && this.retryFailure !== null && event.finalError === this.retryFailure
+          && event.message === undefined && event.error === undefined;
+        if (event.type !== "auto_retry_end") {
+          this.retryFailure = transient && this.retryAttempt !== null && typeof message?.errorMessage === "string"
+            && message.errorMessage.length > 0 ? message.errorMessage : null;
+        } else if (!retrySummary) {
+          this.retryFailure = null;
+        }
+        this.raiseAttention(transient || retrySummary ? "transient_turn_error" : "runtime_error");
+      }
+    }
+    if (this.runtime === "omp" && (event.type === "auto_retry_end" && event.success === true
+      || event.type === "agent_end" && event.isTerminal !== false)) {
+      this.retryAttempt = null;
+      this.retryFailure = null;
     }
     if (!mapped.activity) return;
+    if (event.type === "agent_end" && this.attention === "transient_turn_error") this.clearAttention();
     if (mapped.activity.hookEvent === "Stop" && this.attention) {
       // The turn ended, but the operator still has to act. Drop the Stop; if
       // later activity replaced the attention, restore it as the final state.
@@ -694,14 +859,23 @@ export class RunnerCore {
     ).finally(() => { this.identityInFlight = false; });
   }
 
+  /** Each activity post's place in this runner's event order: posts aren't awaited, so they can arrive out of order. */
+  private activitySequence = 0;
+
   private activityPayload(hookEvent: string, subtype: string | null): Record<string, unknown> {
+    this.lastPostedHook = hookEvent;
+    // Any posted Stop is an idle report, so the next beat is due a full interval after it, not just after a beat.
+    if (hookEvent === "Stop") this.lastHeartbeatMs = Date.parse(this.io.now());
     return {
+      sequence: ++this.activitySequence,
       sessionName: this.identity.sessionName,
       nodeId: this.identity.nodeId ?? null,
       generation: this.identity.generation ?? null,
       runtime: this.runtime,
       hookEvent,
       subtype,
+      // A Pi runner's idle report holds only while it keeps beating; the daemon expires it after two missed beats.
+      ...(this.runtime === "pi" && hookEvent === "Stop" && subtype !== "pi_exited" ? { livenessSeconds: IDLE_HEARTBEAT_MS / 1000 } : {}),
       occurredAt: this.io.now(),
     };
   }
@@ -730,17 +904,22 @@ interface RunnerArgs {
   cwd: string;
   launchId: string;
   model?: string;
+  thinking?: string;
   trust: "approve" | "no-approve";
   sessionFile?: string;
   forkRef?: string;
   /** OPR.0.7.0.2: report usage facts from persisted entries (the daemon passes it when usage.pi_cost_facts is on). */
   usageFacts?: boolean;
+  openRouterCharge?: boolean;
 }
 
 export function parseRunnerArgs(argv: string[]): RunnerArgs {
   const args: Partial<RunnerArgs> & { trust?: "approve" | "no-approve" } = {};
+  // The tokens read as flags; a value, such as a --thinking of "--approval-mode", never counts as one.
+  const flags = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]!;
+    flags.add(flag);
     const next = () => {
       const value = argv[++i];
       if (value === undefined) throw new Error(`${flag} requires a value`);
@@ -758,9 +937,11 @@ export function parseRunnerArgs(argv: string[]): RunnerArgs {
       case "--cwd": args.cwd = next(); break;
       case "--launch-id": args.launchId = next(); break;
       case "--model": args.model = next(); break;
+      case "--thinking": args.thinking = next(); break;
       case "--session": args.sessionFile = next(); break;
       case "--fork": args.forkRef = next(); break;
       case "--usage-facts": args.usageFacts = true; break;
+      case "--openrouter-charge": args.openRouterCharge = true; break;
       case "--approve": args.trust = "approve"; break;
       case "--no-approve": args.trust = "no-approve"; break;
       case "--approval-mode": {
@@ -777,10 +958,10 @@ export function parseRunnerArgs(argv: string[]): RunnerArgs {
   if (!args.cwd) throw new Error("--cwd is required");
   if (!args.launchId) throw new Error("--launch-id is required (launch-attempt scoping)");
   if (args.runtime === "omp") {
-    if (!argv.includes("--approval-mode") || argv.some((flag) => flag === "--approve" || flag === "--no-approve")) {
+    if (!flags.has("--approval-mode") || flags.has("--approve") || flags.has("--no-approve")) {
       throw new Error("OMP requires --approval-mode yolo or always-ask, not Pi trust flags");
     }
-  } else if (!args.trust || argv.includes("--approval-mode")) {
+  } else if (!args.trust || flags.has("--approval-mode")) {
     throw new Error("an explicit trust flag is required: --approve or --no-approve");
   }
   if (args.sessionFile && args.forkRef) throw new Error("--session and --fork are mutually exclusive");
@@ -830,8 +1011,21 @@ export function prepareRunnerSidecar(
   return { catchUpSince: resuming ? prior?.lastEntryId : undefined };
 }
 
+/** Wraps an async send so calls run one after another in call order; a send that rejects doesn't hold up the ones behind it. */
+export function inOrder<A, R>(send: (arg: A) => Promise<R>): (arg: A) => Promise<R> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return (arg) => {
+    const result = tail.then(() => send(arg));
+    tail = result.catch(() => undefined);
+    return result;
+  };
+}
+
 /** How often an OMP runner re-delivers an unconfirmed session identity. */
 const IDENTITY_RETRY_MS = 30_000;
+/** Below the daemon's 5 minute hook freshness window (AGENT_ACTIVITY_FRESHNESS_MS). */
+const IDLE_HEARTBEAT_MS = 3 * 60_000;
+const IDLE_HEARTBEAT_TICK_MS = 15_000;
 
 export interface ExecutableResolverOps {
   isExecutable(path: string): boolean;
@@ -951,6 +1145,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     sessionsDir: paths.sessionsDir,
     sessionName: args.sessionName,
     model: args.model,
+    thinking: args.thinking,
     trust: args.trust,
     sessionFile: args.sessionFile,
     forkRef: args.forkRef,
@@ -991,6 +1186,27 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     command = resolved.path;
   }
 
+  // OPR.0.7.0.2 K4: OpenRouter's charge, looked up with the key this runner forwarded to Pi, only for requests whose
+  // credential is established as that key by the observations before and after them.
+  const readMetadata = (file: string): string => {
+    if (fs.statSync(file).size > 1024 * 1024) throw new Error("Unbounded metadata");
+    return fs.readFileSync(file, "utf8");
+  };
+  const credentialEvidence = (): PiCredentialEvidence => piCredentialEvidence({
+    agentDir: paths.agentDir, cwd: args.cwd, env: childEnv, now: () => Date.now(), readFile: readMetadata,
+    statId: (file) => {
+      try { const st = fs.statSync(file); return `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}`; }
+      catch (error) { if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "absent"; throw error; }
+    },
+    listDir: (dir) => {
+      try { return fs.readdirSync(dir); }
+      catch (error) { if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return []; throw error; }
+    },
+  });
+  // Observed before Pi is spawned, so whatever Pi loads at its start was there for this observation to see
+  // (or was added after it, and is then seen by the next one).
+  const launchCredentialEvidence = args.openRouterCharge === true && runtime === "pi" ? credentialEvidence() : undefined;
+
   const child = spawn(command, childArgs, {
     cwd: args.cwd,
     env: childEnv,
@@ -1000,6 +1216,43 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // The child may close its pipe before the first RPC write completes.
   child.stdin.on("error", () => { /* spawn/exit handlers own the diagnosis */ });
 
+  const chargeLookup = new OpenRouterChargeLookup({
+    fetchGeneration: openRouterGenerationFetcher(() => childEnv["OPENROUTER_API_KEY"]),
+    postCharges: async (piSessionId, charges) => {
+      if (!endpoint || typeof fetch !== "function") return false;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      return fetch(new URL("/api/activity/pi-usage-charges", endpoint.baseUrl).toString(), {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${endpoint.token}` },
+        body: JSON.stringify({ sessionName: args.sessionName, nodeId: process.env.OPENRIG_NODE_ID, piSessionId, charges }),
+        signal: controller.signal,
+      }).then(async (res) => {
+        if (!res.ok) return false as const;
+        const reply = await res.json().catch(() => null) as { acknowledged?: unknown } | null;
+        return new Set(Array.isArray(reply?.acknowledged) ? reply.acknowledged.filter((id): id is string => typeof id === "string") : []);
+      }, () => false as const).finally(() => clearTimeout(timeout));
+    },
+    schedule: (fn, ms) => { setTimeout(fn, ms).unref(); },
+    notice: (line) => { process.stdout.write(`${line}\n`); },
+  });
+
+  // One activity post at a time: the daemon reads its newest record by arrival, so a beat still in flight when a turn
+  // starts must not land after the turn's first post. Each post's own 1.5 s timeout bounds the wait behind it.
+  const postInOrder = inOrder((payload: Record<string, unknown>): Promise<Record<string, unknown> | null> => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+    return fetch(new URL("/api/activity/hooks", endpoint!.baseUrl).toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${endpoint!.token}` },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+      .then(async (response) => response.ok && runtime === "omp" ? await response.json() as Record<string, unknown> : null)
+      .catch(() => null)
+      .finally(() => clearTimeout(timeout));
+  });
+
   const io: RunnerIo = {
     sendRpc: (cmd) => {
       try { child.stdin.write(`${JSON.stringify(cmd)}\n`); } catch { /* exit handler reports */ }
@@ -1008,24 +1261,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     mirrorAppend: (text) => process.stdout.write(text),
     postActivity: (payload) => {
       if (!endpoint || typeof fetch !== "function") return;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 1500);
-      const request = fetch(new URL("/api/activity/hooks", endpoint.baseUrl).toString(), {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${endpoint.token}` },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      if (runtime !== "omp") {
-        request.catch(() => { /* best-effort — never blocks the loop */ }).finally(() => clearTimeout(timeout));
-        return;
-      }
+      const result = postInOrder(payload).catch(() => null);
       // OMP reads the acknowledgement so identity delivery can retry; null
       // (transport failure or a non-OK reply) means "not yet persisted".
-      return request
-        .then(async (response) => response.ok ? await response.json() as Record<string, unknown> : null)
-        .catch(() => null)
-        .finally(() => clearTimeout(timeout));
+      if (runtime === "omp") return result;
     },
     writeSidecar: (state) => {
       try {
@@ -1044,8 +1283,17 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         headers: { "content-type": "application/json", authorization: `Bearer ${endpoint.token}` },
         body: JSON.stringify(payload),
         signal: controller.signal,
-      }).then((res) => res.ok, () => false /* best-effort: a later refresh re-sends what wasn't stored */).finally(() => clearTimeout(timeout));
+      }).then(async (res) => {
+        if (!res.ok) return false;
+        const reply = await res.json().catch(() => null) as { charged?: unknown } | null;
+        return { charged: Array.isArray(reply?.charged) ? reply.charged.filter((id): id is string => typeof id === "string") : [] };
+      }, () => false /* best-effort: a later refresh re-sends what wasn't stored */).finally(() => clearTimeout(timeout));
     },
+    ...(args.openRouterCharge === true && runtime === "pi" ? {
+      enqueueChargeLookups: (piSessionId: string, items: Array<{ fact: PiUsageFact; provenance: ChargeProvenance }>, charged: ReadonlySet<string>) =>
+        chargeLookup.enqueue(piSessionId, items, charged),
+      credentialEvidence,
+    } : {}),
     readFirstLine: (path) => {
       try {
         const fd = fs.openSync(path, "r");
@@ -1065,7 +1313,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     sessionName: args.sessionName, nodeId: process.env.OPENRIG_NODE_ID, launchId: args.launchId,
     // Carry the emitting tenure; never infer it from a later daemon read or Pi event.
     generation: process.env.OPENRIG_OCCUPANT_GENERATION,
-  }, { catchUpSince, runtime, usageFacts: args.usageFacts === true });
+  }, { catchUpSince, runtime, usageFacts: args.usageFacts === true, openRouterCharge: args.openRouterCharge === true, launchCredentialEvidence });
 
   let transportUp = runtime === "pi";
   readline.createInterface({ input: child.stdout }).on("line", (line) => {
@@ -1074,7 +1322,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         const frame = JSON.parse(line) as { type?: string };
         if (frame.type === "ready") {
           transportUp = true;
-          core.start();
+          core.start(frame as Record<string, unknown>);
         }
       } catch { /* surface non-JSON stdout through the core */ }
     }
@@ -1083,6 +1331,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // Re-deliver OMP identity until the daemon confirms the resume token.
   const identityRetry = runtime === "omp" ? setInterval(() => core.retrySessionIdentity(), IDENTITY_RETRY_MS) : undefined;
   identityRetry?.unref();
+  const idleHeartbeat = runtime === "pi" ? setInterval(() => core.heartbeat(), IDLE_HEARTBEAT_TICK_MS) : undefined;
+  idleHeartbeat?.unref();
   // The last few stderr lines, so an OMP that exits during startup is
   // reported with its own words in the error, not only above it.
   const stderrTail: string[] = [];
@@ -1133,6 +1383,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (exited) return;
     exited = true;
     clearInterval(identityRetry);
+    clearInterval(idleHeartbeat);
     if (!core.isReady()) {
       const how = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
       const output = stderrTail.length > 0 ? ` Its last output: ${stderrTail.join(" | ")}` : " It printed nothing on stderr.";

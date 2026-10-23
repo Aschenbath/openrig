@@ -9,6 +9,7 @@ import type { EventBus } from "../domain/event-bus.js";
 import { summarizeSnapshot, type SnapshotRepository } from "../domain/snapshot-repository.js";
 import type { SnapshotCapture } from "../domain/snapshot-capture.js";
 import type { RestoreOrchestrator } from "../domain/restore-orchestrator.js";
+import { joinAutomaticRestore, JOINED_AUTOMATIC_RESTORE_WARNING } from "../domain/existing-rig-restore.js";
 import { projectRigToGraph, type InventoryOverlay, type CurrentQitemSummary } from "../domain/graph-projection.js";
 import {
   getNodeInventory,
@@ -33,10 +34,11 @@ import type { KernelBootTracker, KernelState } from "../domain/kernel-boot-track
 import type { RecoveryPlan } from "../domain/restore-check-service.js";
 import type { ContextUsageStore } from "../domain/context-usage-store.js";
 import type { TranscriptStore } from "../domain/transcript-store.js";
-import type { Pod, ExpansionPodFragment } from "../domain/types.js";
+import type { Pod, ExpansionPodFragment, RestoreOutcome, Snapshot } from "../domain/types.js";
 import type { RigExpansionService } from "../domain/rig-expansion-service.js";
 import type { PodRigInstantiator } from "../domain/rigspec-instantiator.js";
 import { convergeOp } from "../domain/topology-converge.js";
+import type { EdgeOpOutcome } from "../domain/rig-edge-ops.js";
 import type { RigLifecycleService } from "../domain/rig-lifecycle-service.js";
 import type { SelfAttachService } from "../domain/self-attach-service.js";
 
@@ -624,6 +626,7 @@ rigsRoutes.post("/:id/attach-self", async (c) => {
       return c.json(result, 404);
     case "runtime_required":
       return c.json(result, 400);
+    case "address_conflict":
     case "already_bound":
     case "duplicate_logical_id":
     case "invalid_member_name":
@@ -656,6 +659,15 @@ rigsRoutes.post("/:id/up", async (c) => {
 
   const snapshotRepo = c.get("snapshotRepo" as never) as SnapshotRepository;
   const snapshotCapture = c.get("snapshotCapture" as never) as SnapshotCapture;
+  // The same restore daemon start is running, or has just run, for a kernel a reboot left down: its
+  // outcome, as `rig up <rig> --existing` reports it (routes/up.ts).
+  if (!plan && !freshLogicalIds?.length) {
+    const joined = await joinAutomaticRestore({ rigRepo: repo, snapshotRepo }, rigId);
+    if (joined) {
+      if (!joined.ok) return c.json(joined.choice.body, joined.choice.status);
+      return renderExplorerRestore(c, repo, rig.rig.name, rigId, joined.snapshot, joined.capturedCurrentState, joined.staleSnapshot, joined.result, true);
+    }
+  }
   const automaticSelection = snapshotRepo.selectRestoreUsable(rigId);
   let snapshot = automaticSelection.ok ? automaticSelection.snapshot : null;
   let snapshotSelection = automaticSelection.ok ? automaticSelection.selection : undefined;
@@ -680,7 +692,7 @@ rigsRoutes.post("/:id/up", async (c) => {
   // OPR.0.3.4.4 — read-only plan gate BEFORE the auto-rehydrate capture
   // (the capture is itself a mutation) and before restoreOrch.restore().
   if (plan) {
-    return c.json(buildRestorePlanPreview(rig, snapshot ?? null, collectPreviewSessionRows(repo.db, rig, snapshot ?? null), undefined, Date.now(), readFreshOccupantRelations(repo.db, rig.rig.id)), 200);
+    return c.json(buildRestorePlanPreview(rig, snapshot ?? null, collectPreviewSessionRows(repo.db, rig, snapshot ?? null, true), freshLogicalIds, Date.now(), readFreshOccupantRelations(repo.db, rig.rig.id)), 200);
   }
 
   if (!snapshot) {
@@ -705,14 +717,25 @@ rigsRoutes.post("/:id/up", async (c) => {
     adapters: adapters ?? {},
     fsOps: { exists: (p: string) => fs.existsSync(p) },
     freshLogicalIds,
+    preserveStoppedInitial: true,
     snapshotSelection,
   });
+  return renderExplorerRestore(c, repo, rig.rig.name, rigId, snapshot, capturedCurrentState, staleSnapshot, result, false);
+});
+
+async function renderExplorerRestore(
+  c: { json: (data: unknown, status?: number) => Response },
+  repo: RigRepository, rigName: string, rigId: string, snapshot: Snapshot, capturedCurrentState: boolean, staleSnapshot: boolean,
+  result: RestoreOutcome | { ok: false; code: "restore_unavailable"; message: string }, joined: boolean,
+) {
+  const joinedWarning = joined ? [JOINED_AUTOMATIC_RESTORE_WARNING] : [];
   if (!result.ok) {
+    if (result.code === "restore_unavailable") return c.json({ error: result.message }, 500);
     if (result.code === "pre_restore_validation_failed") {
       return c.json({
         status: "not_attempted",
         rigId,
-        rigName: rig.rig.name,
+        rigName,
         error: result.message,
         code: result.code,
         snapshotKind: snapshot.kind,
@@ -720,7 +743,7 @@ rigsRoutes.post("/:id/up", async (c) => {
         remediation: result.result.blockers?.map((blocker) => blocker.remediation) ?? [],
       }, 409);
     }
-    return c.json({ error: result.message, code: result.code }, result.code === "rig_not_stopped" ? 409 : 400);
+    return c.json({ error: result.message, code: result.code, ...(joined ? { warnings: joinedWarning } : {}) }, result.code === "rig_not_stopped" ? 409 : 400);
   }
 
   // Compute attach command from first running/resumed node (same logic as /api/up)
@@ -732,19 +755,19 @@ rigsRoutes.post("/:id/up", async (c) => {
   return c.json({
     status: "restored",
     rigId,
-    rigName: rig.rig.name,
+    rigName,
     snapshotId: snapshot.id,
     snapshotKind: snapshot.kind,
     rigResult: result.result.rigResult,
     nodes: result.result.nodes,
-    warnings: capturedCurrentState
+    warnings: [...joinedWarning, ...(capturedCurrentState
       ? [staleSnapshot
           ? "Existing restore snapshots named an older occupant; captured current DB state as auto-rehydrate snapshot for reboot recovery."
           : "No restore-usable snapshot existed; captured current DB state as auto-rehydrate snapshot for reboot recovery.", ...result.result.warnings]
-      : result.result.warnings,
+      : result.result.warnings)],
     attachCommand,
   }, 200);
-});
+}
 
 // POST /api/rigs/:rigId/expand — dynamic rig expansion
 rigsRoutes.post("/:rigId/expand", async (c) => {
@@ -846,6 +869,53 @@ rigsRoutes.post("/:rigId/pods/:podNamespace/members", async (c) => {
   // 201 created. The node may still be failed/attention_required at launch; that
   // is carried in outcome.result.node.status (mirrors expand's per-node status).
   return c.json(outcome, 201);
+});
+
+function edgeOpStatus(outcome: EdgeOpOutcome): 200 | 201 | 400 | 404 | 500 {
+  if (outcome.ok) return outcome.outcome === "added" ? 201 : 200;
+  if (outcome.code === "rig_not_found" || outcome.code === "edge_not_found") return 404;
+  return outcome.code === "unavailable" ? 500 : 400;
+}
+
+// POST /api/rigs/:rigId/edges — add one typed edge between two seats, by rig-scoped logical ids (same-pod
+// edges included). A repeat returns the existing edge. `plan: true` writes nothing.
+rigsRoutes.post("/:rigId/edges", async (c) => {
+  const rigId = c.req.param("rigId")!;
+  const raw: unknown = await c.req.json().catch(() => null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return c.json({ ok: false, code: "validation_failed", message: "body must be an object { from, to, kind }" }, 400);
+  }
+  const { from, to, kind, plan } = raw as Record<string, unknown>;
+  if (plan !== undefined && typeof plan !== "boolean") {
+    return c.json({ ok: false, code: "validation_failed", message: "plan must be a boolean" }, 400);
+  }
+  if (typeof from !== "string" || typeof to !== "string" || typeof kind !== "string") {
+    return c.json({ ok: false, code: "validation_failed", message: "from, to and kind are required strings" }, 400);
+  }
+  const converged = await convergeOp(
+    { instantiator: c.get("podInstantiator" as never) as PodRigInstantiator, rigRepo: getRepo(c) },
+    rigId,
+    { kind: "add_edge", from, to, edgeKind: kind, plan },
+    ".",
+  );
+  if (converged.kind !== "add_edge" || !converged.supported) return c.json({ error: "Unexpected converge result for add_edge" }, 500);
+  return c.json(converged.outcome, edgeOpStatus(converged.outcome));
+});
+
+// DELETE /api/rigs/:rigId/edges/:edgeId — remove exactly that edge. `?plan=1` writes nothing.
+rigsRoutes.delete("/:rigId/edges/:edgeId", async (c) => {
+  const plan = c.req.query("plan");
+  if (plan !== undefined && plan !== "0" && plan !== "1") {
+    return c.json({ ok: false, code: "validation_failed", message: "plan must be 0 or 1" }, 400);
+  }
+  const converged = await convergeOp(
+    { instantiator: c.get("podInstantiator" as never) as PodRigInstantiator, rigRepo: getRepo(c) },
+    c.req.param("rigId")!,
+    { kind: "remove_edge", edgeId: c.req.param("edgeId")!, plan: plan === "1" },
+    ".",
+  );
+  if (converged.kind !== "remove_edge" || !converged.supported) return c.json({ error: "Unexpected converge result for remove_edge" }, 500);
+  return c.json(converged.outcome, edgeOpStatus(converged.outcome));
 });
 
 // DELETE /api/rigs/:rigId/pods/:podRef

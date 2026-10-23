@@ -7,11 +7,11 @@
 import { describe, it, expect, vi } from "vitest";
 import { PassThrough } from "node:stream";
 import {
-  createRunnerInput, MAX_PI_INPUT_BYTES, RunnerCore, mapPiEvent, parseRunnerArgs,
+  createRunnerInput, inOrder, MAX_PI_INPUT_BYTES, RunnerCore, mapPiEvent, parseRunnerArgs,
   prepareRunnerSidecar,
   type RunnerIo,
 } from "../src/adapters/pi-runner.js";
-import { PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, type PiRunnerState } from "../src/adapters/pi-runner-protocol.js";
+import { PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, buildPiRunnerCommand, buildPiChildArgs, type PiRunnerState } from "../src/adapters/pi-runner-protocol.js";
 
 const SESSION = "devpi-a@some-rig";
 const SESSION_FILE = "/state/pi/devpi-a@some-rig/sessions/2026_0197.jsonl";
@@ -42,6 +42,141 @@ function readyCore(f = fakeIo()) {
   }));
   return { core, ...f };
 }
+
+// ── Activity posts arrive in the runner's own order ─────────────────────────
+
+describe("inOrder", () => {
+  it("starts a post only after the one before it settles, even when the first is slow", async () => {
+    const started: string[] = [];
+    const releases: Array<() => void> = [];
+    const send = inOrder((name: string) => new Promise<string>((resolve) => {
+      started.push(name);
+      releases.push(() => resolve(name));
+    }));
+    const first = send("beat");
+    const second = send("agent_start");
+    await Promise.resolve(); await Promise.resolve();
+    expect(started).toEqual(["beat"]);
+    releases[0]();
+    await first;
+    await Promise.resolve(); await Promise.resolve();
+    expect(started).toEqual(["beat", "agent_start"]);
+    releases[1]();
+    await expect(second).resolves.toBe("agent_start");
+  });
+
+  it("goes on to the next post when one fails", async () => {
+    const send = inOrder(async (n: number) => { if (n === 1) throw new Error("down"); return n; });
+    const failed = send(1);
+    await expect(send(2)).resolves.toBe(2);
+    await expect(failed).rejects.toThrow("down");
+  });
+});
+
+// ── Idle heartbeat ──────────────────────────────────────────────────────────
+
+describe("idle heartbeat", () => {
+  function clocked(runtime?: "pi" | "omp") {
+    const f = fakeIo();
+    let t = Date.parse("2026-07-06T10:00:00Z");
+    f.io.now = () => new Date(t).toISOString();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, nodeId: "node-1", launchId: "launch-77" }, runtime ? { runtime } : undefined);
+    core.start();
+    const beats = () => f.activity.filter(a => a.subtype === "idle_heartbeat");
+    return { core, f, beats, advance: (ms: number) => { t += ms; } };
+  }
+  const ready = (core: RunnerCore) => core.handlePiLine(JSON.stringify({
+    type: "response", id: "pi-runner-get-state", data: { sessionFile: SESSION_FILE, sessionId: "0197a2f0" } }));
+
+  it("says nothing before the runner is ready", () => {
+    const c = clocked();
+    c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+  });
+
+  it("posts idle once ready, then at most once per interval", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.heartbeat();
+    expect(c.beats()).toEqual([expect.objectContaining({ sessionName: SESSION, hookEvent: "Stop", subtype: "idle_heartbeat", runtime: "pi" })]);
+    c.advance(60_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(1);
+    c.advance(120_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(2);
+  });
+
+  it("stays quiet mid-turn and resumes after agent_end", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.advance(10 * 60_000); c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    c.advance(180_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(1);
+  });
+
+  // agent_start is not the only way a turn runs: turn_start, compaction and auto-retry report the agent working
+  // without setting `streaming`, and a beat in those stretches would read idle mid-turn.
+  it.each([
+    ["a turn opened by turn_start alone", { type: "turn_start" }],
+    ["a compaction", { type: "compaction_start" }],
+    ["an automatic retry", { type: "auto_retry_start" }],
+  ])("stays quiet during %s, and resumes after agent_end", (_name, event) => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiLine(JSON.stringify(event));
+    c.advance(10 * 60_000); c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    c.advance(180_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(1);
+  });
+
+  it("counts a Stop the turn posted as a report: the next beat is a full interval after agent_end", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.heartbeat();
+    c.advance(170_000);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    c.advance(60_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(1);
+    c.advance(120_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(2);
+  });
+
+  it("stays quiet after the pi child exits", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiExit(1);
+    c.advance(10 * 60_000); c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+  });
+
+  it("every Stop a Pi runner posts says how often it will beat, except its exit report", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    c.advance(180_000); c.core.heartbeat();
+    const stops = c.f.activity.filter(a => a.hookEvent === "Stop");
+    expect(stops).toHaveLength(2);
+    for (const stop of stops) expect(stop.livenessSeconds).toBe(180);
+    c.core.handlePiExit(1);
+    const exit = c.f.activity.find(a => a.subtype === "pi_exited");
+    expect(exit).toBeDefined();
+    expect(exit).not.toHaveProperty("livenessSeconds");
+    expect(c.f.activity.filter(a => a.hookEvent !== "Stop")).toSatisfy((rest: Record<string, unknown>[]) => rest.every(a => !("livenessSeconds" in a)));
+  });
+
+  it("is a Pi-only behaviour", () => {
+    const c = clocked("omp");
+    ready(c.core);
+    c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+  });
+});
 
 // ── Actual Node line editor + framed input ──────────────────────────────────
 
@@ -595,6 +730,82 @@ describe("parseRunnerArgs", () => {
 
   it("rejects unknown flags loudly", () => {
     expect(() => parseRunnerArgs([...base, "--approve", "--resume"])).toThrow(/unknown flag/);
+  });
+
+  it("accepts --thinking verbatim (Pi warns on a level it does not know)", () => {
+    expect(parseRunnerArgs([...base, "--approve", "--thinking", "high"]).thinking).toBe("high");
+    expect(parseRunnerArgs([...base, "--approve", "--thinking", "bogus"]).thinking).toBe("bogus");
+    expect(parseRunnerArgs([...base, "--approve"]).thinking).toBeUndefined();
+  });
+
+  it("a --thinking VALUE that looks like a control flag is a value, not a flag", () => {
+    const parsed = parseRunnerArgs([...base, "--approve", "--thinking", "--approval-mode"]);
+    expect(parsed.thinking).toBe("--approval-mode");
+    expect(parsed.trust).toBe("approve");
+    const cmdBase = { runnerEntryPath: "/r.js", sessionName: SESSION, stateRoot: "/sr", cwd: "/work", trust: "approve" as const, launchId: "L1", runtime: "pi" as const };
+    const cmd = buildPiRunnerCommand({ ...cmdBase, thinking: "none" });
+    expect(parseRunnerArgs(cmd.split(" ").slice(2).map((w) => w.replace(/^'|'$/g, ""))).thinking).toBe("none");
+  });
+
+  it("still refuses genuinely incompatible trust control flags", () => {
+    expect(() => parseRunnerArgs([...base, "--approve", "--approval-mode", "yolo"])).toThrow(/explicit trust flag is required/);
+    expect(() => parseRunnerArgs([...base, "--runtime", "omp", "--approval-mode", "yolo", "--approve"])).toThrow(/OMP requires --approval-mode/);
+    expect(() => parseRunnerArgs([...base, "--runtime", "omp", "--approve"])).toThrow(/OMP requires --approval-mode/);
+  });
+
+  it("a flag-looking value elsewhere does not count as a Pi trust flag", () => {
+    const parsed = parseRunnerArgs([...base, "--runtime", "omp", "--approval-mode", "yolo", "--model", "--approve"]);
+    expect(parsed.model).toBe("--approve");
+    expect(parsed.trust).toBe("approve");
+  });
+});
+
+describe("--thinking in the runner command and the pi child argv", () => {
+  const cmdBase = { runnerEntryPath: "/r.js", sessionName: SESSION, stateRoot: "/sr", cwd: "/work", trust: "approve" as const, launchId: "L1" };
+  const childBase = { sessionsDir: "/sd", sessionName: SESSION, trust: "approve" as const };
+
+  it("runner command carries --thinking after --model, only when non-blank, never for omp", () => {
+    const cmd = buildPiRunnerCommand({ ...cmdBase, runtime: "pi", model: "zai/glm", thinking: " high " });
+    expect(cmd).toContain("--model 'zai/glm' --thinking 'high'");
+    expect(cmd.indexOf("--thinking")).toBeGreaterThan(cmd.indexOf("--launch-id"));
+    for (const thinking of [undefined, "", "  "]) {
+      expect(buildPiRunnerCommand({ ...cmdBase, runtime: "pi", thinking })).toBe(buildPiRunnerCommand({ ...cmdBase, runtime: "pi" }));
+    }
+    expect(buildPiRunnerCommand({ ...cmdBase, runtime: "omp", thinking: "high" })).toBe(buildPiRunnerCommand({ ...cmdBase, runtime: "omp" }));
+    expect(buildPiRunnerCommand({ ...cmdBase, runtime: "omp", thinking: "high" })).not.toContain("--thinking");
+  });
+
+  it("only a value of set-effort's shape is sent: Pi's levels and unknown words go through, flag-shaped and spaced values are left out", () => {
+    for (const thinking of ["off", "minimal", "low", "medium", "high", "xhigh", "max", "none"]) {
+      expect(buildPiRunnerCommand({ ...cmdBase, runtime: "pi", thinking })).toContain(`--thinking '${thinking}'`);
+      expect(buildPiChildArgs({ ...childBase, thinking })).toEqual(expect.arrayContaining(["--thinking", thinking]));
+    }
+    for (const thinking of ["--cwd", "very high", "x".repeat(33)]) {
+      expect(buildPiRunnerCommand({ ...cmdBase, runtime: "pi", thinking })).toBe(buildPiRunnerCommand({ ...cmdBase, runtime: "pi" }));
+      expect(buildPiChildArgs({ ...childBase, thinking })).not.toContain("--thinking");
+    }
+  });
+
+  it("a suffixed model passes through unchanged next to --thinking", () => {
+    const cmd = buildPiRunnerCommand({ ...cmdBase, runtime: "pi", model: "openrouter/x:high", thinking: "low" });
+    expect(cmd).toContain("--model 'openrouter/x:high' --thinking 'low'");
+    const args = buildPiChildArgs({ ...childBase, runtime: "pi", model: "openrouter/x:high", thinking: "low" });
+    expect(args).toContain("openrouter/x:high");
+    expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 4)).toEqual(["--model", "openrouter/x:high", "--thinking", "low"]);
+  });
+
+  it("child argv: --thinking present with a value, absent when blank, never for omp", () => {
+    expect(buildPiChildArgs({ ...childBase, thinking: "xhigh" })).toEqual(expect.arrayContaining(["--thinking", "xhigh"]));
+    for (const thinking of [undefined, "", " "]) {
+      expect(buildPiChildArgs({ ...childBase, thinking })).not.toContain("--thinking");
+    }
+    expect(buildPiChildArgs({ ...childBase, runtime: "omp", thinking: "high" })).toEqual(buildPiChildArgs({ ...childBase, runtime: "omp" }));
+  });
+
+  it("parseRunnerArgs round-trips the command's --thinking into the child argv", () => {
+    const cmd = buildPiRunnerCommand({ ...cmdBase, runtime: "pi", thinking: "medium" });
+    const parsed = parseRunnerArgs(cmd.split(" ").slice(2).map((w) => w.replace(/^'|'$/g, "")));
+    expect(buildPiChildArgs({ ...childBase, thinking: parsed.thinking })).toEqual(expect.arrayContaining(["--thinking", "medium"]));
   });
 });
 
