@@ -55,10 +55,12 @@ place a view in another existing session from such a caller, use the explicit
 An endpoint-mismatch error also gives a command for the caller's own session,
 such as `rig terminal open future-rig --session work`. Previously it only
 explained how to place the view in the daemon's selected session. The caller's
-name comes from `HERDR_SESSION`, then a socket under
+name comes from the same resolved socket path used by the endpoint check:
 `~/.config/herdr/sessions/<name>/herdr.sock`, or `default` for
-`~/.config/herdr/herdr.sock`. Other custom socket paths keep the existing
-guidance without guessing a session name. Reporting the mismatch opens nothing.
+`~/.config/herdr/herdr.sock`. An explicit `HERDR_SOCKET_PATH` takes precedence
+over `HERDR_SESSION` for both the check and the suggestion. Other custom socket
+paths keep the existing guidance without guessing a session name, even when
+`HERDR_SESSION` is set. Reporting the mismatch opens nothing.
 
 Previews include the selected session in their fingerprint. A preview from one
 session cannot authorize an open in another; refresh the preview after changing

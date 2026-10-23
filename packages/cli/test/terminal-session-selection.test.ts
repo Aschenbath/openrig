@@ -10,12 +10,12 @@ vi.mock("../src/daemon-lifecycle.js", async () => ({
   getDaemonUrl: vi.fn(() => "http://localhost:7433"),
 }));
 
-function fixture(options: { legacy?: boolean; noHerdr?: boolean; statusMismatch?: boolean; dropOpenSession?: boolean } = {}) {
+function fixture(options: { legacy?: boolean; noHerdr?: boolean; statusMismatch?: boolean; dropOpenSession?: boolean; sessionSockets?: Record<string, string> } = {}) {
   const pane = { seat: "worker@prod", label: "worker", paneCommand: "tmux attach -t 'worker@prod'" };
   const get = vi.fn(async (url: string) => {
     const requested = new URL(url, "http://localhost").searchParams.get("session") ?? "default";
     const session = options.legacy ? undefined : options.statusMismatch && url.includes("status") ? "wrong-session" : requested;
-    const launch = { socketPath: `/fixture/${session ?? "legacy-default"}/herdr.sock`, ...(session !== undefined ? { session } : {}) };
+    const launch = { socketPath: options.sessionSockets?.[session ?? "legacy-default"] ?? `/fixture/${session ?? "legacy-default"}/herdr.sock`, ...(session !== undefined ? { session } : {}) };
     return { status: 200, data: url.includes("preview")
       ? { session, planId: `plan-${requested}`, composed: { id: "prod", opened: [pane], pages: [[pane]], absent: [], degraded: [] }, status: { launch } }
       : { session, providers: [{ name: "herdr", status: { launch }, liveness: { alive: true } }] } };
@@ -91,7 +91,9 @@ describe("terminal --session", () => {
   });
 
   it.each([
-    { env: { HERDR_SESSION: "work", HERDR_SOCKET_PATH: "/fixture/.config/herdr/sessions/other/herdr.sock" }, session: "work" },
+    { env: { HERDR_SESSION: "work", HERDR_SOCKET_PATH: "/fixture/.config/herdr/sessions/other/herdr.sock" }, session: "other" },
+    { env: { HERDR_SESSION: "work", HERDR_SOCKET_PATH: "/fixture/.config/herdr/herdr.sock" }, session: "default" },
+    { env: { HERDR_SESSION: "other", HERDR_SOCKET_PATH: "/fixture/.config/herdr/sessions/other/../work/herdr.sock" }, session: "work" },
     { env: { HERDR_SESSION: "work" }, session: "work" },
     { env: { HERDR_SOCKET_PATH: "/fixture/.config/herdr/sessions/work/herdr.sock" }, session: "work" },
     { env: { HERDR_SOCKET_PATH: "/fixture/.config/herdr/herdr.sock" }, session: "default" },
@@ -114,9 +116,14 @@ describe("terminal --session", () => {
     expect(f.windowDeps.env).toEqual(originalEnv);
   });
 
-  it.each(["/custom/herdr.sock", "/other-home/.config/herdr/sessions/work/herdr.sock"])("caller-session guidance keeps a custom socket unnamed: %s", async socket => {
+  it.each([
+    { socket: "/custom/herdr.sock" },
+    { socket: "/custom/herdr.sock", session: "work" },
+    { socket: "/other-home/.config/herdr/sessions/work/herdr.sock" },
+    { socket: "/other-home/.config/herdr/sessions/work/herdr.sock", session: "work" },
+  ])("caller-session guidance keeps a custom socket unnamed: $socket ($session)", async ({ socket, session }) => {
     const f = fixture();
-    f.windowDeps.env = { HOME: "/fixture", TERM_PROGRAM: "herdr", HERDR_SOCKET_PATH: socket };
+    f.windowDeps.env = { HOME: "/fixture", TERM_PROGRAM: "herdr", HERDR_SOCKET_PATH: socket, HERDR_SESSION: session };
     await f.run(["open", "prod", "--json"]);
     const result = JSON.parse(logs[0]!);
     expect(result).toMatchObject({ ok: false, windowAttempted: false, opened: [] });
@@ -124,6 +131,30 @@ describe("terminal --session", () => {
     expect(result.error).not.toContain("--session");
     expect(f.post).not.toHaveBeenCalled();
     expect(f.windowDeps.launch).not.toHaveBeenCalled();
+  });
+
+  it("the suggested session can be retried when the caller's session variable disagrees with its socket", async () => {
+    const socket = "/fixture/.config/herdr/sessions/work/herdr.sock";
+    const f = fixture({ sessionSockets: { work: socket } });
+    f.windowDeps.env = { HOME: "/fixture", TERM_PROGRAM: "herdr", HERDR_SESSION: "other", HERDR_SOCKET_PATH: socket };
+    const originalEnv = { ...f.windowDeps.env };
+
+    await f.run(["open", "prod", "--json"]);
+    expect(JSON.parse(logs[0]!).error).toContain("rig terminal open 'prod' --session 'work'");
+    expect(f.post).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+
+    logs.length = 0; process.exitCode = undefined;
+    await f.run(["open", "prod", "--session", "work", "--json"]);
+    expect(process.exitCode).toBeUndefined();
+    expect(JSON.parse(logs[0]!)).toMatchObject({ ok: true, session: "work", opened: ["worker@prod"] });
+    expect(f.post).toHaveBeenCalledExactlyOnceWith("/api/terminal/open", { view: "prod", provider: "herdr", session: "work", expectedPlan: "plan-work" }, { timeoutMs: 45_000 });
+    for (const [, args] of f.exec.mock.calls.filter(([file]) => file === "/usr/bin/env")) {
+      expect(args).toContain(`HERDR_SOCKET_PATH=${socket}`);
+    }
+    expect(f.exec.mock.calls.some(([file]) => file === "/usr/bin/osascript")).toBe(false);
+    expect(f.windowDeps.launch).not.toHaveBeenCalled();
+    expect(f.windowDeps.env).toEqual(originalEnv);
   });
 
   it("a changed endpoint after window launch is unconfirmed and never drives another session", async () => {

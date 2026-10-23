@@ -319,8 +319,8 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
         ? path.join(base, "sessions", deps.env["HERDR_SESSION"], "herdr.sock") : path.join(base, "herdr.sock"));
       if (!socket || path.resolve(socket) !== path.resolve(callerSocket)) {
         const socketParts = path.relative(base, path.resolve(callerSocket)).split(path.sep);
-        const callerSession = deps.env["HERDR_SESSION"] || (socketParts.length === 1 && socketParts[0] === "herdr.sock" ? "default"
-          : socketParts.length === 3 && socketParts[0] === "sessions" && socketParts[2] === "herdr.sock" ? socketParts[1] : undefined);
+        const callerSession = socketParts.length === 1 && socketParts[0] === "herdr.sock" ? "default"
+          : socketParts.length === 3 && socketParts[0] === "sessions" && socketParts[2] === "herdr.sock" ? socketParts[1] : undefined;
         const here = callerSession
           ? `You're in Herdr session ${JSON.stringify(callerSession)}. To place the view here, run: rig terminal open ${shellQuote(view)} --session ${shellQuote(callerSession)}. ` : "";
         return failed(`The current Herdr endpoint differs from the selected endpoint; no space was opened in another session. ${here}Use --provider herdr without --window to place a view in the selected session.`);
