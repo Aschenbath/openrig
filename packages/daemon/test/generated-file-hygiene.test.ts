@@ -119,6 +119,19 @@ describe("generated file Git hygiene", () => {
     expect(fs.readFileSync(excludePath(repo))).toEqual(after);
   });
 
+  it("excludes generated core plugin files through an aliased seat directory", () => {
+    const alias = path.join(root, "repo-alias"); fs.symlinkSync(repo, alias, "dir");
+    const file = write(".codex/plugins/openrig-core/payload.txt");
+    const aliasFile = path.join(alias, path.relative(repo, file));
+    expect(excludeNewGeneratedFiles(alias, [aliasFile])).toEqual([]);
+    const excluded = fs.readFileSync(excludePath(repo));
+    expect(excluded.toString()).toContain("/.codex/plugins/openrig-core/payload.txt");
+    // The existing-ignore reader must recognize the alias too, so another pass adds nothing.
+    expect(excludeNewGeneratedFiles(alias, [aliasFile])).toEqual([]);
+    expect(fs.readFileSync(excludePath(repo))).toEqual(excluded);
+    expect(execFileSync("git", ["-C", repo, "check-ignore", "--stdin", "-z"], { input: aliasFile + "\0", encoding: "utf8" })).toBe(aliasFile + "\0");
+  });
+
   it("keeps later sibling user guidance visible (review F1)", () => {
     const linked = path.join(root, "linked"); git(repo, "worktree", "add", "-q", "-b", "linked", linked);
     expect(fs.statSync(path.join(linked, ".git")).isFile()).toBe(true);
