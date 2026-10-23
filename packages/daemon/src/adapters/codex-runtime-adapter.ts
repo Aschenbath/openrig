@@ -182,6 +182,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   private configLock: Promise<unknown> = Promise.resolve();
   private codexSystemConfigDir: string;
 
+  /** Build the Codex launch adapter with injectable filesystem, process, and CLI seams for isolated checks. */
   constructor(deps: {
     tmux: TmuxAdapter;
     seatLaunchEnvironment?: SeatLaunchEnvironment;
@@ -871,7 +872,10 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return root ? ` --add-dir ${shellQuote(root)}` : "";
   }
 
-  /** Suppress roots only when no visible config layer might make the profile writable. */
+  /**
+   * Return true only when visible config proves a read-only profile within Codex's default project root.
+   * Unknown markers or unreadable layers retain the generated roots for native launch handling.
+   */
   private profileRemainsReadOnly(profile: string, cwd: string): boolean {
     const root = this.codexHome ?? nodePath.join(this.fs.homedir ?? os.homedir(), ".codex");
     const path = nodePath.join(root, `${profile}.config.toml`);
@@ -880,11 +884,38 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     try {
       const value = parseToml(this.fs.readFile(path));
       if (value.sandbox_mode !== "read-only" || value.default_permissions !== undefined || !nodePath.isAbsolute(cwd)) return false;
-      // Codex can select a named permission profile independently of the legacy
-      // sandbox setting, even when that setting came from a higher-priority profile.
-      if (this.fs.exists(userPath) && parseToml(this.fs.readFile(userPath)).default_permissions !== undefined) return false;
+      // A custom marker set may change the project boundary; leave the prior
+      // generated roots in place unless this default-marker scan proves it.
+      if (value.project_root_markers !== undefined) return false;
+      // Codex merges fixed system/user/legacy-managed layers before choosing
+      // project markers. Any visible override or unreadable layer keeps roots.
+      for (const fixedPath of [
+        nodePath.join(this.codexSystemConfigDir, "config.toml"),
+        userPath,
+        nodePath.join(this.codexSystemConfigDir, "managed_config.toml"),
+      ]) {
+        if (!this.fs.exists(fixedPath)) continue;
+        const fixed = parseToml(this.fs.readFile(fixedPath));
+        if (fixed.default_permissions !== undefined || fixed.project_root_markers !== undefined) return false;
+      }
+      // Codex's default root is the nearest .git file or a .git directory
+      // containing HEAD. When none exists, Codex uses cwd itself.
+      let projectRoot = nodePath.normalize(cwd);
+      for (let dir = projectRoot;;) {
+        const marker = nodePath.join(dir, ".git");
+        if (this.fs.exists(marker)) {
+          if (!this.fs.statMode) return false;
+          const kind = this.fs.statMode(marker) & fs.constants.S_IFMT;
+          // statMode may expose permission bits alone; that cannot prove a file.
+          if (kind !== fs.constants.S_IFREG && kind !== fs.constants.S_IFDIR) return false;
+          if (kind === fs.constants.S_IFREG || this.fs.exists(nodePath.join(marker, "HEAD"))) { projectRoot = dir; break; }
+        }
+        const parent = nodePath.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
       // Trust can exclude a closer project file, leaving a writable ancestor active.
-      // Keep roots if any visible ancestor could make the launch writable.
+      // Keep roots if any visible applicable ancestor could make the launch writable.
       for (let dir = nodePath.normalize(cwd);;) {
         const projectPath = nodePath.join(dir, ".codex", "config.toml");
         // At the home ancestor this is the user config, which loaded before the profile.
@@ -893,9 +924,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           if (project.default_permissions !== undefined) return false;
           if (project.sandbox_mode !== undefined && project.sandbox_mode !== "read-only") return false;
         }
-        const parent = nodePath.dirname(dir);
-        if (parent === dir) return true;
-        dir = parent;
+        if (dir === projectRoot) return true;
+        dir = nodePath.dirname(dir);
       }
     } catch {
       // Preflight owns profile errors; unreadable user or project state keeps prior roots.
