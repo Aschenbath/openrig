@@ -152,6 +152,23 @@ describe("project-qualified proof scope (#132)", () => {
     expect(workspace.sourceObservation).toEqual({ state: "watching", revision: "workspace-1" });
   });
 
+  it("accepts a prepared root through a symlink, but refuses when that link selects another project", async () => {
+    const f = fixture();
+    const alias = join(f.workspace, "alpha-link");
+    fs.symlinkSync(join(f.workspace, "alpha"), alias, "dir");
+    const scope = "alpha:m0/slices/01-t001";
+    for (const root of [alias, `${alias}/.`]) {
+      const read = await f.get(`scope=${encodeURIComponent(scope)}&projectRoot=${encodeURIComponent(root)}`);
+      expect(read.status).toBe(200);
+    }
+    expect((await f.judge(scope, { projectRoot: alias })).status).toBe(201);
+    fs.unlinkSync(alias);
+    fs.symlinkSync(join(f.workspace, "beta"), alias, "dir");
+    const moved = await f.judge(scope, { projectRoot: alias });
+    expect(moved.status).toBe(409);
+    expect(await moved.json()).toMatchObject({ error: "project_changed" });
+  });
+
   it("a judgment pinned to the prepared projectRoot records; a moved root is refused with 409 project_changed", async () => {
     const f = fixture();
     const root = join(f.workspace, "alpha");
