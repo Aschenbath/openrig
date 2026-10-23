@@ -1,3 +1,4 @@
+import type { CodexPermissionEnvelope } from "../src/domain/codex-rebuild-permissions.js";
 import { mockShellCommand } from "./helpers/shell-command-mock.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,10 +12,12 @@ import type { ProjectionPlan, ProjectionEntry } from "../src/domain/projection-p
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import { seedCodexThreads } from "./helpers/codex-state.js";
 import { execFileSync } from "node:child_process";
+import { provenCodexResume } from "./helpers/codex-resume-proof.js";
 
 // Verbatim 250-byte Codex 0.160.0 menu capture, SHA-256
 // 45c70fc01c7d33f4652c9d42523f631734c62aac76f449ff0f2c15e99680ac9b.
 const currentUpdatePrompt = fs.readFileSync(new URL("./fixtures/codex-update-0.160.0.txt", import.meta.url), "utf8");
+const currentTrustPrompt = fs.readFileSync(new URL("./fixtures/codex-trust-0.156.1.txt", import.meta.url), "utf8");
 
 const CODEX_FLOOR_EFFECT = {
   runtime: "codex",
@@ -537,6 +540,224 @@ describe("Codex runtime adapter", () => {
     expect(sendText).toHaveBeenCalledWith("r01-qa", expectedProfileFreshLaunchCommand("fleet"));
   });
 
+  it("omits generated writable roots for a read-only profile on fresh, resume and fork launches", async () => {
+    const codexHome = "/private/codex";
+    const fsOps = mockFs({ [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\napproval_policy = "never"\n' });
+    const resolveGitAddDirs = vi.fn(async () => ["/project/.git"]);
+    const options = [
+      { name: "dev-qa@test-rig" },
+      { name: "dev-qa@test-rig", resumeToken: "sess-456" },
+      { name: "dev-qa@test-rig", forkSource: { kind: "native_id" as const, value: "parent-thread-id" } },
+    ];
+    for (const opts of options) {
+      const proof = provenCodexResume("sess-456");
+      const tmux = mockTmux({ getPanePid: proof.getPanePid });
+      const adapter = new CodexRuntimeAdapter({
+        tmux, fsOps, codexHome, resolveGitAddDirs,
+        listProcesses: proof.listProcesses as never, readResumeEvidence: proof.readResumeEvidence,
+        sleep: async () => {},
+        verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
+      });
+      const binding = { ...makeBinding(), codexConfigProfile: "locked", model: "gpt-5.5", effort: "high" };
+
+      await adapter.launchHarness(binding, opts);
+
+      const command = vi.mocked(tmux.sendText).mock.calls[0]?.[1];
+      expect(command).toContain("-p 'locked'");
+      expect(command).toContain("-m 'gpt-5.5'");
+      expect(command).toContain("model_reasoning_effort=\"high\"");
+      expect(command).not.toContain("--add-dir");
+      expect(command).not.toContain("workspace-write");
+      expect(command).not.toContain("danger-full-access");
+    }
+    expect(resolveGitAddDirs).not.toHaveBeenCalled();
+  });
+
+  it("keeps generated roots when a project layer makes a read-only profile writable", async () => {
+    const codexHome = "/private/codex";
+    const projectPath = "/project/.codex/config.toml";
+    const projectContent = 'sandbox_mode = "workspace-write"\n';
+    const fsOps = mockFs({
+      [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+      [projectPath]: projectContent,
+    });
+    const writeFile = vi.spyOn(fsOps, "writeFile");
+    const options = [
+      { name: "dev-qa@test-rig" },
+      { name: "dev-qa@test-rig", resumeToken: "sess-456" },
+      { name: "dev-qa@test-rig", forkSource: { kind: "native_id" as const, value: "parent-thread-id", pendingIdAllowed: true } },
+    ];
+    for (const opts of options) {
+      const proof = provenCodexResume("sess-456");
+      const tmux = mockTmux({ getPanePid: proof.getPanePid });
+      const adapter = new CodexRuntimeAdapter({
+        tmux, fsOps, codexHome, resolveGitAddDirs: async () => ["/project/.git"],
+        listProcesses: proof.listProcesses as never, readResumeEvidence: proof.readResumeEvidence,
+        sleep: async () => {}, verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
+      });
+
+      const result = await adapter.launchHarness({ ...makeBinding("/project/src"), codexConfigProfile: "locked" }, opts);
+
+      expect(result, JSON.stringify(opts)).toMatchObject({ ok: true });
+      const command = vi.mocked(tmux.sendText).mock.calls[0]?.[1];
+      expect(command).toContain("-p 'locked'");
+      if (!opts.resumeToken && !opts.forkSource) expect(command).toContain("--add-dir '/project/.git'");
+      expect(command).toContain(`--add-dir '${testQueueRoot()}'`);
+    }
+    expect(fsOps.readFile(projectPath)).toBe(projectContent);
+    expect(writeFile).not.toHaveBeenCalledWith(projectPath, expect.anything());
+  });
+
+  it("keeps generated roots when a project config layer cannot be parsed", async () => {
+    const codexHome = "/private/codex";
+    const tmux = mockTmux();
+    const adapter = new CodexRuntimeAdapter({
+      tmux, codexHome, fsOps: mockFs({
+        [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+        "/project/.codex/config.toml": "sandbox_mode = [\n",
+      }),
+      resolveGitAddDirs: async () => ["/project/.git"],
+      listProcesses: () => [], sleep: async () => {},
+      verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
+    });
+
+    const result = await adapter.launchHarness({ ...makeBinding(), codexConfigProfile: "locked" }, { name: "dev-qa@test-rig" });
+
+    expect(result.ok).toBe(true);
+    const command = vi.mocked(tmux.sendText).mock.calls[0]?.[1];
+    expect(command).toContain("--add-dir '/project/.git'");
+    expect(command).toContain(`--add-dir '${testQueueRoot()}'`);
+  });
+
+  it("does not treat the lower-priority user config as a project override", async () => {
+    const codexHome = "/home/test/.codex";
+    const resolveGitAddDirs = vi.fn(async () => ["/home/test/project/.git"]);
+    const tmux = mockTmux();
+    const adapter = new CodexRuntimeAdapter({
+      tmux, codexHome, fsOps: mockFs({
+        [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+        [`${codexHome}/config.toml`]: 'sandbox_mode = "workspace-write"\n',
+      }),
+      resolveGitAddDirs, listProcesses: () => [], sleep: async () => {},
+      verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
+    });
+
+    const result = await adapter.launchHarness({ ...makeBinding("/home/test/project"), codexConfigProfile: "locked" }, { name: "dev-qa@test-rig" });
+
+    expect(result.ok).toBe(true);
+    expect(vi.mocked(tmux.sendText).mock.calls[0]?.[1]).not.toContain("--add-dir");
+    expect(resolveGitAddDirs).not.toHaveBeenCalled();
+  });
+
+  it("keeps generated roots when named permissions or unreadable user config leave the sandbox uncertain", async () => {
+    const codexHome = "/home/test/.codex";
+    for (const files of [
+      { [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\ndefault_permissions = ":workspace"\n' },
+      { [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+        [`${codexHome}/config.toml`]: 'default_permissions = ":workspace"\n' },
+      { [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+        [`${codexHome}/config.toml`]: 'default_permissions = [\n' },
+    ]) {
+      const tmux = mockTmux();
+      const adapter = new CodexRuntimeAdapter({
+        tmux, codexHome, fsOps: mockFs(files),
+        resolveGitAddDirs: async () => ["/home/test/project/.git"],
+        listProcesses: () => [], sleep: async () => {},
+        verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
+      });
+
+      const result = await adapter.launchHarness({ ...makeBinding("/home/test/project"), codexConfigProfile: "locked" }, { name: "dev-qa@test-rig" });
+
+      expect(result.ok).toBe(true);
+      const command = vi.mocked(tmux.sendText).mock.calls[0]?.[1];
+      expect(command).toContain("--add-dir '/home/test/project/.git'");
+      expect(command).toContain(`--add-dir '${testQueueRoot()}'`);
+    }
+  });
+
+  it("keeps generated roots when an untrusted read-only child can leave a writable parent active", async () => {
+    const codexHome = "/private/codex";
+    const userPath = `${codexHome}/config.toml`;
+    const userContent = '[projects."/project"]\ntrust_level = "trusted"\n[projects."/project/src"]\ntrust_level = "untrusted"\n';
+    const fsOps = mockFs({
+      [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+      [userPath]: userContent,
+      "/project/.codex/config.toml": 'sandbox_mode = "workspace-write"\n',
+      "/project/src/.codex/config.toml": 'sandbox_mode = "read-only"\n',
+    });
+    const writeFile = vi.spyOn(fsOps, "writeFile");
+    const resolveGitAddDirs = vi.fn(async () => ["/outside/repo-metadata"]);
+    const tmux = mockTmux();
+    const adapter = new CodexRuntimeAdapter({
+      tmux, codexHome, fsOps,
+      resolveGitAddDirs, listProcesses: () => [], sleep: async () => {},
+      verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
+    });
+
+    const result = await adapter.launchHarness({ ...makeBinding("/project/src"), codexConfigProfile: "locked" }, { name: "dev-qa@test-rig" });
+
+    expect(result.ok).toBe(true);
+    const command = vi.mocked(tmux.sendText).mock.calls[0]?.[1];
+    expect(command).toContain("--add-dir '/outside/repo-metadata'");
+    expect(command).toContain(`--add-dir '${testQueueRoot()}'`);
+    expect(resolveGitAddDirs).toHaveBeenCalled();
+    expect(fsOps.readFile(userPath)).toBe(userContent);
+    expect(writeFile).not.toHaveBeenCalledWith(userPath, expect.anything());
+  });
+
+  it("keeps generated writable roots for writable, absent and unreadable profiles, and an overriding posture", async () => {
+    const codexHome = "/private/codex";
+    const files = mockFs({
+      [`${codexHome}/writable.config.toml`]: 'sandbox_mode = "workspace-write"\n',
+      [`${codexHome}/malformed.config.toml`]: 'sandbox_mode = [\n',
+      [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n',
+    });
+    for (const [profile, launchPosture] of [
+      ["writable", undefined], ["missing", undefined], ["malformed", undefined], ["locked", "full_bypass"],
+    ] as const) {
+      const tmux = mockTmux();
+      const adapter = new CodexRuntimeAdapter({
+        tmux, fsOps: files, codexHome,
+        resolveGitAddDirs: async () => ["/project/.git"],
+        listProcesses: () => [], sleep: async () => {},
+        verifyProfilePreflight: async (selected) => ({ ok: true, profile: selected }),
+      });
+      const binding = { ...makeBinding(), codexConfigProfile: profile, launchPosture };
+
+      await adapter.launchHarness(binding, { name: "dev-qa@test-rig" });
+
+      const command = vi.mocked(tmux.sendText).mock.calls[0]?.[1];
+      expect(command).toContain(`--add-dir '/project/.git'`);
+      expect(command).toContain(`--add-dir '${testQueueRoot()}'`);
+      if (launchPosture) expect(command).toContain("-s danger-full-access -a never");
+      else expect(command).toContain(`-p '${profile}'`);
+    }
+  });
+
+  it("preserves a running launch's carried add-dirs without reading its now read-only profile", async () => {
+    const codexHome = "/private/codex";
+    const profilePath = `${codexHome}/locked.config.toml`;
+    const fsOps = mockFs({ [profilePath]: 'sandbox_mode = "read-only"\n' });
+    const readFile = vi.spyOn(fsOps, "readFile");
+    const verifyProfilePreflight = vi.fn(async (profile: string) => ({ ok: true, profile }));
+    const tmux = mockTmux();
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps, codexHome, verifyProfilePreflight });
+    const binding = { ...makeBinding(), codexConfigProfile: "locked" };
+
+    const result = await adapter.buildResumeCommand(binding, {
+      name: "dev-qa@test-rig", resumeToken: "sess-456",
+      running: { addDirs: ["/carried/git", "/carried/queue"], daemonOptOut: true, networkOverride: false },
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.core).toContain("--add-dir '/carried/git'");
+    expect(result.core).toContain("--add-dir '/carried/queue'");
+    expect(result.core).not.toContain(testQueueRoot());
+    expect(readFile).not.toHaveBeenCalledWith(profilePath);
+    expect(verifyProfilePreflight).not.toHaveBeenCalled();
+  });
+
   it("launchHarness passes the disposable proof Codex model on fresh launch", async () => {
     const tmux = mockTmux();
     const adapter = new CodexRuntimeAdapter({
@@ -754,6 +975,118 @@ describe("Codex runtime adapter", () => {
     expect(tmux.sendKeys).toHaveBeenCalledTimes(1);
   });
 
+  it("a resume stopped at hook review reports the gate kind, and types nothing into it", async () => {
+    const review = "Hooks need review\n1. Review hooks\n2. Trust all and continue\n3. Continue without trusting";
+    const tmux = mockTmux({ capturePaneContent: vi.fn(async () => review), capturePaneScreen: vi.fn(async () => review), getPaneCommand: vi.fn(async () => "codex") });
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, listProcesses: () => [] });
+    const result = await adapter.verifyResumeInPane("impl", "tok");
+    expect(result).toMatchObject({ ok: false, recovery: "attention_required", gate: "hook_trust_gate" });
+    expect(tmux.sendKeys).not.toHaveBeenCalled();
+    expect(tmux.sendText).not.toHaveBeenCalled();
+  });
+
+  // What a failed resume reports must match the newest screen observed and what was typed (reporting only).
+  const UPDATING = ["✨ Update available! 0.120.0 -> 0.121.0", "Updating Codex..."].join("\n"); // no skip option
+  const HOOK_REVIEW = "Hooks need review\n1. Review hooks\n2. Trust all and continue\n3. Continue without trusting";
+  const SKIPPABLE = ["✨ Update available! 0.120.0 -> 0.121.0", "› 1. Update now (runs `npm install -g @openai/codex`)", "  2. Skip", "  3. Skip until next version", "Press enter to continue"].join("\n");
+  function screens(next: () => string) {
+    const capture = vi.fn(async () => next());
+    return mockTmux({ capturePaneContent: capture, capturePaneScreen: capture, getPaneCommand: vi.fn(async () => "codex"), getPanePid: vi.fn(async () => 901) });
+  }
+
+  it("an update still in progress is reported as an update screen with no choice, and nothing typed", async () => {
+    const tmux = screens(() => UPDATING);
+    const result = await new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, listProcesses: () => [] }).verifyResumeInPane("impl", "tok");
+    expect(result).toMatchObject({ ok: false, gate: "update_gate", gateChoice: false, verifierInput: "none" });
+    expect(tmux.sendKeys).not.toHaveBeenCalled();
+  });
+
+  it("when the update helper's own later capture shows hook review, the report names hook review, not the older update screen", async () => {
+    // Count the captures a stable update run makes; then show hook review only at the last one, which is the helper's
+    // nested capture on the final quick poll.
+    const counter = screens(() => UPDATING);
+    await new CodexRuntimeAdapter({ tmux: counter, fsOps: mockFs(), sleep: async () => {}, listProcesses: () => [] }).verifyResumeInPane("impl", "tok");
+    const total = (counter.capturePaneScreen as ReturnType<typeof vi.fn>).mock.calls.length;
+    let n = 0;
+    const tmux = screens(() => (++n === total ? HOOK_REVIEW : UPDATING));
+    const result = await new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, listProcesses: () => [] }).verifyResumeInPane("impl", "tok");
+    expect(n).toBe(total);
+    expect(result).toMatchObject({ ok: false, recovery: "attention_required", gate: "hook_trust_gate" });
+    expect((result as { evidence: string }).evidence).toContain("Hooks need review");
+    expect(tmux.sendKeys).not.toHaveBeenCalled();
+  });
+
+  it("a skip key sent to an update prompt that stays on screen is reported as sent, with the choice-bearing update screen", async () => {
+    const tmux = screens(() => SKIPPABLE);
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {},
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex" }] });
+    const result = await adapter.verifyResumeInPane("impl", "tok");
+    expect(tmux.sendKeys).toHaveBeenCalledTimes(1);
+    expect(tmux.sendKeys).toHaveBeenCalledWith("impl", ["3"]);
+    expect(result).toMatchObject({ ok: false, gate: "update_gate", gateChoice: true, verifierInput: "update_skip_key_sent" });
+    // Captured again after the key, so the reported screen isn't the one before it.
+    expect(result).not.toHaveProperty("screenBeforeInput");
+  });
+
+  // Round 3: the newest observation wins in the order it was taken, including the helper's current-screen recheck, and
+  // a screen OpenRig acted on afterwards is reported as the screen before that input.
+  const RESUMED = "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything";
+  const CODEX_ROW = [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex" }];
+  /** How many screen captures a run on an unchanging, unskippable update screen makes. */
+  async function updatingCaptures(): Promise<number> {
+    const counter = screens(() => UPDATING);
+    await new CodexRuntimeAdapter({ tmux: counter, fsOps: mockFs(), sleep: async () => {}, listProcesses: () => [] }).verifyResumeInPane("impl", "tok");
+    return (counter.capturePaneScreen as ReturnType<typeof vi.fn>).mock.calls.length;
+  }
+
+  it("(a) when the helper's current-screen recheck shows hook review, the report names hook review", async () => {
+    // Final quick poll: the loop sees the update screen, the helper's first capture is skippable, and its recheck (one
+    // capture more than an unskippable run makes) shows hook review. No key is sent.
+    const total = await updatingCaptures() + 1;
+    let n = 0;
+    const tmux = screens(() => { n++; return n === total ? HOOK_REVIEW : n === total - 1 ? SKIPPABLE : UPDATING; });
+    const result = await new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, listProcesses: () => CODEX_ROW }).verifyResumeInPane("impl", "tok");
+    expect(n).toBe(total);
+    expect(tmux.sendKeys).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: false, recovery: "attention_required", gate: "hook_trust_gate", verifierInput: "none" });
+    expect((result as { evidence: string }).evidence).toContain("Hooks need review");
+  });
+
+  it("(b) when the helper's capture on the last quick poll shows a resumed screen, no older gate is reported as current", async () => {
+    const total = await updatingCaptures();
+    let n = 0;
+    const tmux = screens(() => (++n === total ? RESUMED : UPDATING));
+    const result = await new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, listProcesses: () => CODEX_ROW }).verifyResumeInPane("impl", "tok");
+    expect(n).toBe(total);
+    expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
+    expect(result).not.toHaveProperty("gate");
+    expect((result as { evidence: string }).evidence).toContain("Ask Codex to do anything");
+  });
+
+  it.each([["sent", { ok: true }], ["failed", { ok: false, code: "unknown", message: "injected send failure" }]] as const)(
+    "(c) an update prompt first seen on the last quick poll, skip key %s, no later capture: reported as the screen before the key",
+    async (outcome, sendResult) => {
+      // The loop's capture and the helper's two captures on the final quick poll show the skippable prompt.
+      const total = await updatingCaptures() + 1;
+      let n = 0;
+      const tmux = screens(() => (++n >= total - 2 ? SKIPPABLE : UPDATING));
+      (tmux.sendKeys as ReturnType<typeof vi.fn>).mockResolvedValue(sendResult);
+      const result = await new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, listProcesses: () => CODEX_ROW }).verifyResumeInPane("impl", "tok");
+      expect(n).toBe(total);
+      expect(tmux.sendKeys).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ ok: false, recovery: "attention_required", gate: "update_gate", gateChoice: true,
+        screenBeforeInput: true, verifierInput: outcome === "sent" ? "update_skip_key_sent" : "update_skip_key_failed" });
+    });
+
+  it("(d) a current update menu without option 3 is an update screen without a recognised choice, and no key is sent", async () => {
+    const menu = fs.readFileSync(nodePath.join(__dirname, "fixtures", "codex-update-0.160.0.txt"), "utf8").replace(/^.*3\. Skip until next version.*$/m, "");
+    const tmux = screens(() => menu);
+    const result = await new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, listProcesses: () => CODEX_ROW }).verifyResumeInPane("impl", "tok");
+    expect(tmux.sendKeys).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: false, gate: "update_gate", gateChoice: false, verifierInput: "none" });
+    expect(result).not.toHaveProperty("screenBeforeInput");
+  });
+
   it("launchHarness captures a fresh Codex thread id from the live child process", async () => {
     const tmux = mockTmux({
       getPanePid: vi.fn(async () => 900),
@@ -878,8 +1211,9 @@ describe("Codex runtime adapter", () => {
   });
 
   it("launchHarness sends correct resume command", async () => {
-    const tmux = mockTmux();
-    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs() });
+    const proof = provenCodexResume("sess-456");
+    const tmux = mockTmux({ getPanePid: proof.getPanePid });
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), listProcesses: proof.listProcesses as never, readResumeEvidence: proof.readResumeEvidence });
 
     const result = await adapter.launchHarness(makeBinding(), { name: "dev-qa@test-rig", resumeToken: "sess-456" });
 
@@ -889,8 +1223,9 @@ describe("Codex runtime adapter", () => {
   });
 
   it("0.5.2-07 A2-3: launchHarness threads the SPEC model onto the codex RESUME command (pod-aware restore gap)", async () => {
-    const tmux = mockTmux();
-    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs() });
+    const proof = provenCodexResume("sess-456");
+    const tmux = mockTmux({ getPanePid: proof.getPanePid });
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), listProcesses: proof.listProcesses as never, readResumeEvidence: proof.readResumeEvidence });
     const binding = { ...makeBinding(), model: "gpt-5.4-cheap" };
 
     const result = await adapter.launchHarness(binding, { name: "dev-qa@test-rig", resumeToken: "sess-456" });
@@ -934,8 +1269,9 @@ describe("Codex runtime adapter", () => {
   });
 
   it("#75: launchHarness threads reasoning effort onto the codex RESUME command", async () => {
-    const tmux = mockTmux();
-    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs() });
+    const proof = provenCodexResume("sess-456");
+    const tmux = mockTmux({ getPanePid: proof.getPanePid });
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), listProcesses: proof.listProcesses as never, readResumeEvidence: proof.readResumeEvidence });
     const binding = { ...makeBinding(), effort: "high" };
 
     const result = await adapter.launchHarness(binding, { name: "dev-qa@test-rig", resumeToken: "sess-456" });
@@ -977,11 +1313,12 @@ describe("Codex runtime adapter", () => {
   });
 
   it("launchHarness passes the requested Codex config profile on resume", async () => {
-    const tmux = mockTmux();
+    const proof = provenCodexResume("sess-456");
+    const tmux = mockTmux({ getPanePid: proof.getPanePid });
     const adapter = new CodexRuntimeAdapter({
       tmux,
       fsOps: mockFs(),
-      listProcesses: () => [],
+      listProcesses: proof.listProcesses as never, readResumeEvidence: proof.readResumeEvidence,
       sleep: async () => {},
       // Housekeeping B1 fixback: controlled preflight (no real codex subprocess).
       verifyProfilePreflight: async (profile) => ({ ok: true, profile }),
@@ -1053,12 +1390,15 @@ describe("Codex runtime adapter", () => {
         .mockResolvedValue("OpenAI Codex (v0.120.0)\n› Ask Codex to do anything"),
     });
     const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {},
-      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex" }],
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex resume sess-456" }],
+      readResumeEvidence: () => ({ threadId: "sess-456" }),
     });
 
     const result = await adapter.launchHarness(makeBinding(), { name: "dev-qa@test-rig", resumeToken: "sess-456" });
 
-    expect(result).toEqual({ ok: true, resumeToken: "sess-456", resumeType: "codex_id", appliedLaunch: CODEX_FLOOR_EFFECT });
+    // #1524 (b): the result also names the process the resume was proven on, for restore's join.
+    expect(result).toEqual({ ok: true, resumeToken: "sess-456", resumeType: "codex_id", appliedLaunch: CODEX_FLOOR_EFFECT,
+      resumedProcess: { pid: 901, startedAt: "Sat Jan  1 12:00:00 2000" } });
     const sendText = tmux.sendText as ReturnType<typeof vi.fn>;
     expect(sendText.mock.calls).toEqual([
       ["r01-qa", expectedResumeCommand()],
@@ -1076,8 +1416,9 @@ describe("Codex runtime adapter", () => {
   // slice kills. Corrected: resume now CARRIES -m (top-level flag, same class as the shipped -p), and
   // the queue --add-dir stays intact.
   it("launchHarness passes the SPEC model argument (-m) when resuming Codex", async () => {
-    const tmux = mockTmux();
-    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs() });
+    const proof = provenCodexResume("sess-456");
+    const tmux = mockTmux({ getPanePid: proof.getPanePid });
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), listProcesses: proof.listProcesses as never, readResumeEvidence: proof.readResumeEvidence });
     const binding = { ...makeBinding(), model: "gpt-5.5" };
 
     const result = await adapter.launchHarness(binding, { name: "dev-qa@test-rig", resumeToken: "sess-456" });
@@ -1205,6 +1546,49 @@ describe("Codex runtime adapter", () => {
     }
   });
 
+  it.each([
+    ["panel alone", currentTrustPrompt],
+    ["trailing heading fragment", `› Earlier conversation prompt\n  Context 81% left · GPT-6-Astra high\n${currentTrustPrompt}\n  Trust this folder?`],
+    ["earlier default footer", `› Earlier conversation prompt\n  gpt-5.6-sol high · ~/work\n${currentTrustPrompt}`],
+    ["earlier Codex header", `OpenAI Codex (v0.156.1)\n› Earlier conversation prompt\n${currentTrustPrompt}`],
+  ])("classifies current folder trust consistently in readiness and resume without answering it: %s", async (_label, paneContent) => {
+    let pollCount = 0;
+    const tmux = mockTmux({
+      getPaneCommand: vi.fn(async () => { pollCount++; return "codex"; }),
+      capturePaneContent: vi.fn(async () => paneContent),
+    });
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {} });
+
+    expect(await adapter.checkReady(makeBinding())).toMatchObject({ ready: false, code: "trust_gate" });
+    expect(tmux.sendKeys).not.toHaveBeenCalled();
+    expect(tmux.sendText).not.toHaveBeenCalled();
+    pollCount = 0;
+    const result = await adapter.launchHarness(makeBinding(), { name: "dev-qa@test-rig", resumeToken: "sess-456" });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.recovery).toBe("attention_required");
+      expect(result.error).toContain("workspace trust approval");
+    }
+    expect(pollCount).toBeLessThanOrEqual(7);
+    expect(tmux.sendKeys).toHaveBeenCalledTimes(1);
+    expect(tmux.sendKeys).toHaveBeenCalledWith(makeBinding().tmuxSession, ["Enter"]);
+  });
+
+  it("accepts readiness and resume after a current-format panel is superseded by a headerless composer", async () => {
+    const proof = provenCodexResume("sess-456");
+    const tmux = mockTmux({
+      getPanePid: proof.getPanePid,
+      getPaneCommand: vi.fn(async () => "node"),
+      capturePaneContent: vi.fn(async () => `${currentTrustPrompt}\n› Continue\n  5h 71% left · GPT-6-Astra high · Context 81% left`),
+    });
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), listProcesses: proof.listProcesses as never, readResumeEvidence: proof.readResumeEvidence, sleep: async () => {} });
+
+    expect(await adapter.checkReady(makeBinding())).toEqual({ ready: true });
+    expect(await adapter.launchHarness(makeBinding(), { name: "dev-qa@test-rig", resumeToken: "sess-456" }))
+      .toMatchObject({ ok: true, resumeToken: "sess-456" });
+  });
+
   it("FR-2: resume on an unresolved Codex model-selection gate returns attention_required, not ok:true", async () => {
     const modelGate = [
       "Select a model to continue:",
@@ -1249,7 +1633,9 @@ describe("Codex runtime adapter", () => {
   // with resume metadata, not `attention_required`.
   it("OPR.0.3.4.13: slow Codex resume boot-in-progress then ready TUI classifies resumed with metadata", async () => {
     let callCount = 0;
+    const proof = provenCodexResume("019ecd3b-test-thread");
     const tmux = mockTmux({
+      getPanePid: proof.getPanePid,
       getPaneCommand: vi.fn(async () => {
         callCount++;
         return callCount <= 10 ? "node" : "codex";
@@ -1259,7 +1645,7 @@ describe("Codex runtime adapter", () => {
         return "OpenAI Codex (v0.128.0)\n  gpt-5.5 · session 019ecd3b-test-thread\n› ";
       }),
     });
-    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {} });
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), listProcesses: proof.listProcesses as never, readResumeEvidence: proof.readResumeEvidence, sleep: async () => {} });
 
     const result = await adapter.launchHarness(makeBinding(), {
       name: "dev-worker@test-rig",
@@ -1884,5 +2270,46 @@ describe("Codex runtime adapter", () => {
     expect(result.failed).toEqual([]);
     expect(result.projected).toEqual(["reviewer"]);
     expect(fs.readFileSync(nodePath.join(cwd, ".agents", "reviewer.yaml"), "utf-8")).toBe("name: reviewer");
+  });
+});
+
+
+describe("rebuild permission continuity", () => {
+  it.each(["read-only", "danger-full-access"] as const)("emits the observed %s policy over a named read-only profile", async type => {
+    const tmux = mockTmux();
+    const codexHome = "/private/codex";
+    const adapter = new CodexRuntimeAdapter({ tmux, codexHome,
+      fsOps: mockFs({ [`${codexHome}/locked.config.toml`]: 'sandbox_mode = "read-only"\n' }),
+      verifyProfilePreflight: async profile => ({ ok: true, profile }), sleep: async () => {} });
+    const result = await adapter.launchHarness({ ...makeBinding(), codexConfigProfile: "locked", codexRebuildPermissions: {
+      approvalPolicy: "never", sandboxPolicy: { type } } }, { name: "dev-review@test-rig" });
+    expect(result).toMatchObject({ ok: true, appliedLaunch: { state: "observed", value: type, approvalPolicy: "never" } });
+    expect(vi.mocked(tmux.sendText).mock.calls[0]![1]).toContain(` -p 'locked' -s ${type} -a never`);
+    expect(vi.mocked(tmux.sendText).mock.calls[0]![1]).not.toContain("--add-dir");
+  });
+
+  it("emits the predecessor policy without adding fresh network/git/team/queue grants", async () => {
+    const tmux = mockTmux();
+    const readNetworkDefault = vi.fn(async () => ({ apply: true, elapsedMs: 0 }));
+    const resolveGitAddDirs = vi.fn(async () => ["/repo/.git"]);
+    const prepareTeamWorkspace = vi.fn(() => ["/workspace", "/shared-docs"]);
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {},
+      readNetworkDefault, resolveGitAddDirs, prepareTeamWorkspace });
+    const envelope = { approvalPolicy: "on-request", sandboxPolicy: { type: "workspace-write",
+      network_access: false, exclude_tmpdir_env_var: true, exclude_slash_tmp: false,
+      writable_roots: ["/kept dir", "/kept'quote"] } } satisfies CodexPermissionEnvelope;
+    const binding = { ...makeBinding("/repo/review"), teamPermissionDefault: true,
+      codexRebuildPermissions: envelope };
+    expect((await adapter.launchHarness(binding, { name: "dev-review@test-rig" })).ok).toBe(true);
+    const command = vi.mocked(tmux.sendText).mock.calls[0]![1];
+    expect(command).toContain(" -s workspace-write -a on-request");
+    expect(command).toContain("sandbox_workspace_write.network_access=false");
+    expect(command).toContain("sandbox_workspace_write.exclude_tmpdir_env_var=true");
+    expect(command).toContain("sandbox_workspace_write.exclude_slash_tmp=false");
+    expect(command).toContain("sandbox_workspace_write.writable_roots=");
+    expect(command).not.toContain("--add-dir");
+    expect(readNetworkDefault).not.toHaveBeenCalled();
+    expect(resolveGitAddDirs).not.toHaveBeenCalled();
+    expect(prepareTeamWorkspace).not.toHaveBeenCalled();
   });
 });

@@ -150,10 +150,10 @@ describe("ContextMonitor", () => {
     sampled_at: new Date().toISOString(),
   };
 
-  function installRealCompactionEnforcer() {
+  function installRealCompactionEnforcer(threshold = 80) {
     const settings = new SettingsStore(join(tmpDir, "settings.json"));
     settings.set("policies.claude_compaction.enabled", "true");
-    settings.set("policies.claude_compaction.threshold_percent", "80");
+    settings.set("policies.claude_compaction.threshold_percent", String(threshold));
     const send = vi.fn(async (_session: string, text: string) => {
       const marker = text.match(/<!-- openrig-compaction-complete .*? -->/)?.[0];
       const target = text.match(/Write this attempt's complete restore map to ("(?:[^"\\]|\\.)*")/);
@@ -186,14 +186,14 @@ describe("ContextMonitor", () => {
 
   // Bring a seat to the point just after /compact: fresh 80% usage sends the preparation prompt,
   // then the next tick sends /compact, leaving the post-compact turn boundary pending.
-  async function compactFreshSeat(sessionName: string, now: number) {
-    const send = installRealCompactionEnforcer();
+  async function compactFreshSeat(sessionName: string, now: number, threshold = 80) {
+    const send = installRealCompactionEnforcer(threshold);
     const writeUsage = (percentage: number, sampledAt: number) => writeSidecar(sessionName, {
       ...VALID_SIDECAR,
       sampled_at: new Date(sampledAt).toISOString(),
       context_window: { ...VALID_SIDECAR.context_window, used_percentage: percentage, remaining_percentage: 100 - percentage },
     });
-    writeUsage(80, now);
+    writeUsage(threshold, now);
     await monitor.pollOnce();
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0]?.[1]).toContain("OpenRig automatic compaction preparation is now required");
@@ -249,6 +249,30 @@ describe("ContextMonitor", () => {
     expect(texts[1]).toContain("restoring this Claude session after compaction");
     expect(texts[2]).toContain("Now audit your compaction restore");
     expect(texts.some((text) => text.includes("preparation is now required") || text.startsWith("/compact"))).toBe(false);
+  });
+
+  it("drains the owed restore and audit on fresh usage above a low threshold, without a second compact", async () => {
+    let now = Date.parse("2026-10-02T12:00:00Z");
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { node, sessionName } = seedClaudeNode();
+    const { send, writeUsage } = await compactFreshSeat(sessionName, now, 9);
+    writeUsage(15, now);
+    for (let i = 0; i < 3; i++) await monitor.pollOnce();
+    expect(store.getForNode(node.id, sessionName).fresh).toBe(true);
+    const texts = send.mock.calls.slice(2).map(call => call[1]);
+    expect(texts).toHaveLength(3);
+    expect(texts[0]).toContain("OpenRig post-compaction turn boundary.");
+    expect(texts[1]).toContain("restoring this Claude session after compaction");
+    expect(texts[2]).toContain("Now audit your compaction restore");
+    // Even after the cooldown, sustained high usage must not re-arm the trigger.
+    now += 11 * 60_000;
+    writeUsage(15, now);
+    await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(5);
+    writeUsage(1, now); await monitor.pollOnce();
+    writeUsage(15, now); await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(6);
+    expect(send.mock.calls[5]?.[1]).toContain("preparation is now required");
   });
 
   it("an unknown sample with nothing pending triggers nothing", async () => {

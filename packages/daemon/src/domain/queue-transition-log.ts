@@ -322,9 +322,7 @@ export class QueueTransitionLog {
     if (rigNames.length === 0) return [];
     const knownRigs = new Set(rigNames);
     const sessionPatterns = rigNames.map((rig) => `%@${rig.replace(/%/g, "\\%").replace(/_/g, "\\_")}`);
-    const scopeSql = sessionPatterns.map(() => "(q.destination_session LIKE ? ESCAPE '\\' OR q.source_session LIKE ? ESCAPE '\\')").join(" OR ");
-    const scopeParams = sessionPatterns.flatMap((pattern) => [pattern, pattern]);
-    const rows = this.newestQualifying(scopeSql, scopeParams, limit);
+    const rows = this.newestQualifying(sessionPatterns, limit);
 
     return rows.reverse().flatMap((row) => {
       const change = recentChange(row);
@@ -353,11 +351,19 @@ export class QueueTransitionLog {
    * without reading its row, and the walk stops at the limit. A candidate's predecessor is the same
    * item's greatest earlier transition_id across both tables: the value LAG over the item's full
    * history gave, so a same-state note never qualifies. */
-  private newestQualifying(scopeSql: string, scopeParams: string[], limit: number): RecentQueueTransitionRow[] {
+  private newestQualifying(sessionPatterns: string[], limit: number): RecentQueueTransitionRow[] {
+    // The scope is the items whose destination or source session matches a pattern. Each column is
+    // matched on its own index and the ids are read from the primary-key index, so resolving the scope
+    // never reads queue_items' rows, which carry every body. UNION ALL, not UNION: a merged UNION
+    // wants rowid order, which SQLite gets by scanning the table; a duplicate is harmless in IN.
+    const matches = (column: string) => sessionPatterns.map(() => `q.${column} LIKE ? ESCAPE '\\'`).join(" OR ");
     // `+t.qitem_id` keeps the scope list from driving a per-item index lookup (which would then sort);
     // the walk order comes from the (ts, transition_id, qitem_id) index, and the two tables merge.
     const walk = this.db.prepare(`
-      WITH scope_items(qitem_id) AS MATERIALIZED (SELECT q.qitem_id FROM queue_items q WHERE ${scopeSql})
+      WITH scope_rows(rid) AS MATERIALIZED (
+        SELECT q.rowid FROM queue_items q WHERE ${matches("destination_session")}
+        UNION ALL SELECT q.rowid FROM queue_items q WHERE ${matches("source_session")}
+      ), scope_items(qitem_id) AS MATERIALIZED (SELECT q.qitem_id FROM queue_items q WHERE +q.rowid IN (SELECT rid FROM scope_rows))
       ${this.historyTables.map((table) => `
       SELECT t.transition_id, t.qitem_id, t.ts, t.state, t.actor_session, t.closure_reason, t.closure_target
       FROM ${table} t
@@ -382,7 +388,7 @@ export class QueueTransitionLog {
     const rows: RecentQueueTransitionRow[] = [];
     // Reads inside the loop are allowed while the walk's iterator is open, and they see the walk's
     // snapshot; leaving the loop releases it.
-    for (const row of walk.iterate(...scopeParams) as Iterable<WalkedRow>) {
+    for (const row of walk.iterate(...sessionPatterns, ...sessionPatterns) as Iterable<WalkedRow>) {
       const previous = row.state === "in-progress" || row.state === "blocked" ? previousState(row) : null;
       if (!qualifiesAsRecent(row, previous)) continue;
       const item = metadata.get(TRIM_CHARS, BODY_HEAD_CODE_POINTS, row.qitem_id) as Pick<RecentQueueTransitionRow, "tags" | "summary" | "destination_session" | "source_session" | "body_head">;
@@ -435,13 +441,24 @@ export class QueueTransitionLog {
   }
 
   hasOwnerNotificationReceipt(qitemId: string, notificationKey: string): boolean {
+    return this.getOwnerNotificationReceipt(qitemId, notificationKey) !== null;
+  }
+
+  getOwnerNotificationReceipt(qitemId: string, notificationKey: string): { messageTs: string | null; threadTs: string | null; digest: string | null } | null {
     const rows = this.db
       .prepare(
         `SELECT transition_note FROM ${this.historySource}
-          WHERE qitem_id = ? AND transition_note LIKE 'slack-owner-notification-posted %'`,
+          WHERE qitem_id = ? AND transition_note LIKE 'slack-owner-notification-posted %'
+          ORDER BY transition_id DESC`,
       )
       .all(qitemId) as Array<{ transition_note: string }>;
-    return rows.some((row) => row.transition_note.split(/\s+/).includes(`notification_key=${notificationKey}`));
+    for (const row of rows) {
+      const fields = row.transition_note.split(/\s+/);
+      if (!fields.includes(`notification_key=${notificationKey}`)) continue;
+      const value = (name: string) => fields.find((field) => field.startsWith(`${name}=`))?.slice(name.length + 1) ?? null;
+      return { messageTs: value("message_ts"), threadTs: value("thread_ts"), digest: value("digest") };
+    }
+    return null;
   }
 
   private rowToTransition(row: QueueTransitionRow): QueueTransition {

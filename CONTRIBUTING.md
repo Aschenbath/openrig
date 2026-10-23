@@ -40,7 +40,11 @@ repository, and we're happy to link to it.
 
 ## Setting up
 
-Node `^22 || ^24` and a working `tmux` are required. Then:
+Node `^22 || ^24`, a working `tmux` and `rsync` are required. macOS includes `rsync`; many Linux
+installs don't (`sudo apt-get install rsync` on Debian or Ubuntu). `npm test` and `npm run mirror-skills`
+use it. Use the npm that comes with your Node, which is npm 10 or newer (`npm --version` shows which you
+have). A separately packaged npm 9, such as Debian or Ubuntu's `npm` package, fails a fresh `npm ci` with
+`ENOENT` on `chmod` of `node_modules/@openrig/tui/dist/main.js`. Then:
 
 ```bash
 git clone https://github.com/mvschwarz/openrig.git

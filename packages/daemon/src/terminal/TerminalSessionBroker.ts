@@ -305,8 +305,14 @@ export class TerminalSessionBroker {
     if (this.torndown || !this.subscribers.has(sub)) return;
     const clamped = Math.max(0, Math.floor(offset));
     if (clamped === 0) {
-      this.scrollOffsets.delete(sub);
-      await this.repaintScreen(sub);
+      // Keep the subscriber out of live fanout until the screen repaint is complete.
+      // Otherwise new pipe bytes can arrive before the snapshot and be overwritten.
+      this.scrollOffsets.set(sub, 1);
+      try {
+        await this.repaintScreen(sub);
+      } finally {
+        this.scrollOffsets.delete(sub);
+      }
       return;
     }
     this.scrollOffsets.set(sub, clamped);

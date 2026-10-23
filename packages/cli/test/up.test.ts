@@ -663,6 +663,65 @@ describe("Up CLI", () => {
     }
   });
 
+  it("up without --name sends no rigName", async () => {
+    let lastBody: Record<string, unknown> = {};
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      if (req.url === "/api/up") lastBody = JSON.parse(body);
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "completed", runId: "r", rigId: "g", stages: [], errors: [] }));
+    });
+    try {
+      await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", "up", "/tmp/rig.yaml"]);
+      });
+    } finally {
+      server.removeAllListeners("request");
+      for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+    }
+    expect(lastBody).toHaveProperty("sourceRef");
+    expect(lastBody).not.toHaveProperty("rigName");
+  });
+
+  it.each([
+    ["a rig name", ["up", "my-rig", "--name", "alpha"], "renaming an existing rig"],
+    ["--existing", ["up", "my-rig", "--existing", "--name", "alpha"], "renaming an existing rig"],
+    ["an empty name", ["up", "/tmp/rig.yaml", "--name", ""], "--name needs a rig name"],
+  ])("up --name with %s is refused and does not call /api/up", async (_label, args, fragment) => {
+    await withListener((url) => ({ status: 200, body: url.startsWith("/api/rigs/summary") ? [{ id: "r1", name: "my-rig", lifecycleState: "stopped" }] : [] }), async (upCalls) => {
+      const { logs, exitCode } = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", ...args]);
+      });
+      expect(upCalls()).toBe(0);
+      expect(exitCode).toBe(1);
+      expect(logs.join("\n")).toContain(fragment);
+    });
+  });
+
+  it.each([
+    ["a topology", "factory.rigtopology", "A topology launches several rigs"],
+    ["a GitHub bundle link", "https://github.com/acme/rigs/tree/main/team", "GitHub bundle link"],
+  ])("up <%s> --name is refused and does not call /api/up", async (_label, source, fragment) => {
+    const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "up-name-"));
+    try {
+      const target = source.endsWith(".rigtopology") ? nodePath.join(dir, source) : source;
+      if (target !== source) fs.writeFileSync(target, "rigs:\n  - source: ./a.yaml\n");
+      await withListener(() => ({ status: 200, body: {} }), async (upCalls) => {
+        const { logs, exitCode } = await captureLogs(async () => {
+          await makeCmd().parseAsync(["node", "rig", "up", target, "--name", "alpha"]);
+        });
+        expect(upCalls()).toBe(0);
+        expect(exitCode).toBe(1);
+        expect(logs.join("\n")).toContain(fragment);
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   // OPR.0.3.2.22 Bug 3 — path-form `rig up <spec-inside-install>` without
   // --cwd should default cwdOverride to process.cwd() so the spec's
   // member-level cwd: "." does not resolve into the OpenRig install root
@@ -1198,6 +1257,46 @@ describe("Up CLI", () => {
     expect(logs.join("\n")).not.toContain("rename or remove");
     expect(startupRequests).toBe(0);
     expect(exitCode).toBe(1);
+  });
+
+  it.each([
+    ["a running rig", [{ id: "r1", name: "alpha", nodeCount: 1 }], []],
+    ["an archived rig", [], [{ id: "r0", name: "alpha" }]],
+  ])("up <library name> --name launches the library spec when the name also matches %s", async (_label, active, archived) => {
+    const posts: Array<Record<string, unknown>> = [];
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
+      const url = decodeURIComponent(req.url ?? "");
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      res.writeHead(url === "/api/up" ? 201 : 200, { "Content-Type": "application/json" });
+      if (url === "/api/up") {
+        posts.push(JSON.parse(body));
+        res.end(JSON.stringify({ status: "completed", runId: "r", rigId: "g", stages: [], errors: [] }));
+      } else if (url.startsWith("/api/specs/library")) {
+        res.end(JSON.stringify([{ id: "lib1", name: "alpha", sourcePath: "/specs/alpha.yaml" }]));
+      } else if (url === "/api/rigs/summary?archived=only") {
+        res.end(JSON.stringify(archived));
+      } else if (url === "/api/rigs/summary") {
+        res.end(JSON.stringify(active));
+      } else {
+        res.end(JSON.stringify({}));
+      }
+    });
+
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "alpha", "--name", "beta"]);
+    });
+
+    server.removeAllListeners("request");
+    for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+
+    expect(logs.join("\n")).not.toContain("ambiguous");
+    expect(logs.join("\n")).not.toContain("archived");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ sourceRef: "/specs/alpha.yaml", rigName: "beta" });
+    expect(exitCode ?? 0).toBe(0);
   });
 
   it.each([

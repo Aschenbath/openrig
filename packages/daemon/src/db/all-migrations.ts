@@ -105,6 +105,7 @@ import { rigInstallRootSchema } from "./migrations/096_rig_install_root.js";
 import { threadPartMapSchema } from "./migrations/097_thread_part_map.js";
 import { queueTransitionsQitemIdOrderSchema } from "./migrations/098_queue_transitions_qitem_id_order.js";
 import { queueItemsRecoveryTagsSchema } from "./migrations/099_queue_items_recovery_tags.js";
+import { typingGuardModesSchema } from "./migrations/100_typing_guard_modes.js";
 import { resumeRotationSchema } from "./migrations/101_claude_resume_rotation.js";
 import { sessionStopIntentSchema } from "./migrations/103_session_stop_intent.js";
 import { usageSamplesClientCostSchema } from "./migrations/105_usage_samples_client_cost.js";
@@ -114,7 +115,17 @@ import { modePostureCoexistSchema } from "./migrations/109_mode_posture_coexist.
 import { workflowInstanceScopeSchema } from "./migrations/110_workflow_instance_scope.js";
 import { queueTransitionsTsQitemSchema } from "./migrations/112_queue_transitions_ts_qitem.js";
 import { appliedLaunchDaemonOptOutSchema } from "./migrations/113_applied_launch_daemon_opt_out.js";
-import { sessionAgentAppSchema } from "./migrations/114_session_agent_app.js";
+import { sessionAgentAppSchema as sessionCommunityHarnessSchema } from "./migrations/114_session_agent_app.js";
+import { threadSeatMapChannelKeySchema } from "./migrations/115_thread_seat_map_channel_key.js";
+import { queueItemWakeInputBoxSchema } from "./migrations/116_queue_item_wake_input_box.js";
+import { providerAccountReadingsSchema } from "./migrations/117_provider_account_readings.js";
+import { humanQuietWindowsSchema } from "./migrations/118_human_quiet_windows.js";
+import { seatIdentityPanePidSchema } from "./migrations/119_seat_identity_pane_pid.js";
+import { rigStartupLayersSchema } from "./migrations/121_rig_startup_layers.js";
+import { humanOperatingModesSchema } from "./migrations/122_human_operating_modes.js";
+import { queueDelegatedDecisionSchema } from "./migrations/123_queue_delegated_decision.js";
+import { contextUsageWatchdogUnitsSchema } from "./migrations/124_context_usage_watchdog_units.js";
+import { nodeAdvisorSchema } from "./migrations/125_node_advisor.js";
 
 /** Ordered migrations; numbers may be reserved by independent changes. */
 
@@ -217,6 +228,7 @@ export const ALL_MIGRATIONS: Migration[] = [
   threadPartMapSchema,
   queueTransitionsQitemIdOrderSchema,
   queueItemsRecoveryTagsSchema,
+  typingGuardModesSchema,
   resumeRotationSchema,
   sessionStopIntentSchema,
   nodeEffortChoiceSchema,
@@ -228,5 +240,15 @@ export const ALL_MIGRATIONS: Migration[] = [
   seatEnvSchema,
   queueTransitionsTsQitemSchema,
   appliedLaunchDaemonOptOutSchema,
-  sessionAgentAppSchema,
+  sessionCommunityHarnessSchema,
+  threadSeatMapChannelKeySchema,
+  queueItemWakeInputBoxSchema,
+  providerAccountReadingsSchema,
+  humanQuietWindowsSchema,
+  seatIdentityPanePidSchema,
+  rigStartupLayersSchema,
+  humanOperatingModesSchema,
+  queueDelegatedDecisionSchema,
+  contextUsageWatchdogUnitsSchema,
+  nodeAdvisorSchema,
 ];

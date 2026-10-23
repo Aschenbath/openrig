@@ -283,9 +283,9 @@ describe("'names no conversation' is scoped to what the reader could read (verif
     expect(text).toContain("The check could not read a conversation from the running Claude's launch");
     expect(text).not.toContain("names no conversation");
   });
-  it("Codex: a flag's value read as the conversation is worded as what the check read", async () => {
-    // codexResumeToken reads "gpt-5" (the value of -m) as the conversation for `resume -m gpt-5 STORED`.
-    const text = await detail("codex", [shell, codex(`resume -m gpt-5 ${STORED}`)]);
+  it("Codex: a mismatching conversation after options is worded as what the check read", async () => {
+    // The model value is skipped; the actual resumed conversation disagrees with the stored one.
+    const text = await detail("codex", [shell, codex(`resume -m gpt-5 ${RUNNING}`)]);
     expect(text).toContain("read a conversation from the running Codex's launch that does not match the seat's record");
     expect(text).not.toContain("gpt-5");
     expect(text).not.toContain("resumed conversation");
@@ -313,26 +313,26 @@ async function wordingOnly(...args: Parameters<typeof check>): Promise<string> {
 const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 describe("values the check cannot vouch for are not printed (maintainer review)", () => {
-  it("a flag's value read as the conversation (gpt-5) is not shown", async () => {
-    const text = await wordingOnly("codex", [shell, codex(`resume -m gpt-5 ${STORED}`)]);
+  it("a model option is not shown when the resumed conversation mismatches", async () => {
+    const text = await wordingOnly("codex", [shell, codex(`resume -m gpt-5 ${RUNNING}`)]);
     expect(text).toContain("does not match the seat's record");
     expect(text).not.toContain("gpt-5");
   });
   it("a value shaped like a conversation id that is not the conversation is not shown, whole or clipped", async () => {
     const looksLikeId = "0f8fad5b-d9cb-469f-a165-70867728950e";
-    const text = await wordingOnly("codex", [shell, codex(`resume -m ${looksLikeId} ${STORED}`)]);
+    const text = await wordingOnly("codex", [shell, codex(`resume -m ${looksLikeId} ${RUNNING}`)]);
     expect(text).toContain("does not match the seat's record");
     expect(text).not.toContain(looksLikeId);
     expect(text).not.toContain(looksLikeId.slice(0, 8));
   });
-  it("a short value the reader returned is not shown either", async () => {
-    const text = await wordingOnly("codex", [shell, codex(`resume -m x ${STORED}`)]);
+  it("a short model option is not shown either", async () => {
+    const text = await wordingOnly("codex", [shell, codex(`resume -m x ${RUNNING}`)]);
     expect(text).toContain("does not match the seat's record");
     expect(text).not.toContain(" x ");
     expect(text).not.toMatch(/conversation x\b/);
   });
-  it("control characters in what the reader returned are not printed", async () => {
-    const text = await wordingOnly("codex", [shell, codex(`resume -m a\u001b[2Jb ${STORED}`)]);
+  it("control characters in the model option are not printed", async () => {
+    const text = await wordingOnly("codex", [shell, codex(`resume -m a\u001b[2Jb ${RUNNING}`)]);
     expect(text).not.toMatch(CONTROL);
     expect(text).not.toContain("[2J");
   });

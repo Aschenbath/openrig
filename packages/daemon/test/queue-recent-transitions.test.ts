@@ -364,6 +364,34 @@ describe("RECENT queue transition projection", () => {
     }
   });
 
+  it("resolves the scope from the session and primary-key indexes, never from queue_items' rows", () => {
+    db.prepare("INSERT INTO rigs (id, name) VALUES ('r-a', 'rig-a'), ('r-b', 'rig-b')").run();
+    item("q-a", "rig-a", "in-progress");
+    transition("q-a", "pending");
+    transition("q-a", "in-progress");
+    const original = db.prepare;
+    const walks: string[] = [];
+    db.prepare = function(sql: string) {
+      if (sql.includes("scope_rows")) walks.push(sql);
+      return original.call(this, sql);
+    } as typeof db.prepare;
+    try {
+      expect(repo.listRecentTransitions("rig-a")).toHaveLength(1);
+      expect(new QueueTransitionLog(db).listRecent({ kind: "instance" }, 20)).toHaveLength(1);
+    } finally { db.prepare = original; }
+    expect(walks).toHaveLength(2);
+    for (const sql of walks) {
+      const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...Array((sql.match(/\?/g) ?? []).length).fill("%@rig-a")) as Array<{ detail: string }>)
+        .map((row) => row.detail);
+      const itemReads = plan.filter((detail) => /^(SCAN|SEARCH) q\b/.test(detail));
+      expect(itemReads.sort()).toEqual([
+        "SCAN q USING COVERING INDEX idx_queue_items_destination_state",
+        "SCAN q USING COVERING INDEX idx_queue_items_source",
+        "SCAN q USING COVERING INDEX sqlite_autoindex_queue_items_1",
+      ]);
+    }
+  });
+
   it("returns only the newest 20 qualifying transitions and refuses an unscoped read", async () => {
     for (let index = 0; index < 24; index += 1) {
       const id = `q-${String(index).padStart(2, "0")}`;

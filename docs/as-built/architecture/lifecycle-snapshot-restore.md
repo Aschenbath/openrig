@@ -145,15 +145,18 @@ Restore behavior, each point checked in `restore-orchestrator.ts`:
   prefilters missing optional artifacts into warnings; **hard-fails a node if
   a required startup file is missing** (`:1161` — status `"failed"`, error
   "Missing required startup files: …"). Before any mutation,
-  `validatePreRestore` (`restore-preconditions.ts:7`, called at
-  `restore-orchestrator.ts:271`) already blocks the whole restore when a node
-  that will consume replay is missing a required startup file
-  (`required_startup_file_missing`, `restore-preconditions.ts:151`; outcome
-  `pre_restore_validation_failed`, `restore-orchestrator.ts:291`). Its other
+  `validatePreRestore` (`restore-preconditions.ts:7`, called from
+  `RestoreOrchestrator.restore`) finds a node that will consume replay and is
+  missing a required startup file (`required_startup_file_missing`, or
+  `startup_owner_root_missing`). Restore holds only that node: it is not
+  launched and is reported `failed` ("Not launched: …" with the blocker's
+  message and remediation), and the rest of the rig restores. When every node
+  the restore would launch is held, or for any other blocker, the whole restore
+  stops before any mutation (outcome `pre_restore_validation_failed`). Its other
   blockers are `invalid_snapshot_data` (`restore-preconditions.ts:27`),
   `invalid_topology_roster` (`:78`), `checkpoint_missing_node_cwd` (`:91`),
-  `startup_owner_root_missing` (`:139`), `service_rig_root_missing` (`:187`)
-  and `service_compose_file_missing` (`:197`). The `/api/up` route returns
+  `service_rig_root_missing` (`:187`) and `service_compose_file_missing`
+  (`:197`). The `/api/up` route returns
   that outcome as HTTP 409 with `status: "not_attempted"`
   (`routes/up.ts:162`). A node that resumes its exact native session replays
   no startup files, actions, guidance or skills (`replayContained`,

@@ -10,6 +10,8 @@ import { enumArg, positiveIntArg } from "../cli-error.js";
 import type { StatusDeps } from "./status.js";
 import { resolveContextRef } from "../context-resolve.js";
 import { shellQuote } from "../cross-host-executor.js";
+import { loadHostRegistry, resolveHost } from "../host-registry.js";
+import { loadHostBindings } from "../host-bindings.js";
 import { omittedReadField, readView } from "../read-view.js";
 import { buildWriteReceipt, compactOutputEnabled, type ReceiptContext } from "../queue-receipt.js";
 import { TRANSITIONS_SHOWN, compactShow, compactTransitions, showEmptyNotice, transitionsNotice } from "../queue-read-compact.js";
@@ -295,8 +297,10 @@ async function withClient<T>(
   // RULING 1ae863d2 — status is 3-state: hard-block ONLY on positive evidence
   // (stopped/stale). UNVERIFIED (timeout/wedged/wrong-home) proceeds to the
   // configured-target request as the authority — never a down assertion.
+  // A running daemon whose health check failed or reported a starved loop is busy, not down: it gets
+  // the request, under the request's own timeout.
   const positiveDown = status.state === "stopped" || status.state === "stale";
-  if (positiveDown || (status.state === "running" && status.healthy === false)) {
+  if (positiveDown) {
     if (!attemptWhenProbeUnconfirmed) {
       // B8-1b: the ONE epistemic-matched guard renders both branches.
       daemonStatusGuard(status);
@@ -340,6 +344,79 @@ function printResult(json: boolean, body: unknown, status: number): void {
     console.log(JSON.stringify(body, null, 2));
   }
   if (status >= 400) process.exitCode = status >= 500 ? 2 : 1;
+}
+
+/** #1642: why a create provably wrote nothing, for the refusals that come before any write: the
+ *  selected daemon refused the forward before contacting another host (its registry was unreadable,
+ *  the host unknown or SSH-declared), or refused a local create to a rig it doesn't have. Any other
+ *  failure, including a timeout or a remote's error, may follow a commit, so it returns null. */
+function provenCreateRefusal(status: number, body: unknown): string | null {
+  if (!body || typeof body !== "object") return null;
+  const { error, failureClass, hostId } = body as { error?: unknown; failureClass?: unknown; hostId?: unknown };
+  if (status === 502 && error === "remote_queue_write_failed"
+    && (failureClass === "unknown-host" || failureClass === "unsupported-transport" || failureClass === "registry")) {
+    return `the daemon refused to forward it to host '${String(hostId)}' (${failureClass}) before contacting that host.`;
+  }
+  if (status === 400 && error === "unknown_destination_rig") {
+    return "the daemon refused it because the destination's rig doesn't exist on that daemon.";
+  }
+  return null;
+}
+
+/** #1642: after the daemon refuses a host token it doesn't know, the substitution this CLI's own
+ *  registry suggests, when it resolves the token (through an entry's declared hostId or a learned
+ *  binding, as `rig send` does) to another entry id. Only a hint: the registry of the daemon this
+ *  command reached may give that id to another host. Nothing is sent again. */
+function hostSubstitutionHint(
+  status: number,
+  body: unknown,
+  rawDestination: string,
+  explicitHost: string | undefined,
+  resolved: { destination: string; hostId?: string },
+  keep = "",
+): string | null {
+  const token = resolved.hostId;
+  const data = body as { error?: unknown; failureClass?: unknown; hostId?: unknown } | null;
+  if (token === undefined || token === "local" || status !== 502 || data?.error !== "remote_queue_write_failed"
+    || data.failureClass !== "unknown-host" || data.hostId !== token) return null;
+  const registry = loadHostRegistry();
+  const match = registry.ok ? resolveHost(registry.registry, token, loadHostBindings().bindings) : undefined;
+  const entryId = match?.ok ? match.host.id : undefined;
+  if (entryId === undefined || entryId === token) return null;
+  const forms = [
+    ...(rawDestination !== resolved.destination ? [`the destination ${shellQuote(`${resolved.destination}@${entryId}`)}`] : []),
+    ...(explicitHost !== undefined ? [`--host ${shellQuote(entryId)}`] : []),
+  ];
+  return `Host '${token}' resolves to '${entryId}' in this CLI's host registry. That doesn't prove '${entryId}' names the same host in the registry of the daemon this command reached, which OPENRIG_URL can select. If it does, send the write again to the same daemon with ${forms.join(" and ")}${keep}.`;
+}
+
+interface WorkChoiceCandidate {
+  qitemId?: string | null;
+  projects?: string[];
+  mission?: string;
+  slice?: string | null;
+  workNodePath?: string | null;
+  unresolved?: string | null;
+}
+
+/** After the plain answer, the candidates the agent must choose between, one line each, so a
+ *  refused current work is never just a count. Prints nothing when the daemon sent no choice
+ *  (current work is settled, nothing is in progress, or the daemon predates the field). */
+export function printCurrentWorkChoice(data: unknown): void {
+  const choice = (data as { currentWorkChoice?: { instruction?: string; candidates?: WorkChoiceCandidate[];
+    unknown?: Array<{ qitemId?: string | null; reason?: string }> } } | null)?.currentWorkChoice;
+  if (!choice) return;
+  console.log("");
+  console.log(choice.instruction ?? "OpenRig did not choose your current work.");
+  for (const [index, c] of (choice.candidates ?? []).entries()) {
+    const project = c.projects?.length ? `project ${c.projects.join(", ")}` : "no project tag";
+    const where = c.workNodePath ?? "no folder found";
+    const why = c.unresolved ? ` (${c.unresolved})` : "";
+    console.log(`  ${index + 1}. ${project} · mission ${c.mission ?? "?"} · slice ${c.slice ?? "none"} · ${where}${why} · from row ${c.qitemId ?? "unknown"}`);
+  }
+  for (const u of choice.unknown ?? []) {
+    console.log(`  - row ${u.qitemId ?? "unknown"}: work not named (${u.reason ?? "no reason given"})`);
+  }
 }
 
 /** Slice 15: the receipt context when a write should print its receipt — the
@@ -877,6 +954,10 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           printResult(opts.json ?? false, { ...res.data, qitemId, recovery }, res.status);
           return;
         }
+        const refusal = res.status >= 400 ? provenCreateRefusal(res.status, res.data) : null;
+        if (refusal) console.error(`No row was created: ${refusal}`);
+        const hint = hostSubstitutionHint(res.status, res.data, opts.destination, opts.host, hostResolved, `, keeping --id ${shellQuote(qitemId)}`);
+        if (hint) console.error(hint);
         const createWarning = res.data?.createWarning as { code?: unknown; message?: unknown } | undefined;
         if (res.status < 400 && createWarning?.code === "qitem_body_not_saved" && typeof createWarning.message === "string") {
           console.error(`Warning: ${createWarning.message}`);
@@ -933,12 +1014,12 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
 
   cmd
     .command("update <qitemId>")
-    .description("Append a note and/or mutate qitem state. A note without --state never changes row state. state=done REQUIRES --closure-reason (one of: handed_off_to, blocked_on, denied, canceled, no-follow-on, escalation). Closure ≠ acceptance: handed_off_to records delivery to the next stage; acceptance is the next stage's verdict on its own qitem, not this closure.")
+    .description("Append a note and/or mutate qitem state. A note without --state never changes row state. state=done REQUIRES --closure-reason (one of: handed_off_to, denied, canceled, no-follow-on, escalation, superseded). To wait for another qitem, use rig queue block <id> --on <child>. Closure ≠ acceptance: handed_off_to records delivery to the next stage; acceptance is the next stage's verdict on its own qitem, not this closure.")
     .option("--actor <session>", "(deprecated, ignored) the actor is derived from the seat env (X-OpenRig-Session); P21 I3 made the update route derive it from the transport header")
     .option("--state <state>", "New state: pending | in-progress | done | blocked | failed | denied | canceled | handed-off")
     .option("--reopen", "Explicitly acknowledge a deliberate terminal-to-active repair; requires --state and --note")
     .option("--closure-reason <reason>", "Required for state=done; also 'superseded' on state=canceled (with --closure-target = the successor) records a supersession, distinct from an abandoned cancel")
-    .option("--closure-target <target>", "Required for handed_off_to, blocked_on, escalation, and superseded")
+    .option("--closure-target <target>", "Required for handed_off_to, escalation, and superseded; blocked_on park records use state=blocked with --blocked-on")
     .option("--resolution <text>", "The outcome, stored on the row and shown by rig queue show. Needs --state done, canceled, denied, failed or handed-off, and non-blank text. Stored when the update closes an open row, after anything the row already has (a fallback line, an earlier outcome); a row that is already closed keeps what it has")
     .option("--blocked-on <blocker>", "For state=blocked: the blocker — a qitem id (must exist and be live), a human seat (FR-6 park; requires summary + evidence_ref), or a typed non-qitem gate 'fold:<what>' / 'auth:<what>' / 'external:<what>'")
     .option("--wake-watchdog <jobId>", "For state=blocked: attach an existing live watchdog id targeting the row owner")
@@ -1196,6 +1277,8 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           nudge: opts.nudge,
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
         });
+        const hint = hostSubstitutionHint(res.status, res.data, opts.to, opts.host, hostResolved);
+        if (hint) console.error(hint);
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, {
           verb: "handoff", nudgeSuppressed: opts.nudge === false, remoteHost: remoteHostOf(hostResolved.hostId),
         }));
@@ -1293,6 +1376,8 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           nudge: opts.nudge,
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
         });
+        const hint = hostSubstitutionHint(res.status, res.data, opts.to, opts.host, hostResolved);
+        if (hint) console.error(hint);
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, {
           verb: "handoff-and-complete", nudgeSuppressed: opts.nudge === false, remoteHost: remoteHostOf(hostResolved.hostId),
         }));
@@ -1318,6 +1403,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       await withClient(deps, async (client) => {
         const res = await client.get<unknown>(`/api/queue/whoami?${params.toString()}`);
         printResult(opts.json ?? false, res.data, res.status);
+        if (!opts.json && res.status < 400) printCurrentWorkChoice(res.data);
       });
     });
 

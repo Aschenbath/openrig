@@ -18,7 +18,10 @@
 // tail-sized chunks up to MAX_SCAN_BYTES. A signal older than the scan cap reads as null (honest
 // UNKNOWN — the detector reports it as observable pending), never a guess.
 
-import { openSync, readSync, closeSync, fstatSync } from "node:fs";
+import { openSync, readSync, closeSync, fstatSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { parsePiModelsJson } from "../../adapters/pi-readiness.js";
+import { KNOWN_EFFORT_LEVELS } from "../seat-effort.js";
 import { parsePiSessionHeader, piAssistantFields, piEntryOrigin, type PiSessionBoundary } from "../pi-usage-facts.js";
 
 const TAIL_BYTES = 512 * 1024;
@@ -51,15 +54,30 @@ export function readTailLines(path: string, tailBytes = TAIL_BYTES): string[] {
 /** The model from the seat's newest determinate, non-synthetic model-bearing assistant record, or
  *  null when no such record is in the tail window (a just-launched or synthetic-only seat has none
  *  — the detector treats null as PENDING, not as a match). */
+export interface NativeModelObservation {
+  model: string;
+  source: "claude-assistant-response" | "codex-turn-context" | "codex-world-state" | "pi-assistant-response";
+  /** Native record time, not file mtime or the time this reader ran. */
+  observedAt: string | null;
+}
+
+function recordTime(value: unknown): string | null {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
+}
+
 export function readClaudeEffectiveModel(transcriptPath: string): string | null {
+  return readClaudeModelObservation(transcriptPath)?.model ?? null;
+}
+
+export function readClaudeModelObservation(transcriptPath: string): NativeModelObservation | null {
   const lines = readTailLines(transcriptPath);
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!;
     if (!line.includes('"assistant"') || !line.includes('"model"')) continue;
     try {
-      const obj = JSON.parse(line) as { type?: unknown; message?: { role?: unknown; model?: unknown } };
+      const obj = JSON.parse(line) as { type?: unknown; timestamp?: unknown; message?: { role?: unknown; model?: unknown } };
       if (obj.message?.role === "assistant" && typeof obj.message.model === "string" && obj.message.model.length > 0 && obj.message.model !== "<synthetic>") {
-        return obj.message.model;
+        return { model: obj.message.model, source: "claude-assistant-response", observedAt: recordTime(obj.timestamp) };
       }
     } catch {
       /* corrupt line — keep scanning */
@@ -68,7 +86,7 @@ export function readClaudeEffectiveModel(transcriptPath: string): string | null 
   return null;
 }
 
-function newestCodexModel(lines: string[]): string | null {
+function newestCodexModel(lines: string[]): NativeModelObservation | null {
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!;
     // PRIMARY: turn_context.payload.model — preferred for DENSITY, not existence. (~~"old July-era
@@ -79,10 +97,10 @@ function newestCodexModel(lines: string[]): string | null {
     // signals are real, turn_context is just denser.)
     if (line.includes('"turn_context"')) {
       try {
-        const obj = JSON.parse(line) as { type?: unknown; payload?: { model?: unknown } };
+        const obj = JSON.parse(line) as { type?: unknown; timestamp?: unknown; payload?: { model?: unknown } };
         if (obj.type === "turn_context") {
           const model = obj.payload?.model;
-          if (typeof model === "string" && model.length > 0) return model;
+          if (typeof model === "string" && model.length > 0) return { model, source: "codex-turn-context", observedAt: recordTime(obj.timestamp) };
         }
       } catch {
         /* corrupt line — keep scanning */
@@ -93,11 +111,12 @@ function newestCodexModel(lines: string[]): string | null {
       try {
         const obj = JSON.parse(line) as {
           type?: unknown;
+          timestamp?: unknown;
           payload?: { state?: { collaboration_mode?: { model?: unknown } } };
         };
         if (obj.type === "world_state") {
           const model = obj.payload?.state?.collaboration_mode?.model;
-          if (typeof model === "string" && model.length > 0) return model;
+          if (typeof model === "string" && model.length > 0) return { model, source: "codex-world-state", observedAt: recordTime(obj.timestamp) };
         }
       } catch {
         /* corrupt line — keep scanning */
@@ -113,6 +132,10 @@ function newestCodexModel(lines: string[]): string | null {
  *  census put records 0.4-0.8MB from EOF on the big rollouts), so one tail window is not always
  *  enough, but 8MB bounds the read far under the loop-stall class. */
 export function readCodexEffectiveModel(rolloutPath: string, maxScanBytes = MAX_SCAN_BYTES): string | null {
+  return readCodexModelObservation(rolloutPath, maxScanBytes)?.model ?? null;
+}
+
+export function readCodexModelObservation(rolloutPath: string, maxScanBytes = MAX_SCAN_BYTES): NativeModelObservation | null {
   return scanBackward(rolloutPath, newestCodexModel, maxScanBytes);
 }
 
@@ -173,6 +196,63 @@ export interface PiOccupantScope {
   notBeforeMs: number;
 }
 
+/** Pi's thinking levels for `--thinking` and the `--model` suffix (`pi --help`; the same at the
+ *  tested 0.87.1 baseline and 1.3.0). */
+const PI_THINKING_LEVELS = new Set(KNOWN_EFFORT_LEVELS.pi);
+
+/** The model ids a Pi pin can resolve to, in Pi's own order (`parseModelPattern`): the whole pin
+ *  first, then with each trailing `:<thinking level>` removed in turn. Pi records the model without
+ *  the level, so `openrouter/x-ai/grok-4:high` matches a `grok-4` record, and a model id that
+ *  really ends in `:high` still matches as itself. Any other `:` suffix, such as OpenRouter's
+ *  `:free`, stays part of the id, and the provider is never touched. */
+export function piPinReadings(pinned: string): string[] {
+  const readings = [pinned.trim()];
+  for (;;) {
+    const last = readings[readings.length - 1]!;
+    const colon = last.lastIndexOf(":");
+    if (colon === -1 || !PI_THINKING_LEVELS.has(last.slice(colon + 1))) return readings;
+    readings.push(last.slice(0, colon));
+  }
+}
+
+/** The readings a Pi seat's record may match. Pi tries the exact pin first and stops there, so
+ *  when the seat's own `models.json` defines a model whose `provider/id` is the pin, or the pin
+ *  with only some levels removed, that reading is the only one: `lab/y:high` stays `lab/y:high`
+ *  when `lab` defines `y:high`. Otherwise every reading, since Pi's built-in models and extension
+ *  models are not read here. Only a pin with a level suffix reads the file. A missing file defines
+ *  no model; one that can't be read or doesn't have Pi's shape is unknown (the seat stays pending).
+ *  Ids compare case-insensitively, as in Pi's exact match. */
+export function piSeatPinReadings(pinned: string, agentDir: string): { ok: true; readings: string[] } | { ok: false; reason: string } {
+  const readings = piPinReadings(pinned);
+  if (readings.length === 1) return { ok: true, readings };
+  const file = join(agentDir, "models.json");
+  const unknown = { ok: false as const, reason: `the seat's models.json (${file}) could not be read as Pi's model config` };
+  let config: unknown;
+  try {
+    if (statSync(file).size > 1024 * 1024) return unknown;
+    config = parsePiModelsJson(readFileSync(file, "utf8"));
+  } catch (error) {
+    // Never report the error itself: models.json can hold keys.
+    return (error as NodeJS.ErrnoException)?.code === "ENOENT" ? { ok: true, readings } : unknown;
+  }
+  const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+  if (!object(config)) return unknown;
+  if (config.providers === undefined) return { ok: true, readings };
+  if (!object(config.providers)) return unknown;
+  const defined = new Set<string>();
+  for (const [provider, entry] of Object.entries(config.providers)) {
+    if (!object(entry)) return unknown;
+    if (entry.models === undefined) continue;
+    if (!Array.isArray(entry.models)) return unknown;
+    for (const model of entry.models) {
+      if (!object(model) || typeof model.id !== "string") return unknown;
+      defined.add(`${provider}/${model.id}`.toLowerCase());
+    }
+  }
+  const literal = readings.slice(0, -1).find((reading) => defined.has(reading.toLowerCase()));
+  return { ok: true, readings: literal ? [literal] : readings };
+}
+
 /** The Pi runtime's effective model, `provider/model`, from the NEWEST determinate assistant
  *  record in the session file — provided that record is this occupant's own. Pi's `model` is the
  *  runtime's own record of what answered; `responseModel` (a routed/dated API variant) is not
@@ -188,6 +268,19 @@ export function readPiEffectiveModel(
   scope: PiOccupantScope,
   maxScanBytes = MAX_SCAN_BYTES,
 ): { ok: true; model: string } | { ok: false; reason: string } {
+  const result = readPiModelObservation(sessionFile, scope, maxScanBytes);
+  return result.ok ? { ok: true, model: result.model } : result;
+}
+
+/** Pi's observation also carries the `thinkingLevel` that same record names (Pi 0.99.0 and later
+ *  stamp it on every assistant message; absent on older Pi). */
+export type PiModelObservation = ({ ok: true; thinkingLevel?: string } & NativeModelObservation) | { ok: false; reason: string };
+
+export function readPiModelObservation(
+  sessionFile: string,
+  scope: PiOccupantScope,
+  maxScanBytes = MAX_SCAN_BYTES,
+): PiModelObservation {
   const header = readFirstLine(sessionFile);
   if (header === null) return { ok: false, reason: `Pi session file ${sessionFile} is unreadable` };
   const boundary = parsePiSessionHeader(header);
@@ -200,7 +293,7 @@ function newestPiModel(
   lines: string[],
   boundary: PiSessionBoundary,
   scope: PiOccupantScope,
-): { ok: true; model: string } | { ok: false; reason: string } | null {
+): PiModelObservation | null {
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!;
     if (!line.includes('"assistant"')) continue;
@@ -223,7 +316,12 @@ function newestPiModel(
     if (origin !== "own") return { ok: false, reason: `newest Pi assistant record ${id} is ${origin === "inherited" ? "inherited from the fork parent" : "of undecidable fork origin"}` };
     if (at <= scope.notBeforeMs) return { ok: false, reason: `newest Pi assistant record ${id} predates the current runner` };
     if (!fields.provider || !fields.model) return { ok: false, reason: `newest Pi assistant record ${id} names no provider and model` };
-    return { ok: true, model: `${fields.provider}/${fields.model}` };
+    const message = entry["message"] as Record<string, unknown>;
+    const thinkingLevel = typeof message["thinkingLevel"] === "string" && message["thinkingLevel"].length > 0 ? message["thinkingLevel"] : undefined;
+    return {
+      ok: true, model: `${fields.provider}/${fields.model}`, source: "pi-assistant-response", observedAt: recordTime(timestamp),
+      ...(thinkingLevel ? { thinkingLevel } : {}),
+    };
   }
   return null;
 }

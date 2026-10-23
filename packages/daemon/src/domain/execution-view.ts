@@ -1,3 +1,4 @@
+import { physicalSessionName } from "./session-registry.js";
 import { resolveNodeFile } from "./scope/node-file.js";
 import { belongsToProject } from "./workspace/project-catalog.js";
 import { inspectGraph } from "./workflow-reconciliation.js";
@@ -334,11 +335,10 @@ function hasColumn(db: Database.Database, table: string, column: string): boolea
 function lifecycleProjectAction(input: {
   instanceId: string;
   packetId: string;
-  owner: string;
   acceptance: Record<string, unknown> | null;
   receiptRequired?: boolean;
 }): string {
-  const base = `rig workflow project --instance ${input.instanceId} --current-packet ${input.packetId} --exit <handoff|waiting|done|failed> --actor-session ${input.owner}${input.receiptRequired ? " --evidence-ref <agent-judged-receipt>" : ""}`;
+  const base = `rig workflow project --instance ${input.instanceId} --current-packet ${input.packetId} --exit <handoff|waiting|done|failed>${input.receiptRequired ? " --evidence-ref <agent-judged-receipt>" : ""}`;
   if (!input.acceptance) return base;
   const verdicts = Array.isArray(input.acceptance["verdicts"])
     ? input.acceptance["verdicts"].filter((value): value is string => typeof value === "string")
@@ -418,7 +418,7 @@ function readLifecycleExecutions(db: Database.Database, mission: string, project
         gate: step && isRecord(step["gate"]) ? step["gate"] : null,
         acceptance,
         targeted_action: matches.length === 1 && packet
-          ? lifecycleProjectAction({ instanceId, packetId, owner: String(packet.destination_session), acceptance, receiptRequired: stepId !== null && requiredLifecycleSteps(binding).includes(stepId) })
+          ? lifecycleProjectAction({ instanceId, packetId, acceptance, receiptRequired: stepId !== null && requiredLifecycleSteps(binding).includes(stepId) })
           : INDETERMINATE,
       };
     });
@@ -438,7 +438,7 @@ function readLifecycleExecutions(db: Database.Database, mission: string, project
             failure["status"] === "unresolved" &&
             row["status"] !== "completed" &&
             row["status"] !== "aborted"
-            ? `rig workflow resume ${instanceId} --occurrence ${String(failure["occurrence_id"])} --actor-session <you>`
+            ? `rig workflow resume ${instanceId} --occurrence ${String(failure["occurrence_id"])}`
             : null,
         }))
       : [];
@@ -847,7 +847,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     const pickup = derivePickup({
       state: r.state,
       lastMeaningfulAt: lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
-      activity: arbitrated?.activity, needsInput: arbitrated?.needsInput.count,
+      activity: arbitrated?.activity, needsInput: arbitrated?.needsInput.count, needsInputReason: arbitrated?.needsInput.reason,
       claimedAt: r.claimed_at,
       lastHeartbeat: r.last_heartbeat,
       postClaimMotionCount: Number(r.post_claim_motion ?? 0),
@@ -1181,7 +1181,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
       const activity = deps.seatActivity?.getSeatStateBySession(r.destination_session);
       const pickup = derivePickup({
         lastMeaningfulAt: lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
-        activity: activity?.activity, needsInput: activity?.needsInput.count,
+        activity: activity?.activity, needsInput: activity?.needsInput.count, needsInputReason: activity?.needsInput.reason,
         state: r.state,
         claimedAt: r.claimed_at,
         lastHeartbeat: r.last_heartbeat,
@@ -1197,7 +1197,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
       let parkKind: "deliberate-with-wake" | "stalled" | "indeterminate";
       if (pickup.state === "parked" && wake) {
         parkKind = "deliberate-with-wake";
-      } else if (pickup.state === "stalled-after-claim") {
+      } else if (pickup.state === "stalled-after-claim" || pickup.stall) {
         parkKind = "stalled";
       } else {
         parkKind = "indeterminate";
@@ -1207,6 +1207,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
         qitem_id: r.qitem_id,
         pickup_state: pickup.state,
         ...(pickup.evidence ? { pickup_evidence: pickup.evidence } : {}),
+        ...(pickup.stall ? { pickup_stall: pickup.stall } : {}),
         park_kind: parkKind,
         park_kind_basis: wake
           ? `armed wake ${wake.wake_ref} on queue_transition_wakes`
@@ -1218,7 +1219,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     });
 
   // ---- Q6 parallelism health ----
-  const inProgressSeats = new Set(rows.filter((r) => r.state === "in-progress").map((r) => r.destination_session));
+  const inProgressSeats = new Set(rows.filter((r) => r.state === "in-progress").map((r) => physicalSessionName(deps.db, r.destination_session)));
   // Idle capacity: the ROSTER comes from sessions (names only); idleness comes
   // from the ACTIVITY ORACLE — sessions.status is not consulted (it labeled
   // live working lanes `superseded` on the real board).

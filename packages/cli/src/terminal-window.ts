@@ -108,10 +108,10 @@ async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((comm
     : deps.env["KONSOLE_VERSION"] ? "konsole" : deps.env["XTERM_VERSION"] ? "xterm" : undefined;
   const host = !program || program === "tmux" ? deps.env["__CFBundleIdentifier"] ?? linuxHost : program;
   if (deps.env["CI"] && !["0", "false"].includes(deps.env["CI"])) return "This is a CI run.";
-  if (deps.env["SSH_CONNECTION"] || deps.env["SSH_CLIENT"] || deps.env["SSH_TTY"]) return "This is an SSH session; no desktop window is opened over SSH.";
   // A tmux started inside a Herdr pane sets TERM_PROGRAM=tmux but inherits Herdr's pane markers, so read those too.
   const inHerdrPane = deps.env["HERDR_ENV"] === "1" && !!deps.env["HERDR_PANE_ID"] && !!deps.env["HERDR_SOCKET_PATH"];
   if (host === "herdr" || inHerdrPane) return { currentHerdr: true };
+  if (deps.env["SSH_CONNECTION"] || deps.env["SSH_CLIENT"] || deps.env["SSH_TTY"]) return "This is an SSH session; no desktop window is opened over SSH.";
   if (deps.platform === "darwin") {
     const inGhostty = host === "ghostty" || host === "com.mitchellh.ghostty";
     const inTerminal = host === "Apple_Terminal" || host === "com.apple.Terminal";

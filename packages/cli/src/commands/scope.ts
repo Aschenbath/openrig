@@ -11,7 +11,9 @@ import path from "node:path";
 import { Command } from "commander";
 import { DaemonClient } from "../client.js";
 import { attestationLineage, type AttestationLineage } from "../lib/scope/attestation-lineage.js";
-import { getDaemonStatus, getDaemonUrl , statusGuardMessage} from "../daemon-lifecycle.js";
+import { getDaemonStatus, getDaemonUrl , statusGuardMessage } from "../daemon-lifecycle.js";
+import { renderDaemonTransportError } from "../cli-error.js";
+import { daemonMayAnswer } from "../daemon-reachability.js";
 import { realDeps } from "./daemon.js";
 
 import {
@@ -146,7 +148,8 @@ function fail(err: unknown, json: boolean, out: Stdout): never {
     } else {
       process.stderr.write(`Error: ${err.fact}\n${err.consequence}\n${err.action}\n`);
     }
-  } else {
+  } else if (!renderDaemonTransportError(err, { out: (l) => out.write(`${l}\n`), err: (l) => process.stderr.write(`${l}\n`), json })) {
+    // A daemon timeout says the outcome is unknown and to check before any retry; anything else as before.
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`Error: ${message}\n`);
   }
@@ -2071,7 +2074,7 @@ function buildApproveCommand(tier: "slice" | "mission"): Command {
 
         const lifecycleDeps = realDeps();
         const status = await getDaemonStatus(lifecycleDeps);
-        if (status.state !== "running" || status.healthy === false) {
+        if (!daemonMayAnswer(status)) {
           throw new ScopeCliError({
             fact: statusGuardMessage(status).fact, // B8-1b: down ≠ busy
             consequence: "scope approve writes the stamp + audit row through the daemon (one operation).",
@@ -2141,7 +2144,7 @@ function shadowedNodeFileFinding(dir: string, level: "mission" | "slice"): {
 export function scopeCommand(): Command {
   const cmd = new Command("scope")
     .description("Scope tree primitive: missions, slices, sub-slices (per conventions/scope-and-versioning)")
-    .option("--workspace <path>", "Workspace root; its missions are in project.yaml's missions.root, else missions/ (otherwise $OPENRIG_WORK_ROOT, then workspace.slices_root)");
+    .option("--workspace <path>", "Workspace root; use its project.yaml missions.root, else missions/. A directory named missions without its own missions/ child is used directly. If the tree is missing, fall back to configured workspace.slices_root, except mission create, which creates the named tree, and approve, which refuses. Without this flag, OPENRIG_WORK_ROOT is tried first with the same exceptions.");
 
   const slice = new Command("slice").description("Slice-tier commands");
   slice.addCommand(buildSliceLsCommand());

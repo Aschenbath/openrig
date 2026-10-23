@@ -6,8 +6,9 @@ import { resolveEffectiveHost } from "../host-selection.js";
 import { existsSync, readFileSync } from "node:fs";
 import { parse as parseYamlDoc } from "yaml";
 import { Command } from "commander";
-import { DaemonClient, DaemonConnectionError } from "../client.js";
+import { DaemonClient, DaemonConnectionError, DaemonTimeoutError } from "../client.js";
 import { getDaemonStatus, getDaemonUrl, startDaemon, type LifecycleDeps, daemonStatusGuard } from "../daemon-lifecycle.js";
+import { shouldAutoStartDaemon } from "../daemon-reachability.js";
 import { prepareDaemonAutoStart } from "../daemon-auto-start.js";
 import type { StartOptions } from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
@@ -43,6 +44,9 @@ function isFilesystemRoot(cwd: string): boolean {
   return resolved === nodePath.parse(resolved).root;
 }
 
+const RENAME_REFUSAL = "--name applies to a new launch from a rig spec or bundle. An existing rig is restored under its own name; renaming an existing rig is not supported.";
+const HOST_RENAME_REFUSAL = "--name over --host needs a spec path or bundle file, not a bare spec or rig name: pass the spec path or bundle file with --name.";
+
 /** The mistakes the daemon would refuse in an env: block, caught before anything is sent. */
 function checkEnvAssignment(assignment: string): string | null {
   const eq = assignment.indexOf("=");
@@ -76,6 +80,19 @@ export function sourceLooksLikeTopology(source: string): boolean {
   }
 }
 
+/** #1654: a plan creates or changes no rig or seat, so a plan the daemon didn't answer is safe to run again, locally
+ *  or with --host. Reported in place of the unknown-outcome guidance, which stays for writes. */
+const PLAN_NOT_ANSWERED = "A plan doesn't create or change any rig or seat, so it's safe to run again. If the daemon stays slow, check it with: rig status";
+function reportPlanNotAnswered(fact: string, error: string, json: boolean | undefined, extra: Record<string, unknown> = {}): void {
+  if (json) {
+    console.log(JSON.stringify({ ok: false, ...extra, error, plan: true, changed: false, message: PLAN_NOT_ANSWERED }));
+  } else {
+    console.error(fact);
+    console.error(PLAN_NOT_ANSWERED);
+  }
+  process.exitCode = 1;
+}
+
 export const HOST_TOPOLOGY_REJECTION =
   "rig up --host cannot take a topology source: per-entry 'host:' in the manifest is the ONLY placement mechanism for topologies (two placement mechanisms must not coexist). Put 'host: <id>' on the entries you want placed remotely and run 'rig up <topology>' without --host.";
 
@@ -94,6 +111,7 @@ export function upCommand(
 Examples:
   rig up secrets-manager
   rig up ./rig.yaml
+  rig up ./rig.yaml --name alpha
   rig up ./demo.rigbundle --target ~/work
 
 An existing rig's name restores that rig from its automatically selected usable
@@ -112,6 +130,7 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
     .option("--yes", "Auto-approve trusted actions")
     .option("--cwd <path>", "Override launch working directory for all members for this run only")
     .option("--env <KEY=VALUE>", "Set a launch environment variable on every seat for this run only; repeatable. Not saved: a later restore uses the spec's env: block. Values are visible to local processes, so never pass secrets", (v: string, all: string[]) => [...all, v], [] as string[])
+    .option("--name <rig>", "Launch the spec as a rig with this name instead of its name: field; the rig keeps it for --existing, snapshots and restore. The spec file is not changed")
     .option("--target <root>", "Install target for a .rigbundle (default: current directory). A v2 bundle is materialized there and relative member cwds resolve against it; --cwd still overrides launch cwd")
     .option("--preset <name>", "For a GitHub bundle link, choose a declared configuration")
     .option("--seat <member=runtime>", "For a GitHub bundle link, choose a declared seat runtime; repeatable", (v: string, all: string[]) => [...all, v], [] as string[])
@@ -119,7 +138,7 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
     .option("--fresh <seats...>", "Deliberately fresh-prime the named seats (logical ids) instead of resuming their original sessions (operation B; reported as fresh-primed)")
     .option("--json", "JSON output for agents")
     .option("--host <id>", "Run on a remote host declared in ~/.openrig/hosts.yaml")
-    .action(async (source: string, opts: { nonInterruptive?: boolean; plan?: boolean; yes?: boolean; cwd?: string; env?: string[]; target?: string; existing?: boolean; fresh?: string[]; json?: boolean; host?: string; preset?: string; seat?: string[] }) => {
+    .action(async (source: string, opts: { nonInterruptive?: boolean; plan?: boolean; yes?: boolean; cwd?: string; env?: string[]; name?: string; target?: string; existing?: boolean; fresh?: string[]; json?: boolean; host?: string; preset?: string; seat?: string[] }) => {
       // OPR.0.4.6.MH1 FR-2: selected-host routing — explicit --host wins;
       // else the persisted selection feeds the SHIPPED --host path; no
       // selection = today exactly. Topology
@@ -144,6 +163,18 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
         console.error("--env applies to a new launch from one rig spec or bundle. A topology launches several rigs from their own specs; put env: in each rig's spec instead.");
         process.exitCode = 1;
         return;
+      }
+      const rigName = opts.name;
+      if (rigName !== undefined) {
+        const problem = rigName === "" ? "--name needs a rig name."
+          : sourceLooksLikeTopology(source) ? "--name applies to a new launch from one rig spec or bundle. A topology launches several rigs from their own specs; each takes its spec's name."
+          : isGitHubBundleLink(source) ? "--name is not supported for a GitHub bundle link yet. Download the bundle and run rig up <file>.rigbundle --name <rig>, or launch without --name."
+          : null;
+        if (problem) {
+          console.error(problem);
+          process.exitCode = 1;
+          return;
+        }
       }
 
       // Link preparation verifies the effective endpoint before fetch or local auto-start.
@@ -207,6 +238,11 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
           process.exitCode = 1;
           return;
         }
+        if (rigName !== undefined && !source.includes("/") && !/\.(ya?ml|rigbundle|rigtopology)$/i.test(source)) {
+          console.error(HOST_RENAME_REFUSAL);
+          process.exitCode = 1;
+          return;
+        }
         const { runRemoteHttpOp } = await import("../remote-host-ops.js");
         const body = {
           sourceRef: source,
@@ -214,6 +250,7 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
           autoApprove: opts.yes, nonInterruptive: opts.nonInterruptive,
           cwdOverride: opts.cwd,
           envOverride: envOverrideBody,
+          rigName,
           targetRoot: opts.target,
           existing: opts.existing,
           freshLogicalIds: opts.fresh,
@@ -223,8 +260,14 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
             const inspected = await runRemoteHttpOp(opts.host!, "POST", "/api/bundles/inspect", { bundlePath: source }, deps, opts);
             return { status: inspected.ok ? 200 : 500, data: (inspected.data ?? { error: inspected.error }) as Record<string, unknown> };
           }) : undefined;
-        const result = await runRemoteHttpOp(opts.host, "POST", "/api/up", body, deps, { ...opts, timeoutMs: opts.plan ? undefined : LONG_RUNNING_UP_TIMEOUT_MS });
+        const result = await runRemoteHttpOp(opts.host, "POST", "/api/up", body, deps, { ...opts, timeoutMs: LONG_RUNNING_UP_TIMEOUT_MS });
         if (behaviour) result.data = { ...(result.data as Record<string, unknown> | undefined), behaviour };
+        if (opts.plan && !result.ok && result.outcomeUnknown) {
+          const rest: Record<string, unknown> = { ...result };
+          delete rest["outcomeUnknown"];
+          reportPlanNotAnswered(`The daemon on host ${opts.host} didn't answer the plan${result.error ? `: ${result.error}` : ""}`, result.error ?? "no answer", opts.json, rest);
+          return;
+        }
         if (opts.json) {
           console.log(JSON.stringify(result));
           if (!result.ok) process.exitCode = 1;
@@ -239,7 +282,8 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
 
       // Run preflight before auto-start
       let status = await getDaemonStatus(deps.lifecycleDeps);
-      if (status.state !== "running") {
+      // A busy daemon of this home gets the request instead of a start attempt (shouldAutoStartDaemon).
+      if (shouldAutoStartDaemon(status)) {
         let startOptions: StartOptions;
         try {
           const prepared = await prepareDaemonAutoStart(deps.lifecycleDeps, depsOverride?.preflightExec);
@@ -354,7 +398,18 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
         process.exitCode = 1;
         return true;
       };
-      if (isRigName && await refuseArchivedName(source)) return;
+      // A restore brings the rig back under its own name; renaming an existing rig is out of scope.
+      const refuseNameOnRestore = (): boolean => {
+        if (rigName === undefined) return false;
+        console.error(RENAME_REFUSAL);
+        process.exitCode = 1;
+        return true;
+      };
+      if (isRigName && opts.existing && refuseNameOnRestore()) return;
+      // With --name a bare name can only mean a library spec to launch under the new name, so a rig of the
+      // same name, running or archived, does not make it ambiguous; with no library match the restore refuses --name.
+      const launchingUnderNewName = rigName !== undefined;
+      if (isRigName && !launchingUnderNewName && await refuseArchivedName(source)) return;
       if (isRigName && !opts.existing) {
         try {
           const { resolveLibrarySpec } = await import("./specs.js");
@@ -365,8 +420,8 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
           // An alias must not bypass the canonical name's existing/archive checks.
           const resolvedName = source === "first-project" && entry.name === "starter" && entry.sourceType === "builtin"
             ? entry.name : source;
-          if (resolvedName !== source && await refuseArchivedName(resolvedName)) return;
-          const rigMatches = rigSummaries.filter((r) => r.name === source || r.name === resolvedName);
+          if (!launchingUnderNewName && resolvedName !== source && await refuseArchivedName(resolvedName)) return;
+          const rigMatches = launchingUnderNewName ? [] : rigSummaries.filter((r) => r.name === source || r.name === resolvedName);
           if (rigMatches.length > 0) {
             console.error(`'${source}' is ambiguous — it matches both an existing rig restore target and a library spec.`);
             console.error(`  To launch the library spec: rig up ${entry.sourcePath}`);
@@ -394,7 +449,7 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
         // "Turning on ..." per the rig's derived lifecycleState. Help text honesty:
         // "Recover" describes what `rig up` does; it does not promise success before
         // tester L4 VM proof completes.
-        if (sourceRef === source && refuseEnvOnRestore()) return;
+        if (sourceRef === source && (refuseEnvOnRestore() || refuseNameOnRestore())) return;
         if (sourceRef === source && !opts.json) {
           const summaries = await fetchRigSummaries();
           const match = summaries.find((r) => r.name === source);
@@ -490,13 +545,18 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
           autoApprove: opts.yes ?? false, nonInterruptive: opts.nonInterruptive,
           cwdOverride: opts.cwd ? nodePath.resolve(opts.cwd) : defaultLibraryCwdOverride,
           envOverride: envOverrideBody,
+          rigName,
           targetRoot,
           // OPR.0.3.4.2 — operation B opt-in seats (deliberate fresh-prime).
           freshLogicalIds: opts.fresh,
-        }, opts.plan ? undefined : { timeoutMs: LONG_RUNNING_UP_TIMEOUT_MS });
+        }, { timeoutMs: LONG_RUNNING_UP_TIMEOUT_MS }); // #1654: a plan runs an apply's preflight, Codex profile probes included
       } catch (err) {
         if (err instanceof DaemonConnectionError && !opts.plan) {
           printHonestTimeout(err);
+          return;
+        }
+        if (opts.plan && (err instanceof DaemonTimeoutError || (err instanceof DaemonConnectionError && err.writeOutcome === "unknown"))) {
+          reportPlanNotAnswered(`The daemon didn't answer the plan (${err.message}).`, err.message, opts.json);
           return;
         }
         throw err;
@@ -631,9 +691,10 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
         const nodes = (res.data["nodes"] as Array<{ logicalId: string; status: string; error?: string }>) ?? [];
         for (const n of nodes) {
           // OPR.0.3.4.2 — the five-term vocabulary renders distinctly; the
-          // awaiting-decision reason is part of the line (not a dead end).
-          if (n.status === "awaiting-decision" && n.error) {
-            console.log(`  ${n.logicalId}: awaiting-decision — ${n.error}`);
+          // awaiting-decision reason is part of the line (not a dead end), and so is a failed seat's (such as a seat held
+          // back for a missing startup file, with its fix).
+          if ((n.status === "awaiting-decision" || n.status === "failed") && n.error) {
+            console.log(`  ${n.logicalId}: ${n.status} — ${n.error}`);
           } else {
             console.log(`  ${n.logicalId}: ${n.status}`);
           }
@@ -714,6 +775,14 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
           console.log(`Dashboard: rig ui open`);
         }
         console.log(`Status: ${resStatus}`);
+        // A seat that failed to launch says why (its named error), as --json already carries it: in the import stage's
+        // result, or at the top level.
+        type NodeResult = { logicalId: string; status: string; error?: string };
+        const importDetail = stages.find((s) => s.stage === "import_rig") as { detail?: { nodes?: NodeResult[]; result?: { nodes?: NodeResult[] } } } | undefined;
+        const launchNodes = importDetail?.detail?.nodes ?? importDetail?.detail?.result?.nodes ?? (res.data["nodes"] as NodeResult[] | undefined) ?? [];
+        for (const n of launchNodes) {
+          if (n.status === "failed" && n.error) console.error(`  ${n.logicalId}: failed: ${n.error}`);
+        }
         for (const line of startupAttentionSummary(res.data)) console.log(line);
 
         // Surface warnings (e.g. transcript attach failures)

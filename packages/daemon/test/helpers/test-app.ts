@@ -1,13 +1,22 @@
+import { seatIdentityPanePidSchema } from "../../src/db/migrations/119_seat_identity_pane_pid.js";
+import { rigStartupLayersSchema } from "../../src/db/migrations/121_rig_startup_layers.js";
+import { humanOperatingModesSchema } from "../../src/db/migrations/122_human_operating_modes.js";
+import { queueDelegatedDecisionSchema } from "../../src/db/migrations/123_queue_delegated_decision.js";
 import { rigInstallRootSchema } from "../../src/db/migrations/096_rig_install_root.js";
 import { threadPartMapSchema } from "../../src/db/migrations/097_thread_part_map.js";
 import { queueTransitionsQitemIdOrderSchema } from "../../src/db/migrations/098_queue_transitions_qitem_id_order.js";
 import { queueItemsRecoveryTagsSchema } from "../../src/db/migrations/099_queue_items_recovery_tags.js";
 import { resumeRotationSchema } from "../../src/db/migrations/101_claude_resume_rotation.js";
+import { nodeAdvisorSchema } from "../../src/db/migrations/125_node_advisor.js";
 import { sessionStopIntentSchema } from "../../src/db/migrations/103_session_stop_intent.js";
 import { nodeEffortChoiceSchema } from "../../src/db/migrations/104_node_effort_choice.js";
 import { seatEnvSchema } from "../../src/db/migrations/111_seat_env.js";
 import { appliedLaunchDaemonOptOutSchema } from "../../src/db/migrations/113_applied_launch_daemon_opt_out.js";
-import { sessionAgentAppSchema } from "../../src/db/migrations/114_session_agent_app.js";
+import { sessionAgentAppSchema as sessionCommunityHarnessSchema } from "../../src/db/migrations/114_session_agent_app.js";
+import { threadSeatMapChannelKeySchema } from "../../src/db/migrations/115_thread_seat_map_channel_key.js";
+import { queueItemWakeInputBoxSchema } from "../../src/db/migrations/116_queue_item_wake_input_box.js";
+import { providerAccountReadingsSchema } from "../../src/db/migrations/117_provider_account_readings.js";
+import { humanQuietWindowsSchema } from "../../src/db/migrations/118_human_quiet_windows.js";
 import { modePostureCoexistSchema } from "../../src/db/migrations/109_mode_posture_coexist.js";
 import { rigNonInterruptiveSchema } from "../../src/db/migrations/095_rig_non_interruptive.js";
 import { mockShellCommand } from "./shell-command-mock.js";
@@ -131,7 +140,7 @@ import fs from "node:fs";
 
 /** Seam B R6: the canonical full-fixture migration list, exported so file-backed
  *  DB-reopen tests migrate IDENTICALLY to createFullTestDb. */
-export const migrationsForFullTestDb = [coreSchema, bindingsSessionsSchema, eventsSchema, snapshotsSchema, checkpointsSchema, resumeMetadataSchema, nodeSpecFieldsSchema, packagesSchema, installJournalSchema, journalSeqSchema, bootstrapSchema, discoverySchema, discoveryFkFix, agentspecRebootSchema, startupContextSchema, chatMessagesSchema, podNamespaceSchema, contextUsageSchema, externalCliAttachmentSchema, rigServicesSchema, seatHandoverObservabilitySchema, nodeCodexConfigProfileSchema, nodePermissionPolicySchema, rigPermissionPolicySchema, nodePolicyProvenanceSchema, rigPolicyProvenanceSchema, streamItemsSchema, queueItemsSchema, queueTransitionsSchema, rigPolicySchema, rigArchiveSchema, resumeProvenanceSchema, resumeVerificationSchema, seatIdentityVerdictsSchema, selfHostIdentitySchema, occupantTenuresSchema, daemonLifecycleSchema, watchdogJobsSchema, occupantGenerationStampsSchema, projectionManifestSchema, watchdogTargetGenerationSchema, appliedLaunchObservationsSchema, appliedLaunchObservationInvalidationsSchema, threadSeatMapSchema, queueTransitionWakesSchema, nodeSessionSourceSchema, scopedOperatingPostureSchema, humanNotificationIntentSchema, reviewReadIndexesSchema, inventoryEventIndexesSchema, rigClaudeManagedBlockFileSchema, nodePermissionSelectionsSchema, humanReplyToSchema, humanQuestionsSchema, nodeEffortSchema, rigNonInterruptiveSchema, rigInstallRootSchema, threadPartMapSchema, queueTransitionsQitemIdOrderSchema, queueItemsRecoveryTagsSchema, resumeRotationSchema, sessionStopIntentSchema, nodeEffortChoiceSchema, modePostureCoexistSchema, seatEnvSchema, appliedLaunchDaemonOptOutSchema, sessionAgentAppSchema];
+export const migrationsForFullTestDb = [coreSchema, bindingsSessionsSchema, eventsSchema, snapshotsSchema, checkpointsSchema, resumeMetadataSchema, nodeSpecFieldsSchema, packagesSchema, installJournalSchema, journalSeqSchema, bootstrapSchema, discoverySchema, discoveryFkFix, agentspecRebootSchema, startupContextSchema, chatMessagesSchema, podNamespaceSchema, contextUsageSchema, externalCliAttachmentSchema, rigServicesSchema, seatHandoverObservabilitySchema, nodeCodexConfigProfileSchema, nodePermissionPolicySchema, rigPermissionPolicySchema, nodePolicyProvenanceSchema, rigPolicyProvenanceSchema, streamItemsSchema, queueItemsSchema, queueTransitionsSchema, rigPolicySchema, rigArchiveSchema, resumeProvenanceSchema, resumeVerificationSchema, seatIdentityVerdictsSchema, selfHostIdentitySchema, occupantTenuresSchema, daemonLifecycleSchema, watchdogJobsSchema, occupantGenerationStampsSchema, projectionManifestSchema, watchdogTargetGenerationSchema, appliedLaunchObservationsSchema, appliedLaunchObservationInvalidationsSchema, threadSeatMapSchema, queueTransitionWakesSchema, nodeSessionSourceSchema, scopedOperatingPostureSchema, humanNotificationIntentSchema, reviewReadIndexesSchema, inventoryEventIndexesSchema, rigClaudeManagedBlockFileSchema, nodePermissionSelectionsSchema, humanReplyToSchema, humanQuestionsSchema, nodeEffortSchema, rigNonInterruptiveSchema, rigInstallRootSchema, threadPartMapSchema, queueTransitionsQitemIdOrderSchema, queueItemsRecoveryTagsSchema, resumeRotationSchema, sessionStopIntentSchema, nodeEffortChoiceSchema, modePostureCoexistSchema, seatEnvSchema, appliedLaunchDaemonOptOutSchema, sessionCommunityHarnessSchema, threadSeatMapChannelKeySchema, queueItemWakeInputBoxSchema, providerAccountReadingsSchema, humanQuietWindowsSchema, seatIdentityPanePidSchema, rigStartupLayersSchema, humanOperatingModesSchema, queueDelegatedDecisionSchema, nodeAdvisorSchema];
 
 /**
  * P24 — the DECLARED exclusions for {@link migrationsForFullTestDb}. That list is deliberately a
@@ -155,6 +164,7 @@ export const migrationsForFullTestDbExclusions: Record<string, string> = {
   "029_classifier_leases.sql": "project-classification subsystem table — classifier-lease suites migrate it inline.",
   "086_classification_fields_and_attempts.sql": "extends 028 (excluded here) and adds the S02 attempt ledger — classifier suites migrate it inline.",
   "087_seat_delivery_guard.sql": "extends outbox_entries (027 is excluded); delivery-guard suites use ALL_MIGRATIONS. Revisit if a core-fixture consumer uses retained delivery.",
+  "100_typing_guard_modes.sql": "extends outbox_entries and its typing guard (027 and 087 are excluded); guard-mode and retry suites use ALL_MIGRATIONS.",
   "089_classification_identity_provenance.sql": "extends project_classifications (028 is excluded); classifier fixtures migrate it inline.",
   "030_views_custom.sql": "custom-views subsystem table — views suites migrate it inline.",
   "032_watchdog_history.sql": "watchdog history table — watchdog suites migrate it inline (watchdog_jobs is the only watchdog base the core edge carries).",
@@ -190,6 +200,7 @@ export const migrationsForFullTestDbExclusions: Record<string, string> = {
   "075_context_usage_watchdog_generation.sql": "context watchdog generation-binding extension migrated inline by context-usage watchdog suites.",
   "076_owner_notification_levels.sql": "owner-notification columns extend queue transitions plus the archive table (054 is excluded); focused S14 suites use the canonical full migration list.",
   "078_idle_gate_fired_condition.sql": "idle-gate watchdog extension migrated inline by the idle-gate policy suite.",
+  "124_context_usage_watchdog_units.sql": "context watchdog token and percent units, extending 074 and 075 (excluded here); migrated inline by the context-usage watchdog units suite.",
   "079_workflow_lifecycle_parallel.sql": "workflow lifecycle identity, frontier, and failure tables — workflow suites migrate the canonical workflow schema inline; the shared core fixture does not read them.",
 };
 

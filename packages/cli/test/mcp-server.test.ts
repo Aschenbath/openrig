@@ -41,8 +41,8 @@ describe("MCP Server", () => {
     if (cleanup) await cleanup();
   });
 
-  // T1: MCP server lists all 23 tools: the original 18 and the five queue tools
-  it("lists all 23 tools", async () => {
+  // T1: MCP server lists all 24 tools: the original 18, the five queue tools and the telemetry events read
+  it("lists all 24 tools", async () => {
     await setup();
     const result = await mcpClient.listTools();
     const names = result.tools.map((t) => t.name).sort();
@@ -69,6 +69,7 @@ describe("MCP Server", () => {
       "rig_snapshot_create",
       "rig_snapshot_list",
       "rig_status",
+      "rig_telemetry_events",
       "rig_up",
     ]);
     await cleanup();
@@ -299,7 +300,7 @@ describe("MCP Server", () => {
 
     // Verify server is responsive
     const result = await mcpClient.listTools();
-    expect(result.tools.length).toBe(23);
+    expect(result.tools.length).toBe(24);
 
     // Clean disconnect
     await cleanup();
@@ -313,7 +314,7 @@ describe("MCP Server", () => {
     await client2.connect(ct2);
 
     const result2 = await client2.listTools();
-    expect(result2.tools.length).toBe(23);
+    expect(result2.tools.length).toBe(24);
 
     await client2.close();
     await server2.close();
@@ -572,8 +573,8 @@ describe("MCP Server", () => {
     await cleanup();
   });
 
-  // T15: rig_capture returns structured result
-  it("rig_capture returns structured result", async () => {
+  // T15: rig_capture asks for the input box and returns structured result
+  it("rig_capture asks for the input box and returns structured result", async () => {
     const postFn = vi.fn(async () => ({
       status: 200,
       data: { ok: true, sessionName: "dev-impl@my-rig", content: "pane output", lines: 20 },
@@ -586,6 +587,9 @@ describe("MCP Server", () => {
     });
 
     expect(postFn).toHaveBeenCalled();
+    const [path, body] = postFn.mock.calls[0] as unknown as [string, Record<string, unknown>];
+    expect(path).toBe("/api/transport/capture");
+    expect(body).toEqual({ session: "dev-impl@my-rig", inputBox: true });
     expect(result.isError).toBeUndefined();
     const parsed = JSON.parse((result.content as Array<{ text: string }>)[0]!.text);
     expect(parsed.ok).toBe(true);

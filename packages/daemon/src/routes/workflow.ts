@@ -13,6 +13,7 @@ import { ProjectReadError } from "../domain/workspace/project-catalog.js";
 import { declaredProject } from "../domain/workspace/project-read.js";
 import { WorkflowSpecError } from "../domain/workflow-spec-cache.js";
 import { WorkflowHumanDestinationError } from "../domain/workflow-human-destination.js";
+import { requireSenderIdentity, resolveRecordedProvenance } from "./require-sender-identity.js";
 
 /**
  * Workflow runtime HTTP routes (PL-004 Phase D). Backs `rig workflow` CLI.
@@ -285,7 +286,10 @@ export function workflowRoutes(): Hono {
     if (!body.instanceId) return c.json({ error: "instanceId is required" }, 400);
     if (!body.currentPacketId) return c.json({ error: "currentPacketId is required" }, 400);
     if (!body.exit) return c.json({ error: "exit is required" }, 400);
-    if (!body.actorSession) return c.json({ error: "actorSession is required" }, 400);
+    // The agent that projected the step is the caller: its transport identity supersedes a declared actorSession, which is
+    // used, labelled claimed, only when the caller has none.
+    const actor = requireSenderIdentity(c, { verb: "workflow project", bodyClaim: body.actorSession });
+    if (!actor.ok) return actor.response;
     try {
       const result = await getRuntime(c).project({
         instanceId: body.instanceId,
@@ -294,7 +298,8 @@ export function workflowRoutes(): Hono {
         resultNote: body.resultNote,
         blockedOn: body.blockedOn,
         closureEvidence: body.closureEvidence,
-        actorSession: body.actorSession,
+        actorSession: actor.session,
+        identityProvenance: resolveRecordedProvenance(c, actor),
         nextOwnerSession: body.nextOwnerSession,
       });
       return c.json(result);
@@ -379,13 +384,15 @@ export function workflowRoutes(): Hono {
       .json<{ packetId?: string; toSession?: string; actorSession?: string; reason?: string }>()
       .catch(() => ({}) as never);
     if (!body.toSession) return c.json({ error: "toSession is required" }, 400);
-    if (!body.actorSession) return c.json({ error: "actorSession is required" }, 400);
+    const actor = requireSenderIdentity(c, { verb: "workflow route", bodyClaim: body.actorSession });
+    if (!actor.ok) return actor.response;
     try {
       const result = await getRuntime(c).route({
         instanceId,
         packetId: body.packetId,
         toSession: body.toSession,
-        actorSession: body.actorSession,
+        actorSession: actor.session,
+        identityProvenance: resolveRecordedProvenance(c, actor),
         reason: body.reason,
       });
       return c.json(result);
@@ -399,13 +406,15 @@ export function workflowRoutes(): Hono {
     const body = await c.req
       .json<{ occurrenceId?: string; decision?: string; actorSession?: string }>()
       .catch(() => ({}) as never);
-    if (!body.actorSession) return c.json({ error: "actorSession is required" }, 400);
+    const actor = requireSenderIdentity(c, { verb: "workflow resume", bodyClaim: body.actorSession });
+    if (!actor.ok) return actor.response;
     try {
       const result = await getRuntime(c).resume({
         instanceId,
         occurrenceId: body.occurrenceId,
         decision: body.decision,
-        actorSession: body.actorSession,
+        actorSession: actor.session,
+        identityProvenance: resolveRecordedProvenance(c, actor),
       });
       return c.json(result);
     } catch (err) {
@@ -417,9 +426,11 @@ export function workflowRoutes(): Hono {
     const instanceId = c.req.param("instance_id");
     const body = await c.req.json<{ reason?: string; actorSession?: string }>().catch(() => ({} as never));
     if (!body.reason) return c.json({ error: "reason is required" }, 400);
-    if (!body.actorSession) return c.json({ error: "actorSession is required" }, 400);
+    const actor = requireSenderIdentity(c, { verb: "workflow abort", bodyClaim: body.actorSession });
+    if (!actor.ok) return actor.response;
     try {
-      return c.json(await getRuntime(c).abort({ instanceId, reason: body.reason, actorSession: body.actorSession }));
+      return c.json(await getRuntime(c).abort({ instanceId, reason: body.reason, actorSession: actor.session,
+        identityProvenance: resolveRecordedProvenance(c, actor) }));
     } catch (err) {
       return errorResponse(c, err);
     }
@@ -428,7 +439,7 @@ export function workflowRoutes(): Hono {
   app.get("/:instance_id/trace", (c) => {
     const instanceId = c.req.param("instance_id");
     try {
-      const result = getRuntime(c).continue(instanceId);
+      const result = getRuntime(c).continue(instanceId, { fullHistory: c.req.query("full") === "true" });
       return c.json(result);
     } catch (err) {
       return errorResponse(c, err);

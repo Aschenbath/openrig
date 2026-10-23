@@ -6,9 +6,10 @@ import { describe, it, expect, afterEach } from "vitest";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ModelDivergenceMonitor, type PinnedSeat } from "../src/domain/model-divergence/model-divergence-monitor.js";
-import { readCurrentPiOccupantModel, type ProcessRow } from "../src/domain/model-divergence/current-generation-record.js";
+import { ModelDivergenceMonitor, type ModelDivergenceMonitorDeps, type PinnedSeat } from "../src/domain/model-divergence/model-divergence-monitor.js";
+import { readCurrentPiOccupantModel, resolveIdentityVerifiedPiRecord, type ProcessRow } from "../src/domain/model-divergence/current-generation-record.js";
 import { buildPiRunnerCommand } from "../src/adapters/pi-runner-protocol.js";
+import { piPinReadings, readPiModelObservation } from "../src/domain/model-divergence/effective-model-readers.js";
 
 const SESSION = "dev-impl@r";
 const PANE = "%7";
@@ -71,9 +72,16 @@ interface Fixture {
   paneRoot?: string;
 }
 
-function fixture(lines: string[], overrides: Partial<Omit<Fixture, "sessionsDir" | "sessionFile">> = {}): Fixture {
+/** `modelsJson`: the seat's Pi models.json under a state root in the temp folder (null = that
+ *  state root with no file). Without it the state root is STATE_ROOT. */
+function fixture(lines: string[], overrides: Partial<Omit<Fixture, "sessionsDir" | "sessionFile">> & { modelsJson?: string | null } = {}): Fixture {
+  const { modelsJson, ...rest } = overrides;
   const root = mkdtempSync(join(tmpdir(), "pi-emo-"));
   dirs.push(root);
+  if (typeof modelsJson === "string") {
+    mkdirSync(join(root, SESSION, "agent"), { recursive: true });
+    writeFileSync(join(root, SESSION, "agent", "models.json"), modelsJson);
+  }
   const sessionsDir = join(root, SESSION, "sessions");
   mkdirSync(join(sessionsDir, "--p--"), { recursive: true });
   const sessionFile = join(sessionsDir, "--p--", "2026-10-17_s1.jsonl");
@@ -87,17 +95,17 @@ function fixture(lines: string[], overrides: Partial<Omit<Fixture, "sessionsDir"
     bootAt: BOOT,
     pin: PIN,
     entryPath: ENTRY,
-    stateRoot: STATE_ROOT,
-    ...overrides,
+    stateRoot: modelsJson === undefined ? STATE_ROOT : root,
+    ...rest,
   };
 }
 
 /** The managed runner command as ps shows it, built by the launch builder itself so the reader's
  *  expected argument order cannot drift from it: argv joined by spaces, shell quoting removed. */
-function runnerCommand(f: Pick<Fixture, "entryPath" | "stateRoot">, launchId: string, opts: { node?: string; entryPath?: string; stateRoot?: string } = {}): string {
+function runnerCommand(f: Pick<Fixture, "entryPath" | "stateRoot">, launchId: string, opts: { node?: string; entryPath?: string; stateRoot?: string; thinking?: string } = {}): string {
   const built = buildPiRunnerCommand({
     runtime: "pi", runnerEntryPath: opts.entryPath ?? f.entryPath, sessionName: SESSION, stateRoot: opts.stateRoot ?? f.stateRoot,
-    cwd: "/p", trust: "approve", model: PIN, launchId,
+    cwd: "/p", trust: "approve", model: PIN, launchId, thinking: opts.thinking,
   });
   const ps = built.replace(/'([^']*)'/g, "$1");
   return opts.node ? ps.replace(/^node /, `${opts.node} `) : ps;
@@ -129,12 +137,12 @@ function read(f: Fixture) {
   });
 }
 
-function monitorFor(f: Fixture) {
-  const seat: PinnedSeat = { nodeId: "n1", sessionName: SESSION, rigId: "rig-1", rigName: "r", runtime: "pi", pinnedModel: f.pin, generation: "gen-1" };
+function monitorFor(f: Fixture, runtime = "pi", readEffectiveModel: ModelDivergenceMonitorDeps["readEffectiveModel"] = () => read(f)) {
+  const seat: PinnedSeat = { nodeId: "n1", sessionName: SESSION, rigId: "rig-1", rigName: "r", runtime, pinnedModel: f.pin, generation: "gen-1" };
   const sent: string[] = [];
   const monitor = new ModelDivergenceMonitor({
     listPinnedSeats: () => [seat],
-    readEffectiveModel: () => read(f),
+    readEffectiveModel,
     sendToSession: async (target) => { sent.push(target); return { ok: true }; },
     resolveOrchSeats: () => ["orch-lead@r"],
     resolveOperatorSeat: () => "operator-admin@kernel",
@@ -390,6 +398,20 @@ describe("Pi runner arguments and pane process must be unambiguous", () => {
     }
   });
 
+  it("a runner command carrying --thinking still matches the managed shape", async () => {
+    const command = `${runnerCommand(managed, "L2").replace(`--model ${PIN}`, `--model ${PIN} --thinking high`)}`;
+    expect(command).toContain("--thinking high");
+    expect((await pass(monitorFor(withRunner(command)))).fired).toHaveLength(1);
+  });
+
+  it("an effort shaped like an identity flag is never sent, so the runner still verifies", async () => {
+    for (const thinking of ["--cwd", "high --cwd", "--launch-id", "--runtime"]) {
+      const command = runnerCommand(managed, "L2", { thinking });
+      expect(command).not.toContain("--thinking");
+      expect((await pass(monitorFor(withRunner(command)))).fired).toHaveLength(1);
+    }
+  });
+
   it("a pane whose own process is not a shell stays pending, with the exact runner under it", async () => {
     expect(await pendingReason(withRunner(runnerCommand(managed, "L2"), { paneRoot: "vim notes.md" }))).toMatch(/is not a shell/);
   });
@@ -398,5 +420,160 @@ describe("Pi runner arguments and pane process must be unambiguous", () => {
     for (const paneRoot of ["-zsh", "/usr/bin/fish", "bash"]) {
       expect((await pass(monitorFor(withRunner(runnerCommand(managed, "L2"), { paneRoot })))).fired).toHaveLength(1);
     }
+  });
+});
+
+describe("Pi pin with a :<thinking level> suffix", () => {
+  it("reads a pin as Pi does: the whole pin first, then each trailing level removed in turn", () => {
+    expect(piPinReadings("anthropic/claude-fable-5:high")).toEqual(["anthropic/claude-fable-5:high", "anthropic/claude-fable-5"]);
+    for (const level of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+      expect(piPinReadings(` openrouter/x-ai/grok-4:${level} `)).toEqual([`openrouter/x-ai/grok-4:${level}`, "openrouter/x-ai/grok-4"]);
+    }
+    expect(piPinReadings("openrouter/meta/llama-4:free")).toEqual(["openrouter/meta/llama-4:free"]);
+    expect(piPinReadings("anthropic/claude-fable-5:HIGH")).toEqual(["anthropic/claude-fable-5:HIGH"]); // Pi's levels are case-sensitive
+    expect(piPinReadings("anthropic/claude-fable-5:free:low")).toEqual(["anthropic/claude-fable-5:free:low", "anthropic/claude-fable-5:free"]);
+    expect(piPinReadings("anthropic/claude-fable-5:low:high")).toEqual(["anthropic/claude-fable-5:low:high", "anthropic/claude-fable-5:low", "anthropic/claude-fable-5"]);
+  });
+
+  it("a model id that really ends in a level, and a chained suffix, both settle on what Pi ran", async () => {
+    const own = fixture([header(T0), assistant(RUNNER_START + 5_000, "claude-fable-5:high")], { pin: `${PIN}:high` });
+    expect((await pass(monitorFor(own))).pending).toEqual([]);
+    const chained = fixture([header(T0), assistant(RUNNER_START + 5_000, "claude-fable-5")], { pin: `${PIN}:low:high` });
+    const r = await pass(monitorFor(chained));
+    expect(r.fired).toEqual([]);
+    expect(r.pending).toEqual([]);
+  });
+
+  it("a suffixed pin settles on a record of its model and proclaims a different model with the raw pin", async () => {
+    const same = fixture([header(T0), assistant(RUNNER_START + 5_000, "claude-fable-5")], { pin: `${PIN}:low` });
+    const settled = await pass(monitorFor(same));
+    expect(settled.fired).toEqual([]);
+    expect(settled.pending).toEqual([]);
+
+    const other = fixture([header(T0), assistant(RUNNER_START + 5_000, OTHER)], { pin: `${PIN}:low` });
+    const r = await pass(monitorFor(other));
+    expect(r.fired).toHaveLength(1);
+    expect(r.fired[0]!.pinnedModel).toBe(`${PIN}:low`);
+    expect(r.fired[0]!.effectiveModel).toBe(`anthropic/${OTHER}`);
+  });
+
+  it("a bare model with a level suffix still does not resolve to provider/model", async () => {
+    const f = fixture([header(T0), assistant(RUNNER_START + 5_000, "claude-fable-5")], { pin: "claude-fable-5:high" });
+    const r = await pass(monitorFor(f));
+    expect(r.fired).toEqual([]);
+    expect(r.pending[0]?.reason).toMatch(/does not resolve to a provider\/model id/);
+  });
+
+  it("the suffix is set aside for Pi seats only: another runtime's read compares the raw pin", async () => {
+    const f = fixture([header(T0), assistant(RUNNER_START + 5_000, "claude-fable-5")], { pin: `${PIN}:low` });
+    const withoutReadings = async () => {
+      const r = await read(f);
+      return r.ok ? { ok: true as const, model: r.model } : r;
+    };
+    expect((await pass(monitorFor(f, "omp", withoutReadings))).fired).toHaveLength(1);
+  });
+});
+
+describe("Pi pin that is itself a model id in the seat's models.json", () => {
+  const lab = (...ids: string[]) => JSON.stringify({ providers: { lab: { baseUrl: "http://lab", api: "openai-completions", models: ids.map((id) => ({ id })) } } });
+  const seat = (record: string, pin: string, modelsJson: string | null) =>
+    fixture([header(T0), assistant(RUNNER_START + 5_000, record, { provider: "lab" })], { pin, modelsJson });
+
+  it("a pin that names a defined model is read literally, so the stripped model is a divergence", async () => {
+    const r = await pass(monitorFor(seat("y", "lab/y:high", lab("y:high", "y"))));
+    expect(r.fired).toHaveLength(1);
+    expect(r.fired[0]!.pinnedModel).toBe("lab/y:high");
+    expect(r.fired[0]!.effectiveModel).toBe("lab/y");
+    expect((await pass(monitorFor(seat("y:high", "lab/y:high", lab("y:high", "y"))))).fired).toEqual([]);
+    // Pi's own models.json reading (comments, trailing commas) and its case-insensitive exact match.
+    const commented = `// lab models\n{ "providers": { "lab": { "models": [{ "id": "Y:High" }, { "id": "y" },] } } }`;
+    expect((await pass(monitorFor(seat("y", "lab/y:high", commented)))).fired).toHaveLength(1);
+    expect((await pass(monitorFor(seat("y", "lab/Y:high", lab("y:high", "y"))))).fired).toHaveLength(1);
+  });
+
+  it("a chained suffix is read up to the first defined model", async () => {
+    expect((await pass(monitorFor(seat("y", "lab/y:low:high", lab("y:low", "y"))))).fired).toHaveLength(1);
+    const r = await pass(monitorFor(seat("y:low", "lab/y:low:high", lab("y:low", "y"))));
+    expect(r.fired).toEqual([]);
+    expect(r.pending).toEqual([]);
+  });
+
+  it("the ordinary suffix case is unchanged: only the model is defined, or no models.json at all", async () => {
+    for (const modelsJson of [lab("y"), JSON.stringify({ providers: { other: { models: [{ id: "y:high" }] } } }), "{}", null]) {
+      const r = await pass(monitorFor(seat("y", "lab/y:high", modelsJson)));
+      expect(r.fired).toEqual([]);
+      expect(r.pending).toEqual([]);
+    }
+  });
+
+  it("a models.json that can't be read as Pi's config leaves a suffixed pin pending, never settled or proclaimed", async () => {
+    const bad = ["{ not json", "[]", JSON.stringify({ providers: [] }), JSON.stringify({ providers: { lab: { models: {} } } }), JSON.stringify({ providers: { lab: { models: [{ name: "y" }] } } })];
+    for (const modelsJson of bad) {
+      const r = await pass(monitorFor(seat("y", "lab/y:high", modelsJson)));
+      expect(r.fired).toEqual([]);
+      expect(r.pending[0]?.reason).toMatch(/models\.json .* could not be read as Pi's model config/);
+    }
+  });
+
+  it("with a models.json that can't be read as Pi's config, a record matching no reading of the pin is a divergence", async () => {
+    const bad = ["{ not json", "[]", JSON.stringify({ providers: [] }), JSON.stringify({ providers: { lab: { models: {} } } }), JSON.stringify({ providers: { lab: { models: [{ name: "y" }] } } })];
+    for (const modelsJson of bad) {
+      const m = monitorFor(seat("z", "lab/y:high", modelsJson));
+      const r = await pass(m);
+      expect(r.pending).toEqual([]);
+      expect(r.fired).toHaveLength(1);
+      expect(r.fired[0]).toMatchObject({ sessionName: SESSION, runtime: "pi", pinnedModel: "lab/y:high", effectiveModel: "lab/z" });
+      expect(m.sent).toEqual(["orch-lead@r", "operator-admin@kernel", "watch-lead@oversight"]);
+    }
+  });
+
+  it("a pin without a level suffix never reads models.json", async () => {
+    const r = await pass(monitorFor(seat("y", "lab/y", "{ not json")));
+    expect(r.fired).toEqual([]);
+    expect(r.pending).toEqual([]);
+  });
+});
+
+describe("Pi effort report inputs: the verified runner and its newest own record", () => {
+  function select(f: Fixture) {
+    return resolveIdentityVerifiedPiRecord({
+      sessionName: SESSION, generation: "gen-1", occupantBootAt: sqliteUtc(f.bootAt),
+      binding: { tmuxSession: SESSION, tmuxPane: PANE },
+      runner: { state: f.sidecar, sessionsDir: f.sessionsDir, entryPath: f.entryPath, stateRoot: f.stateRoot },
+    }, { getPanePid: async (target) => (target === PANE ? PANE_PID : null), listProcesses: async () => processes(f) },
+    (path) => { try { return realpathSync(path); } catch { return null; } });
+  }
+  function thinking(atMs: number, level: string | null): string {
+    const record = JSON.parse(assistant(atMs, "claude-fable-5")) as { message: Record<string, unknown> };
+    if (level !== null) record.message.thinkingLevel = level;
+    return JSON.stringify(record);
+  }
+
+  it("the selection carries the verified runner's pid, start time and command", async () => {
+    const f = fixture([header(T0)]);
+    const selection = await select(f);
+    expect(selection).toMatchObject({ ok: true, launchId: "L2", pid: PANE_PID + 1, startedAt: lstart(RUNNER_START), command: runnerCommand(f, "L2") });
+  });
+
+  it("the observation returns thinkingLevel from the newest own record, never one from before this runner", async () => {
+    const f = fixture([header(T0), thinking(RUNNER_START - 60_000, "xhigh"), thinking(RUNNER_START + 5_000, "high")]);
+    const selection = await select(f);
+    if (!selection.ok) throw new Error(selection.reason);
+    expect(readPiModelObservation(selection.path, { notBeforeMs: selection.notBeforeMs })).toMatchObject({ ok: true, model: PIN, thinkingLevel: "high" });
+
+    const old = fixture([header(T0), thinking(RUNNER_START - 60_000, "xhigh")]);
+    const before = await select(old);
+    if (!before.ok) throw new Error(before.reason);
+    const read = readPiModelObservation(before.path, { notBeforeMs: before.notBeforeMs });
+    expect(read).toMatchObject({ ok: false, reason: expect.stringMatching(/predates the current runner/) });
+  });
+
+  it("a record without thinkingLevel (Pi before 0.99.0) still reads its model, with no level", async () => {
+    const f = fixture([header(T0), thinking(RUNNER_START + 5_000, null)]);
+    const selection = await select(f);
+    if (!selection.ok) throw new Error(selection.reason);
+    const read = readPiModelObservation(selection.path, { notBeforeMs: selection.notBeforeMs });
+    expect(read).toMatchObject({ ok: true, model: PIN });
+    expect(read).not.toHaveProperty("thinkingLevel");
   });
 });

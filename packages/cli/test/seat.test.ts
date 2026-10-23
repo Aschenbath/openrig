@@ -93,6 +93,72 @@ const STATUS = {
   restore_outcome: "n-a",
 };
 
+describe("seat typing guard commands", () => {
+  it("keeps the legacy on prefix when status reports hold", async () => {
+    const paths: string[] = [];
+    const deps = makeDeps({ status: 200, data: { ...STATUS, typingGuard: { desired: true, effective: true, effectiveMode: "hold", pending: false, heldCount: 0 } } }, paths);
+    const status = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "status", "worker@test"]).then(() => undefined));
+    expect(status.logs.join("\n")).toContain("Typing guard: on (hold)");
+  });
+
+  it("sets a level through the same control, and status names it with what types and what's held", async () => {
+    const paths: string[] = [], bodies: unknown[] = [];
+    const set = makeDeps({ status: 200, data: { effectiveMode: "hold", effectiveLevel: "urgent-only", pending: false } }, paths, bodies);
+    await captureLogs(() => makeCommand(set).parseAsync(["node", "rig", "seat", "set-typing-guard", "worker@test",
+      "--mode", "urgent-only", "--reason", "reviewing by hand", "--json"]).then(() => undefined));
+    expect(bodies).toEqual([{ mode: "urgent-only", reason: "reviewing by hand" }]);
+    const deps = makeDeps({ status: 200, data: { ...STATUS, typingGuard: { desired: true, effective: true, effectiveMode: "hold", effectiveLevel: "urgent-only", pending: false, heldCount: 2 } } }, []);
+    const status = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "status", "worker@test"]).then(() => undefined));
+    expect(status.logs.join("\n")).toContain("Typing guard: urgent-only; 2 retained\nOnly messages marked urgent type. Other automatic input is held, readable with rig seat held-messages dev-impl@seat-rig.");
+  });
+
+  it("sends draft-aware mode through the existing control", async () => {
+    const paths: string[] = [], bodies: unknown[] = [];
+    const deps = makeDeps({ status: 200, data: { effectiveMode: "draft-aware", pending: false } }, paths, bodies);
+    const result = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "set-typing-guard", "worker@test",
+      "--mode", "draft-aware", "--reason", "keep my draft", "--json"]).then(() => undefined));
+    expect(result.exitCode).toBeUndefined();
+    expect(paths).toEqual(["/api/seat/set-typing-guard/worker%40test"]);
+    expect(bodies).toEqual([{ mode: "draft-aware", reason: "keep my draft" }]);
+    expect(JSON.parse(result.logs.join(""))).toMatchObject({ effectiveMode: "draft-aware" });
+  });
+
+  it.each([["--mode", "typo"]])("rejects invalid %s %s before requesting a change", async (flag, value) => {
+    const paths: string[] = [];
+    const deps = makeDeps({ status: 200, data: {} }, paths);
+    const result = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "set-typing-guard", "worker@test",
+      "--mode", "draft-aware", "--reason", "draft", flag, value]).then(() => undefined));
+    expect(result.exitCode).toBe(1); expect(paths).toEqual([]);
+  });
+
+  it.each(["true", "false"])("keeps --enabled %s compatible with the existing endpoint", async enabled => {
+    const paths: string[] = [], bodies: unknown[] = [];
+    const deps = makeDeps({ status: 200, data: {} }, paths, bodies);
+    await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "set-typing-guard", "worker@test",
+      "--enabled", enabled, "--reason", "existing workflow"]).then(() => undefined));
+    expect(paths).toEqual(["/api/seat/set-typing-guard/worker%40test"]);
+    expect(bodies).toEqual([{ enabled: enabled === "true", reason: "existing workflow" }]);
+  });
+
+  it.each([{ selectors: [] }, { selectors: ["--mode", "hold", "--enabled", "true"] }])("requires exactly one selector: $selectors", async ({ selectors }) => {
+    const paths: string[] = [];
+    const deps = makeDeps({ status: 200, data: {} }, paths);
+    const result = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "set-typing-guard", "worker@test",
+      "--reason", "draft", ...selectors]).then(() => undefined));
+    expect(result.exitCode).toBe(1); expect(paths).toEqual([]);
+  });
+
+  it("prints requested/effective activation and immediate send behavior in seat status", async () => {
+    const paths: string[] = [];
+    const typingGuard = { desired: true, effective: false, desiredMode: "hold", effectiveMode: "draft-aware", pending: true, heldCount: 1 };
+    const deps = makeDeps({ status: 200, data: { ...STATUS, typingGuard } }, paths);
+    const status = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "status", "worker@test"]).then(() => undefined));
+    expect(status.logs.join("\n")).toContain("Typing guard: draft-aware (activation pending; requested hold)");
+    expect(status.logs.join("\n")).toContain("Draft-aware sends return immediately");
+    expect(paths.at(-1)).toBe("/api/seat/status/worker%40test");
+  });
+});
+
 const HANDOVER_PLAN = {
   ok: true,
   dryRun: true,
@@ -559,6 +625,20 @@ describe("rig seat status", () => {
         provenanceRecordWritten: false,
       },
     });
+  });
+
+  it.each([false, true])("shows an unverified rebuild permission fallback (json=%s)", async json => {
+    const permissions = { state: "unverified", detail: "No complete native policy was observed; existing launch behaviour was used. Permissions were not verified or carried." };
+    const response = { ...HANDOVER_RESULT, source: { mode: "rebuild", raw: "rebuild" },
+      sourceOutcome: { mode: "rebuild", primedArtifacts: [], gaps: [], permissions } };
+    const deps = makeDeps({ status: 200, data: response }, []);
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCommand(deps).parseAsync(["node", "rig", "seat", "handover", "dev-impl@seat-rig",
+        "--source", "rebuild", "--reason", "rebuild", ...(json ? ["--json"] : [])]);
+    });
+    expect(exitCode).toBeUndefined();
+    if (json) expect(JSON.parse(logs.join("\n")).sourceOutcome.permissions).toEqual(permissions);
+    else expect(logs.join("\n")).toContain(`Codex rebuild permissions: unverified. ${permissions.detail}`);
   });
 
   it("handover non-dry-run human output avoids continuity claims (discovered, no context delivery)", async () => {

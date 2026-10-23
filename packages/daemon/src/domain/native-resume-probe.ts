@@ -1,5 +1,6 @@
+import { currentClaudeMcpMenu } from "./claude-mcp-menu.js";
 import { shellQuote } from "../adapters/shell-quote.js";
-import { codexPostureArg } from "../adapters/yolo-mode.js";
+import { claudePostureFlag, codexPostureArg } from "../adapters/yolo-mode.js";
 
 // L3 adds `attention_required` for the Claude resume-selection prompt proxy.
 // Distinct from `inconclusive` (we don't know yet) and `failed` (terminal
@@ -40,7 +41,7 @@ export function buildNativeResumeCommand(
   if (!resumeToken) return null;
   if (runtime === "claude-code") {
     const nameSuffix = sessionName ? ` --name ${shellQuote(sessionName)}` : "";
-    return `claude --resume ${shellQuote(resumeToken)}${nameSuffix}`;
+    return `claude ${claudePostureFlag(process.env)} --resume ${shellQuote(resumeToken)}${nameSuffix}`;
   }
   if (runtime === "codex") {
     return buildCodexResumeCore(resumeToken, codexConfigProfile, undefined, undefined, undefined, undefined, undefined, codexDaemonOptOut === true);
@@ -119,7 +120,7 @@ export function assessNativeResumeProbe(
         detail: "Claude is waiting for workspace trust approval before the session can become interactive.",
       };
     }
-    if (looksLikeClaudeMcpApprovalPrompt(paneContent)) {
+    if (currentClaudeMcpMenu(paneContent) || looksLikeClaudeMcpApprovalPrompt(paneContent)) {
       return {
         status: "inconclusive",
         code: "mcp_gate",
@@ -211,14 +212,17 @@ export function assessNativeResumeProbe(
         detail: "Codex is waiting for hook trust approval before the session can become interactive.",
       };
     }
-    if (looksLikeCodexTui(paneContent)) {
+    // Only the current-format panel can override TUI evidence. Legacy text
+    // retains its existing position after the TUI check, including scrollback.
+    const currentTrustPrompt = looksLikeCurrentCodexTrustPrompt(paneContent);
+    if (!currentTrustPrompt && looksLikeCodexTui(paneContent)) {
       return {
         status: "resumed",
         code: "active_runtime",
         detail: "Codex is running with an active interactive TUI in the probe pane.",
       };
     }
-    if (looksLikeCodexTrustPrompt(paneContent)) {
+    if (currentTrustPrompt || looksLikeCodexTrustPrompt(paneContent)) {
       return {
         status: "inconclusive",
         code: "trust_gate",
@@ -400,11 +404,7 @@ function looksLikeCodexTui(paneContent: string): boolean {
   // A custom row must not make an unresolved trust/update panel disappear.
   const hasCustomModelFooter = !looksLikeCodexTrustPrompt(current)
     && !hasCodexUpdateHeader(current) && !current.includes("Updating Codex")
-    && recentLines.split("\n").some((line) => {
-      const fields = line.trim().split(" · ");
-      return /^[ \t]{2,}\S/.test(line) && fields.length > 1
-        && fields.some((field) => /^gpt-\d[\w.-]*(?: [\w-]+)?$/i.test(field));
-    });
+    && recentLines.split("\n").some(isCodexModelFooterLine);
   return hasPromptLine && (current.includes("OpenAI Codex (v") || hasModelFooter || hasCustomModelFooter);
 }
 
@@ -430,8 +430,34 @@ function looksLikeCodexAuthRefusal(paneContent: string): boolean {
 }
 
 function looksLikeCodexTrustPrompt(paneContent: string): boolean {
+  // Preserve legacy wording semantics, including scrollback matching.
   return paneContent.includes("Do you trust the contents of this directory?")
     && paneContent.includes("Yes, continue");
+}
+
+function isCodexModelFooterLine(line: string): boolean {
+  // Preserve the existing default-footer shape, including multiple modifiers.
+  if (/^\s{2,}gpt-[^\n]+ · [^\n]+$/.test(line)) return true;
+  const fields = line.trim().split(" · ");
+  return /^[ \t]{2,}\S/.test(line) && fields.length > 1
+    && fields.some((field) => /^gpt-\d[\w.-]*(?: [\w-]+)?$/i.test(field));
+}
+
+function looksLikeCurrentCodexTrustPrompt(paneContent: string): boolean {
+  const headings = [...paneContent.matchAll(/^[ \t]*Trust this folder\?/gm)];
+  // A trailing partial redraw must not erase the latest complete panel.
+  for (let index = headings.length - 1; index >= 0; index--) {
+    const heading = headings[index]!;
+    const start = heading.index! + heading[0].length;
+    const panel = paneContent.slice(start, headings[index + 1]?.index);
+    const choice = /^[ \t]*(?:[›»]\s*)?\d+\.\s+Trust and continue[ \t]*$/m.exec(panel);
+    if (!choice) continue;
+    const afterChoice = paneContent.slice(start + choice.index + choice[0].length);
+    return !hasCodexComposer(afterChoice)
+      && !/(^|\n)\s{2,}gpt-[^\n]+ · [^\n]+(?:\n|$)/.test(afterChoice)
+      && !afterChoice.split("\n").some(isCodexModelFooterLine);
+  }
+  return false;
 }
 
 function looksLikeCodexHookReviewPrompt(paneContent: string): boolean {
