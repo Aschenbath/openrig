@@ -317,6 +317,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // Only the explicit selection overrides a pane rc or the legacy PID-home
   // reader. The resolved default remains the writer/network-reader/session root.
   const dbPath = opts?.dbPath ?? ":memory:";
+  const seatDbPath = dbPath === ":memory:" ? dbPath : nodePath.resolve(dbPath);
   const databaseWarnings = await daemonDatabaseWarnings(dbPath, OPENRIG_HOME,
     process.env.OPENRIG_DB === dbPath ? "OPENRIG_DB" : process.env.RIGGED_DB === dbPath ? "RIGGED_DB" : undefined);
   for (const warning of databaseWarnings) console.warn(`Warning: ${warning}`);
@@ -614,6 +615,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const launchSessionEnv: Record<string, string | undefined> = {
     PATH: process.env.PATH,
     OPENRIG_HOME,
+    OPENRIG_DB: seatDbPath,
+    TMUX_TMPDIR: process.env.TMUX_TMPDIR,
     OPENRIG_PORT: openRigPort,
     OPENRIG_HOST: openRigHost,
     OPENRIG_URL: resolvedActivityHookUrl,
