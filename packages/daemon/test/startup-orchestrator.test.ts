@@ -4,7 +4,7 @@ import { createFullTestDb } from "./helpers/test-app.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
-import { StartupOrchestrator, type StartupInput } from "../src/domain/startup-orchestrator.js";
+import { StartupOrchestrator, isRecoverableStartupFailure, type StartupInput, type StartupResult } from "../src/domain/startup-orchestrator.js";
 import type { RuntimeAdapter, NodeBinding, ResolvedStartupFile, ProjectionResult, StartupDeliveryResult, ReadinessResult } from "../src/domain/runtime-adapter.js";
 import { resolveConcreteHint } from "../src/domain/runtime-adapter.js";
 import type { ProjectionPlan } from "../src/domain/projection-planner.js";
@@ -768,8 +768,11 @@ describe("StartupOrchestrator", () => {
         ownerRoot: "/fixture", deliveryHint: "send_text", required: true, appliesOn: ["fresh_start", "restore"] }],
       startupActions: [source === "initial_identity" ? makeIdentityAction() : makeAction({ type: "send_text", value: "Read the project instructions." })],
     }));
+    // A fresh start's refused turn wasn't read, so its context stays pending for `rig seat continue`; a restore's doesn't.
     expect(result).toMatchObject({ ok: false, startupStatus: "attention_required",
-      errors: [expect.stringContaining("workspace trust approval")] });
+      errors: source === "restore_preload" ? [expect.stringContaining("workspace trust approval")] : [
+        expect.stringContaining("workspace trust approval"), expect.stringContaining("hasn't read its startup context"),
+        expect.stringContaining("rig seat continue")] });
     expect(adapter.checkReady).toHaveBeenCalledTimes(2);
     expect(t.sendText).toHaveBeenCalledTimes(1);
     expect(t.sendKeys).toHaveBeenCalledTimes(1); // no extra Enter into the trust menu
@@ -793,6 +796,157 @@ describe("StartupOrchestrator", () => {
     const event = db.prepare("SELECT payload FROM events WHERE node_id = ? AND type = 'node.startup_ready'").get(seed.nodeId) as { payload: string };
     expect(JSON.parse(event.payload).submission).toMatchObject({ status: "unverified" });
     expect(tmux.killSession).not.toHaveBeenCalled();
+  });
+
+  describe("a startup turn the runtime refuses (an expired login)", () => {
+    const files: ResolvedStartupFile[] = ["role.md", "a.md", "b.md"].map((path) => ({
+      path, absolutePath: `/fixture/${path}`, ownerRoot: "/fixture", deliveryHint: "send_text" as const, required: true,
+      appliesOn: ["fresh_start" as const, "restore" as const],
+    }));
+    const LOGIN: ReadinessResult = { ready: false, code: "login_required", reason: "Claude refused the request: Login expired · Please run /login" };
+    const CONTINUE = "The seat hasn't read its startup context. Continuing delivers the whole startup again, the refused turn included.";
+    const read = (path: string) => {
+      if (path.endsWith("unreadable.md")) throw new Error("EACCES: permission denied");
+      return `Contents of ${nodePath.basename(path)}`;
+    };
+    const sent = (typed: string[]) => typed.map((text) => text.match(/Contents of (\S+)/)?.[1] ?? text);
+    // The adapter's own loop: read each file, send it through the orchestrator's checked send, and collect a required
+    // file's error and go on (claude-code-adapter deliverStartup).
+    const deliverStartup: RuntimeAdapter["deliverStartup"] = async (pending, _binding, send) => {
+      const failed: Array<{ path: string; error: string }> = [];
+      for (const file of pending) {
+        try { await send?.(read(file.absolutePath)); } catch (err) { if (file.required) failed.push({ path: file.path, error: (err as Error).message }); }
+      }
+      return { delivered: pending.length - failed.length, failed };
+    };
+    function harness(readiness: (typed: string[]) => ReadinessResult, enterFails: (typed: string[]) => boolean = () => false) {
+      const typed: string[] = [];
+      const t = mockTmux({ sendText: vi.fn(async (_session: string, text: string) => { typed.push(text); return { ok: true as const }; }),
+        sendKeys: vi.fn(async () => enterFails(typed) ? { ok: false as const, code: "unknown", message: "tmux: Enter failed" } : { ok: true as const }) });
+      const adapter = mockAdapter({ deliverStartup: vi.fn(deliverStartup), checkReady: vi.fn(async () => readiness(typed)) });
+      return { typed, orchestrator: createOrchestrator({ tmux: t, readFile: read }), adapter };
+    }
+    const errorsOf = (result: StartupResult) => result.ok ? [] : result.errors;
+    const readyEvents = (nodeId: string) => db.prepare("SELECT count(*) AS n FROM events WHERE node_id = ? AND type = 'node.startup_ready'").get(nodeId);
+
+    it("sends nothing more, holds the rest as owed, and a continuation delivers the whole startup in order after sign-in", async () => {
+      const seed = seedSession();
+      let loggedIn = false;
+      const { typed, orchestrator, adapter } = harness((t) => t.length > 0 && !loggedIn ? LOGIN : { ready: true });
+      const failed = await orchestrator.startNode(makeInput(seed, { adapter, resolvedStartupFiles: files, startupActions: [makeIdentityAction()] }));
+
+      expect(sent(typed)).toEqual(["role.md"]); // only the refused first turn (identity + role.md)
+      expect(failed).toMatchObject({ ok: false, startupStatus: "attention_required" });
+      expect(errorsOf(failed)).toEqual([LOGIN.reason, `2 later startup inputs weren't sent. ${CONTINUE}`,
+        "After resolving it in r01-impl, run: rig seat continue 'r01-impl'"]);
+      expect(orchestrator.pendingStartupContext(seed.nodeId, seed.sessionId)).toMatchObject({ mode: "fresh" });
+      expect(readyEvents(seed.nodeId)).toEqual({ n: 0 });
+
+      loggedIn = true;
+      typed.length = 0;
+      const continued = await orchestrator.startNode(makeInput(seed, { adapter, resolvedStartupFiles: files,
+        startupActions: [makeIdentityAction()], skipHarnessLaunch: true, continueFreshStartup: true }));
+      expect(continued).toMatchObject({ ok: true, startupStatus: "ready" });
+      expect(sent(typed)).toEqual(["role.md", "a.md", "b.md"]);
+    });
+
+    it("doesn't offer continuing once a one-shot action ran, names the fresh launch, and is never marked ready later", async () => {
+      const seed = seedSession();
+      const { typed, orchestrator, adapter } = harness((t) => t.includes("/setup-once") ? LOGIN : { ready: true });
+      const result = await orchestrator.startNode(makeInput(seed, { adapter, resolvedStartupFiles: files, startupActions: [
+        makeIdentityAction(),
+        makeAction({ value: "/setup-once", idempotent: false, phase: "after_files", appliesOn: ["fresh_start"] }),
+        makeAction({ value: "/later", phase: "after_ready", appliesOn: ["fresh_start"] }),
+      ] }));
+
+      expect(sent(typed)).toEqual(["role.md", "a.md", "b.md", "/setup-once"]);
+      expect(result).toMatchObject({ ok: false, startupStatus: "attention_required" });
+      expect(errorsOf(result)).toEqual([LOGIN.reason, "1 later startup input wasn't sent. The seat hasn't read all of its startup context, "
+        + "and continuing isn't offered: a one-shot startup action already ran and must not run twice. "
+        + "To deliver it, launch the seat fresh: rig seat launch 'r01-impl' --fresh --stop --reason \"<why>\"."]);
+      expect(orchestrator.pendingStartupContext(seed.nodeId, seed.sessionId)).toBeNull();
+      expect(isRecoverableStartupFailure(db, seed.nodeId, seed.sessionId)).toBe(false); // a later reconcile can't mark it ready
+      expect(readyEvents(seed.nodeId)).toEqual({ n: 0 });
+    });
+
+    it("counts a one-shot whose text was typed but whose Enter failed, so continuing isn't offered", async () => {
+      const seed = seedSession();
+      const lastIsSetup = (t: string[]) => t.at(-1) === "/setup-once";
+      const { typed, orchestrator, adapter } = harness((t) => t.includes("/setup-once") ? LOGIN : { ready: true }, lastIsSetup);
+      const result = await orchestrator.startNode(makeInput(seed, { adapter, resolvedStartupFiles: files, startupActions: [
+        makeIdentityAction(),
+        makeAction({ value: "/setup-once", idempotent: false, phase: "after_files", appliesOn: ["fresh_start"] }),
+        makeAction({ value: "/later", phase: "after_files", appliesOn: ["fresh_start"] }),
+      ] }));
+
+      expect(sent(typed)).toEqual(["role.md", "a.md", "b.md", "/setup-once"]);
+      expect(result).toMatchObject({ ok: false, startupStatus: "attention_required" });
+      expect(errorsOf(result)).toEqual([LOGIN.reason, "Action failed (slash_command): tmux: Enter failed",
+        expect.stringMatching(/^1 later startup input wasn't sent\. .*a one-shot startup action already ran and must not run twice/)]);
+      expect(orchestrator.pendingStartupContext(seed.nodeId, seed.sessionId)).toBeNull();
+      expect(isRecoverableStartupFailure(db, seed.nodeId, seed.sessionId)).toBe(false);
+    });
+
+    it("keeps a resumed conversation and never tells it to relaunch blank", async () => {
+      const seed = seedSession();
+      const { typed, orchestrator, adapter } = harness((t) => t.length > 0 ? LOGIN : { ready: true });
+      const result = await orchestrator.startNode(makeInput(seed, { adapter, isRestore: true, resumeToken: "existing-token",
+        resolvedStartupFiles: files.slice(0, 2) }));
+
+      expect(sent(typed)).toEqual(["role.md"]);
+      expect(result).toMatchObject({ ok: false, startupStatus: "attention_required" });
+      expect(errorsOf(result)).toEqual([LOGIN.reason,
+        "1 later startup input wasn't sent. The seat's conversation is kept, but it hasn't read that input; continuing isn't offered for a resumed start."]);
+      expect(errorsOf(result).join("\n")).not.toContain("--fresh");
+      expect(orchestrator.pendingStartupContext(seed.nodeId, seed.sessionId)).toBeNull();
+      expect(isRecoverableStartupFailure(db, seed.nodeId, seed.sessionId)).toBe(false);
+    });
+
+    it("keeps the hold when a later file can't be read, listing that error beside it", async () => {
+      const seed = seedSession();
+      const withUnreadable = [files[0]!, files[1]!, { ...files[2]!, path: "unreadable.md", absolutePath: "/fixture/unreadable.md" }];
+      const { typed, orchestrator, adapter } = harness((t) => t.length > 0 ? LOGIN : { ready: true });
+      const result = await orchestrator.startNode(makeInput(seed, { adapter, resolvedStartupFiles: withUnreadable, startupActions: [makeIdentityAction()] }));
+
+      expect(sent(typed)).toEqual(["role.md"]);
+      expect(result).toMatchObject({ ok: false, startupStatus: "attention_required" });
+      expect(errorsOf(result)).toEqual([LOGIN.reason, "Post-launch file delivery failed: unreadable.md: EACCES: permission denied",
+        `1 later startup input wasn't sent. ${CONTINUE}`, "After resolving it in r01-impl, run: rig seat continue 'r01-impl'"]);
+      expect(orchestrator.pendingStartupContext(seed.nodeId, seed.sessionId)).toMatchObject({ mode: "fresh" });
+    });
+
+    it("holds a refused only turn too, and continuing delivers it after sign-in", async () => {
+      const seed = seedSession();
+      let loggedIn = false;
+      const { typed, orchestrator, adapter } = harness((t) => t.length > 0 && !loggedIn ? LOGIN : { ready: true });
+      const failed = await orchestrator.startNode(makeInput(seed, { adapter, startupActions: [makeIdentityAction()] }));
+
+      expect(typed).toHaveLength(1);
+      expect(failed).toMatchObject({ ok: false, startupStatus: "attention_required" });
+      expect(errorsOf(failed)).toEqual([LOGIN.reason, CONTINUE, "After resolving it in r01-impl, run: rig seat continue 'r01-impl'"]);
+      expect(orchestrator.pendingStartupContext(seed.nodeId, seed.sessionId)).toMatchObject({ mode: "fresh" });
+
+      loggedIn = true;
+      typed.length = 0;
+      const continued = await orchestrator.startNode(makeInput(seed, { adapter, startupActions: [makeIdentityAction()],
+        skipHarnessLaunch: true, continueFreshStartup: true }));
+      expect(continued).toMatchObject({ ok: true, startupStatus: "ready" });
+      expect(typed).toHaveLength(1);
+      expect(typed[0]).toContain("OpenRig session identity:");
+    });
+
+    it.each([
+      ["ready", (): ReadinessResult => ({ ready: true })],
+      ["not ready with no attention code", (): ReadinessResult => ({ ready: false, code: "awaiting_runtime", reason: "still drawing" })],
+      ["unreadable", (): ReadinessResult => { throw new Error("capture failed"); }],
+    ])("sends everything as before when the read between sends is %s", async (_label, between) => {
+      const seed = seedSession();
+      const { typed, orchestrator, adapter } = harness((t) => t.length > 0 ? between() : { ready: true });
+      const result = await orchestrator.startNode(makeInput(seed, { adapter, resolvedStartupFiles: files, startupActions: [makeIdentityAction()] }));
+      expect(result).toMatchObject({ ok: true, startupStatus: "ready" });
+      expect(sent(typed)).toEqual(["role.md", "a.md", "b.md"]);
+      expect(orchestrator.pendingStartupContext(seed.nodeId, seed.sessionId)).toBeNull();
+    });
   });
 
   it("records the exact adapter-returned launch effect only after successful managed launch", async () => {
@@ -1474,11 +1628,8 @@ describe("StartupOrchestrator", () => {
     const seed = seedSession();
 
     // First attempt: fails during action (non-idempotent action executes then something else fails)
-    const failAdapter = mockAdapter({
-      checkReady: vi.fn()
-        .mockResolvedValueOnce({ ready: true }) // first attempt: ready
-        .mockResolvedValueOnce({ ready: true }), // retry: ready
-    });
+    // Ready on both attempts. Readiness is also read between startup sends (a refused turn holds the rest).
+    const failAdapter = mockAdapter({ checkReady: vi.fn(async () => ({ ready: true })) });
     // OPR.0.4.3.06 — text-aware mock (robust to the extra orientation-challenge
     // send on fresh continuity): everything succeeds except the FIRST /configure
     // (attempt 1's second action), which fails as before.
