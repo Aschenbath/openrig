@@ -26,8 +26,8 @@ import { shellQuote } from "../adapters/shell-quote.js";
 import { observeClaudeResumeLaunch, type ClaudeLaunchedProcess, type NativeProcessLister } from "./native-process-lineage.js";
 import { CommunityHarnessRuntimeAdapter } from "../adapters/community-harness-runtime-adapter.js";
 import { join } from "node:path";
-import { readFootprintAnswer, routerLineSkipReason, type FootprintAnswer, type RouterLineWriteResult } from "./footprint-choice.js";
-import { describeSkillRouterFootprint, refusedSeatSkillsRootForNode, seatCatalogKeptNote, seatRouterKeptNote, seatSkillPathsForNode, seatSkillPluginDirForNode, writeSeatSkillCatalog, writeSeatSkillRouter } from "./seat-skill-storage.js";
+import { guidanceFileIsLink, readFootprintAnswer, readGuidanceFile, routerLineSkipReason, type FootprintAnswer, type RouterLineWriteResult } from "./footprint-choice.js";
+import { SEAT_SKILLS_BOOTSTRAP_BLOCK_ID, describeSkillRouterFootprint, seatSkillsLineEdited, refusedSeatSkillsRootForNode, seatCatalogKeptNote, seatRouterKeptNote, seatSkillPathsForNode, seatSkillPluginDirForNode, writeSeatSkillCatalog, writeSeatSkillRouter } from "./seat-skill-storage.js";
 import { recordConversationPromptForNode, recordForkConversationPromptForNode, seatLaunchAdditionsForLaunch, systemPromptPendingNoteForNode } from "./seat-launch-additions.js";
 
 // Expanded startup text can put the current input marker above 50 scrollback lines.
@@ -164,7 +164,7 @@ export function isRecoverableStartupFailure(db: Database.Database, nodeId: strin
 /** The seat-skills bootstrap line among a seat's startup files: the built-in guidance merged into its managed block
  *  (never the Codex catalog, which shares the logical name but is sent as text). */
 export function isSeatSkillsBootstrapLine(file: Pick<ResolvedStartupFile, "path" | "deliveryHint">): boolean {
-  return file.path === "openrig-seat-skills.md" && file.deliveryHint === "guidance_merge";
+  return file.path === SEAT_SKILLS_BOOTSTRAP_BLOCK_ID && file.deliveryHint === "guidance_merge";
 }
 
 export interface StartupInput {
@@ -484,7 +484,15 @@ export class StartupOrchestrator {
       if (target) {
         const skip = routerLineSkipReason(answer);
         if (skip) routerLine = { answer, files: [{ path: target, outcome: "skipped", reason: skip }] };
-        else {
+        else if (guidanceFileIsLink(target)) {
+          // A linked guidance file is someone's layout, often a file outside the project: the line isn't written through it.
+          routerLine = { answer, files: [{ path: target, outcome: "linked" }] };
+          warnings.push(`seat_skills_line_linked: ${target} is a link, so the line wasn't written through it; the seat started without it`);
+        } else if (seatSkillsLineEdited(readGuidanceFile(target))) {
+          // Someone edited the line: a start leaves their block as it is, as rig down does.
+          routerLine = { answer, files: [{ path: target, outcome: "edited" }] };
+          warnings.push(`seat_skills_line_edited: ${target} holds an edited seat-skills line, so this start left it as it is`);
+        } else {
           try {
             // The saved line is optional, and the adapters swallow an optional file's write error; for this one isolated
             // call, mark it required so the adapter reports the real error, which is handled here without failing the start.
