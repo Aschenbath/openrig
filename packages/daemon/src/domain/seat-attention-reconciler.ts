@@ -427,6 +427,15 @@ export class SeatAttentionReconciler {
     if (derivedOutcome?.source === "restore.completed") {
       const reconcile = this.deps.reconcileRestoreOutcome;
       if (!reconcile) {
+        eventBus.emit({
+          type: "seat.attention_clear_refused",
+          rigId: session.rigId,
+          nodeId: session.nodeId,
+          sessionId: session.id,
+          sessionName,
+          attentionClass: "restore_outcome",
+          code: "strict_reconciler_unavailable",
+        });
         return {
           ok: false,
           code: "not_demonstrably_responsive",
