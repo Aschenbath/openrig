@@ -5,7 +5,7 @@ import {compactionRoutes} from '../src/routes/compaction.js';
 import {mkdtempSync, mkdirSync, writeFileSync, renameSync, rmSync, readFileSync, symlinkSync, lstatSync, statSync, utimesSync, chmodSync, existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join, dirname} from 'node:path';
-import {ClaudeCompactionEnforcer, AUTO_PREP_WAIT_MS_DEFAULT} from '../src/domain/claude-compaction-enforcer.js';
+import {ClaudeCompactionEnforcer, AUTO_PREP_WAIT_MS_DEFAULT, AUTO_RETRY_AFTER_STOP_MS_DEFAULT, MANUAL_PREP_WAIT_MS_DEFAULT} from '../src/domain/claude-compaction-enforcer.js';
 import {SessionTransport} from '../src/domain/session-transport.js';
 import {SeatDeliveryGuard} from '../src/domain/seat-delivery-guard.js';
 import {TmuxAdapter} from '../src/adapters/tmux.js';
@@ -16,7 +16,7 @@ import {migrate} from '../src/db/migrate.js';
 const seat='writer@demo', input={sessionName:seat,runtime:'claude-code',usedPercentage:90};
 const homes:string[]=[];
 afterEach(()=>{vi.restoreAllMocks();for(const h of homes.splice(0))rmSync(h,{recursive:true,force:true});});
-function fixture(manualPrepWaitMs=1000,guardDb?:Database.Database){
+function fixture(manualPrepWaitMs:number|null=1000,guardDb?:Database.Database){
  const home=mkdtempSync(join(tmpdir(),'compaction-preparation-'));homes.push(home);
  let clock=10000,generation='generation-one',activity='idle';
  let onSleep:(()=>Promise<void>)|undefined;
@@ -32,7 +32,7 @@ function fixture(manualPrepWaitMs=1000,guardDb?:Database.Database){
  (transport as any).classifySendReadiness=async()=>({state:activity,reason:'fixture',evidenceSource:'fixture'});
  (transport as any).diagnoseProducerLink=async()=> 'fixture';
  const settings={resolveClaudeCompactionPolicy:()=>policy};
- const e=new ClaudeCompactionEnforcer(settings as any,transport,{openrigHome:home,manualPrepWaitMs,now:()=>clock,sleep:async(ms)=>{clock+=ms;await onSleep?.();},resolveOccupantGeneration:()=>generation});
+ const e=new ClaudeCompactionEnforcer(settings as any,transport,{openrigHome:home,...(manualPrepWaitMs===null?{}:{manualPrepWaitMs}),now:()=>clock,sleep:async(ms)=>{clock+=ms;await onSleep?.();},resolveOccupantGeneration:()=>generation});
  return{e,transport,tmux,guard,settings,onSleep:(fn:()=>Promise<void>)=>{onSleep=fn;},writes,keys,policy,home,clock:()=>clock,advance:(ms:number)=>{clock+=ms;},generation:(g:string)=>{generation=g;},activity:(s:string)=>{activity=s;}};
 }
 function stageMap(f:ReturnType<typeof fixture>,suffix=''){
@@ -67,6 +67,38 @@ for(const end of ['expiry','cancel','disable','replacement'])it(`${end} disarms;
  await f.e.maybeAutoCompact(input);await f.e.maybeAutoCompact(input);
  expect(compacts(f)).toHaveLength(0);expect(f.writes).toHaveLength(1);expect(f.e.getPreparationState(seat)?.status).toBe('stopped');
  expect(existsSync(f.e.getPreparationState(seat)!.mapPath)).toBe(false);
+});
+for(const end of ['expiry','disable','replacement'])it(`after ${end}, automatic preparation starts again once the retry cooldown has passed`,async()=>{
+ const f=fixture();await f.e.maybeAutoCompact(input);const first=f.e.getPreparationState(seat)!.attemptId;
+ await f.e.maybeAutoCompact({...input,usedPercentage:20});
+ if(end==='expiry')f.advance(AUTO_PREP_WAIT_MS_DEFAULT+1);
+ if(end==='disable')f.policy.enabled=false;
+ if(end==='replacement')f.generation('generation-two');
+ f.e.reconcilePreparations();f.policy.enabled=true;
+ await f.e.maybeAutoCompact(input);expect(f.writes).toHaveLength(1);
+ f.advance(AUTO_RETRY_AFTER_STOP_MS_DEFAULT-1);await f.e.maybeAutoCompact(input);expect(f.writes).toHaveLength(1);
+ f.advance(1);await f.e.maybeAutoCompact(input);
+ const next=f.e.getPreparationState(seat)!;expect(next.attemptId).not.toBe(first);
+ expect(next).toMatchObject({mode:'automatic',status:'waiting',delivery:'delivered'});expect(f.writes).toHaveLength(2);expect(compacts(f)).toHaveLength(0);
+ stageMap(f);await f.e.maybeAutoCompact(input);expect(compacts(f)).toHaveLength(1);
+});
+it('a cancel after a stop keeps automatic preparation off after the retry cooldown',async()=>{
+ const f=fixture();await f.e.maybeAutoCompact(input);f.advance(AUTO_PREP_WAIT_MS_DEFAULT+1);f.e.reconcilePreparations();
+ expect(f.e.getPreparationState(seat)?.status).toBe('stopped');f.e.cancelPreparation(seat);
+ f.advance(AUTO_RETRY_AFTER_STOP_MS_DEFAULT+1);await f.e.maybeAutoCompact(input);
+ expect(f.writes).toHaveLength(1);expect(f.e.getPreparationState(seat)?.status).toBe('stopped');
+});
+it('an explicit cancel keeps automatic preparation off after the retry cooldown',async()=>{
+ const f=fixture();await f.e.maybeAutoCompact(input);f.e.cancelPreparation(seat);
+ f.advance(AUTO_RETRY_AFTER_STOP_MS_DEFAULT+1);await f.e.maybeAutoCompact(input);
+ expect(f.writes).toHaveLength(1);expect(f.e.getPreparationState(seat)?.status).toBe('stopped');
+});
+it('a stopped manual preparation holds automatic preparation only until the retry cooldown has passed',async()=>{
+ const f=fixture();expect(await f.e.triggerManualCompact(input,{operatorInitiated:true})).toMatchObject({triggered:false,reason:'preparation_incomplete'});
+ expect(f.e.getPreparationState(seat)).toMatchObject({mode:'manual',status:'stopped'});
+ const sent=f.writes.length;await f.e.maybeAutoCompact(input);expect(f.writes).toHaveLength(sent);
+ f.advance(AUTO_RETRY_AFTER_STOP_MS_DEFAULT);await f.e.maybeAutoCompact(input);
+ expect(f.e.getPreparationState(seat)).toMatchObject({mode:'automatic',status:'waiting'});expect(f.writes).toHaveLength(sent+1);
 });
 it('deadline begins when prep delivery returns, not before its await',async()=>{
  const f=fixture();const original=f.tmux.sendKeys.getMockImplementation()!;f.tmux.sendKeys.mockImplementationOnce(async(...args)=>{f.advance(60000);return original(...args);});
@@ -123,7 +155,9 @@ for(const mapBeforeRise of [true,false])it(`threshold dip retains the same attem
  if(!mapBeforeRise){expect(compacts(f)).toHaveLength(0);expect(f.writes).toHaveLength(1);stageMap(f);await f.e.maybeAutoCompact(input);}
  await f.e.maybeAutoCompact(input);
  expect(f.e.getPreparationState(seat)).toMatchObject({attemptId:original.attemptId,deadlineAt:original.deadlineAt,status:'compact-sent'});
- expect(f.writes.filter(t=>!t.startsWith('/compact'))).toHaveLength(1);expect(compacts(f)).toHaveLength(1);
+ // A high tick now delivers the owed boundary; it must not create another preparation/map.
+ expect(f.writes.filter(t=>t.includes('automatic compaction preparation is now required'))).toHaveLength(1);
+ expect(f.writes.at(-1)).toContain('OpenRig post-compaction turn boundary.');expect(compacts(f)).toHaveLength(1);
 });
 for(const boundary of ['writeFile','load-buffer','key-list'])it(`actual tmux adapter checks cancellation after ${boundary} await`,async()=>{
  const f=fixture();await f.e.maybeAutoCompact(input);stageMap(f);
@@ -172,6 +206,10 @@ it('uncertain compact receipt never replays an already submitted command',async(
  await f.e.maybeAutoCompact(input);f.advance(60_001);
  await f.e.maybeAutoCompact(input);await f.e.maybeAutoCompact(input);
  expect(compacts(f)).toHaveLength(1);expect(f.e.getPreparationState(seat)?.status).toBe('stopped');
+ // Past the retry cooldown too: a /compact that may have run is never followed by a fresh preparation.
+ const stopped=f.e.getPreparationState(seat)!.attemptId;const sent=f.writes.length;
+ f.advance(AUTO_RETRY_AFTER_STOP_MS_DEFAULT+1);await f.e.maybeAutoCompact(input);await f.e.maybeAutoCompact(input);
+ expect(compacts(f)).toHaveLength(1);expect(f.writes).toHaveLength(sent);expect(f.e.getPreparationState(seat)?.attemptId).toBe(stopped);
 });
 
 it('skip-map cannot bypass typing guard or a changed occupant',async()=>{
@@ -267,7 +305,8 @@ for(const expiry of ['missing map','idle after completed map'])it(`route reports
   c.set('compactionEnforcer' as never,f.e);
   c.set('sessionTransport' as never,f.transport);
   c.set('contextUsageStore' as never,{getForNode:()=>({availability:'known',usedPercentage:4})});
-  c.set('db' as never,{prepare:()=>({get:()=>({node_id:'node-one',runtime:'claude-code'})})});
+  // Canonical-only fixture: no bindings table exists for alias normalization.
+  c.set('db' as never,{prepare:(sql:string)=>({get:()=>sql.includes('sqlite_master')?undefined:({node_id:'node-one',runtime:'claude-code'})})});
   await next();
  });
  app.route('/api/compaction',compactionRoutes());
@@ -291,17 +330,18 @@ function routeFixture(f:ReturnType<typeof fixture>, cwd?:string){
   c.set('compactionEnforcer' as never,f.e);
   c.set('sessionTransport' as never,f.transport);
   c.set('contextUsageStore' as never,{getForNode:()=>({availability:'known',usedPercentage:4})});
-  c.set('db' as never,{prepare:()=>({get:()=>({node_id:'node-one',runtime:'claude-code',cwd})})});
+  // Canonical-only fixture: no bindings table exists for alias normalization.
+  c.set('db' as never,{prepare:(sql:string)=>({get:()=>sql.includes('sqlite_master')?undefined:({node_id:'node-one',runtime:'claude-code',cwd})})});
   await next();
  });
  app.route('/api/compaction',compactionRoutes());
  return ()=>app.request('/api/compaction/trigger',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session:seat})});
 }
 
-it('preparation receipt: later permission refusal discloses the delivered prep and its exact attempt',async()=>{
+it('preparation receipt: unresolved permission at deadline discloses the delivered prep and exact attempt',async()=>{
  const f=fixture();f.onSleep(async()=>{stageMap(f);f.activity('needs_input');});
  const res=await routeFixture(f)();const body=await res.json();
- expect(res.status).toBe(409);expect(body.reason).toBe('target_needs_input');
+ expect(res.status).toBe(409);expect(body.reason).toBe('preparation_incomplete');
  expect(body.preparation).toMatchObject({attemptId:f.e.getPreparationState(seat)!.attemptId,delivery:'delivered'});
  expect(body.error).toContain('Preparation was sent');expect(body.error).not.toContain('could not be sent');
  expect(body.error).toContain('disarmed');expect(compacts(f)).toHaveLength(0);expect(f.writes).toHaveLength(1);
@@ -466,4 +506,55 @@ it('legacy fallback parent is created before asking the seat to edit its temp fi
  expect(statSync(dirname(a.mapPath)).isDirectory()).toBe(true);
  writeFileSync(a.mapPath+'.tmp',`# legacy map\n${a.marker}\n`);
  await f.e.maybeAutoCompact(input);expect(compacts(f)).toHaveLength(1);
+});
+
+// Manual preparation owns this bounded attention wait; generic sends still refuse attention.
+it('manual attention clears within the same attempt with one preparation and one compact',async()=>{
+ const f=fixture();let sleeps=0;let id='';
+ f.onSleep(async()=>{
+  expect(f.guard.ownsLifecycle('node-one')).toBe(false);
+  if(++sleeps===1){stageMap(f);id=f.e.getPreparationState(seat)!.attemptId;f.activity('needs_input');}
+  else{expect(f.e.getPreparationState(seat)!.attemptId).toBe(id);f.activity('idle');}
+ });
+ expect((await f.e.triggerManualCompact(input,{operatorInitiated:true})).triggered).toBe(true);
+ expect(f.writes.filter(t=>!t.startsWith('/compact'))).toHaveLength(1);expect(compacts(f)).toHaveLength(1);
+});
+it('manual unresolved attention consumes the deadline and never revives',async()=>{
+ const f=fixture();const start=f.clock();f.onSleep(async()=>{stageMap(f);f.activity('needs_input');});
+ expect(await f.e.triggerManualCompact(input,{operatorInitiated:true})).toMatchObject({triggered:false,reason:'preparation_incomplete'});
+ expect(f.clock()).toBe(start+1000);expect(compacts(f)).toHaveLength(0);
+ f.activity('idle');stageMap(f);await f.e.maybeAutoCompact(input);expect(compacts(f)).toHaveLength(0);
+});
+it('manual default accepts a map after120s but before180s',async()=>{
+ expect(MANUAL_PREP_WAIT_MS_DEFAULT).toBe(180_000);
+ const f=fixture(null);const start=f.clock();f.onSleep(async()=>{if(f.clock()>=start+130_000)stageMap(f);});
+ expect((await f.e.triggerManualCompact(input,{operatorInitiated:true})).triggered).toBe(true);
+ expect(f.e.getPreparationState(seat)!.deadlineAt).toBe(start+180_000);expect(compacts(f)).toHaveLength(1);
+});
+it('manual default refuses a map after180s permanently',async()=>{
+ const f=fixture(null);const start=f.clock();
+ expect(await f.e.triggerManualCompact(input,{operatorInitiated:true})).toMatchObject({triggered:false,reason:'preparation_incomplete'});
+ expect(f.clock()).toBe(start+180_000);stageMap(f);await f.e.maybeAutoCompact(input);expect(compacts(f)).toHaveLength(0);
+});
+for(const end of ['cancel','disable','replacement'])it(`manual attention wait preserves ${end}`,async()=>{
+ const f=fixture();let sleeps=0;f.onSleep(async()=>{
+  if(++sleeps===1){stageMap(f);f.activity('needs_input');return;}
+  if(end==='cancel')f.e.cancelPreparation(seat);
+  if(end==='disable')f.policy.enabled=false;
+  if(end==='replacement')f.generation('generation-two');
+ });
+ expect(await f.e.triggerManualCompact(input,{operatorInitiated:true})).toMatchObject({triggered:false,reason:{cancel:'preparation_cancelled',disable:'disabled',replacement:'stale_generation'}[end]});
+ expect(compacts(f)).toHaveLength(0);expect(f.writes).toHaveLength(1);
+});
+it('manual explicit retry cannot use the stopped attempt marker',async()=>{
+ const f=fixture();await f.e.triggerManualCompact(input,{operatorInitiated:true});const old=f.e.getPreparationState(seat)!;
+ f.onSleep(async()=>{const current=f.e.getPreparationState(seat)!;expect(current.attemptId).not.toBe(old.attemptId);mkdirSync(dirname(current.mapPath),{recursive:true});writeFileSync(current.mapPath+'.tmp',old.marker);});
+ expect((await f.e.triggerManualCompact(input,{operatorInitiated:true})).triggered).toBe(false);expect(compacts(f)).toHaveLength(0);
+});
+it('manual uncertain compact receipt never retries input',async()=>{
+ const f=fixture();f.onSleep(async()=>{stageMap(f);});const send=f.transport.send.bind(f.transport);
+ vi.spyOn(f.transport,'send').mockImplementation(async(...args)=>{const r=await send(...args);if(args[1].startsWith('/compact'))throw new Error('receipt lost');return r;});
+ expect((await f.e.triggerManualCompact(input,{operatorInitiated:true})).triggered).toBe(false);
+ await f.e.maybeAutoCompact(input);await f.e.maybeAutoCompact(input);
+ expect(compacts(f)).toHaveLength(1);expect(f.e.getPreparationState(seat)?.compact).toBe('uncertain');
 });

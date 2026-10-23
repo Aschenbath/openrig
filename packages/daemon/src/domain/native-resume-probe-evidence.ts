@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
-import type { TmuxAdapter } from "../adapters/tmux.js";
+import type { TmuxAdapter, TmuxPane } from "../adapters/tmux.js";
 import type { NativeResumeProbeResult } from "./native-resume-probe.js";
+
+const GEOMETRY_TIMEOUT_MS = 250;
 
 /** Bounded metadata from the exact capture assessed by the probe; never its text or detail. */
 export interface NativeResumeProbeEvidence {
@@ -11,7 +13,7 @@ export interface NativeResumeProbeEvidence {
     lines: number;
     bytes: number;
     sha256: string;
-    /** Geometry observed after the capture; null when the pane cannot be identified. */
+    /** Geometry observed after the capture; null when unavailable within the diagnostic deadline. */
     columns: number | null;
     rows: number | null;
   };
@@ -26,13 +28,19 @@ export async function resumeProbeEvidence(
 ): Promise<NativeResumeProbeEvidence> {
   let columns: number | null = null;
   let rows: number | null = null;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
   const dimension = (value: number | undefined) => Number.isSafeInteger(value) && value! > 0 ? value! : null;
   try {
-    const panes = await tmux.listPanes(target);
+    // Geometry is optional: a stuck tmux read must not hold up an already-decided failure or its event.
+    const panes = await Promise.race([
+      tmux.listPanes(target),
+      new Promise<TmuxPane[]>(resolve => { timeout = setTimeout(() => resolve([]), GEOMETRY_TIMEOUT_MS); }),
+    ]);
     const pane = /^%\d+$/.test(target) ? panes.find(pane => pane.id === target) : panes.length === 1 ? panes[0] : undefined;
     columns = dimension(pane?.width);
     rows = dimension(pane?.height);
   } catch { /* Diagnostics must not replace the original failure when geometry is unavailable. */ }
+  finally { if (timeout !== undefined) clearTimeout(timeout); }
   return {
     status: probe.status,
     code: probe.code,

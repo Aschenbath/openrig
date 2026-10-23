@@ -280,6 +280,7 @@ decisions, and posts its own replies.
   and the machine checks it when it has `OPENRIG_AUTH_BEARER_TOKEN` set.
 - **What the receiving machine trusts:** a relayed event comes from whoever holds that machine's
   daemon token (or, with no token set, anything that can reach its daemon), not from Slack directly, and nothing checks Slack's own signature on it. The
+  credential issued by `rig host pair` is the daemon API bearer, not a relay-only credential; it also authorizes the other daemon write APIs that use that bearer. The
   machine still looks up the sender in its own list of people, but on a relayed event that's no
   proof a person just typed or clicked it in Slack: it trusts the caller for where the event came
   from.
@@ -297,54 +298,130 @@ decisions, and posts its own replies.
   that's down costs one attempt per retry: its other relays wait for the next one. A relay the
   machine keeps refusing is kept and retried with no limit, because dropping it would lose a
   person's message.
+- **Changing forwarding entries is not a drain or cancellation:** relays already retained keep
+  their original host and remain visible in `rig slack status`, even after the last entry is
+  removed. An enabled connector retries them; disabling it pauses retry without deleting them.
+  Let relays finish before removing a forward entry. A zero dead-letter backlog alone does not
+  prove they have drained: it does not count relay HTTP requests still in flight.
 - **Who answered:** every post ends `from <seat> on <machine>`, using the machine's host id (set
   it with `host.name`).
 - **The hub's own channels** are handled on the hub, as before. A channel can be relayed to one
   machine only, and never the hub's own default channel.
+  Messages that match neither forwarding nor an existing thread or channel route fall back locally
+  to `inboundDestination`; `rig slack status` names that policy and destination. These lists do not
+  establish exclusive channel ownership: two machines can still both handle a channel.
+- **Missed messages:** each machine recovers the channels it owns: the hub its own channels, and
+  every other machine its default channel and its channel map's (the hub never recovers a channel
+  it relays). See [Reconnect recovery and status](#reconnect-recovery-and-status).
 - **Not covered yet:** `rig slack verify` on the hub doesn't check the app's membership in relayed
-  channels, and missed-message recovery covers the hub's default channel only.
+  channels.
+
+## Quiet hours for a person (optional)
+
+Quiet hours hold a person's routine asks while they're on, and post them once they end.
+
+- **Set them** with `rig gateway human quiet set <entityId> --daily 22:00-07:00` (every day) or `--until 07:00` (from now
+  until then), with `--tz` for the person's zone. `show` reports whether they're on, `end` ends tonight's early ("I'm back";
+  a daily rule stays for tomorrow), and `clear` removes the rule. A person's mode can set them too (`rig gateway human
+  mode save … --quiet`).
+- **While quiet is on,** an ask that would post to the person isn't posted and doesn't mention them, whatever their delivery
+  class: it's held, and its row records the hold.
+- **Not held:** an urgent ask, meaning one tagged `escalation` or `wake-escalation` that isn't an update, and the operator's
+  wake-ladder alerts. These reach the person exactly as they would outside quiet. An ask below the posting level is only
+  logged, as at any time.
+- **When quiet ends,** each held ask that never started posts once, on its own, with no mention. One that no longer applies
+  isn't posted, and its row says why: it closed, a newer notification replaced it, its recipient changed, or it's now below
+  the posting level.
+- **A post that may already be in Slack**, confirmed or only partly sent, isn't held: it finishes as itself, in its own
+  thread.
+- **If quiet hours can't be read,** nothing is posted to that person until they can.
 
 ## Reconnect recovery and status
 
 The daemon scans available top-level messages and replies broadcast with **Also send to
-channel** in the configured default channel after a Socket Mode connection and on its
-existing five-minute retry cadence. Broadcast replies keep their thread's routing. Recovered
-tasks say **Recovered after a gap** and show the original Slack posting time.
+channel** in the channels this machine owns: its default channel and its channel map's, except a
+channel it relays to another machine. It also scans replies in the threads it tracks in those
+channels whose root was posted, or which closed, within the last seven days. A root's age is its
+Slack posting time, so rebuilding the thread map doesn't make an old thread eligible again. An old
+thread that closed within seven days is scanned from its root, so this isn't a seven-day history
+limit. Missed replies in older open threads aren't caught up; live delivery is unchanged.
+
+The hub scans after a Socket Mode connection and on its existing five-minute retry cadence. A
+machine the hub relays to scans every five minutes, and recovers only the channels it owns that the
+hub has relayed it an event for. Each such channel's coverage starts when its first relayed event
+arrives, and is kept across restarts, so a restart needs no new event. A channel the machine no
+longer owns isn't scanned, and a machine nothing is relayed to never reads its channels' history.
+
+Broadcast replies keep their thread's routing. Recovered tasks say **Recovered after a gap** and
+show the original Slack posting time. A recovered thread reply lands as a reply in its thread,
+marked late, and never answers a decision, even one still open: the seat reads it and decides. A
+recovered broadcast reply does the same in every channel except the default channel of the machine
+that holds the Socket Mode connection, where it behaves as before; a relayed machine's default
+channel counts as newly covered. A dead-lettered recovered reply keeps that mark when it's retried.
 They use the same sender admission, routing, attachment handling, fixed identity
 and dead-letter path as live messages. A durable dead letter is custody of a
 failed delivery, not successful delivery.
 
 Recovery keeps a per-channel checkpoint across reconnects, restarts and channel
-switches. On upgrade it initializes once from the newest retained accepted
-channel landing; without such evidence it starts at feature adoption. **Older
-history is unknown.** New live messages never move the recovery checkpoint. A
+switches. For the hub's default channel it initializes once from the newest retained accepted
+channel landing; without such evidence it starts at feature adoption. Every other channel starts
+when recovery first adopts it. **Older history is unknown.** A tracked thread's checkpoint starts
+at its root, so its first scan reads the whole thread; replies that already landed are recognized
+and not delivered twice. New live messages never move the recovery checkpoint. A
 partial scan resumes its saved interval; only an exhausted interval advances the
-covered boundary. Each new interval ends five seconds before the local clock to
+covered boundary. The checkpoint moves past a message once it landed, was a duplicate, was
+dead-lettered, was refused because its sender isn't admitted, or was skipped as a kind inbound
+doesn't take (a bot's post, an edit or join, an empty message). Each new interval ends five seconds before the local clock to
 allow recent messages to become visible; larger clock skew or visibility lag is
 not covered by that margin. A corrupt or unreadable checkpoint leaves recovery unavailable
 and preserves the existing file; live inbound continues.
 
-Each pass admits at most four pages, 100 entries and 15 seconds of work, with a
-five-second history-request ceiling. Work already started on a message, such as
+Each pass admits at most four history calls, 100 entries and 15 seconds of work, with a
+five-second request ceiling. Channels and threads take turns within that one budget, so with many
+tracked threads each thread is scanned every few passes; `rig slack status` shows how far behind
+the oldest waiting thread is. Work already started on a message, such as
 an attachment transfer, is not cancelled by these limits or by a stop, and a new
-pass waits for it to finish. Rate limits retain Slack's Retry-After across restart.
+pass waits for it to finish. Rate limits retain Slack's Retry-After across restart, and hold back
+only the method Slack limited (channel history or thread replies).
 Transport and server failures use a five-second backoff unless Slack supplies Retry-After.
 When Slack reports a plan history limit, recovery still lands the available page
 and advances normally, retaining an older-history limitation in status across restarts.
 Missing bot credentials, history scope, membership, retention limits and API
-failures appear as recovery limitations. No additional scope is required to keep
-live delivery working. Non-broadcast thread replies and other channels remain outside
-this recovery scope; global chronological order is not promised. This change does not
-replay intervals already checkpointed before broadcast-reply recovery was added.
+failures appear as recovery limitations. A tracked thread Slack can't find stays incomplete in
+status, with no further call, until its thread mapping changes or the daemon restarts or rewires
+the connector; that isn't proof the thread was deleted. No additional scope is required to keep
+live delivery working. Threads nobody tracks, older open threads, threads closed more than seven
+days ago and other channels remain outside this recovery scope; global chronological order is
+not promised. This change does not replay intervals already checkpointed before broadcast-reply
+recovery was added.
 
 `rig slack status` retains local configuration checks and adds a bounded daemon
-snapshot: socket state/generation, last event, recovery interval/state/reason,
+snapshot: socket state/generation, last event, recovery interval/state/reason for each
+channel, a thread line (tracked, scanned, waiting and why any are backing off or incomplete),
 retry time and accepted/dead-lettered recovery counts since the connector last
-started (they reset when it is enabled or disabled, and when the daemon restarts).
+started, including threads that have since left the window (they reset when it is enabled or disabled, and when the daemon restarts).
 It also reports the durable dead-letter backlog: the retained records for inbound messages,
-reactions and click answers that await retry, counted from both dead-letter files so the number
-survives a restart, and shown as unknown with a reason (and no count) when a file cannot be read.
+reactions and click answers that await retry, including retained relays, counted across all three
+dead-letter files so the number survives a restart. Retry is paused while the connector is disabled.
+If a file cannot be read, status shows unknown with a reason and no count.
 Human-readable coverage and pending bounds use ISO timestamps; JSON keeps Slack timestamps.
 The status read calls no Slack API and starts no scan. If the daemon cannot be
 observed, local configuration remains visible and live state is unknown. A
 connected socket or valid configuration alone does not prove end-to-end delivery.
+
+### Slack rejects a message with `invalid_blocks`
+
+`rig queue show <qitemId> --json` records the failure as
+`class=slack-invalid-blocks error=invalid_blocks` in the delivery transition.
+Slack rejected that message's blocks, so OpenRig retains the notification as
+undelivered and does not post the same payload again, including after a daemon
+restart. The rejection is tied to the rendered payload: corrected content can
+make a new attempt. Network failures, server errors and rate limits still retry
+as before; a timed-out request remains uncertain until reconciliation.
+
+The source seat gets a `slack-undeliverable` queue item explaining the failure.
+Check the evidence links and message content, then send a corrected ask as a new
+queue item. Close the original when you have handled it. If a long ask was split
+into several messages, earlier parts may already be in Slack; the notice says
+when only part of the ask was posted. A failed part never counts as delivery of
+the whole ask.

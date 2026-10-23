@@ -16,6 +16,8 @@ import type { WsLike } from "../src/domain/gateway/slack/socket-inbound.js";
 import { DEFAULT_CONFIG, saveConfig, type SlackConnectorConfig } from "../src/domain/gateway/slack/config.js";
 import { resolveSlackHandle } from "../src/domain/gateway/human-registry.js";
 import { setSelfHostId } from "../src/domain/hosts/fanout-contract.js";
+import { DeadLetterStore } from "../src/domain/gateway/slack/state-store.js";
+import type { SocketEnvelope } from "../src/domain/gateway/slack/inbound.js";
 
 const human = "human-ada@external";
 const registry = { ok: true as const, entities: [{ entityId: "human-ada", class: "human" as const, displayName: "Ada", address: human, connectorBindings: [{ kind: "slack" as const, connectorRef: "primary", secretsRef: "env:SLACK_BOT_TOKEN", role: "primary" as const, handle: "UADA" }], prefs: { deliveryClass: "A" as const } }] };
@@ -51,12 +53,14 @@ describe("one shared Slack app across two machines", () => {
     stops.push(() => vps.wire?.stop()); vps.wire.startServices?.();
   }
 
-  function wireHub(): void {
+  function wireHub(forwardChannels: SlackConnectorConfig["forwardChannels"] = [{ channel: "C0VPS04", host: "vps04" }, { channel: "C0VPSWS", host: "vps04" }], enabled = true): void {
+    hub.wire?.stop();
+    sockets = [];
     const secrets = join(hub.home, "fake.env");
     writeFileSync(secrets, "SLACK_BOT_TOKEN=xoxb-EXAMPLE-fake\nSLACK_APP_TOKEN=xapp-EXAMPLE-fake\n");
     saveConfig({
-      ...DEFAULT_CONFIG, enabled: true, channel: "C0BUILD", inboundDestination: "orch-advisor@v-build", secretsEnvFile: secrets,
-      forwardChannels: [{ channel: "C0VPS04", host: "vps04" }, { channel: "C0VPSWS", host: "vps04" }],
+      ...DEFAULT_CONFIG, enabled, channel: "C0BUILD", inboundDestination: "orch-advisor@v-build", secretsEnvFile: secrets,
+      forwardChannels,
     }, hub.home);
     hub.wire = buildSlackGatewayWire({
       home: hub.home, queueRepo: hub.repo, registry: { loadHumanRegistry: () => registry, resolveSlackHandle },
@@ -150,6 +154,14 @@ describe("one shared Slack app across two machines", () => {
     expect(await answer(hub, "orch-advisor@v-build", row.qitemId, "Seen")).toMatchObject({ channel: "C0BUILD", thread_ts: "730.1" });
   });
 
+  it("reports the local fallback and still routes an unmapped channel to that destination", async () => {
+    expect(hub.wire!.status()).toMatchObject({ inboundRouting: { fallback: "local", destination: "orch-advisor@v-build" } });
+    await say("C0UNMAPPED", "735.1");
+    await vi.waitFor(() => expect(inbound(hub)).toHaveLength(1));
+    expect(inbound(hub)[0]!.destinationSession).toBe("orch-advisor@v-build");
+    expect(inbound(vps)).toEqual([]);
+  });
+
   it("a machine without its own connection reports that it can take relayed events, and how many have arrived", async () => {
     expect(vps.wire!.status()).toMatchObject({ inboundReady: false, relayedInbound: { accepting: true, received: 0 } });
     expect(vps.wire!.status()).not.toHaveProperty("inboundRelayed");
@@ -162,6 +174,27 @@ describe("one shared Slack app across two machines", () => {
     await say("C0VPS04", "740.1", "USTRANGER");
     await new Promise((r) => setTimeout(r, 100));
     expect(inbound(vps)).toEqual([]);
+    expect(inbound(hub)).toEqual([]);
+  });
+
+  it.each(["message", "click", "one-entry-left", "disabled"])("keeps a retained relay visible after removing its mapping, retrying only while enabled (%s)", async (kind) => {
+    const envelope: SocketEnvelope = kind === "click"
+      ? { envelope_id: "retained-click", type: "interactive", payload: { type: "block_actions", channel: { id: "C0VPS04" }, actions: [] } }
+      : { envelope_id: "retained-message", type: "events_api", payload: { event: { type: "message", user: "UADA", text: "retained reply", ts: "970.1", channel: "C0VPS04" } } };
+    const store = new DeadLetterStore<{ host: string; envelope: SocketEnvelope }>(join(hub.home, "state/slack-inbound-forward-deadletter.jsonl"));
+    store.append({ host: "vps04", envelope }, 1);
+    wireHub(kind === "one-entry-left" ? [{ channel: "C0VPSWS", host: "vps04" }] : [], kind !== "disabled");
+    expect(hub.wire!.status()).toMatchObject({ deadLetterBacklog: 1, deadLetterBacklogState: "ok" });
+    if (kind === "disabled") {
+      expect(hub.wire!.status()).toMatchObject({ inboundReady: false, outboundReady: false });
+      expect(store.readAll()).toHaveLength(1);
+      return;
+    }
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.onopen?.();
+    await vi.waitFor(() => expect(store.readAll()).toEqual([]));
+    expect(vps.wire!.status()).toMatchObject({ relayedInbound: { received: 1 } });
+    if (kind !== "click") expect(inbound(vps)).toHaveLength(1);
     expect(inbound(hub)).toEqual([]);
   });
 });

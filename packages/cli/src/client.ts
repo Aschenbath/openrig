@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { assessLocalDaemonOwner, ForeignLocalDaemonError, type LocalDaemonOwner } from "./local-daemon-owner.js";
+export { ForeignLocalDaemonError } from "./local-daemon-owner.js";
 import path from "node:path";
 import { ConfigStore } from "./config-store.js";
 import { getOpenRigHome, readOpenRigEnv } from "./openrig-compat.js";
@@ -109,6 +111,7 @@ export class DaemonResponseError extends Error {
 export interface DaemonResponse<T = unknown> {
   status: number;
   data: T;
+  headers?: Headers;
 }
 
 /**
@@ -131,6 +134,7 @@ interface DaemonRequestOptions {
 }
 
 interface DaemonClientOptions {
+  ownerProbe?: (baseUrl: string, timeoutMs?: number) => Promise<LocalDaemonOwner>;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
 }
@@ -155,6 +159,7 @@ export class DaemonClient {
   readonly baseUrl: string;
   private fetchImpl: typeof fetch = fetch;
   private timeoutMs = 5_000;
+  private ownerProbe: (baseUrl: string, timeoutMs?: number) => Promise<LocalDaemonOwner>;
   /** Set by remoteDaemonClient; absent origin is labelled explicitly on remote requests. */
   originSelfHostId?: string;
   remoteTarget = false;
@@ -213,7 +218,25 @@ export class DaemonClient {
     }
 
     this.fetchImpl = options?.fetchImpl ?? fetch;
+    this.ownerProbe = options?.ownerProbe ?? ((url, timeoutMs) => assessLocalDaemonOwner(url, { fetchImpl: this.fetchImpl, timeoutMs }));
     this.timeoutMs = options?.timeoutMs ?? 5_000;
+  }
+
+  /** Shared with raw CLI data readers. Constructor URLs alone do not establish explicit intent. */
+  localOwnerCheckEnabled(): boolean {
+    if (this.remoteTarget) return false;
+    const explicit = readOpenRigEnv("OPENRIG_URL", "RIGGED_URL");
+    if (explicit && explicit.replace(/\/+$/, "") === this.baseUrl.replace(/\/+$/, "")) return false;
+    let enabled = false;
+    try { enabled = new ConfigStore().resolveWithSource("transport.local_user_guard").value === true; }
+    catch { /* Unreadable owner evidence/config is not a new default-on refusal. */ }
+    return enabled;
+  }
+
+  async assertLocalOwner(timeoutMs = 1000): Promise<void> {
+    if (!this.localOwnerCheckEnabled()) return;
+    const owner = await this.ownerProbe(this.baseUrl, timeoutMs);
+    if (owner.state === "foreign") throw new ForeignLocalDaemonError(this.baseUrl, owner);
   }
 
   async get<T = unknown>(path: string, options?: DaemonRequestOptions): Promise<DaemonResponse<T>> {
@@ -266,6 +289,8 @@ export class DaemonClient {
   }
 
   private async fetch(path: string, init: RequestInit, options?: DaemonRequestOptions, consumeResponse?: (response: Response) => Promise<void>): Promise<Response> {
+    // Diagnostic health/status remains reachable even for a known foreign listener.
+    if (path.split("?")[0] !== "/healthz") await this.assertLocalOwner();
     const timeoutMs = options?.timeoutMs ?? this.timeoutMs;
     if (options?.signal) init = { ...init, signal: options.signal };
     if (options?.headers) {
@@ -333,7 +358,11 @@ export class DaemonClient {
 
   private async requestText(path: string, init: RequestInit, options?: DaemonRequestOptions): Promise<DaemonResponse<string>> {
     let data = "";
-    const res = await this.fetch(path, init, options, async (response) => { data = await response.text(); });
-    return { status: res.status, data };
+    let headers: Headers | undefined;
+    const res = await this.fetch(path, init, options, async (response) => {
+      headers = response.headers;
+      data = await response.text();
+    });
+    return { status: res.status, data, headers };
   }
 }

@@ -8,7 +8,7 @@ daemon-owned retry scheduler. Sibling seats keep their own mode.
 | Mode | Terminal input | When input is unavailable |
 |---|---|---|
 | `off` (default) | Existing delivery and prompt checks | Existing send result |
-| `draft-aware` | Paste into a recognized empty composer; check ownership again before Enter | Immediately retain the original message with the exact refusal reason and ID |
+| `draft-aware` | Paste into a recognized empty composer; check ownership again before Enter | Hold input and retain this attempt for inspection when bookkeeping is available |
 | `hold` | No automatic terminal input, even at an empty prompt | Retain for inspection outside the pane |
 
 Runtime permissions are separate. Recipient and interactive-prompt checks still
@@ -36,13 +36,22 @@ to finish. The API may return HTTP 202 with `pending: true`; wait for
 `pending: false` before relying on the requested mode. Status reports desired
 and effective modes and retains the text `Typing guard: on (hold)` for hold.
 
-A held send immediately returns `outcome: "retained"`, `sent: false`,
-`outboxIds` and its exact reason, such as `draft_input_busy` or
-`draft_input_unknown`. No automatic retry is scheduled, including when the
-caller requested wait-for-idle. The caller can inspect or route the retained work
-and decide when to make a new request. Reusing the same delivery ID reads its
-original result; it does not replay that message. Changing modes, clearing a
-draft, or restarting the daemon also does not flush held records.
+A held send immediately returns `outcome: "retained"`, `sent: false`, its exact
+reason (such as `draft_input_busy`) and the saved attempt's `outboxIds`. No automatic
+retry is scheduled. Each explicit draft-aware request is a new attempt, including
+one with a reused `deliveryId`; the result warns older callers that this field no
+longer deduplicates input. The CLI does not generate a deduplication key.
+
+Clearing a draft, changing modes or restarting does not flush saved messages or
+callbacks. To try again, send a current request: it rechecks the recipient and input.
+A caller abort before paste cancels input; after a write may have started, the
+result preserves that uncertainty rather than claiming nothing was sent.
+
+Bookkeeping is observational. If its write fails, an otherwise valid input attempt
+still proceeds and the response includes a warning instead of a saved receipt.
+Actual transport success stays success; an unknown write stays unknown. If input
+was held and no record could be saved, the response reports failure with `sent:
+false` and the protection reason, rather than claiming durable custody.
 
 Reading never sends. Retirement frees that record's active retention quota while
 preserving evidence; it does not deliver a message or close queue work.
@@ -72,22 +81,34 @@ A large paste can appear as several labels plus a literal tail. The existing
 boundary. That complete rendering must be observed after this operation's paste
 and remain unchanged before Enter. Labels alone do not prove arbitrary content.
 
-| Delivery state | Meaning |
+| Historical delivery state | Meaning |
 |---|---|
-| `sending` | The original IDs have an unresolved write attempt |
-| `held` | No input was written; the original message remains retained or has been retired |
+| `sending` | This saved attempt has an unresolved write outcome |
+| `held` | No input was written; this attempt remains retained or has been retired |
 | `complete` | Transport execution succeeded, including render verification if requested; native consumption is not asserted |
-| `indeterminate` | Input may have occurred or requested render verification failed; no automatic replay |
+| `indeterminate` | Input may have occurred or requested render verification failed |
+| `failed` | A definite failure before input, such as caller cancellation |
 
 Migration `100_typing_guard_modes` extends the existing guard/audit rows and
 adds receipt metadata to the original outbox rows; it creates no tables, retry
 indexes or executable requests. Combined wakes retain each original ID and body.
-A held queue wake stays on the existing queue recovery path. Interrupted writes
-become indeterminate at startup regardless of which recovery component runs first.
+A held queue wake stays on the existing queue recovery path. Interrupted historical
+writes become indeterminate at startup. That history never suppresses a current
+explicit request and is not consulted to determine its result.
+
+At startup, the queue recovery pass retries still-current failed or unconfirmed
+wake notifications. It preserves their original envelopes and warns that delivery
+may repeat. Each notification is attempted once per pass, including coalesced
+wakes; a failed attempt cannot spin in that pass. A no-write failure on a later
+retry does not resolve an earlier unknown delivery. Prior-process claims are
+reconciled before new startup sends can begin. Known deliveries and held or
+retired messages stay untouched. Closed, claimed or reassigned work is not woken,
+and the retry never repeats the queue mutation or a lifecycle action.
 
 The existing retention limits apply: 100 records and 8 MiB per seat, with a 1 MiB
-message limit. New admissions refuse at capacity; already-committed queue intent
-remains durable even if concurrent activation exceeds the limit.
+message limit. Hold mode cannot retain another message at capacity. Draft-aware
+input attempts continue with a bookkeeping warning if a record cannot be saved;
+already-committed queue intent remains durable.
 
 ## Rollback and lifecycle
 
@@ -121,7 +142,25 @@ unchanged; no RigSpec field is required.
 ## Verification scope
 
 Regression tests exercise rollback/re-upgrade, same-value legacy writes, exact
-retained outcomes, restart without replay, unchanged IDs/bodies, trailing spaces,
-numbered bodies, real-menu refusals and multi-placeholder ownership. Native tests
+retained outcomes, current requests after restart, coalesced queue bodies, trailing
+spaces, numbered bodies, real-menu refusals and multi-placeholder ownership. Native tests
 use private real tmux panes with scripted editable composers. These verify the
 transport mechanics; they are not live Claude/Codex provider sessions.
+
+## Watchdog reminders
+
+A currently due watchdog reminder makes a new delivery attempt, including after an interrupted attempt or job
+accounting. Historical outbox receipts do not suppress a lone reminder or prevent it from joining a digest. The
+message tells its recipient that delivery may repeat after an unconfirmed attempt. Its job history records the
+current transport result; an unknown write is not proof that nothing arrived.
+
+The transport still protects approval/question prompts, human drafts and recipient identity. Scheduler timing,
+current parked-row eligibility and stop checks still apply. This changes message retries, not the idempotence of
+structured continuity actions such as creating a cutover baton.
+
+The parked-owner supervisor also retries current obligations despite an earlier failed, unknown or unrecorded attempt.
+A recorded success to the same known occupant waits for a change in its obligations. Rotation includes retained attempts,
+so a held input cannot starve another owner. Interactive prompts stay with the existing prompt-refusal recovery.
+Its own reminders wait while managed compaction owes the turn boundary, restore or audit, including a fresh check
+at the paste and Enter boundary. A stage that begins after paste leaves an honest partial-input result; OpenRig
+does not erase or replay that text. Peer messages and unrelated reminder policies keep their existing behavior.

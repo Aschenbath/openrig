@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { Command } from "commander";
 import { resolveEffectiveHost } from "../host-selection.js";
 import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, terminalAuthHeaders } from "../client.js";
@@ -243,6 +242,7 @@ export function sendCommand(depsOverride?: SendDeps): Command {
     .option("--raw", "Send exact text/keystrokes without the From/To messaging envelope (still guarded against interactive prompts)")
     .option("--dangerously-interact", "DANGEROUS: type an answer as keystrokes into an interactive prompt (implies --raw; requires --reason). Letters can select menu shortcuts; CR/ESC act as keys. Enter is added only for the complete visibly staged answer.")
     .option("--reason <text>", "Why the prompt is being driven (required with --dangerously-interact; recorded in the audit log)")
+    .option("--urgent", "Mark this message urgent: it types at seats whose interruption level holds other messages. Anyone may mark one; the recipient sees who did")
     .option("--host <id>", "Send on a remote host declared in ~/.openrig/hosts.yaml (ssh hosts shell out; http hosts go CLI-direct to the remote daemon)")
     .option("--from <session>", "DEPRECATED + IGNORED (P21 I4). The rendered From:/actor now DERIVES from the transport identity ($OPENRIG_SESSION_NAME, stamped as X-OpenRig-Session) — never a caller-supplied string, which was specimen-5's forgeable surface. Cross-host origin is carried by the relay re-stamping from its authenticated context.")
     .option("--context <ref>", "Deliver a context pack by its path-like ref (e.g. packs/compaction-restore). The resolved content is sent; an oversized ref is flagged as 'walk-sized'.")
@@ -263,6 +263,15 @@ Examples:
 Targeting: a bare seat (single send), OR one of --to / --pod / --rig (fan-out).
 Fan-out reports per-recipient results + an "N/M delivered" summary; one recipient's
 guard refusal does NOT block the others. Each recipient gets its own From/To envelope.
+
+Sender: the From: line names the seat this shell belongs to; from anywhere else
+a message arrives from <unknown sender>. To say who it's from, send a queue item
+with a declared source (recorded as declared; a registered human in
+rig gateway human list gets a reply route):
+  rig queue create --source <you>@external --destination <seat> --summary "<one line>" --body-file <file>
+or join this shell to a seat so its sends carry the seat's name
+(rig attach --help covers adding the shell as a new member):
+  eval "$(rig attach --self --rig <rigId> --node <logicalId> --print-env)"
 
 The two-step send pattern (paste text, wait, submit Enter) is handled
 automatically. By default a send is REFUSED only on POSITIVE evidence the target
@@ -315,7 +324,7 @@ result and verify verdict are the REMOTE's, verbatim. A target of the form
 agent@rig@host is sugar for --host when the suffix is a REGISTERED host id
 (explicit --host > target sugar > persisted selection; a conflict between
 --host and the sugar is an error).`)
-    .action(async (session: string | undefined, text: string | undefined, opts: { to?: string[]; pod?: string; rig?: string; verify?: boolean; force?: boolean; waitForIdle?: string; raw?: boolean; dangerouslyInteract?: boolean; reason?: string; host?: string; from?: string; context?: string; json?: boolean }) => {
+    .action(async (session: string | undefined, text: string | undefined, opts: { to?: string[]; pod?: string; rig?: string; verify?: boolean; force?: boolean; waitForIdle?: string; raw?: boolean; dangerouslyInteract?: boolean; reason?: string; urgent?: boolean; host?: string; from?: string; context?: string; json?: boolean }) => {
       // OPR.0.4.6.MH1 FR-2: selected-host routing — explicit --host wins;
       // else the persisted selection feeds the SHIPPED --host path; no
       // selection = today exactly. OPR.0.4.6.MH4 §4: the raw flag is kept
@@ -496,8 +505,9 @@ agent@rig@host is sugar for --host when the suffix is a REGISTERED host id
       let res: { status: number; data: Record<string, unknown> };
       try {
         res = await client.post<Record<string, unknown>>("/api/transport/send", {
-          session, text: outboundText, deliveryId: randomUUID(), verify: opts.verify, force: opts.force, waitForIdleMs,
+          session, text: outboundText, verify: opts.verify, force: opts.force, waitForIdleMs,
           dangerouslyInteract: opts.dangerouslyInteract, reason: opts.reason, actorSession: senderSession ?? null,
+          ...(opts.urgent ? { urgent: true } : {}),
         }, transportRequestOptions(waitForIdleMs));
       } catch (err) {
         if (err instanceof DaemonConnectionError) {
@@ -512,8 +522,12 @@ agent@rig@host is sugar for --host when the suffix is a REGISTERED host id
         throw err;
       }
 
+      // Context beside the send's own result: the seat was in a managed compaction or restore when it ran.
+      const compactionNotice = (res.data["managedCompaction"] as { notice?: unknown } | undefined)?.notice;
+      const printCompactionNotice = (write: (line: string) => void) => { if (typeof compactionNotice === "string") write(`Notice: ${compactionNotice}`); };
       if (res.data["outcome"] === "retained") {
         console.log(opts.json ? JSON.stringify(res.data) : `Retained, not delivered to ${session}. ${String(res.data["warning"] ?? "")}`);
+        if (!opts.json) printCompactionNotice(console.log);
         return;
       }
 
@@ -543,6 +557,7 @@ agent@rig@host is sugar for --host when the suffix is a REGISTERED host id
       if (res.status >= 400) {
         const error = res.data["error"] as string | undefined;
         console.error(error ?? `Send failed (HTTP ${res.status})`);
+        printCompactionNotice(console.error);
         // MH-4 §4 loud-failure hint: the target was 3-part-shaped but its
         // suffix matched no registered host — name the near-miss.
         if (crossHostHint) console.error(`hint: ${crossHostHint}`);
@@ -551,6 +566,7 @@ agent@rig@host is sugar for --host when the suffix is a REGISTERED host id
       }
 
       console.log(`Sent to ${session}`);
+      printCompactionNotice(console.log);
       // OPR.0.4.3.28 correction — an `unknown`-telemetry send now PROCEEDS with a non-blocking
       // advisory (was a fail-closed refusal). Surface it on the human output, not only in --json.
       const advisory = res.data["warning"] as string | undefined;
@@ -574,10 +590,7 @@ agent@rig@host is sugar for --host when the suffix is a REGISTERED host id
           const verified = res.data["verified"] as boolean | undefined;
           console.log(`Verified: ${verified ? "yes" : "no"}`);
           const outcome = res.data["outcome"] as string | undefined;
-          const inputBoxLine = inputBoxDeliveryLine(outcome, res.data["inputBox"], session);
-          if (inputBoxLine) {
-            console.log(inputBoxLine);
-          } else if (outcome === "delivered") {
+          if (outcome === "delivered") {
             console.log("Delivery: delivered (message landed; render confirmed)");
           } else if (outcome === "rendered-unconfirmed") {
             console.log(`Delivery: rendered-unconfirmed (landed; pane re-render not confirmed - confirm with: rig capture ${session})`);
@@ -658,43 +671,6 @@ async function classifyDeliveryEffect(
   return recheck.state === "staged"
     ? { checked: true, state: "staged", remedy: "submitted-still-staged" }
     : { checked: true, state: "staged", remedy: "submitted-cleared" };
-}
-
-const SEAT_READING_WORDS: Record<string, string> = {
-  idle: "idle",
-  "not-idle": "not idle (a running turn, a queue, a pending input or a paste hint showed)",
-  unknown: "not a known idle layout",
-};
-
-const INPUT_BOX_READING_WORDS: Record<string, string> = {
-  exact: "the exact text",
-  ambiguous: "the text, but a line break in the box may split a word (word boundaries uncertain)",
-  empty: "empty",
-  queued: "queued or possibly queued (a queued label, or a turn was running)",
-  hidden: "a collapsed paste (text hidden)",
-  other: "other text",
-  unrecognized: "layout not recognized",
-  unavailable: "no capture",
-};
-
-/** The Delivery line for a send verified by its input box (transport.verify_input_box), shared by the local
- *  and cross-host printers. Null when the result carries no inputBox, so the legacy lines print verbatim. */
-function inputBoxDeliveryLine(outcome: string | undefined, inputBox: unknown, session: string): string | null {
-  if (!inputBox || typeof inputBox !== "object") return null;
-  const box = inputBox as { seat?: unknown; before?: unknown; after?: unknown; sameProcess?: unknown };
-  const words = (reading: unknown) => INPUT_BOX_READING_WORDS[String(reading)] ?? String(reading);
-  if (outcome === "delivered") {
-    return "Delivery: delivered (seat idle before the paste; input box: the exact text before Enter, empty after it, same pane process; not agent acknowledgement)";
-  }
-  if (outcome !== "rendered-unconfirmed") return null;
-  // `rig capture` is an optional look, never a required follow-up, and nothing here suggests sending again.
-  const look = `not a failure; to look, optionally: rig capture ${session}`;
-  if (box.before === "unchecked") {
-    return `Delivery: rendered-unconfirmed (input box not checked: an audited prompt answer is typed as keys and its box is not read; ${look})`;
-  }
-  const paneProcess = box.sameProcess === true ? "" : "; pane process changed or unknown";
-  const seat = box.seat === undefined ? "" : `seat before the paste: ${SEAT_READING_WORDS[String(box.seat)] ?? String(box.seat)}; `;
-  return `Delivery: rendered-unconfirmed (${seat}input box before Enter: ${words(box.before)}; after Enter: ${words(box.after)}${paneProcess}; ${look})`;
 }
 
 /** Renders an EffectCheck on the human surface — shared wording across the
@@ -785,7 +761,7 @@ async function runCrossHostSend(
   hostId: string,
   session: string,
   text: string,
-  opts: { verify?: boolean; force?: boolean; waitForIdle?: string; raw?: boolean; dangerouslyInteract?: boolean; reason?: string; from?: string; json?: boolean },
+  opts: { verify?: boolean; force?: boolean; waitForIdle?: string; raw?: boolean; dangerouslyInteract?: boolean; reason?: string; urgent?: boolean; from?: string; json?: boolean },
   deps: SendDeps,
   waitForIdleMs?: number,
   hint?: string,
@@ -826,6 +802,7 @@ async function runCrossHostSend(
   if (opts.raw) argv.push("--raw");
   if (opts.dangerouslyInteract) argv.push("--dangerously-interact");
   if (opts.reason !== undefined) argv.push("--reason", opts.reason);
+  if (opts.urgent) argv.push("--urgent");
   // Sender provenance: the ssh relay re-runs `rig send` on the remote, which
   // would otherwise resolve ITS OWN session and degrade the envelope sender
   // to "unknown". Carry the origin so the remote envelope names the originating
@@ -895,7 +872,7 @@ async function runHttpHostSend(
   host: HttpHostEntry,
   session: string,
   text: string,
-  opts: { verify?: boolean; force?: boolean; waitForIdle?: string; raw?: boolean; dangerouslyInteract?: boolean; reason?: string; from?: string; json?: boolean },
+  opts: { verify?: boolean; force?: boolean; waitForIdle?: string; raw?: boolean; dangerouslyInteract?: boolean; reason?: string; urgent?: boolean; from?: string; json?: boolean },
   deps: SendDeps,
   waitForIdleMs?: number,
   hint?: string,
@@ -915,8 +892,9 @@ async function runHttpHostSend(
   const outboundText = raw ? text : wrapSendBody(originSender, session, text, { stampISO: new Date().toISOString() });
 
   const result = await runRemoteHttpOp(host.id, "POST", "/api/transport/send", {
-    session, text: outboundText, deliveryId: randomUUID(), verify: opts.verify, force: opts.force, waitForIdleMs,
+    session, text: outboundText, verify: opts.verify, force: opts.force, waitForIdleMs,
     dangerouslyInteract: opts.dangerouslyInteract, reason: opts.reason, actorSession: senderSession ?? null,
+    ...(opts.urgent ? { urgent: true } : {}),
   }, deps, { timeoutMs: (waitForIdleMs ?? 0) + CROSS_HOST_SEND_TIMEOUT_MS });
 
   // A send that may have reached the remote is unconfirmed, not unreachable: it may have been delivered, and a
@@ -968,10 +946,7 @@ async function runHttpHostSend(
     const verified = data["verified"] as boolean | undefined;
     console.log(`Verified: ${verified ? "yes" : "no"}`);
     const outcome = data["outcome"] as string | undefined;
-    const inputBoxLine = inputBoxDeliveryLine(outcome, data["inputBox"], session);
-    if (inputBoxLine) {
-      console.log(inputBoxLine);
-    } else if (outcome === "delivered") {
+    if (outcome === "delivered") {
       console.log("Delivery: delivered (message landed; render confirmed)");
     } else if (outcome === "rendered-unconfirmed") {
       console.log(`Delivery: rendered-unconfirmed (landed; pane re-render not confirmed - confirm with: rig capture ${session})`);
@@ -998,7 +973,7 @@ async function runFanOutSend(params: {
   // ba41fea2 — `from` was omitted here while the caller already forwarded it
   // at runtime, so an explicit --from was silently dropped on fan-out only
   // (single-seat + both cross-host paths always honored it).
-  opts: { verify?: boolean; force?: boolean; raw?: boolean; dangerouslyInteract?: boolean; reason?: string; from?: string; json?: boolean };
+  opts: { verify?: boolean; force?: boolean; raw?: boolean; dangerouslyInteract?: boolean; reason?: string; urgent?: boolean; from?: string; json?: boolean };
   deps: SendDeps;
   /** P18: the seat identity resolved from the seat env, or `undefined` when unresolvable (env-less send
    *  DELIVERS with the `<unknown sender>` marker + null actorSession — no refusal). */
@@ -1024,6 +999,7 @@ async function runFanOutSend(params: {
     dangerouslyInteract: opts.dangerouslyInteract,
     reason: opts.reason,
     actorSession: senderSession ?? null,
+    ...(opts.urgent ? { urgent: true } : {}),
   };
   if (toList) body.sessions = toList;
   else if (pod) body.pod = pod;
@@ -1096,14 +1072,19 @@ async function runFanOutSend(params: {
   }
 
   const data = res.data;
-  const results = (data["results"] as Array<{ sessionName: string; ok: boolean; error?: string; outcome?: string }>) ?? [];
+  const results = (data["results"] as Array<{ sessionName: string; ok: boolean; error?: string; outcome?: string; managedCompaction?: { notice?: unknown } }>) ?? [];
+  // Context beside a recipient's own result: it was in a managed compaction or restore when the send ran.
+  const printNotice = (r: (typeof results)[number]) => {
+    if (typeof r.managedCompaction?.notice === "string") console.log(`Notice: ${r.managedCompaction.notice}`);
+  };
   // Round-2 F1 (desk-binding): ONE verdict line per recipient. A
   // staged-unresolved recipient gets its staged verdict INSTEAD of "sent" —
   // the false delivery claim is suppressed entirely, not qualified.
   for (const r of results) {
-    if (r.outcome === "retained") { console.log(`${r.sessionName}: retained, not delivered; inspect with rig seat held-messages`); continue; }
+    if (r.outcome === "retained") { console.log(`${r.sessionName}: retained, not delivered; inspect with rig seat held-messages`); printNotice(r); continue; }
     if (!r.ok) {
       console.log(`${r.sessionName}: FAILED — ${r.error ?? "unknown error"}`);
+      printNotice(r);
       continue;
     }
     const ec = effectBySeat.get(r.sessionName);
@@ -1118,6 +1099,7 @@ async function runFanOutSend(params: {
     } else {
       console.log(`${r.sessionName}: sent`);
     }
+    printNotice(r);
   }
   // The delivered count never includes a staged-unresolved recipient.
   const deliveredCount = Math.max(0, ((data["sent"] as number) ?? 0) - unresolvedCount);

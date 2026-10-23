@@ -40,7 +40,7 @@ seatRoutes.post("/set-typing-guard/:seatRef", async c => {
   try {
     const target = guard.target(c.req.param("seatRef"));
     const preference = await guard.set(target.nodeId, { mode: body.mode ?? (body.enabled ? "hold" : "off") }, actor, body.reason);
-    return c.json({ ...preference, tradeoff: "Hold retains all automatic input. Draft-aware sends once or immediately holds with the exact refusal reason; it schedules no retry. Off permits new sends. Changing mode does not flush earlier held messages." }, preference.pending ? 202 : 200);
+    return c.json({ ...preference, tradeoff: "Hold retains all automatic input. Each draft-aware request attempts input or immediately holds with the exact refusal reason; retrying is a new attempt. Off permits new sends. Changing mode does not flush earlier held messages." }, preference.pending ? 202 : 200);
   } catch (error) {
     return c.json({ error: (error as Error).message, code: (error as { code?: string }).code }, error instanceof DeliveryGuardError && error.code === "invalid_typing_guard" ? 400 : 409);
   }
@@ -109,6 +109,7 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
   const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
   const rigRepo = c.get("rigRepo" as never) as RigRepository;
   const service = new SeatHandoverService({
+    codexPermissions: (c.get("currentModelReader" as never) as import("../domain/model-divergence/current-model-reader.js").CurrentModelReader | undefined) ?? undefined,
     db: rigRepo.db,
     rigRepo,
     sessionRegistry: c.get("sessionRegistry" as never) as SessionRegistry,
@@ -220,7 +221,7 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
   if (result.code === "tmux_probe_failed") {
     return c.json(result, 502);
   }
-  if (result.code === "current_occupant_required" ||
+  if (result.code === "address_conflict" || result.code === "current_occupant_required" ||
     result.code === "discovered_not_active" ||
     result.code === "successor_tmux_absent" ||
     result.code === "successor_already_managed" ||
@@ -255,16 +256,18 @@ export function seatLifecycleService(c: { get(key: never): unknown }): SeatLifec
     occupantInvalidator: (c.get("occupantInvalidator" as never) as import("../domain/occupant-invalidator.js").OccupantInvalidator | undefined) ?? undefined,
     activityOracle: (c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined) ?? undefined,
     transcripts: (c.get("contextUsageStore" as never) as ContextUsageStore | undefined) ?? undefined,
+    piRecords: (c.get("currentModelReader" as never) as import("../domain/model-divergence/current-model-reader.js").CurrentModelReader | undefined) ?? undefined,
   });
 }
 
 function seatLifecycleStatus(code: string): 400 | 404 | 409 | 500 | 502 {
   if (code === "seat_ref_required" || code === "missing_model" || code === "missing_reason" || code === "fresh_required"
-    || code === "missing_effort" || code === "invalid_effort" || code === "invalid_policy") return 400;
+    || code === "missing_effort" || code === "invalid_effort" || code === "invalid_policy"
+    || code === "missing_cwd" || code === "invalid_cwd" || code === "invalid_stop_precondition") return 400;
   if (code === "seat_not_found") return 404;
   if (code === "tmux_probe_failed") return 502;
   if (code === "launch_unavailable" || code === "runtime_adapter_missing" || code === "launch_failed" || code === "startup_failed"
-    || code === "effort_unavailable") return 500;
+    || code === "effort_unavailable" || code === "cwd_check_failed" || code === "cwd_persistence_failed") return 500;
   // seat_ambiguous / session_live / session_not_live / no_session / claimed_session /
   // nothing_to_clean — state conflicts, not client syntax errors.
   return 409;
@@ -304,6 +307,18 @@ seatRoutes.post("/set-model/:seatRef", async (c) => {
   });
   if (result.ok) return c.json(result);
   return c.json(result, seatLifecycleStatus(result.code));
+});
+
+seatRoutes.post("/set-cwd/:seatRef", async (c) => {
+  const value: unknown = await c.req.json().catch(() => null);
+  const body = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const result = await seatLifecycleService(c).setCwd({
+    seatRef: c.req.param("seatRef"),
+    cwd: typeof body.cwd === "string" ? body.cwd : "",
+    reason: typeof body.reason === "string" ? body.reason : "",
+    operator: transportSenderSession(c) ?? (typeof body.operator === "string" ? body.operator : null),
+  });
+  return c.json(result, result.ok ? 200 : seatLifecycleStatus(result.code));
 });
 
 // OPR.0.7.0.7 — save (or, with clear: true, remove) one seat's effort choice for its next
@@ -383,12 +398,18 @@ seatRoutes.post("/continue/:seatRef", async (c) => {
   return c.json(result, result.ok ? 200 : 409);
 });
 
+seatRoutes.get("/stop-precondition/:seatRef", c => {
+  const result = seatLifecycleService(c).stopPrecondition(c.req.param("seatRef")!);
+  return "contract" in result ? c.json(result) : c.json(result, seatLifecycleStatus(result.code));
+});
+
 seatRoutes.post("/stop/:seatRef", async (c) => {
   const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
   const result = await seatLifecycleService(c).stopSeat({
     seatRef: c.req.param("seatRef")!,
     reason: typeof body["reason"] === "string" ? body["reason"] : "",
     operator: typeof body["operator"] === "string" ? body["operator"] : null,
+    ...(Object.prototype.hasOwnProperty.call(body, "expected") ? { expected: body["expected"] } : {}),
   });
   if (result.ok) return c.json(result);
   return c.json(result, seatLifecycleStatus(result.code));

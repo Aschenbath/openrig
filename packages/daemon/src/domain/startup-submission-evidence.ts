@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import {
   composerPromptClassForRuntime,
   composerPromptIsAmbiguous,
@@ -47,6 +46,17 @@ export function composerRegion(pane: string | null, runtime: string | null = nul
     closingRuleLine: end < 0 ? null : end + 1, capturedLines: pane === null ? 0 : lines.length };
 }
 
+/** Whether Claude's input box is drawn: its input line, then a closing rule with the composer footer under it. */
+export function claudeInputBoxDrawn(pane: string | null): boolean {
+  const { markerLine, closingRuleLine } = composerRegion(pane, "claude-code");
+  return markerLine !== null && closingRuleLine !== null;
+}
+
+/** Whether a screen has no input line at all, as while Claude is still drawing it: not a draft and not a dialog. */
+export function startupNoInputLine(pane: string | null, runtime: string | null = null): boolean {
+  return Boolean(pane?.trim()) && composerRegion(pane, runtime).markerLine === null;
+}
+
 /** An echoed turn or a partial/opaque composer stays unverified. */
 export function inspectStartupStagedText(pane: string | null, expected: string, runtime: string | null = null): "staged" | "clear" | "unverified" {
   const { body } = composerRegion(pane, runtime);
@@ -68,16 +78,11 @@ export function startupOwnCollapsedPaste(pane: string | null, expected: string, 
 }
 
 export interface StartupSubmissionEvidence {
-  normalization: "whitespace-stripped-utf8";
-  expected: { bytes: number; sha256: string };
-  observed: { bytes: number; sha256: string } | null;
   /** One-based positions in this capture, not absolute terminal rows. */
   markerLine: number | null;
   closingRuleLine: number | null;
   capturedLines: number;
   captureScrollbackLines: number;
-  /** Zero-based UTF-8 byte offset; null when equal or no valid region exists. */
-  firstDifferenceByte: number | null;
   /** Diagnostic only; absent for unavailable captures or an excluded selector. */
   reason?: "unrecognized_composer_boundary" | "extracted_text_mismatch";
   windowsOmitted: "unclassified-startup-text";
@@ -102,22 +107,10 @@ export interface StartupSubmissionDiagnostic {
 export function startupSubmissionEvidence(pane: string | null, expected: string, captureScrollbackLines: number, runtime: string | null = null): StartupSubmissionEvidence | undefined {
   try {
     const { body, ...positions } = composerRegion(pane, runtime);
-    const expectedBytes = Buffer.from(normalize(expected));
-    const observedBytes = body === null ? null : Buffer.from(body);
-    const digest = (bytes: Buffer) => ({ bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") });
-    let firstDifferenceByte: number | null = null;
-    if (observedBytes !== null) {
-      let i = 0;
-      while (i < expectedBytes.length && i < observedBytes.length && expectedBytes[i] === observedBytes[i]) i++;
-      if (i !== expectedBytes.length || i !== observedBytes.length) firstDifferenceByte = i;
-    }
     const reason = !pane?.trim() ? undefined
       : positions.markerLine === null || positions.closingRuleLine === null ? "unrecognized_composer_boundary"
-      : observedBytes !== null && firstDifferenceByte !== null ? "extracted_text_mismatch" : undefined;
-    return { normalization: "whitespace-stripped-utf8", expected: digest(expectedBytes),
-      observed: observedBytes === null ? null : digest(observedBytes), ...positions,
-      ...(reason ? { reason } : {}),
-      captureScrollbackLines, firstDifferenceByte, windowsOmitted: "unclassified-startup-text" };
+      : body !== null && body !== normalize(expected) ? "extracted_text_mismatch" : undefined;
+    return { ...positions, ...(reason ? { reason } : {}), captureScrollbackLines, windowsOmitted: "unclassified-startup-text" };
   } catch {
     return undefined;
   }

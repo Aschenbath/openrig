@@ -1,5 +1,6 @@
+import { currentClaudeMcpMenu } from "./claude-mcp-menu.js";
 import { shellQuote } from "../adapters/shell-quote.js";
-import { codexPostureArg } from "../adapters/yolo-mode.js";
+import { claudePostureFlag, codexPostureArg } from "../adapters/yolo-mode.js";
 
 // L3 adds `attention_required` for the Claude resume-selection prompt proxy.
 // Distinct from `inconclusive` (we don't know yet) and `failed` (terminal
@@ -41,7 +42,7 @@ export function buildNativeResumeCommand(
   if (!resumeToken) return null;
   if (runtime === "claude-code") {
     const nameSuffix = sessionName ? ` --name ${shellQuote(sessionName)}` : "";
-    return `claude --resume ${shellQuote(resumeToken)}${nameSuffix}`;
+    return `claude ${claudePostureFlag(process.env)} --resume ${shellQuote(resumeToken)}${nameSuffix}`;
   }
   if (runtime === "codex") {
     return buildCodexResumeCore(resumeToken, codexConfigProfile, undefined, undefined, undefined, undefined, undefined, codexDaemonOptOut === true);
@@ -120,7 +121,7 @@ export function assessNativeResumeProbe(
         detail: "Claude is waiting for workspace trust approval before the session can become interactive.",
       };
     }
-    if (looksLikeClaudeMcpApprovalPrompt(paneContent)) {
+    if (currentClaudeMcpMenu(paneContent) || looksLikeClaudeMcpApprovalPrompt(paneContent)) {
       return {
         status: "inconclusive",
         code: "mcp_gate",

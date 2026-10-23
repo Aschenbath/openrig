@@ -14,6 +14,7 @@ export const DEFAULT_BODY_EXCERPT = SLACK_SECTION_CAP;
 
 export interface QitemLike {
   qitemId: string;
+  ownerNotificationKind?: string | null;
   summary?: string | null;
   body?: string | null;
   destinationSession?: string | null;
@@ -75,7 +76,12 @@ export interface OutboundMessageOpts {
   mentionUserId?: string;
   /** Stable decision/part identity. Included in the complete fallback budget. */
   reconcileMarker?: string;
+  /** A retry that couldn't confirm whether an earlier attempt landed says so in one context line, left out when it
+   *  doesn't fit. */
+  possibleRepeat?: boolean;
 }
+
+const POSSIBLE_REPEAT_NOTE = "Delivery may repeat after an earlier unconfirmed attempt.";
 
 /** A1.2 — the four attribution fields. */
 export interface SeatAttribution {
@@ -383,7 +389,9 @@ export function buildOutboundMessage(q: QitemLike, opts: OutboundMessageOpts): S
   if (opts.extraBlocks?.length) {
     throw new HumanMessageShapeError("Extra blocks have no complete accessible fallback. Use mediaRefs for images or author supplemental human detail.");
   }
-  const fallback = (context: string | null) => [headline, context, body, questionParts?.text, attr, evidence ? evidence.text : null, attachmentText, opts.reconcileMarker].filter(Boolean).join("\n");
+  const replyHint = q.ownerNotificationKind === "human-required"
+    ? "Reply in this thread after this question to answer it. Earlier and extra messages still reach the agent as conversation." : null;
+  const fallback = (context: string | null, repeat: string | null = null) => [headline, repeat, context, body, questionParts?.text, replyHint, attr, evidence ? evidence.text : null, attachmentText, opts.reconcileMarker].filter(Boolean).join("\n");
   // The gate context line is supplementary: when it alone would push the complete fallback over
   // budget, the instance part alone is tried, and the line is left out only when even that
   // doesn't fit, rather than refusing the gate.
@@ -392,14 +400,19 @@ export function buildOutboundMessage(q: QitemLike, opts: OutboundMessageOpts): S
     const instanceLine = buildGateContextLine(q.tags ?? [], true);
     shownContext = fallback(instanceLine).length <= SLACK_TEXT_CAP ? instanceLine : null;
   }
-  const text = bounded(fallback(shownContext), SLACK_TEXT_CAP, "complete fallback");
+  // The repeat note is supplementary too: left out rather than refusing a message it would push over a limit.
+  const shownRepeat = opts.possibleRepeat && fallback(shownContext, POSSIBLE_REPEAT_NOTE).length <= SLACK_TEXT_CAP ? POSSIBLE_REPEAT_NOTE : null;
+  const text = bounded(fallback(shownContext, shownRepeat), SLACK_TEXT_CAP, "complete fallback");
   const blocks: unknown[] = [{ type: "section", text: { type: "mrkdwn", text: headline } }];
+  if (shownRepeat) blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: shownRepeat }] });
   if (shownContext) blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: shownContext }] });
   if (body.trim()) blocks.push({ type: "section", text: { type: "mrkdwn", text: body } });
   if (questionParts) blocks.push(...questionParts.blocks);
+  if (replyHint) blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: replyHint }] });
   blocks.push(...imageBlocks);
   if (evidence) blocks.push(evidence.block);
   blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: attr }] });
+  if (shownRepeat && blocks.length > 50) blocks.splice(1, 1);
   if (blocks.length > 50) throw new HumanMessageShapeError("Message exceeds 50 Slack blocks. Reduce attachments before sending.");
   return { text, blocks };
 }

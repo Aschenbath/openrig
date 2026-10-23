@@ -2,11 +2,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { afterEach, describe, expect, it } from "vitest";
-import { CodexThreadIdResolver, lstartToMinTs } from "../src/domain/codex-thread-id.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { CodexThreadIdResolver, lstartToMinTs, readCodexThreadIdFromCandidateHomes } from "../src/domain/codex-thread-id.js";
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
 const identity = "Sun Sep  6 23:52:32 2026";
 const start = lstartToMinTs(identity)!;
 function fixture() {
@@ -23,6 +27,38 @@ function fixture() {
     finish: () => { logs.close(); state.close(); return new CodexThreadIdResolver({ defaultHome: home, resolveHomeDirByPid: () => home }); },
   };
 }
+
+describe("Codex home discovery respects an explicit HOME", () => {
+  it("reads the default home before resolving a process home and never consults passwd", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-default-home-")); roots.push(home);
+    vi.stubEnv("HOME", home);
+    const passwd = vi.spyOn(os, "userInfo").mockImplementation(() => { throw new Error("passwd home must not be read"); });
+    const processHome = vi.fn(() => "/synthetic-other-home");
+    const read = vi.fn((_pid: number, candidate: string) => candidate === home ? "conversation" : undefined);
+    const resolver = new CodexThreadIdResolver({ readFromLogs: read, resolveHomeDirByPid: processHome });
+    expect(await resolver.resolve(60422, identity)).toBe("conversation");
+    expect(read).toHaveBeenCalledExactlyOnceWith(60422, home, expect.any(Function), "exclude");
+    expect(processHome).not.toHaveBeenCalled();
+    expect(passwd).not.toHaveBeenCalled();
+  });
+
+  it("candidate-home fallback finds fixture logs without searching the passwd home", () => {
+    const f = fixture(); f.thread("conversation"); f.log("conversation"); f.finish();
+    vi.stubEnv("HOME", f.home);
+    const passwd = vi.spyOn(os, "userInfo").mockImplementation(() => { throw new Error("passwd home must not be read"); });
+    expect(readCodexThreadIdFromCandidateHomes(60422, [])).toBe("conversation");
+    expect(passwd).not.toHaveBeenCalled();
+  });
+
+  it("an empty fixture home never resolves another home's conversation", () => {
+    const foreign = fixture(); foreign.thread("foreign-conversation"); foreign.log("foreign-conversation"); foreign.finish();
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-empty-home-")); roots.push(home);
+    vi.stubEnv("HOME", home);
+    const passwd = vi.spyOn(os, "userInfo").mockReturnValue({ homedir: foreign.home } as ReturnType<typeof os.userInfo>);
+    expect(readCodexThreadIdFromCandidateHomes(60422, [])).toBeUndefined();
+    expect(passwd).not.toHaveBeenCalled();
+  });
+});
 
 describe("native conversation identity excludes same-process auxiliary threads", () => {
   it("resolves the first native conversation while title generation is the newest log activity", async () => {

@@ -1,24 +1,39 @@
+import { shellQuote } from "../adapters/shell-quote.js";
+import { resumeTypeForRuntime, validateResumeToken } from "./resume-token-validation.js";
 import { OutboxHandler } from "./outbox-handler.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
-import type { SessionRegistry } from "./session-registry.js";
+import { SessionAddressConflict, type SessionRegistry } from "./session-registry.js";
 import type { DiscoveryRepository } from "./discovery-repository.js";
 import type { EventBus } from "./event-bus.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import { startTmuxTranscriptCapture } from "./transcript-capture.js";
 import { deriveResumeToken, type ResumeTokenCaptureDeps } from "./resume-token-capture.js";
-import { verifyClaudePaneRuntime, verifyCodexPaneProcess, type NativeProcessLister } from "./native-process-lineage.js";
+import { verifyClaudePaneRuntime, verifyCodexPaneProcess, witnessedClaudeVersionLabel, type NativeProcessLister } from "./native-process-lineage.js";
 import {
   observeSolePane,
   paneObservationVerdict,
   type PaneBindingObservation,
 } from "./pane-binding-observation.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
+import { DeliveryGuardError } from "./seat-delivery-guard.js";
 
 export type ClaimResult =
   | { ok: true; nodeId: string; sessionId: string }
   | { ok: false; code: string; error: string };
+
+export interface AdoptionCaptureOutcome {
+  outcome: "captured" | "preserved" | "skipped" | "exempt" | "noop" | "error";
+  reason?: string;
+}
+
+export interface ReconcileResumeMetadata {
+  capture: AdoptionCaptureOutcome;
+  /** Recorded metadata is not proof of conversation continuity or resumability. */
+  status: "recorded" | "missing" | "unknown" | "not_applicable";
+  guidance?: string;
+}
 
 /**
  * OPR.0.3.4.3 — outcome of the no-launch reconcile (adopt a hand-resumed
@@ -39,15 +54,18 @@ export interface ReconcileSessionResult {
   projectionDrift: string[];
   /** Provider-session conversation continuity is never verified by reconcile. */
   continuity: "unverified";
+  /** Absent for the binding-only missing-pane repair, which does not capture. */
+  resumeMetadata?: ReconcileResumeMetadata;
+}
+
+export interface MissingPaneRepairResult extends ReconcileSessionResult {
+  mode: "repair-missing-pane";
+  pane: string;
 }
 
 export type ReconcileSessionOutcome =
-  | { ok: true; result: ReconcileSessionResult }
-  | { ok: false; code: "session_not_found"; message: string }
-  | { ok: false; code: "node_not_found"; message: string }
-  | { ok: false; code: "rig_not_found"; message: string }
-  | { ok: false; code: "node_mismatch"; message: string }
-  | { ok: false; code: "reconcile_error"; message: string };
+  | { ok: true; result: ReconcileSessionResult | MissingPaneRepairResult }
+  | { ok: false; code: string; message: string };
 
 export interface ReconcileSessionOptions {
   sessionName: string;
@@ -55,6 +73,8 @@ export interface ReconcileSessionOptions {
    *  cross-checked against the session-name mapping. */
   rigId?: string;
   logicalId?: string;
+  /** Explicit binding-only recovery; never enters adoption or capture housekeeping. */
+  repairMissingPane?: boolean;
 }
 
 interface ClaimServiceDeps {
@@ -77,7 +97,7 @@ interface ClaimServiceDeps {
   };
   /** #421 — start time of the pane's current Claude process; a sidecar sampled earlier is skipped. */
   claudeProcessStartedAt?: ResumeTokenCaptureDeps["claudeProcessStartedAt"];
-  /** Process census for the runtime proof in `reconcileSession`; defaults to the live process table. */
+  /** Process census for the runtime proof in `reconcileSession` and #86's native version-label witness; defaults to the live process table. */
   listProcesses?: NativeProcessLister;
   resumeTokenCapturer?: {
     captureCodexThreadId(sessionName: string): Promise<string | undefined>;
@@ -209,7 +229,7 @@ export class ClaimService {
     if (guard) await guard.operation(tmuxSession, write, async target => {
       new OutboxHandler(this.db).retain({ outboxId: `guard-claim-${target.nodeId}-${target.occupant ?? "unknown"}`,
         senderSession: "claim@system", destinationSession: tmuxSession, body: hint }, target);
-    });
+    }, { source: "openrig", urgent: false });
     else await write();
   }
 
@@ -243,7 +263,7 @@ export class ClaimService {
    */
   private async captureResumeTokenOnAdoption(input: {
     rigId: string; nodeId: string; sessionId: string; sessionName: string; runtime: string | null;
-  }): Promise<void> {
+  }): Promise<AdoptionCaptureOutcome> {
     try {
       // Derivation is the shared PURE helper (OPR.0.4.3.04 B2 — reused by the
       // seat-handover discovered-mode capture); persistence + events stay here so
@@ -252,11 +272,12 @@ export class ClaimService {
         { runtime: input.runtime, sessionName: input.sessionName },
         { contextUsageStore: this.contextUsageStore, claudeProcessStartedAt: this.claudeProcessStartedAt, resumeTokenCapturer: this.resumeTokenCapturer, piRunnerStateStore: this.piRunnerStateStore, ompRunnerStateStore: this.ompRunnerStateStore },
       );
-      if (derived.outcome === "exempt" || derived.outcome === "noop") return;
+      if (derived.outcome === "exempt" || derived.outcome === "noop") return { outcome: derived.outcome };
       const runtime = input.runtime as string; // non-null past exempt
       if (derived.outcome === "skipped") {
         this.emitCaptureSkip(input, runtime, derived.reason);
-        return;
+        // The legacy capture reason also covers an absent result before a deadline.
+        return { outcome: "skipped", reason: derived.reason === "probe_timeout" ? "not_obtained" : derived.reason };
       }
       const validation = { resumeType: derived.resumeType, token: derived.token };
 
@@ -279,8 +300,10 @@ export class ClaimService {
               runtime, outcome: "preserved", resumeType: validation.resumeType, reason: "higher_rank_present", redacted: true,
             });
       } catch { /* best-effort */ }
+      return { outcome: wrote ? "captured" : "preserved" };
     } catch {
-      // best-effort — capture never fails or blocks the adoption (PRD Rule 7)
+      // No exception text or native token crosses the result boundary.
+      return { outcome: "error", reason: "capture_failed" };
     }
   }
 
@@ -399,6 +422,7 @@ export class ClaimService {
 
       return { ok: true, nodeId, sessionId };
     } catch (err) {
+      if (err instanceof SessionAddressConflict) return { ok: false, code: "address_conflict", error: err.message };
       return { ok: false, code: "claim_error", error: (err as Error).message };
     }
   }
@@ -438,6 +462,7 @@ export class ClaimService {
     if (!sessionName) {
       return { ok: false, code: "session_not_found", message: "sessionName is required." };
     }
+    if (opts.repairMissingPane) return this.repairMissingPane({ ...opts, sessionName });
 
     // 1. Resolve the persisted node for this canonical session name. The
     // session-name mapping is the daemon's own history (bindings + session
@@ -521,11 +546,10 @@ export class ClaimService {
     const projectionDrift: string[] = [];
     const paneObservation = await this.observeBindingPane(sessionName);
     if (!paneObservation.ok) projectionDrift.push(paneObservation.detail);
+    const paneTarget = paneObservation.ok ? paneObservation.pane : sessionName;
     let paneCommand: string | null = null;
     try {
-      paneCommand = await this.tmuxAdapter.getPaneCommand(
-        paneObservation.ok ? paneObservation.pane : sessionName,
-      );
+      paneCommand = await this.tmuxAdapter.getPaneCommand(paneTarget);
     } catch { paneCommand = null; }
     if (nodeRow.runtime) {
       const expectation: Record<string, string[]> = {
@@ -537,7 +561,10 @@ export class ClaimService {
       if (!paneCommand) {
         projectionDrift.push(`runtime unverified: pane command unreadable; node declares runtime "${nodeRow.runtime}"`);
       } else if (expected && expected.length > 0 && !expected.includes(paneCommand)
-        && !await this.runtimeProvenInPane(nodeRow.runtime, paneObservation.ok ? paneObservation.pane : sessionName)) {
+        // #86: a native install's version label confirms claude-code only with its OS executable witness.
+        && !(nodeRow.runtime === "claude-code" && await witnessedClaudeVersionLabel(paneCommand,
+          { target: paneTarget, tmux: this.tmuxAdapter, listProcesses: this.listProcesses }))
+        && !await this.runtimeProvenInPane(nodeRow.runtime, paneTarget)) {
         // A script-launched runtime reads as its launcher (`sh`); only a pane whose process tree shows no such runtime is drift.
         projectionDrift.push(`runtime unverified: pane command "${paneCommand}" does not confirm runtime "${nodeRow.runtime}"`);
       }
@@ -594,10 +621,25 @@ export class ClaimService {
       // Pure reads only (sidecar file / pid-keyed log) — consistent with the
       // no-launch/no-input contract above; does NOT touch `continuity`
       // (FR-3 captures a token, it does not assert conversation continuity).
-      await this.captureResumeTokenOnAdoption({
+      const capture = await this.captureResumeTokenOnAdoption({
         rigId: nodeRow.rig_id, nodeId: nodeRow.id, sessionId, sessionName,
         runtime: nodeRow.runtime,
       });
+      const expectedType = resumeTypeForRuntime(nodeRow.runtime);
+      let status: ReconcileResumeMetadata["status"] = expectedType ? "unknown" : "not_applicable";
+      if (expectedType) {
+        try {
+          const row = this.db.prepare("SELECT resume_type, resume_token FROM sessions WHERE id=?").get(sessionId) as
+            { resume_type: string | null; resume_token: string | null } | undefined;
+          status = row?.resume_type === expectedType && validateResumeToken(nodeRow.runtime, row.resume_token).ok ? "recorded" : "missing";
+        } catch { /* Reporting cannot turn an already committed binding into failure. */ }
+      }
+      const resumeMetadata: ReconcileResumeMetadata = { capture, status };
+      if (status === "missing" || status === "unknown") {
+        resumeMetadata.guidance = `The seat is bound, but future resume metadata is ${status === "missing" ? "missing" : "unconfirmed"}. ` +
+          `After confirming the live conversation identity, pipe its verified token to rig seat set-resume-token ${shellQuote(sessionName)} --token-stdin --reason "verified live conversation". ` +
+          "The token must come from stdin, never a command argument. No prior token was copied.";
+      }
 
       return {
         ok: true,
@@ -610,11 +652,84 @@ export class ClaimService {
           sessionId,
           projectionDrift,
           continuity: "unverified",
+          resumeMetadata,
         },
       };
     } catch (err) {
+      if (err instanceof SessionAddressConflict) return { ok: false, code: "address_conflict", message: err.message };
       return { ok: false, code: "reconcile_error", message: (err as Error).message };
     }
+  }
+
+  private async repairMissingPane(opts: ReconcileSessionOptions): Promise<ReconcileSessionOutcome> {
+    const { sessionName } = opts;
+    const tmux = this.tmuxAdapter, guard = tmux?.deliveryGuard;
+    if (!tmux || !guard) return { ok: false, code: "reconcile_error", message: "Missing-pane repair requires the managed tmux delivery guard." };
+    const deadline = performance.now() + 5000;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const refuse = (code: string, message: string): never => { throw new DeliveryGuardError(code, message); };
+    try {
+      const expected = guard.target(sessionName);
+      const owner = this.db.prepare("SELECT rig_id FROM nodes WHERE id=?").get(expected.nodeId) as { rig_id: string } | undefined;
+      const rig = owner && this.rigRepo.getRig(owner.rig_id);
+      const node = rig?.nodes.find(n => n.id === expected.nodeId);
+      if (!rig || !node) return refuse("node_not_found", "The current managed node no longer exists.");
+      if ((opts.rigId && opts.rigId !== rig.rig.id) || (opts.logicalId && opts.logicalId !== node.logicalId)) {
+        return refuse("node_mismatch", "The supplied rig/node does not match the current managed session.");
+      }
+      const current = () => this.db.prepare(`SELECT b.id AS bindingId, b.tmux_session AS sessionName,
+        b.tmux_pane AS pane, b.attachment_type AS attachment, s.id AS sessionId,
+        s.session_name AS registeredName, s.status, s.origin, n.rig_id AS rigId, n.logical_id AS logicalId
+        FROM bindings b JOIN sessions s ON s.node_id=b.node_id JOIN nodes n ON n.id=b.node_id
+        WHERE b.node_id=? ORDER BY s.id DESC LIMIT 1`).get(expected.nodeId) as {
+          bindingId: string; sessionName: string; pane: string | null; attachment: string;
+          sessionId: string; registeredName: string; status: string; origin: string;
+          rigId: string; logicalId: string;
+        } | undefined;
+      const before = current();
+      if (!before || before.attachment !== "tmux" || before.sessionName !== sessionName || before.registeredName !== sessionName
+        || before.pane !== null || expected.pane !== null || expected.session !== sessionName
+        || before.status !== "running" || before.origin !== "launched") {
+        return refuse("repair_not_applicable", "Repair requires a current running launched session with its own NULL tmux pane binding; nothing was adopted or overwritten.");
+      }
+      const observe = async () => {
+        const presence = await tmux.probeSession(sessionName);
+        if (presence.state !== "present") return refuse(presence.state === "absent" ? "session_not_found" : "tmux_unavailable", "The managed tmux session could not be positively observed.");
+        const sessions = (await tmux.listSessions()).filter(s => s.name === sessionName);
+        if (sessions.length !== 1 || sessions[0]!.windows !== 1 || !sessions[0]!.created) {
+          return refuse("pane_ambiguous", "Repair requires exactly one positively observed session with one window.");
+        }
+        const pane = await observeSolePane(tmux, sessionName);
+        if (!pane.ok) return refuse(pane.code, pane.detail);
+        const pid = await tmux.getPanePid(pane.pane);
+        if (!Number.isInteger(pid) || pid! <= 0) return refuse("pane_missing", "The sole pane has no observable process PID.");
+        return { created: sessions[0]!.created, pane: pane.pane, pid };
+      };
+      // ponytail: one command-local wait/commit fence. Late read-only tmux calls may finish,
+      // but cannot reach the commit below; do not cancel the shared tmux control client.
+      const observation = await Promise.race([
+        (async () => {
+          const first = await observe(), second = await observe();
+          if (JSON.stringify(first) !== JSON.stringify(second)) return refuse("guard_target_changed", "The session, pane or PID changed during observation; nothing was repaired.");
+          return second;
+        })(),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new DeliveryGuardError("repair_timed_out", "Pane observation exceeded five seconds; no repair will commit.")), 5000); }),
+      ]);
+      this.db.transaction(() => guard.reconcileBinding(expected, () => {
+        if (performance.now() >= deadline) return refuse("repair_timed_out", "The repair deadline expired before commit; nothing was repaired.");
+        if (JSON.stringify(guard.maybeTarget(sessionName)) !== JSON.stringify(expected)
+          || JSON.stringify(current()) !== JSON.stringify(before)) return refuse("guard_target_changed", "The current name, binding or session changed during observation; nothing was repaired.");
+        const changed = this.db.prepare(`UPDATE bindings SET tmux_pane=?, updated_at=datetime('now')
+          WHERE id=? AND node_id=? AND tmux_session=? AND attachment_type='tmux' AND tmux_pane IS NULL`)
+          .run(observation.pane, before.bindingId, expected.nodeId, sessionName).changes;
+        if (changed !== 1) return refuse("guard_target_changed", "The NULL binding changed before commit; nothing was repaired.");
+      })).immediate();
+      return { ok: true, result: { mode: "repair-missing-pane", pane: observation.pane,
+        rigId: rig.rig.id, rigName: rig.rig.name, nodeId: node.id, logicalId: node.logicalId,
+        sessionName, sessionId: before.sessionId, projectionDrift: [], continuity: "unverified" } };
+    } catch (error) {
+      return { ok: false, code: error instanceof DeliveryGuardError ? error.code : "reconcile_error", message: (error as Error).message };
+    } finally { if (timer) clearTimeout(timer); }
   }
 
   /** The session name a managed node is EXPECTED to live at — pod-aware nodes
@@ -756,6 +871,7 @@ export class ClaimService {
 
       return { ok: true, nodeId, sessionId };
     } catch (err) {
+      if (err instanceof SessionAddressConflict) return { ok: false, code: "address_conflict", error: err.message };
       return { ok: false, code: "claim_error", error: (err as Error).message };
     }
   }

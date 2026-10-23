@@ -282,6 +282,74 @@ must inspect `launchable === true` before deciding to execute. Request failures 
 Execution always resolves and checks the current state again. An older daemon without the preview
 endpoint refuses the request; the CLI never falls back to executing a launch.
 
+### Change an existing seat's working directory
+
+Editing `cwd` in an already applied RigSpec doesn't update an existing seat's saved launch directory. Use `set-cwd` to
+save a new one for the seat's next launch:
+
+```sh
+rig seat set-cwd planning-lead@project \
+  --cwd /work/project/seats/planning-lead --reason "isolate planning"
+rig seat status planning-lead@project
+```
+
+**The path:** it must be absolute **on the daemon's host**. OpenRig creates a missing directory, resolves symlinks to
+its real path, and refuses a filesystem root.
+
+**What it saves:** the directory and a `node.cwd_changed` audit event (from, to, reason, operator), together, in one
+transaction. The seat's node, canonical address, queue, session history and skill selection stay as they are.
+`rig seat status` shows **Working directory for future launches** (`launch_cwd` in JSON). That's saved configuration,
+not where the running process is.
+
+**What it writes:** it creates the folder if it's missing, and writes nothing else there. The seat's next fresh launch or
+rebuild handover writes its startup files there, as launch does today.
+
+**`set-cwd`'s preflight policy:** before saving, it reads, without writing, the enumerated resource copies (including
+nested plugin files) and startup skills that launch would place in the new directory, at their actual destinations,
+as they are at that moment. It's a point-in-time check, not a global overwrite guarantee or protection against later
+changes; at adoption, launch applies its own policy. (The commit's re-check covers the saved startup configuration,
+not the destination's file contents.)
+- **Refused, with the protected paths named (`cwd_destination_conflict`):** a file there that an operator edited, an
+  unrecorded file with different content, or two sources for one destination. That's stricter than launch, which
+  overwrites an unrecorded differing file with a warning; the refusal is deliberate, while the occupant still runs.
+- **What to do:** use a clean destination, or move or merge those files, then retry.
+- **Not checked:** managed guidance blocks and native configuration merges keep the adapter's policy at launch, and
+  launch-owned files such as `.openrig/context-collector.cjs` are written by launch as always.
+- **A community harness** takes no startup files, so none are checked for it.
+
+**The running occupant keeps its current directory.** Adopt the new one with:
+- `rig seat launch <seat> --fresh --stop --reason <text>`, which starts a blank conversation; or
+- `rig handover <seat> --source rebuild --reason <text>`, which carries durable context.
+
+For Codex rebuilds, OpenRig also carries a complete supported native permission policy read from the live
+predecessor's own conversation and process, without adding fresh-launch grants. A later recorded seat permission
+or policy choice, or a differing declared successor profile, takes precedence. Missing, stale or unsupported observations keep the existing launch
+behaviour and are reported as unverified in the handover result; requested modes and profiles alone don't prove
+preservation. The result reports what was emitted, not native successor equivalence.
+
+**Adopt it promptly.** The saved directory doesn't move the running process, but background work can use it before
+adoption. Saved configuration isn't the live process's directory, and these examples aren't the only consumers. For a
+running Claude seat:
+- **Collector provisioning** writes `.openrig/context-collector.cjs` and merges `.claude/settings.local.json` in the
+  saved directory, under its existing preservation rules.
+- **Managed compaction,** manual (`POST /api/compaction/trigger`) or automatic, asks the seat to write its restore map
+  under it. That may be outside the seat's current workspace, so a seat without bypass permissions may meet a write
+  prompt.
+
+Adopting promptly is guidance. It doesn't protect against a poll or a compaction that runs before your next command.
+
+**Before adopting,** don't `rig down`/`rig up` or hand over by fork. Those resume the existing conversation in the
+saved directory, and Claude keeps conversations per project directory, so a resume there may not find it.
+Cross-directory resume hasn't been run natively; this is the order to follow. `rig seat restart --keep-conversation`
+(Codex) isn't adoption: it respawns in the directory it observes from the running process.
+
+**Failures:** a refusal, missing or malformed saved startup context, or an audit-write failure leaves the prior
+directory saved, and changes no seat, custody or startup file (a refusal may leave the new folder created). A concurrent configuration change is reported, not overwritten. A CLI timeout means the outcome is
+unknown; check `rig seat status` before retrying. Choosing the same directory again records no second event.
+
+**The old directory:** files there are left as they are, since other seats may still use them. The source RigSpec
+declaration isn't changed either; update it separately if a future recreation should use the new directory.
+
 ### The `applies_on` Field
 
 Each startup file and action specifies when it applies:
@@ -565,6 +633,28 @@ The shipped kernel seats no longer project their role into shared guidance.
 Existing user files and legacy role blocks are left intact; this is not a cleanup
 of already-installed shared blocks. General user-authored guidance projection is
 unchanged.
+
+The other shipped agent specs that start a seat with `guidance/role.md` mark that
+file `orientation: role` too, so `rig queue whoami --json` reports their role and
+refocus names it. They never projected a role into shared guidance; their startup
+delivery is unchanged.
+
+**Removing a leftover shared role block by hand.** A kernel installed before 0.6.5
+may still hold one seat's old role in its working directory's `CLAUDE.md` (or the
+rig's configured `managed_blocks` file) or `AGENTS.md`. Upgrading doesn't remove it.
+`rig down` removes OpenRig's managed blocks from that file when no other running
+rig uses it, so it stays until then. To remove it sooner, by hand:
+
+1. Find the exact block: the lines from `<!-- BEGIN OpenRig MANAGED BLOCK: role -->`
+   through `<!-- END OpenRig MANAGED BLOCK: role -->` (in older files, `RIGGED`
+   instead of `OpenRig`). Only the block whose id is exactly `role`; leave
+   `rig-role`, other ids and everything outside the markers alone.
+2. Confirm each seat that shares that directory has its per-seat replacement:
+   `rig queue whoami --json` run in the seat reports `role.state` as `present`.
+   A seat started before it was upgraded still has the old content in its
+   conversation; restart it fresh if you want it to start from the per-seat role.
+3. Keep a copy of the file, remove only those lines, and compare the result with
+   the copy: nothing else in the file should differ.
 
 **Separate project context from role**
 

@@ -24,13 +24,14 @@ import { parsePodBundleManifest } from "./bundle-types.js";
 import os from "node:os";
 import fs from "node:fs";
 import { getOpenRigInstallCwdError, resolveLaunchCwd } from "./cwd-resolution.js";
-import { runSyncSite } from "./sync-site-wrap.js";
 import { runtimeVersionProbeCwd } from "../adapters/preflight-exec.js";
+import { execRuntimeProbe } from "../adapters/runtime-probe-exec.js";
 import { routeBundleContents, routingFailureWarnings, thrownMessage, type BundleContentRouting } from "./bundle-content-routing.js";
 import { bundleInstallContext, bundleInstallContextLines, isExistingBundleTarget, type BundleInstallContext } from "./bundle-install-context.js";
 import { confirmStoppedGenerations } from "./running-name-guard.js";
 import { inspectBundleBehaviour } from "./bundle-behaviour-inspect.js";
 import { getDaemonVersion } from "./daemon-version.js";
+import { rigNameComposeProjectConflict, withRigName } from "./rig-name-override.js";
 
 /** Bootstrap mode */
 export type BootstrapMode = "plan" | "apply";
@@ -43,6 +44,8 @@ export interface BootstrapOptions {
   cwdOverride?: string;
   /** One-off launch env from `rig up --env`; used for this launch only and not saved. */
   envOverride?: SeatEnv;
+  /** Rig name from `rig up --name`; replaces the spec's `name:` for this rig, which keeps it from then on. */
+  rigName?: string;
   autoApprove?: boolean;
   nonInterruptive?: boolean;
   approvedActionKeys?: string[];
@@ -61,6 +64,8 @@ export interface BootstrapStageResult {
 
 /** Full bootstrap result */
 export interface BootstrapResult {
+  /** A started launch failed to remove one-off env from tmux session state. */
+  code?: string;
   runId: string;
   status: BootstrapStatus;
   stages: BootstrapStageResult[];
@@ -180,13 +185,16 @@ export class BootstrapOrchestrator {
         let podBundleTempDir: string | null = null;
         try {
           const podSource = await this.deps.podBundleSourceResolver.resolve(sourceRef);
-          const rawYaml = this.deps.fsOps.readFile(podSource.specPath);
-          specDir = nodePath.dirname(podSource.specPath);
-          let installRoot: string | undefined;
           podBundleTempDir = podSource.tempDir;
-          stages.push({ stage: "resolve_spec", status: "ok", detail: { specName: podSource.manifest.name, source: "pod_bundle" } });
-
           try {
+            const sourceYaml = this.deps.fsOps.readFile(podSource.specPath);
+            const sharedProject = rigNameComposeProjectConflict(sourceYaml, opts.rigName);
+            if (sharedProject) return this.refuseRigName(run, stages, warnings, sharedProject);
+            const rawYaml = withRigName(sourceYaml, opts.rigName);
+            specDir = nodePath.dirname(podSource.specPath);
+            let installRoot: string | undefined;
+            stages.push({ stage: "resolve_spec", status: "ok", detail: { specName: podSource.manifest.name, source: "pod_bundle" } });
+
             const parsedSpec = parsePodBundleManifest(rawYaml) as Record<string, unknown>;
             const serviceBundleTarget = Boolean(opts.targetRoot && parsedSpec?.services && typeof parsedSpec.services === "object"
               && new SettingsStore().resolveOne("bundle.services_enabled").value === true);
@@ -287,7 +295,7 @@ export class BootstrapOrchestrator {
         bundleSource = await this.deps.bundleSourceResolver.resolve(sourceRef);
         bundleTempDir = bundleSource.tempDir;
         specDir = nodePath.dirname(bundleSource.specPath);
-        const rawYaml = this.deps.fsOps.readFile(bundleSource.specPath);
+        const rawYaml = withRigName(this.deps.fsOps.readFile(bundleSource.specPath), opts.rigName);
         const raw = RigSpecCodec.parse(rawYaml);
         const validation = RigSpecSchema.validate(raw);
         if (!validation.valid) {
@@ -308,7 +316,10 @@ export class BootstrapOrchestrator {
       // Direct rig_spec path — detect format BEFORE legacy validation
       try {
         specDir = nodePath.dirname(nodePath.resolve(sourceRef));
-        const rawYaml = this.deps.fsOps.readFile(nodePath.resolve(sourceRef));
+        const sourceYaml = this.deps.fsOps.readFile(nodePath.resolve(sourceRef));
+        const sharedProject = rigNameComposeProjectConflict(sourceYaml, opts.rigName);
+        if (sharedProject) return this.refuseRigName(run, stages, warnings, sharedProject);
+        const rawYaml = withRigName(sourceYaml, opts.rigName);
         const raw = RigSpecCodec.parse(rawYaml) as Record<string, unknown> | null;
 
         // Pod-aware format detection: if has pods[], delegate to PodRigInstantiator
@@ -635,7 +646,7 @@ export class BootstrapOrchestrator {
     }
 
     const nonInterruptive = opts.nonInterruptive ?? (new SettingsStore().resolveOne("launch.non_interruptive").value === true);
-    const instantiateOutcome = await this.deps.rigInstantiator.instantiate(spec, { nonInterruptive });
+    const instantiateOutcome = await this.deps.rigInstantiator.instantiate(spec, { nonInterruptive, ...(opts.envOverride ? { env: opts.envOverride } : {}) });
     if ((instantiateOutcome.ok || "rigId" in instantiateOutcome) && (nonInterruptive || opts.nonInterruptive === false)) warnings.push(nonInterruptiveSummary(nonInterruptive));
 
     this.deps.bootstrapRepo.journalAction(run.id, seqCounter++, "rig_import", null, spec.name, instantiateOutcome.ok ? "completed" : "failed", {
@@ -671,6 +682,12 @@ export class BootstrapOrchestrator {
 
   // -- Pod-aware bootstrap path --
 
+  private refuseRigName(run: { id: string }, stages: BootstrapStageResult[], warnings: string[], message: string): BootstrapResult {
+    stages.push({ stage: "resolve_spec", status: "failed", detail: { code: "rig_name_compose_project", error: message } });
+    this.deps.bootstrapRepo.updateRunStatus(run.id, "failed");
+    return { runId: run.id, status: "failed", stages, errors: [message], warnings };
+  }
+
   private async handlePodAwareSpec(
     opts: BootstrapOptions,
     run: { id: string },
@@ -689,7 +706,7 @@ export class BootstrapOrchestrator {
       // Plan mode: validate + preflight only
       const { rigPreflight } = await import("./rigspec-preflight.js");
       const { RigSpecCodec: PodCodec } = await import("./rigspec-codec.js");
-      const { RigSpecSchema: PodSchema } = await import("./rigspec-schema.js");
+      const { RigSpecSchema: PodSchema, sessionNameCollisions } = await import("./rigspec-schema.js");
 
       try {
         const raw = PodCodec.parse(rigSpecYaml);
@@ -702,10 +719,7 @@ export class BootstrapOrchestrator {
         const spec = PodSchema.normalize(raw as Record<string, unknown>);
         stages.push({ stage: "resolve_spec", status: "ok", detail: { specName: spec.name, specVersion: spec.version } });
 
-        const { execSync } = await import("node:child_process");
-        const execFn = async (cmd: string) => runSyncSite("bootstrap.plan.preflight", () =>
-          execSync(cmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], timeout: 10_000, cwd: runtimeVersionProbeCwd(cmd) })
-        );
+        const execFn = (cmd: string) => execRuntimeProbe("bootstrap.plan.preflight", cmd, { cwd: runtimeVersionProbeCwd(cmd) });
         const preflight = await rigPreflight({
           rigSpecYaml,
           rigRoot,
@@ -727,7 +741,7 @@ export class BootstrapOrchestrator {
           status: preflight.ready ? "planned" : "failed",
           stages,
           errors: preflight.errors,
-          warnings: [...warnings, ...preflight.warnings],
+          warnings: [...warnings, ...sessionNameCollisions(raw), ...preflight.warnings],
         };
       } catch (err) {
         stages.push({ stage: "resolve_spec", status: "failed", detail: { error: (err as Error).message } });

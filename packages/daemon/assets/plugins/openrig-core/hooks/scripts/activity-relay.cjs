@@ -46,7 +46,9 @@ function firstString(...values) {
   return null;
 }
 
-function buildOpenRigPayload(providerPayload, env = process.env, now = () => new Date()) {
+// The route this run reports by, so the daemon can count one event once per route: "plugin" for the plugin's hook
+// (started with --from-plugin), "managed" for the settings or managed hook copy.
+function buildOpenRigPayload(providerPayload, env = process.env, now = () => new Date(), argv = process.argv) {
   const sessionName = firstString(env.OPENRIG_SESSION_NAME, env.RIGGED_SESSION_NAME);
   const nodeId = firstString(env.OPENRIG_NODE_ID, env.RIGGED_NODE_ID);
   const runtime = firstString(env.OPENRIG_RUNTIME, env.RIGGED_RUNTIME);
@@ -80,6 +82,7 @@ function buildOpenRigPayload(providerPayload, env = process.env, now = () => new
     subtype,
     turnId: firstString(providerPayload.turn_id, providerPayload.turnId),
     occurredAt: now().toISOString(),
+    relayRoute: argv.includes("--from-plugin") ? "plugin" : "managed",
   };
 }
 
@@ -170,6 +173,10 @@ function buildSessionIdentityPayload(providerPayload, env = process.env, now = (
 
   if ((!sessionName && !nodeId) || !runtime) return null;
 
+  // #1524 (a): whether the runtime sent transcript_path, and its raw value. Codex sends an explicit null for a
+  // thread it never persists; the daemon tells that apart from an absent key, an empty string or a malformed value.
+  const transcriptPathPresent = Object.prototype.hasOwnProperty.call(providerPayload, "transcript_path");
+
   return {
     eventFamily: "session_identity",
     sessionName,
@@ -182,6 +189,8 @@ function buildSessionIdentityPayload(providerPayload, env = process.env, now = (
     // The daemon finds the Claude that ran this hook from its parent chain.
     hookPid: process.pid,
     sessionId,
+    transcriptPathPresent,
+    ...(transcriptPathPresent ? { transcriptPath: providerPayload.transcript_path } : {}),
     occurredAt: now().toISOString(),
   };
 }
@@ -214,15 +223,31 @@ function uid() {
 // each event once either way. Anything unreadable, missing or different counts as "not registered": a seat is never silent.
 const SETTINGS_RELAY_TAIL = "state/claude-activity-hooks/activity-relay.cjs";
 
-// The adapter's own test for the entry it writes (isOwnedRelayCommand): `node` and one single-quoted token, in the form
-// shellQuote produces, naming the relay copy. A wrapper that only mentions the path is not that entry. Returns the path.
+// Keep this finite Node-command grammar in parity with parseManagedClaudeNodeCommand.
+// Canonical POSIX quotes and literal unquoted words only; no expansion or wrappers.
 function settingsRelayPath(command) {
-  const m = /^node\s+(.+)$/.exec(command.trim());
-  const arg = m && m[1];
-  if (!arg || arg.length < 2 || !arg.startsWith("'") || !arg.endsWith("'")) return null;
-  const decoded = arg.slice(1, -1).split(`'"'"'`).join("'");
-  if ("'" + decoded.replace(/'/g, `'"'"'`) + "'" !== arg) return null;
-  return path.isAbsolute(decoded) && decoded.endsWith(`/${SETTINGS_RELAY_TAIL}`) ? decoded : null;
+  if (/[\r\n]/.test(command)) return null;
+  const token = /'(?:[^']|'"'"')*'|[-A-Za-z0-9_./:@%+=,]+/.source;
+  const m = new RegExp(`^(${token})[ \t]+(${token})$`).exec(command.trim());
+  if (!m) return null;
+  const decode = token => token.startsWith("'") ? token.slice(1, -1).split(`'"'"'`).join("'") : token;
+  const quote = value => "'" + value.replace(/'/g, `'"'"'`) + "'";
+  const executable = decode(m[1]);
+  const relay = decode(m[2]);
+  if (m.slice(1).some(token => token.startsWith("'") && quote(decode(token)) !== token)) return null;
+  if (!path.isAbsolute(relay) || !relay.endsWith(`/${SETTINGS_RELAY_TAIL}`)) return null;
+  if (executable !== "node" && (!path.isAbsolute(executable) || !/^node(?:\.exe)?$/i.test(path.basename(executable)))) return null;
+  return { executable, relay };
+}
+
+function interpreterAvailable(executable, env) {
+  const candidates = executable === "node"
+    ? typeof env.PATH === "string" ? env.PATH.split(path.delimiter).map(dir => path.resolve(dir || ".", "node")) : []
+    : [executable];
+  return candidates.some(candidate => {
+    try { fs.accessSync(candidate, fs.constants.X_OK); return fs.statSync(candidate).isFile(); }
+    catch { return false; }
+  });
 }
 
 // A settings entry only silences this run if it would really report: the file it names is there and is this very script.
@@ -243,7 +268,7 @@ function settingsRelayReports(hookEvent, providerPayload, env = process.env) {
     return Array.isArray(groups) && groups.some((group) => group && unrestricted(group) && Array.isArray(group.hooks)
       && group.hooks.some((hook) => {
         const relay = hook && typeof hook.command === "string" ? settingsRelayPath(hook.command) : null;
-        return relay !== null && isThisScript(relay);
+        return relay !== null && interpreterAvailable(relay.executable, env) && isThisScript(relay.relay);
       }));
   } catch {
     return false;
@@ -253,6 +278,10 @@ function settingsRelayReports(hookEvent, providerPayload, env = process.env) {
 function pluginRunIsRedundant(providerPayload, argv = process.argv, env = process.env) {
   if (!argv.includes("--from-plugin")) return false;
   const hookEvent = firstString(providerPayload.hookEvent, providerPayload.hookEventName, providerPayload.hook_event_name, providerPayload.event, providerPayload.eventName);
+  // Codex: the plugin's run always reports. Whether Codex runs the daemon's managed relay for this event depends on hook
+  // state merged from every user layer (a selected profile included) and session flags, which this script can't see, so it
+  // never assumes so. With both routes active an event is reported twice; it is never lost.
+  if (firstString(env.OPENRIG_RUNTIME, env.RIGGED_RUNTIME) === "codex") return false;
   return settingsRelayReports(hookEvent, providerPayload, env);
 }
 
@@ -306,4 +335,5 @@ module.exports = {
   resolveEndpoint,
   pluginRunIsRedundant,
   settingsRelayReports,
+  settingsRelayPath,
 };

@@ -108,6 +108,7 @@ describe("SettingsStore (User Settings v0)", () => {
       "context.root",
       "context.system_world",
       "skills.root",
+      "skills.router_line.enabled",
       "onboarding.default_pack.enabled",
       "launch.non_interruptive",
       "health.context_pressure.warning_percent",
@@ -153,6 +154,8 @@ describe("SettingsStore (User Settings v0)", () => {
       "snapshots.periodic.retention_keep",
       // OPR.0.4.6.02 S1 — inner-tmux status-bar launch default (static bool).
       "terminal.status_bar",
+      "terminal.history_limit",
+      "terminal.inherit_tmux_environment",
       // Slice 15 (OPR.0.7.0.15) — compact command-output defaults switch.
       "output.compact",
       // Slice 15 P5 — the whoami peer bound under output.compact.
@@ -160,11 +163,10 @@ describe("SettingsStore (User Settings v0)", () => {
       // Slice 01 (OPR.0.7.0.1) — Codex usage windows switch.
       "provider.usage_windows",
       "bundle.services_enabled",
-      // Slice 18 (OPR.0.7.0.18) — the subscription move record switch.
-      "provider.subscription_moves",
       "usage.pi_cost_facts",
       "usage.pi_openrouter_charge",
       "transport.verify_input_box",
+      "transport.local_user_guard",
       // OPR.0.4.6.FS-1 W2 — queue-retention maintenance knobs.
       "retention.enabled",
       "retention.transitions_days",
@@ -207,6 +209,16 @@ describe("SettingsStore (User Settings v0)", () => {
   it("defaults the advisor session to the kernel's advisor seat", () => {
     const store = new SettingsStore(configPath);
     expect(store.resolveOne("agents.advisor_session")).toMatchObject({ value: "advisor-lead@kernel", source: "default" });
+  });
+
+  it("defaults terminal.history_limit to 10000 and accepts only an integer in [2000, 1000000]", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("terminal.history_limit")).toMatchObject({ value: 10000, source: "default" });
+    store.set("terminal.history_limit", "50000");
+    expect(store.resolveOne("terminal.history_limit")).toMatchObject({ value: 50000, source: "file" });
+    for (const raw of ["0", "-5000", "1999", "1000001", "2.5", "10000rows", "many"]) {
+      expect(() => store.set("terminal.history_limit", raw)).toThrow(/terminal\.history_limit/);
+    }
   });
 
   it("defaults output.whoami_peers to 8 and accepts only an integer >= 1 (slice 15 P5)", () => {
@@ -375,6 +387,46 @@ describe("SettingsStore (User Settings v0)", () => {
     vi.unstubAllEnvs();
     store.reset("bundle.services_enabled");
     expect(store.resolveOne("bundle.services_enabled")).toMatchObject({ value: false, source: "default" });
+  });
+
+  it("reset(key) removes a section it leaves empty", () => {
+    const store = new SettingsStore(configPath);
+    store.set("bundle.services_enabled", "true");
+    store.reset("bundle.services_enabled");
+    const raw = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(raw.bundle).toBeUndefined();
+  });
+
+  it("reset(key) keeps the section when a sibling key remains", () => {
+    const store = new SettingsStore(configPath);
+    store.set("transport.local_user_guard", "true");
+    store.set("transport.verify_input_box", "true");
+    store.reset("transport.local_user_guard");
+    const raw = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(raw.transport).toEqual({ verifyInputBox: true });
+  });
+
+  it("reset(key) leaves a pre-existing unrelated empty object alone", () => {
+    const store = new SettingsStore(configPath);
+    store.set("transport.local_user_guard", "true");
+    const raw1 = JSON.parse(readFileSync(configPath, "utf8"));
+    raw1.unrelatedEmptySection = {};
+    writeFileSync(configPath, JSON.stringify(raw1, null, 2) + "\n");
+    store.reset("transport.local_user_guard");
+    const raw2 = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(raw2.unrelatedEmptySection).toEqual({});
+    expect(raw2.transport).toBeUndefined();
+  });
+
+  it("local user guard is opt-in and resolves the file/env twins", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("transport.local_user_guard")).toMatchObject({ value: false, source: "default" });
+    store.set("transport.local_user_guard", "true");
+    expect(store.resolveOne("transport.local_user_guard")).toMatchObject({ value: true, source: "file" });
+    try {
+      process.env.OPENRIG_TRANSPORT_LOCAL_USER_GUARD = "false";
+      expect(store.resolveOne("transport.local_user_guard")).toMatchObject({ value: false, source: "env" });
+    } finally { delete process.env.OPENRIG_TRANSPORT_LOCAL_USER_GUARD; }
   });
 
   it("transport.verify_input_box is off by default and resolves file, then env", () => {

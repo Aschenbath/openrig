@@ -71,8 +71,13 @@ are not yet runnable checks.
   database, workspace and topology roots, seat identity, bearer tokens), forces a fixture
   `OPENRIG_HOME` and fails if the home is not fixture-scoped. It also wraps `fetch`, so a real
   request to anything other than a loopback ephemeral-port fixture or a registered target fails.
-  Unless `OPENRIG_E2E_REAL_CODEX=1`, it points `HOME` and the XDG directories at a fixture user
-  home and clears `CODEX_HOME`; that opt-in keeps the real homes. A test can still set its own
+  It points `HOME` and the XDG directories at a fixture user home and clears `CODEX_HOME` and
+  `CLAUDE_CONFIG_DIR`. `OPENRIG_E2E_REAL_CODEX=1` keeps native homes and binaries only for
+  `seat-handover-model-fidelity-e2e.test.ts` and `seat-lifecycle-set-model-resume-e2e.test.ts`;
+  all other files remain isolated. The scenario scaffold always uses fixture homes and runtime stubs.
+  The two native files rely on Vitest's default per-file isolation; runs without it are unsupported.
+  Scenario scaffolds scrub inherited provider roots but preserve those passed in an explicit `baseEnv`.
+  A test can still set its own
   overrides after setup. The UI suite (jsdom) uses its own `packages/ui/test/setup.ts`.
 
 - **Stale vendored daemon.** `npm run build:package` leaves an assembled copy of the daemon at
@@ -254,7 +259,7 @@ means:
 | Reboot / tmux reset | `daemon: {op: restart}` restarts only the scenario daemon, and the tmux server keeps running. No step resets tmux. | Recycled pane IDs and stale bindings after a real reboot (the class behind #141) are not covered by a daemon restart. |
 | Multi-rig and same-name identities | The `up` step always uses the scenario's top-level `topology` and ignores a per-step override. No step archives or removes a rig. | Cross-rig scope, same-name generations and archive/remove routing (the class behind #174) need runner work before they can be tested. |
 | Step-time restore, compaction, mutation, policy | `restore`, `emit`, `mutate` and `policy` parse, but the runner throws `UnboundActionError` when it reaches them. Behaviours run only from a per-seat launch script (`env.stub_scripts`). A seat `restart` step maps to `rig launch`, which is not native resume or fork. | Step-time compaction and restore, and native resume and fork, are not covered. |
-| Skill projection | The stub projects skills into `<cwd>/.openrig/stub/skills/`. Claude Code projects into `<cwd>/.claude/skills/`. | A stub green says nothing about provider-specific projection (the class behind #159). |
+| Skill projection | The stub projects skills into `<cwd>/.openrig/stub/skills/`. Claude Code projects a team seat's skills into the seat's generated plugin in OpenRig's state, and into `<cwd>/.claude/skills/` only for a seat without one. | A stub green says nothing about provider-specific projection (the class behind #159). |
 | Model and provider | No model, no tokens. Stub scripts refuse `usage_limit` because it only exists on real runtimes. | Model behaviour, provider usage limits and real context usage need live evals or a real runtime. |
 | Platform | CI's scenario job runs in a Linux container. | macOS process behaviour is covered by the macOS `package-tests` jobs, not by scenarios. |
 
@@ -264,8 +269,11 @@ The most useful next pieces of harness work, roughly in dependency order:
 2. A model-free test entry point shaped like a provider, that goes through the real native
    adapter and managed launch. Package tests such as `claude-interactive-launch.test.ts` and
    the `*-native.test.ts` files already drive the real adapters through tmux against an
-   offline recorder; they prove command resolution and arguments, not readiness, history or
-   answers.
+   offline recorder; they prove command resolution and arguments.
+   `claude-executable-foreground.test.ts` holds that recorder open in private Bash, zsh, dash and ksh panes
+   to check parent PID, process-group ownership, tmux's pane command and parent-shell
+   restoration for unmanaged fresh, fork and resume launches. These fixtures do not prove
+   native readiness, history or answers.
 3. Lifecycle and identity steps (tmux reset, archive/remove).
 4. Then pickup, wake and restore scenarios.
 
@@ -315,6 +323,19 @@ contracts without extending the YAML grammar. The corresponding library scenario
 above remain pending: pane rendering does not prove input consumption, durable
 stream replay does not prove live subscription, and this test does not exercise
 native providers, restore or policy changes.
+
+`packages/daemon/test/rig-edge-cli.integration.test.ts` uses the same private
+scenario daemon and tmux helpers for edge repair. It removes a stub seat, re-adds
+its logical ID with the terminal runtime, then restores its cross-pod edges with one
+`rig edge add` per edge. It checks repeat IDs and edge counts, refusal without a
+write, unchanged sibling node/binding identities and pane PIDs, export,
+snapshot capture and exact rollback. It models the cross-runtime replacement
+workaround without invoking Claude Code or Codex. The YAML runner has no bound
+edge/remove/add verbs, so this journey drives the real CLI directly:
+
+```sh
+npm test -w @openrig/daemon -- test/rig-edge-cli.integration.test.ts
+```
 
 ## If your change touches an artery, add or extend a scenario (or say why not)
 

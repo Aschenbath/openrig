@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { Command } from "commander";
 import { seatCommand } from "../src/commands/seat.js";
+import { DaemonTimeoutError } from "../src/client.js";
 import { STATE_FILE, type DaemonState, type LifecycleDeps } from "../src/daemon-lifecycle.js";
 import type { StatusDeps } from "../src/commands/status.js";
 
@@ -146,6 +147,71 @@ describe("rig seat set-permissions", () => {
       body: { mode: "floor", reason: "future launch choice", operator: "human@example.test" } }]);
     expect(logs.join("\n")).toContain("Permission mode: floor");
     expect(exitCode).toBeUndefined();
+  });
+});
+
+describe("rig seat set-cwd", () => {
+  const args = ["node", "rig", "seat", "set-cwd", "planner@project", "--cwd", "/srv/remote/space dir/../planner", "--reason", "isolate planning"];
+
+  it("requires cwd and reason before contacting the daemon", async () => {
+    const calls: Array<{ path: string; body: unknown }> = [];
+    const deps = makeDeps({ status: 200, data: {} }, calls);
+    await expect(makeCommand(deps).parseAsync(args.slice(0, 5))).rejects.toThrow(/--cwd/);
+    await expect(makeCommand(deps).parseAsync(args.slice(0, 7))).rejects.toThrow(/--reason/);
+    expect(calls).toEqual([]);
+  });
+
+  it("forwards the daemon-host path unchanged and describes the future-launch effect", async () => {
+    const calls: Array<{ path: string; body: unknown }> = [];
+    const deps = makeDeps({ status: 200, data: { ok: true, seat: { logicalId: "planner", rigName: "project" },
+      from: "/srv/shared", to: "/srv/remote/planner", changed: true, effect: "next_launch", warnings: ["Retained local guidance"] } }, calls);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { logs, exitCode } = await captureLogs(() => makeCommand(deps).parseAsync([...args, "--operator", "operator@project"]).then(() => {}));
+    expect(calls).toEqual([{ path: "/api/seat/set-cwd/planner%40project", body: {
+      cwd: "/srv/remote/space dir/../planner", reason: "isolate planning", operator: "operator@project",
+    } }]);
+    expect(logs.join("\n")).toContain("/srv/remote/planner");
+    expect(logs.join("\n")).toContain("The running process keeps its current directory");
+    expect(logs.join("\n")).toContain("rig seat launch planner@project --fresh --stop");
+    expect(warn).toHaveBeenCalledWith("Warning: Retained local guidance");
+    expect(exitCode).toBeUndefined();
+  });
+
+  it.each([200, 409, 500])("preserves the daemon response in JSON, including a refused change (HTTP %s)", async status => {
+    const data = status === 200
+      ? { ok: true, changed: false, to: "/srv/remote/planner", effect: "next_launch", warnings: [] }
+      : { ok: false, code: status === 500 ? "cwd_check_failed" : "cwd_destination_conflict", message: "The working directory was not changed", warnings: ["Protected destination file: /srv/remote/planner/.claude/agents/reviewer.md"] };
+    const calls: Array<{ path: string; body: unknown }> = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { logs, exitCode } = await captureLogs(() => makeCommand(makeDeps({ status, data }, calls)).parseAsync([...args, "--json"]).then(() => {}));
+    expect(logs).toHaveLength(1);
+    expect(JSON.parse(logs[0]!)).toEqual(data);
+    expect(warn).not.toHaveBeenCalled();
+    expect(exitCode).toBe(status === 200 ? undefined : status === 500 ? 2 : 1);
+  });
+
+  it("treats a timeout as an unknown outcome and directs the caller to status", async () => {
+    const post = vi.fn(async () => { throw new DaemonTimeoutError("directory change timed out"); });
+    const deps = { ...makeDeps({ status: 200, data: {} }, []), clientFactory: () => ({ post }) as never };
+    const { logs, exitCode } = await captureLogs(() => makeCommand(deps).parseAsync([...args, "--json"]).then(() => {}));
+    // set-cwd writes no startup files now, so it uses the default request deadline.
+    expect(post).toHaveBeenCalledExactlyOnceWith("/api/seat/set-cwd/planner%40project", expect.any(Object));
+    expect(JSON.parse(logs[0]!)).toMatchObject({ ok: false, code: "set_cwd_outcome_unknown", status: "unknown",
+      guidance: expect.stringContaining("rig seat status planner@project") });
+    expect(exitCode).toBe(1);
+  });
+
+  it("prints protected destination paths and recovery guidance for a conflict", async () => {
+    const protectedPath = "/srv/remote/planner/.claude/agents/reviewer.md";
+    const data = { ok: false, code: "cwd_destination_conflict", message: "Destination files conflict; cwd was not committed",
+      guidance: "Use a clean destination, or inspect and move/merge the reported files before retrying.",
+      warnings: [`Protected destination file: ${protectedPath}`] };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { errors, exitCode } = await captureLogs(() => makeCommand(makeDeps({ status: 409, data }, [])).parseAsync(args).then(() => {}));
+    expect(warn).toHaveBeenCalledWith(`Warning: Protected destination file: ${protectedPath}`);
+    expect(errors.join("\n")).toContain("cwd was not committed");
+    expect(errors.join("\n")).toContain("inspect and move/merge");
+    expect(exitCode).toBe(1);
   });
 });
 
@@ -361,6 +427,22 @@ describe("fresh launch preview", () => {
     expect(deps.lifecycleDeps.spawn).not.toHaveBeenCalled();
   });
 
+  it("OPR.0.7.0.9: the printed plan shows the seat's launch additions, as the seat view does", async () => {
+    const launchAdditions = { agent: "openrig:reviewer", agentPromptReplacesDefault: true, appendSystemPromptFile: "/s/additions/system-prompt.md",
+      pluginDirs: ["/s/additions/plugins/review"], missing: ["/s/gone"], refused: ["/s/linked is not inside this seat's storage"] };
+    const data = { ok: true, planOnly: true, complete: true, launchable: true, sessionName: "dev@fixture", currentOccupant: "absent",
+      startup: { projectionCount: 0, fileCount: 0, actionCount: 0 }, stopRequired: false, wouldStop: false, blockers: [], warnings: [], siblings: [],
+      launchAdditions };
+    const deps = makeDeps({ status: 200, data }, []);
+    const output = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "launch", "dev@fixture", "--fresh", "--plan"]).then(() => undefined));
+    const text = output.logs.join("\n");
+    expect(text).toContain("agent       openrig:reviewer (--agent; its prompt replaces Claude's default system prompt)");
+    expect(text).toContain("prompt      /s/additions/system-prompt.md (--append-system-prompt-file)");
+    expect(text).toContain("plugin dir  /s/additions/plugins/review (CLAUDE_CODE_PLUGIN_DIRS)");
+    expect(text).toContain("missing     /s/gone: not passed to the launch");
+    expect(text).toContain("refused     /s/linked is not inside this seat's storage: not passed to the launch");
+  });
+
   it("fails closed on an older daemon without ever posting to the launch endpoint", async () => {
     const calls: Array<{ path: string; body: unknown }> = [];
     const deps = makeDeps({ status: 404, data: { error: "Not Found" } }, calls);
@@ -388,9 +470,23 @@ describe("OPR.0.7.0.5 rig seat restart --keep-conversation", () => {
     ok: true, planOnly: outcome === undefined, ...(outcome ? { outcome } : {}), message: "Done.",
     seat: { logicalId: "dev.codex", rigName: "r" }, sessionName: "dev-codex@r", pane: "%1", paneShape: "shell_backed",
     conversationId: "tok", conversationProof: "argv", activity: { state: "working", detail: "Mid-turn." },
-    childProcesses: [{ pid: 9, name: "node" }], codexHome: "/h/.codex", billingRoute: { detail: "Unknown." },
+    childProcesses: [{ pid: 9, name: "node" }], codexHome: "/h/.codex",
     account: { credentialStore: { detail: "File-backed." }, authFile: { detail: "Stat only." }, startupGate: null },
     peers: [{ logicalId: "dev.peer", effect: "Not restarted; account unverified." }], warnings: [],
+  });
+
+  it("prints the --no-daemon launch evidence and a named startup gate's kind", async () => {
+    const data = { ...report("incomplete"), codexNoDaemonFlag: { present: true, detail: "Launch evidence: the running Codex was started with --no-daemon. This doesn't show whether an app-server process, its login or any lock is involved." },
+      account: { credentialStore: { detail: "File-backed." }, authFile: { detail: "Stat only." }, startupGate: "Codex is waiting for hook trust approval.", startupGateKind: "hook_trust_gate" },
+      remainingStep: "Codex is waiting for a hook review decision in the pane (dev-codex@r, pane %1). That decision is for the person or an authorised operator; once it's made, run the recovery command." };
+    const output = await captureLogs(() => makeCommand(makeDeps({ status: 200, data }, [])).parseAsync([
+      "node", "rig", "seat", "restart", "dev@r", "--keep-conversation", "--reason", "x"]).then(() => undefined));
+    const text = output.logs.join("\n");
+    expect(text).toContain("Launch evidence: the running Codex was started with --no-daemon.");
+    expect(text).not.toContain("Process mode");
+    expect(text).not.toContain("Billing route");
+    expect(text).toContain("Codex startup gate (hook_trust_gate): Codex is waiting for hook trust approval.");
+    expect(text).toContain("Remaining step: Codex is waiting for a hook review decision");
   });
 
   it("requires a reason before contacting the daemon, and refuses --plan with --verify", async () => {

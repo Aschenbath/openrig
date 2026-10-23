@@ -1,12 +1,20 @@
 import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { fixtureUserHomeEnv } from "../../../test/hermetic-env.setup.js";
 import {
   DAEMON_TARGET_ENV_VARS,
   detectForeignDaemonTarget,
   assertNoForeignDaemon,
   HermeticEnvError,
 } from "./helpers/hermetic-env.js";
+
+it.each(["win32", "darwin", "linux"] as const)("keeps provider home selection in the fixture on %s", (platform) => {
+  const home = "/fixture-user-home";
+  expect({ USERPROFILE: "inherited-profile", ...fixtureUserHomeEnv(home, platform) }).toEqual({
+    HOME: home, USERPROFILE: platform === "win32" ? home : "inherited-profile",
+  });
+});
 
 // Slice 51-02 — the hermetic env-discipline helper's FAIL-CLOSED guard (proof item 4,
 // the safety keystone). If a live-daemon TARGET the helper did not create is present in

@@ -33,12 +33,12 @@ blanket-replaced: `rigged` → `rig` is a per-occurrence question, not a global
 substitution.
 
 **Axis 1 — MCP tool names are `rig_*`.** `packages/cli/src/mcp-server.ts`
-registers **23** tools, all named `rig_*`
+registers **24** tools, all named `rig_*`
 (`grep -c 'server.tool(' packages/cli/src/mcp-server.ts`), including
 `rig_rig_nodes` (`mcp-server.ts:290`), `rig_send` (`:307`),
 `rig_capture` (`:341`), `rig_chatroom_send` (`:366`) and `rig_chatroom_watch`
-(`:402`), and the five queue tools `rig_queue_create`, `_show`, `_list`, `_claim`
-and `_update`. No `rigged_*` name other than the tmux keys below remains in product
+(`:402`), the five queue tools `rig_queue_create`, `_show`, `_list`, `_claim`
+and `_update`, and `rig_telemetry_events`. No `rigged_*` name other than the tmux keys below remains in product
 source: **0** hits
 (`git grep -n 'rigged_' -- ':(glob)packages/*/src/**' | grep -v -c '@rigged_'`).
 
@@ -277,21 +277,21 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
      after Enter must show the box empty, with the pane process
      (`#{pane_pid}`) and the seat's binding unchanged.
 
-   The result's `inputBox: { seat, before, after, sameProcess }` says which
-   reading failed. An empty box reads `queued` instead of `empty` where the
-   frames say the message may wait behind a turn: Codex's pending-input rows
-   or a row under its running-turn status, or a running turn in the frame
-   read before Enter (Codex's `• Working` row; for Claude Code,
-   `esc to interrupt` or a live status row above the box, including above a
-   box of several rows). The verdict uses these readings: verified needs
-   `empty`, so for a seat that was idle before the paste they are the only
-   check that rejects a message queued behind a turn that started after the
-   pre-paste capture. An audited prompt answer (step 4) reads no box: with
-   the setting on its `inputBox` reads `unchecked` for `seat`, `before` and
-   `after`, `sameProcess` is `false` (it stays a boolean), and the send reads
-   unconfirmed, whatever the default matcher would say.
-   It reports only: the seat is read from the capture `--verify` already
-   takes, and none of the extra reads decides whether Enter is sent. Each has
+   These readings stay internal to the send; the result carries only the
+   verdict (`verified`, `outcome`). An empty box reads `queued` instead of
+   `empty` where the frames say the message may wait behind a turn: Codex's
+   pending-input rows or a row under its running-turn status, or a running
+   turn in the frame read before Enter (Codex's `• Working` row; for Claude
+   Code, `esc to interrupt` or a live status row above the box, including
+   above a box of several rows). The verdict uses these readings: verified
+   needs `empty`, so for a seat that was idle before the paste they are the
+   only check that rejects a message queued behind a turn that started after
+   the pre-paste capture. An audited prompt answer (step 4) reads no box: with
+   the setting on it stays unconfirmed, whatever the default matcher would
+   say.
+   The readings decide the verification verdict, not whether Enter is sent:
+   the seat is read from the capture `--verify` already takes, and none of
+   the extra reads decides whether Enter is sent. Each has
    a 500 ms deadline, which is a budget, not a guarantee: the pre-Enter read
    comes after the existing 200 ms wait and can add about 500 ms before
    Enter, and the post-Enter process read can add about another 500 ms

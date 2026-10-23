@@ -118,8 +118,11 @@ Examples:
 
 Exit codes:
   0  Success
-  1  Daemon not running, or the rig is unknown or ambiguous
-  2  Failed to fetch data from daemon (or wake timed out)`);
+  1  Daemon not running, the rig is unknown or ambiguous, or --runtime or
+     --wake-timeout is invalid
+  2  Failed to fetch data from daemon; the --wake seat has no such tenure, or its
+     tenure isn't Claude or Codex or has no resume token; or the wake failed or
+     timed out`);
 
   const getDeps = (): AskCommandDeps => (depsOverride as AskCommandDeps | undefined) ?? {
     lifecycleDeps: realDeps(),
@@ -145,7 +148,7 @@ Exit codes:
       }
 
       let token = target;
-      let runtime: "claude" | "codex" = opts.runtime === "codex" ? "codex" : "claude";
+      let runtime = opts.runtime ?? "claude";
 
       if (target.includes("@")) {
         const status = await getDaemonStatus(deps.lifecycleDeps);
@@ -177,6 +180,13 @@ Exit codes:
         }
         token = resolution.token;
         runtime = resolution.runtime;
+      }
+
+      if (runtime === "claude-code") runtime = "claude";
+      if (runtime !== "claude" && runtime !== "codex") {
+        console.error(`Wake runtime '${runtime || "unknown"}' is not supported. Supported runtimes are claude and codex.`);
+        process.exitCode = 1;
+        return;
       }
 
       const runner = deps.wakeRunner ?? defaultWakeRunner;

@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
-import type { TmuxAdapter } from "../adapters/tmux.js";
+import type { TmuxAdapter, SessionProbe } from "../adapters/tmux.js";
 import type { SnapshotCapture } from "./snapshot-capture.js";
 import type { EventBus } from "./event-bus.js";
 import { RigNotFoundError } from "./errors.js";
@@ -11,6 +11,8 @@ import nodePath from "node:path";
 import { removeManagedBlocksFromFile, DEFAULT_CLAUDE_MANAGED_BLOCK_FILE } from "./managed-blocks.js";
 import { stopTranscriptRotation } from "./transcript-rotation.js";
 import { findOtherSessionOwner } from "./session-owner.js";
+import { cleanSeatSkills, seatSkillPaths } from "./seat-skill-storage.js";
+import { settleAutomaticRestore } from "./existing-rig-restore.js";
 
 export interface TeardownResult {
   rigId: string;
@@ -20,6 +22,9 @@ export interface TeardownResult {
   deleteBlocked: boolean;
   alreadyStopped: boolean;
   errors: string[];
+  /** OPR.0.7.0.13: team skill files left in seats' own storage because they were edited, or were never recorded as
+   *  OpenRig's. Present only when something was kept. */
+  keptSkills?: string[];
 }
 
 interface TeardownOptions {
@@ -52,6 +57,13 @@ interface LatestNodeSession {
   cwd: string | null;
 }
 
+/** Only a reported missing server permits a bootstrap; other unreadable/permission results do not. */
+function isMissingTmuxServer(probe: SessionProbe): boolean {
+  if (probe.state !== "transport_unavailable" || /permission denied|operation not permitted|EACCES|EPERM/i.test(probe.cause)) return false;
+  return /no server running/i.test(probe.cause)
+    || /(?:error connecting to|tmux-\d+)[^\n]*(?:No such file or directory|Connection refused)/i.test(probe.cause);
+}
+
 /**
  * Graceful rig shutdown. Kills tmux sessions, clears bindings, marks
  * sessions exited. Optionally snapshots before teardown, optionally
@@ -77,12 +89,20 @@ export class RigTeardownOrchestrator {
 
     const guard = this.deps.tmuxAdapter.deliveryGuard;
     const ids = rig.nodes.map(node => node.id);
+    // Daemon start may be restoring this rig (a kernel a reboot left down). A stop made meanwhile
+    // waits, holding no lease, for that restore to return and then stops what it left, so the stop
+    // wins either way; taking the leases first would bind to seats that restore then replaces.
+    if (!guard || !ids.some(id => guard.ownsLifecycle(id))) await settleAutomaticRestore(this.db, rigId);
     if (guard && ids.some(id => !guard.ownsLifecycle(id))) return guard.lifecycle(ids, () => this.teardown(rigId, opts));
     const result: TeardownResult = {
       rigId, sessionsKilled: 0, snapshotId: null,
       deleted: false, deleteBlocked: false, alreadyStopped: false, errors: [],
     };
     const archived = this.db.prepare("SELECT archived_at FROM rigs WHERE id = ?").get(rigId) as { archived_at: string | null };
+    // OPR.0.7.0.13: read the seats' storage keys now; a delete removes the node rows. Only a seat whose consumer is
+    // confirmed gone has its skills cleaned (settledSkillSeats); the rest keep theirs.
+    const skillSeats = rig.nodes.filter((node) => node.runtime === "claude-code" || node.runtime === "codex")
+      .map((node) => ({ id: node.id, logicalId: node.logicalId, runtime: node.runtime as string }));
     // A live seat can create its guidance while teardown awaits tmux. Resolve
     // file identities only after those waits, immediately before each cleanup.
     const currentLiveGuidanceTargets = () => this.liveGuidanceTargets(rigId);
@@ -106,6 +126,8 @@ export class RigTeardownOrchestrator {
           result.errors.push(`Service teardown warning: ${(err as Error).message}`);
         }
       }
+      // Read which seats are settled before a delete removes their session rows.
+      const settled = this.settledSkillSeats(skillSeats);
       // Skip to delete if requested
       if (opts?.delete) {
         this.atomicDelete(rigId);
@@ -113,6 +135,7 @@ export class RigTeardownOrchestrator {
       } else {
         this.deps.eventBus.emit({ type: "rig.stopped", rigId });
       }
+      this.cleanupSeatSkills(rigId, skillSeats, settled, result);
       return result;
     }
 
@@ -199,6 +222,8 @@ export class RigTeardownOrchestrator {
       }
     }
 
+    // Read which seats are settled before a delete removes their session rows.
+    const settled = this.settledSkillSeats(skillSeats);
     // 6. Delete if requested (blocked by kill failures)
     if (opts?.delete) {
       if (killFailures > 0) {
@@ -219,11 +244,51 @@ export class RigTeardownOrchestrator {
       this.deps.eventBus.emit({ type: "rig.stopped", rigId });
     }
 
+    this.cleanupSeatSkills(rigId, skillSeats, settled, result);
     return result;
   }
 
+  /**
+   * OPR.0.7.0.13: the seats whose consumer is confirmed gone: its latest session was confirmed stopped (this down killed
+   * it or found it absent, or an earlier down did; both record the stop), or it never had a session. A running,
+   * exited or detached row whose absence wasn't confirmed (a session still present, a probe unavailable or failing, no
+   * probe at all) leaves the seat unsettled: a detached row doesn't prove the process is gone.
+   */
+  private settledSkillSeats(seats: ReadonlyArray<{ id: string }>): Set<string> {
+    const settled = new Set<string>();
+    const latest = this.db.prepare(`SELECT intentionally_stopped AS stopped FROM sessions WHERE node_id = ?
+      ORDER BY created_at DESC, id DESC LIMIT 1`);
+    for (const seat of seats) {
+      try {
+        const row = latest.get(seat.id) as { stopped: number } | undefined;
+        if (!row || row.stopped === 1) settled.add(seat.id);
+      } catch {}
+    }
+    return settled;
+  }
+
+  /** OPR.0.7.0.13: once a seat's consumer is confirmed gone, remove the unchanged skill files OpenRig wrote into its
+   *  own storage and report what was kept. The records go only with the rig itself, so a restore can rebuild them. */
+  private cleanupSeatSkills(rigId: string, seats: ReadonlyArray<{ id: string; logicalId: string; runtime: string }>, settled: ReadonlySet<string>, result: TeardownResult): void {
+    const kept: string[] = [];
+    for (const seat of seats) {
+      if (!settled.has(seat.id)) {
+        const paths = seatSkillPaths({ rigId, logicalId: seat.logicalId, runtime: seat.runtime });
+        if (fs.existsSync(paths.root)) result.errors.push(`Seat skills for ${seat.logicalId} kept: its consumer isn't confirmed stopped`);
+        continue;
+      }
+      try {
+        const cleaned = cleanSeatSkills(seatSkillPaths({ rigId, logicalId: seat.logicalId, runtime: seat.runtime }), { dropRecords: result.deleted });
+        kept.push(...cleaned.kept, ...cleaned.refused);
+      } catch (err) {
+        result.errors.push(`Seat skill cleanup for ${seat.logicalId}: ${(err as Error).message}`);
+      }
+    }
+    if (kept.length > 0) result.keptSkills = kept;
+  }
+
   /** Atomically record the supported stop and clear its binding. */
-  private atomicNodeCleanup(session: LatestNodeSession): void {
+  private atomicNodeCleanup(session: Pick<LatestNodeSession, "sessionId" | "nodeId">): void {
     const tx = this.db.transaction(() => {
       this.deps.sessionRegistry.markIntentionallyStopped(session.sessionId);
       this.deps.sessionRegistry.clearBinding(session.nodeId);
@@ -246,15 +311,26 @@ export class RigTeardownOrchestrator {
     for (const row of eligible.all(rigId) as Array<{ id: string; node_id: string; session_name: string }>) {
       const binding = this.deps.sessionRegistry.getBindingForNode(row.node_id);
       if (binding && (binding.attachmentType !== "tmux" || binding.tmuxSession !== row.session_name)) continue;
+      const stillEligible = () => (eligible.all(rigId) as Array<{ id: string }>).some(current => current.id === row.id)
+        && JSON.stringify(this.deps.sessionRegistry.getBindingForNode(row.node_id)) === JSON.stringify(binding);
       try {
-        if ((await probe.call(this.deps.tmuxAdapter, row.session_name)).state !== "absent") continue;
+        let observed = await probe.call(this.deps.tmuxAdapter, row.session_name);
+        if (!stillEligible()) continue;
+        if (isMissingTmuxServer(observed)) {
+          // A reboot may have removed tmux's server/socket. Start only an empty server, then
+          // demand positive session absence; transport_unavailable itself proves nothing.
+          const started = await this.deps.tmuxAdapter.startServer();
+          if (!stillEligible() || !started.ok) continue;
+          observed = await probe.call(this.deps.tmuxAdapter, row.session_name);
+          if (!stillEligible()) continue;
+        }
+        if (observed.state !== "absent") continue;
       } catch {
         continue;
       }
       this.db.transaction(() => {
-        // A launch may have rebound the node while the absence probe awaited.
-        if ((eligible.all(rigId) as Array<{ id: string }>).some(current => current.id === row.id)
-          && JSON.stringify(this.deps.sessionRegistry.getBindingForNode(row.node_id)) === JSON.stringify(binding)) {
+        // Every await above can admit a new binding or latest session. Check again at the write.
+        if (stillEligible()) {
           this.deps.sessionRegistry.markIntentionallyStopped(row.id);
           this.deps.sessionRegistry.clearBinding(row.node_id);
         }

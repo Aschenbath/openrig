@@ -53,4 +53,48 @@ describe("bounded resume probe evidence (#1480)", () => {
     expect((await resumeProbeEvidence(probe, content, { listPanes: async () => [pane, { ...pane, id: "%2" }] }, "seat")).capture)
       .toMatchObject({ columns: null, rows: null });
   });
+
+  it("keeps the probe when the geometry read times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const content = "● Login expired · Please run /login";
+      const result = resumeProbeEvidence(assess(content), content, {
+        listPanes: () => new Promise<never>(() => {}),
+      }, "%1");
+      const returned = vi.fn();
+      void result.then(returned);
+      await vi.advanceTimersByTimeAsync(250);
+      expect(returned).toHaveBeenCalledOnce();
+      expect(await result).toMatchObject({
+        status: "failed", code: "login_required",
+        capture: { columns: null, rows: null, sha256: createHash("sha256").update(content).digest("hex") },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["resolve", "reject"] as const)("ignores a geometry read that later %ss after its deadline", async settlement => {
+    vi.useFakeTimers();
+    try {
+      let resolveRead!: (panes: typeof pane[]) => void;
+      let rejectRead!: (error: Error) => void;
+      const read = new Promise<typeof pane[]>((resolve, reject) => { resolveRead = resolve; rejectRead = reject; });
+      const content = "● Login expired · Please run /login";
+      const result = resumeProbeEvidence(assess(content), content, { listPanes: () => read }, "%1");
+      const returned = vi.fn();
+      void result.then(returned);
+      await vi.advanceTimersByTimeAsync(250);
+      expect(returned).toHaveBeenCalledOnce();
+      const evidence = await result;
+      if (settlement === "resolve") resolveRead([pane]);
+      else rejectRead(new Error("fixture-private-late-error"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(evidence.capture).toMatchObject({ columns: null, rows: null });
+      expect(returned).toHaveBeenCalledOnce();
+      expect(JSON.stringify(evidence)).not.toContain("fixture-private");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

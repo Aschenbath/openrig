@@ -3,6 +3,7 @@ import { z } from "zod";
 import { randomBytes } from "node:crypto";
 import type { DaemonClient, DaemonResponse } from "./client.js";
 import { readOpenRigEnv } from "./openrig-compat.js";
+import { resolveRigHandle } from "./rig-handle.js";
 import { CLI_VERSION } from "./version.js";
 
 const LONG_RUNNING_UP_TIMEOUT_MS = 120_000;
@@ -12,6 +13,22 @@ type TextResult = {
   content: Array<{ type: "text"; text: string }>;
   isError?: true;
 };
+
+/**
+ * The rig id for a tool's rig argument, resolved as the rig CLI commands resolve it: an id, or a name one
+ * active rig has, gives that rig's id; a name two active rigs share is an error result with their ids;
+ * anything else (no match, or the rig list can't be read) goes to the daemon as given. `known` is false
+ * only when the rig list was read and nothing matched.
+ */
+async function rigIdFor(client: DaemonClient, handle: string): Promise<{ id: string; known: boolean } | TextResult> {
+  const resolution = await resolveRigHandle(client, handle);
+  if (resolution.kind === "ambiguous") {
+    const message = `'${handle}' matches ${resolution.ids.length} rigs. Nothing was done; pass one of these ids instead.`;
+    return { content: [{ type: "text", text: JSON.stringify({ ok: false, code: "rig_ambiguous", message, candidates: resolution.ids }) }], isError: true };
+  }
+  if (resolution.kind === "resolved") return { id: resolution.id, known: true };
+  return { id: handle, known: resolution.kind === "passthrough" };
+}
 
 /**
  * Maps a DaemonResponse to MCP tool result.
@@ -86,15 +103,17 @@ export function createMcpServer(client: DaemonClient): McpServer {
     "rig_down",
     "Tear down a rig",
     {
-      rigId: z.string().describe("Rig identifier to tear down"),
+      rigId: z.string().describe("Rig name or identifier to tear down"),
       delete: z.boolean().optional().describe("Delete rig record after stopping"),
       force: z.boolean().optional().describe("Kill sessions immediately"),
       snapshot: z.boolean().optional().describe("Take snapshot before teardown"),
     },
     async (params) => {
       try {
+        const rig = await rigIdFor(client, params.rigId);
+        if ("content" in rig) return rig;
         const res = await client.post("/api/down", {
-          rigId: params.rigId,
+          rigId: rig.id,
           delete: params.delete ?? false,
           force: params.force ?? false,
           snapshot: params.snapshot ?? false,
@@ -141,11 +160,13 @@ export function createMcpServer(client: DaemonClient): McpServer {
     "rig_snapshot_create",
     "Create a snapshot for a rig",
     {
-      rigId: z.string().describe("Rig identifier"),
+      rigId: z.string().describe("Rig name or identifier"),
     },
     async ({ rigId }) => {
       try {
-        const res = await client.post(`/api/rigs/${encodeURIComponent(rigId)}/snapshots`, {});
+        const rig = await rigIdFor(client, rigId);
+        if ("content" in rig) return rig;
+        const res = await client.post(`/api/rigs/${encodeURIComponent(rig.id)}/snapshots`, {});
         return mapResult(res);
       } catch (err) {
         return { content: [{ type: "text" as const, text: (err as Error).message }], isError: true as const };
@@ -158,11 +179,18 @@ export function createMcpServer(client: DaemonClient): McpServer {
     "rig_snapshot_list",
     "List snapshots for a rig",
     {
-      rigId: z.string().describe("Rig identifier"),
+      rigId: z.string().describe("Rig name or identifier"),
     },
     async ({ rigId }) => {
       try {
-        const res = await client.get(`/api/rigs/${encodeURIComponent(rigId)}/snapshots`);
+        const rig = await rigIdFor(client, rigId);
+        if ("content" in rig) return rig;
+        const res = await client.get(`/api/rigs/${encodeURIComponent(rig.id)}/snapshots`);
+        // The list answers [] for an id it has nothing under, so a handle no rig matches would read as a rig
+        // with no snapshots. Snapshots kept under a removed rig's id still list.
+        if (!rig.known && Array.isArray(res.data) && res.data.length === 0) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: `Rig '${rigId}' not found: no rig has that name or id` }) }], isError: true as const };
+        }
         return mapResult(res);
       } catch (err) {
         return { content: [{ type: "text" as const, text: (err as Error).message }], isError: true as const };
@@ -175,12 +203,14 @@ export function createMcpServer(client: DaemonClient): McpServer {
     "rig_restore",
     "Restore a rig from a snapshot",
     {
-      rigId: z.string().describe("Rig identifier"),
+      rigId: z.string().describe("Rig name or identifier"),
       snapshotId: z.string().describe("Snapshot identifier"),
     },
     async ({ rigId, snapshotId }) => {
       try {
-        const res = await client.post(`/api/rigs/${encodeURIComponent(rigId)}/restore/${encodeURIComponent(snapshotId)}`, {});
+        const rig = await rigIdFor(client, rigId);
+        if ("content" in rig) return rig;
+        const res = await client.post(`/api/rigs/${encodeURIComponent(rig.id)}/restore/${encodeURIComponent(snapshotId)}`, {});
         return mapResult(res);
       } catch (err) {
         return { content: [{ type: "text" as const, text: (err as Error).message }], isError: true as const };
@@ -209,14 +239,16 @@ export function createMcpServer(client: DaemonClient): McpServer {
     "Bind a discovered session to an existing node or create a new node in a pod",
     {
       discoveryId: z.string().describe("Discovery session identifier"),
-      rigId: z.string().describe("Target rig identifier"),
+      rigId: z.string().describe("Target rig name or identifier"),
       logicalId: z.string().optional().describe("Existing node logical ID (mode: bind to existing)"),
       podNamespace: z.string().optional().describe("Pod namespace to create node in (mode: create in pod)"),
       memberName: z.string().optional().describe("Member name for new node (required with podNamespace)"),
     },
     async ({ discoveryId, rigId, logicalId, podNamespace, memberName }) => {
       try {
-        const body: Record<string, unknown> = { rigId };
+        const rig = await rigIdFor(client, rigId);
+        if ("content" in rig) return rig;
+        const body: Record<string, unknown> = { rigId: rig.id };
         if (logicalId) body["logicalId"] = logicalId;
         if (podNamespace) body["podNamespace"] = podNamespace;
         if (memberName) body["memberName"] = memberName;
@@ -290,11 +322,13 @@ export function createMcpServer(client: DaemonClient): McpServer {
     "rig_rig_nodes",
     "Get node inventory for a rig — session names, status, attach commands, resume commands",
     {
-      rigId: z.string().describe("Rig identifier"),
+      rigId: z.string().describe("Rig name or identifier"),
     },
     async ({ rigId }) => {
       try {
-        const res = await client.get(`/api/rigs/${encodeURIComponent(rigId)}/nodes`);
+        const rig = await rigIdFor(client, rigId);
+        if ("content" in rig) return rig;
+        const res = await client.get(`/api/rigs/${encodeURIComponent(rig.id)}/nodes`);
         return mapResult(res);
       } catch (err) {
         return { content: [{ type: "text" as const, text: (err as Error).message }], isError: true as const };
@@ -353,6 +387,7 @@ export function createMcpServer(client: DaemonClient): McpServer {
         if (rig) body.rig = rig;
         if (pod) body.pod = pod;
         if (lines) body.lines = lines;
+        body.inputBox = true; // what the live input box holds, in the result's inputBox
         const res = await client.post("/api/transport/capture", body);
         return mapResult(res);
       } catch (err) {
@@ -433,7 +468,7 @@ export function createMcpServer(client: DaemonClient): McpServer {
     "rig_add",
     "Add a single member to an existing pod in a running rig (the add_member converge op). Identity-migration-free: mints a fresh seat, nothing existing re-keys.",
     {
-      rigId: z.string().describe("Target rig identifier"),
+      rigId: z.string().describe("Target rig name or identifier"),
       podNamespace: z.string().describe("Namespace of the existing pod to add the member to"),
       member: z.record(z.string(), z.unknown()).describe("Member fragment with spec snake_case fields: id, runtime, agent_ref, profile, cwd (and optional model, codex_config_profile, restore_policy, label)"),
       edges: z.array(z.object({ from: z.string(), to: z.string(), kind: z.string() })).optional().describe("Optional pod-local edges (from/to are member ids within the pod; resolved against the new member + existing pod-mates)"),
@@ -444,8 +479,10 @@ export function createMcpServer(client: DaemonClient): McpServer {
         const body: Record<string, unknown> = { member };
         if (edges) body["edges"] = edges;
         if (rigRoot) body["rigRoot"] = rigRoot;
+        const rig = await rigIdFor(client, rigId);
+        if ("content" in rig) return rig;
         const res = await client.post(
-          `/api/rigs/${encodeURIComponent(rigId)}/pods/${encodeURIComponent(podNamespace)}/members`,
+          `/api/rigs/${encodeURIComponent(rig.id)}/pods/${encodeURIComponent(podNamespace)}/members`,
           body,
         );
         // Structural failure: the add persisted (201) but the new node did not
@@ -583,6 +620,40 @@ export function createMcpServer(client: DaemonClient): McpServer {
         return mapResult(await client.post(`/api/queue/${encodeURIComponent(qitemId)}/update`, {
           state, closureReason, closureTarget, summary, evidenceRef, blockedOn, wakeAfterSeconds, transitionNote: note,
         }));
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: (err as Error).message }], isError: true as const };
+      }
+    },
+  );
+
+  // 24. rig_telemetry_events — one bounded page of event metadata, the page `rig telemetry events` reads
+  server.tool(
+    "rig_telemetry_events",
+    "Read one bounded page of event metadata: seq, rig, node, type and time, never payloads. Without a cursor it starts at the newest event and returns no rows; start retained reads the retained past instead. Continue with page.nextCursor and the same filters. coverage.gaps names any history it could not read, including a daemon restart, after which the old cursor can't continue.",
+    {
+      cursor: z.string().optional().describe("page.nextCursor from the previous page; not with start"),
+      start: z.enum(["latest", "retained"]).optional().describe("Without a cursor: latest (default) or retained"),
+      rigId: z.string().optional().describe("Rig name or identifier; events with no rig are left out"),
+      nodeId: z.string().optional().describe("Node identifier"),
+      limit: z.number().int().min(1).max(128).optional().describe("Source rows to scan (default and maximum 128); a filter can return fewer"),
+    },
+    async ({ cursor, start, rigId, nodeId, limit }) => {
+      try {
+        const params = new URLSearchParams();
+        if (rigId) {
+          const rig = await rigIdFor(client, rigId);
+          if ("content" in rig) return rig;
+          // The daemon filters by exact id and matches nothing for an unknown one, which would read as a quiet rig.
+          if (!rig.known) {
+            return { content: [{ type: "text" as const, text: JSON.stringify({ error: `Rig '${rigId}' not found: no rig has that name or id` }) }], isError: true as const };
+          }
+          params.set("rigId", rig.id);
+        }
+        if (cursor) params.set("cursor", cursor);
+        if (start) params.set("start", start);
+        if (nodeId) params.set("nodeId", nodeId);
+        if (limit !== undefined) params.set("limit", String(limit));
+        return mapResult(await client.get(`/api/telemetry/v1/events?${params.toString()}`));
       } catch (err) {
         return { content: [{ type: "text" as const, text: (err as Error).message }], isError: true as const };
       }

@@ -40,6 +40,10 @@ export interface SlackEvent {
   event_ts?: string;
   /** Internal history provenance, retained across dead-letter retry. */
   recoveredAfterGap?: boolean;
+  /** Internal: a reply recovered from history, from a tracked thread or as a broadcast reply in a channel recovery newly
+   *  covers. It lands as a late reply row and never answers a decision; the seat reads it and decides. Retained across
+   *  dead-letter retry; a live envelope can't set it. */
+  recoveredThreadReply?: boolean;
   /** The envelope's `api_app_id`: the app RECEIVING the event, ours. Set by handleEnvelope only, and
    *  retained across dead-letter retry; a named bot whose app matches it is OpenRig itself. */
   receivingAppId?: string;
@@ -74,6 +78,12 @@ export const CLICK_REPLIES = {
   unavailable: "This click wasn't recorded: OpenRig couldn't record a button answer here. Reply in this thread in words instead.",
   notClosed: "Your answers were recorded and sent to the agent that asked, but the decision itself didn't close.",
 } as const;
+
+/** The reply for a click on a decision made on the person's behalf: who decided, under which mode, and what. */
+export function decidedForThemReply(d: { decidedBy: string; modeName: string; chose: string; reversible: boolean }): string {
+  return `This was decided on your behalf by ${d.decidedBy} under ${d.modeName}: ${d.chose}${d.reversible ? "" : " (it can't be undone)"}. `
+    + "Your click wasn't recorded; it's listed in that mode's account.";
+}
 
 /** The reply for a click recordHumanAnswer didn't record, by its reason. */
 export function clickNotRecordedReply(reason: string): string {
@@ -172,7 +182,7 @@ export interface InboundDeps {
    *  `--reply-to` reply and later updates land under it. Absent: nothing is minted. */
   mintThread?: (m: { threadTs: string; channel: string; human: string; seat: string; conversationId: string }) => void;
   /** Continue an exact human gate through the existing Mission Control resolve primitive. */
-  resolveHumanReply?: (input: { qitemId: string; actorSession: string; decision: string }) => Promise<"resolved" | "already-resolved" | "not-applicable">;
+  resolveHumanReply?: (input: { qitemId: string; actorSession: string; decision: string; messageTs?: string }) => Promise<"resolved" | "resolved-uncertain" | "already-resolved" | "not-applicable">;
   /** #193 — record a clicked answer on the decision the clicked message belongs to. */
   recordHumanAnswer?: RecordHumanAnswer;
   /** #193 — clicks whose continuation (reply row + resolve) failed; retried with the event
@@ -223,7 +233,9 @@ export class InboundRouter {
     const sections: string[] = [text];
     if (ev.recoveredAfterGap) {
       const posted = new Date(Number(ev.ts) * 1000).toISOString();
-      sections.unshift(`Recovered after a gap (late delivery). Originally posted ${posted} (Slack ts ${ev.ts}).`);
+      const unapplied = ev.recoveredThreadReply && correlationQitemId
+        ? ` It was not applied as an answer to ${correlationQitemId}; read it and decide.` : "";
+      sections.unshift(`Recovered after a gap (late delivery). Originally posted ${posted} (Slack ts ${ev.ts}).${unapplied}`);
     }
     if (transfer && (transfer.stored.length > 0 || transfer.failed.length > 0)) {
       const lines: string[] = [];
@@ -266,7 +278,7 @@ export class InboundRouter {
     qitemId?: string;
     reason?: "dup" | "inflight" | "inactive" | "create_failed" | "resolve_failed" | "unregistered";
     correlationQitemId?: string;
-    replyResolution?: "resolved" | "already-resolved" | "not-applicable";
+    replyResolution?: "resolved" | "resolved-uncertain" | "already-resolved" | "not-applicable";
   }> {
     const ts = ev.ts ?? "";
     const eventId = this.inboundEventId(ev);
@@ -333,16 +345,29 @@ export class InboundRouter {
         this.deps.log?.(`qitem create failed ts=${ts}: ${(e as Error).message}`);
         return { landed: false, reason: "create_failed" };
       }
-      let replyResolution: "resolved" | "already-resolved" | "not-applicable" | undefined;
-      if (route.correlationQitemId && this.deps.resolveHumanReply) {
+      let replyResolution: "resolved" | "resolved-uncertain" | "already-resolved" | "not-applicable" | undefined;
+      if (route.correlationQitemId && this.deps.resolveHumanReply && !ev.recoveredThreadReply) {
         try {
           replyResolution = await this.deps.resolveHumanReply({
             qitemId: route.correlationQitemId,
             actorSession: who.source,
             decision: String(ev.text ?? "").trim() || "[file reply]",
+            messageTs: ev.ts,
           });
         } catch (e) {
           this.deps.log?.(`human reply continuation failed qitem=${route.correlationQitemId} ts=${ts}: ${(e as Error).message}`);
+          return { landed: false, qitemId, reason: "resolve_failed", correlationQitemId: route.correlationQitemId };
+        }
+      }
+      if (replyResolution === "resolved-uncertain") {
+        // The resolve is already durable. A failed notice stays owed on the existing
+        // inbound retry path; its retry recognizes the resolution instead of repeating it.
+        try {
+          const posted = await this.deps.acknowledgeAnswer?.({ channel: ev.channel, threadTs: ev.thread_ts ?? ts,
+            text: "Your reply was sent as the answer. OpenRig could not verify its timing against the question; the agent has that context. Resuming does not imply approval." });
+          if (!this.deps.acknowledgeAnswer || posted === false) throw new Error("uncertainty acknowledgement not posted");
+        } catch (e) {
+          this.deps.log?.(`human reply notice failed qitem=${route.correlationQitemId} ts=${ts}: ${(e as Error).message}`);
           return { landed: false, qitemId, reason: "resolve_failed", correlationQitemId: route.correlationQitemId };
         }
       }
@@ -372,7 +397,7 @@ export class InboundRouter {
     disposition: "accepted" | "ignored" | "refused" | "dead-lettered";
     reason?: string;
     correlationQitemId?: string;
-    replyResolution?: "resolved" | "already-resolved" | "not-applicable";
+    replyResolution?: "resolved" | "resolved-uncertain" | "already-resolved" | "not-applicable";
   }> {
     const r = await this.attemptLand(ev, isCurrent);
     if (!r.landed && (r.reason === "create_failed" || r.reason === "resolve_failed")) {
@@ -449,7 +474,10 @@ export class InboundRouter {
       const reason = recorded?.reason ?? "answers-unavailable";
       // A closed decision holding this person's clicked answer: typically Slack's redelivery of the click that closed
       // it, after that click's own confirmation failed to post. It was recorded, so say that.
-      if (live) await acknowledge(recorded?.answerOnRecord ? CLICK_REPLIES.onRecord : clickNotRecordedReply(reason));
+      if (live) {
+        await acknowledge(recorded?.answerOnRecord ? CLICK_REPLIES.onRecord
+          : recorded?.decidedForThem ? escapeSlackText(redactSecrets(decidedForThemReply(recorded.decidedForThem))) : clickNotRecordedReply(reason));
+      }
       return { status: "ignored", reason };
     }
     const lines = formatHumanAnswers(recorded.questions, recorded.answers);
@@ -460,7 +488,7 @@ export class InboundRouter {
       if (live) await acknowledge(escapeSlackText(redactSecrets(`Recorded: ${just}. Still to answer: ${waiting.join("; ")}`)));
       return { status: "accepted", reason: "answer-recorded" };
     }
-    let resolution: "resolved" | "already-resolved" | "not-applicable" | undefined;
+    let resolution: "resolved" | "resolved-uncertain" | "already-resolved" | "not-applicable" | undefined;
     try {
       await this.deps.queue.createQitem({
         qitemId: `qitem-slack-answers-${createHash("sha256").update(qitemId).digest("hex").slice(0, 20)}`,
@@ -922,7 +950,7 @@ export async function handleEnvelope(
   }
   if (env.type !== "events_api") return { status: "ignored", reason: "envelope-type" };
   // Only history admission supplies recovery provenance; only the envelope names the receiving app.
-  const ev = { ...env.payload?.event, recoveredAfterGap: undefined, receivingAppId: env.payload?.api_app_id, botAdmitted: undefined };
+  const ev = { ...env.payload?.event, recoveredAfterGap: undefined, recoveredThreadReply: undefined, receivingAppId: env.payload?.api_app_id, botAdmitted: undefined };
   // A bot's post in the bot inbox; every other bot post stays dropped by ingestDecision.
   if (ev.bot_id && router.hearsBotsIn(ev.channel)) return router.routeBot(ev);
   const decision = ingestDecision(ev);

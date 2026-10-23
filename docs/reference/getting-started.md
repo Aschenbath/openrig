@@ -1,29 +1,87 @@
-# Getting started: meet the kernel, then make one useful change
+# OpenRig setup reference
 
-Install OpenRig, use a working provider login, and meet the kernel operator with
-the advisor and TUI beside it. No starter team is needed to reach that view.
-Tell the operator what you want to do, then choose a project team for a bounded
-change you can exercise. Reuse the accounts and terminal tools you already have.
+This is the full reference for installing and running OpenRig, written for the agent doing the setup and for anyone
+who wants the detail. The short version for people is [Getting started](quickstart.md).
 
-After installation and sign-in, your agent opens the **OpenRig TUI and operator** for you. The path is `rig daemon start` (if stopped),
-then `rig terminal open saved:kernel --window`. The second command opens the
-desktop window itself. An agent can run it from its shell on the daemon's
-desktop; it does not need to type into your current terminal. See
-[Open the kernel conversations](#open-the-kernel-conversations).
-`rig tui` is the team dashboard; installation ends when you are talking to the
-operator in the OpenRig view.
+## For the agent doing the setup
+
+The `rigs` skill is the procedure: follow it in order. This page is what it looks things up in.
+
+- **Done** means the person is talking to the operator in a visible OpenRig view. A healthy daemon, a started kernel
+  or an opened window isn't done on its own. If they'd rather talk later, the handoff is still pending: say so, and
+  leave them the exact command.
+- **Read readiness; don't assume it:**
+  - **The kernel:** the `Kernel:` line in `rig status`, and `rig ps --nodes --rig kernel`.
+  - **A team:** `rig ps --nodes --rig <team>`.
+  - A missing or unknown signal isn't ready.
+  - `rig up` exiting 1 with `Status: partial` and `Startup attention` means a seat is waiting at a prompt. Answer it,
+    or ask the person to, then run the `rig seat continue <seat>` it names.
+- **Prerequisites:** check the person's existing toolchain first (mise, nvm, Homebrew or the nodejs.org installer)
+  and the PATH. Use what's there. Don't change a shared Homebrew's ownership, and don't make a local workaround the
+  standard route. If Node.js is installed after your session started, check that new shells and the session's hooks
+  can find it. In one published-0.6.11 Mac run, OpenRig's Claude hooks reported `node: command not found` until the
+  PATH was fixed.
+- **Ask once, then reuse the answer:** the provider (Claude Code, Codex or both), Herdr, Ghostty on macOS,
+  remembered command allowances, and the team.
+- **Before changing their machine:** say what applies to their route, then wait for a yes. See
+  [what OpenRig changes on your machine](../../README.md#what-openrig-changes-on-your-machine).
+- **When something stops:**
+  - [Incomplete setup and restart](#incomplete-setup-and-restart) maps what you see to the next action.
+  - [What can interrupt installation and the OpenRig view](#what-can-interrupt-installation-and-the-openrig-view)
+    covers the view.
+  - [Headless or SSH handoff](#headless-or-ssh-handoff) covers no-display cases.
+  - A timed-out command may still have taken effect. Read `rig ps` or `rig seat status <seat>` before you run it
+    again.
+- **Don't:**
+  - relaunch a team to reopen its view;
+  - start another seat to clear a prompt;
+  - build the person's project yourself. Give the goal to the operator.
 
 ## Before you start
 
-You need Node.js 22 or 24 and tmux, on macOS or Linux. On Linux, the
-distribution's own Node.js can be older (Ubuntu 24.04's is 18); install a
-supported version with [nvm](https://github.com/nvm-sh/nvm) (`nvm install 22`)
-or NodeSource. On a Mac with Apple
-silicon, use Node.js 22 (see the [compatibility
-history](../releases/v0.5.15.md#known-compatibility-limitation)). Native
-Windows isn't supported. On Windows, use WSL2: it's the Windows route OpenRig
-supports, though OpenRig's automated tests don't run on it yet. One user's
-[working setup](#wsl2-a-reported-working-setup) is below. Node 20 and
+> **What OpenRig changes on your machine**
+> - **Install:** `@openrig/cli` goes in globally with npm.
+> - **Setup:** `rig setup` adds an OpenRig block to `~/.tmux.conf`. It can install tmux (with Homebrew on macOS), and
+>   Herdr unless you pass `--no-herdr`. Plain `rig setup`, which is what the one-command install runs, checks both
+>   Claude Code and Codex and may install a missing one; `rig setup --providers claude` (or `codex`) limits it to
+>   yours.
+> - **Starting OpenRig, for the coding agent you use** (paths are the usual defaults):
+>   - Codex: hooks and trust in `~/.codex/config.toml`.
+>   - Claude Code: workspace trust in `~/.claude.json`, and activity hooks in the project's
+>     `.claude/settings.local.json`, plus a status line unless you already have your own.
+>   - Discovery skills go in `~/.claude/skills` and `~/.agents/skills`.
+> - **Starting a team in your project:** adds managed guidance to `AGENTS.md` or `CLAUDE.md`, plus the team's skills
+>   and plugins.
+> - **Permissions:** by default, OpenRig's own kernel gets broader permissions than a project team gets by default.
+>   On Codex that's full access with no approval prompts (`-s danger-full-access -a never`). On Claude Code, its file
+>   tools, web fetches and operational commands, including reads under your home folder, run without asking. A
+>   permission policy, per-agent choice or Codex profile changes that. What your team can do depends on the team you
+>   choose and your settings; `workshop`, for example, ships with broad access.
+> - **Backups:** OpenRig doesn't guarantee it can preserve or roll back these files, so back them up first.
+>
+> [Everything OpenRig writes, and why →](https://github.com/mvschwarz/openrig#what-openrig-changes-on-your-machine)
+
+You need Node.js 22 or 24 and tmux, on macOS or Linux, and one working Claude
+Code or Codex account: one is enough, since the kernel operator adapts the
+shipped `starter` team to whichever you have. On Linux, the distribution's own
+Node.js can be older (Ubuntu 24.04's is 18); install a supported version with
+[nvm](https://github.com/nvm-sh/nvm) (`nvm install 22`) or NodeSource. On a Mac
+with Apple silicon, use Node.js 22 (see the [compatibility
+history](../releases/v0.5.15.md#known-compatibility-limitation)). On a Mac where
+you aren't an administrator, or where Homebrew belongs to another account (its
+`brew install` is refused), install Node.js in your own home folder with
+[nvm](https://github.com/nvm-sh/nvm): run `touch ~/.zshrc` (a new Mac account
+has none, and nvm's installer only adds itself to a profile file that already
+exists), then nvm's install command, for nvm v0.40.8
+`curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash`
+([nvm's page](https://github.com/nvm-sh/nvm#install--update-script) has the
+newest), open a new terminal, and run `nvm install 22`. nvm itself needs no
+administrator password, and `npm install -g` then installs into your nvm folder.
+If nvm's installer says you need Apple's command line tools, run
+`xcode-select --install`, then its install command again. Native Windows isn't
+supported. On Windows, use WSL2: it's the Windows route
+OpenRig supports, though OpenRig's automated tests don't run on it yet. One
+user's [working setup](#wsl2-a-reported-working-setup) is below. Node 20 and
 odd-numbered releases (23, 25 and so on) are not supported; Node 26 and later
 even-numbered releases are untested.
 
@@ -123,11 +181,11 @@ You can also read [`skills/rigs/SKILL.md`](../../skills/rigs/SKILL.md) directly.
 script will do and changes nothing:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mvschwarz/openrig/v0.6.8/scripts/install.sh | sh -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/mvschwarz/openrig/v0.6.12/scripts/install.sh | sh -s -- --dry-run
 ```
 
 The same command without `--dry-run`,
-`curl -fsSL https://raw.githubusercontent.com/mvschwarz/openrig/v0.6.8/scripts/install.sh | sh`, installs the
+`curl -fsSL https://raw.githubusercontent.com/mvschwarz/openrig/v0.6.12/scripts/install.sh | sh`, installs the
 latest published `@openrig/cli` with `npm install -g`,
 runs the Node.js and SQLite check, then `rig setup --dry-run` and `rig setup`. `rig setup` checks both Claude Code and
 Codex and may install a missing one, as described below. A failed step prints
@@ -165,6 +223,26 @@ writes an OpenRig-managed block (mouse on, a longer history) into `~/.tmux.conf`
 It is optional for this selected-provider path, not a requirement to fix an unused
 provider.
 
+The block keeps `terminal.history_limit` rows of scrollback per pane (default
+10000). To keep more, run `rig config set terminal.history_limit 50000`, then
+`rig setup` again. A running tmux server keeps its old limit until it restarts
+or you run `tmux source-file ~/.tmux.conf`; before tmux 3.7 that changes new
+panes only.
+
+New managed agents and handover successors on macOS/Linux start from the daemon's
+selected launch environment and declared seat values, rather than stored tmux globals.
+Values named by tmux's `update-environment` option, including its default SSH-agent
+and display variables, come from the daemon's environment.
+Normal shell startup and configured tmux shell commands still run. If your custom setup
+intentionally supplies values through tmux's global environment, opt in with
+`rig config set terminal.inherit_tmux_environment true`. Setup points out this option
+when it detects custom tmux configuration; it never enables it automatically. The setting
+applies to future launches and successors, not running agents or your personal tmux server.
+If the scoped environment cannot be prepared, launch keeps its previous environment and
+reports a warning in fresh launch results and the daemon log. For handovers, check
+that log for this warning. This is not a promise that shell startup cannot add or override values.
+
+
 ## Start the kernel and check its state
 
 With a working selected login, start the daemon if it is stopped, then read its
@@ -196,9 +274,51 @@ A missing or unknown readiness signal is not proof of readiness. Follow
 startup or missing-seat problems.
 
 `rig setup` itself does not start the daemon. Preserve a daemon and kernel that
-already exist: ordinary daemon startup skips a managed kernel, and
-`OPENRIG_NO_KERNEL=1` skips automatic kernel startup. If neither runtime is
-authenticated, kernel boot reports `auth_blocked`. Do not restart or recreate an
+already exist: daemon startup does not boot a second kernel when one is managed,
+and `OPENRIG_NO_KERNEL=1` (`--no-kernel`) skips automatic kernel startup,
+including the restore below. If neither runtime is authenticated, kernel boot
+reports `auth_blocked`.
+
+Daemon startup restores one existing kernel by itself: a managed kernel whose
+seats are all `detached` and still bound to their newest session, which is what
+startup reconcile leaves when every kernel terminal is gone, for example after a
+reboot. It does not detect a reboot as such. It uses the same restore as
+`rig up kernel --existing`, and `rig status` reports it as `Kernel: booting`
+until the seats are ready. A kernel stopped with `rig down kernel`, including
+one whose seats were already detached, stays down on later starts. So do a kernel
+with only some seats stopped and seats you unclaimed. Start one again with
+`rig up kernel --existing`.
+When the tmux server is gone, an explicit `rig down` of any rig can start an
+empty server and probe again. It records the stop and clears eligible bindings
+only after confirming the sessions are absent. This can leave an empty tmux
+server running; it never launches an agent or provider session. Unreadable or
+permission results and changed occupants leave the stop bookkeeping unchanged.
+
+While that automatic restore runs, `rig start` continues to your other rigs and
+says the kernel is still restoring (`kernelRestore.state: "restoring"` with
+`--json`). Its exit status 0 then does not mean the kernel is ready; check
+`rig status`. When the restore has returned without a ready kernel, `rig start`
+still goes on to your other rigs but exits 1 (`kernelRestore.state: "failed"`),
+so `rig start && next` does not run `next`. A `rig down kernel` made during the
+restore waits for it to return and then stops the kernel, which stays down on
+later starts. A `rig up kernel --existing` with no fresh seats and no change to
+the saved non-interruptive choice, made during the restore, or after it restored
+every seat while those seats still run the sessions it started, reports that
+restore's outcome instead of starting another. Explicitly repeating the saved
+`--non-interruptive` or `--no-non-interruptive` choice also joins that restore.
+
+An explicit `rig up kernel --existing --fresh <seat...>` waits for startup's
+restore to finish, then replaces only the named seats that still hold the exact
+sessions startup launched. Other seats keep running. An operator's conversation
+correction also takes effect for that seat on the next explicit `up` or
+`restore`, using the corrected target; editing the token alone restarts nothing.
+Each replacement takes new seat leases, rechecks the managed occupant and terminal,
+and reports its own per-seat outcome. If the occupant changed, it is left alone.
+A different `--non-interruptive` or `--no-non-interruptive` choice after startup
+launched the seats is refused: the running launch choice stays unchanged. Stop
+the rig, then rerun with the desired choice.
+
+Do not restart or recreate an
 existing kernel merely to open its view. The startup TUI (`rig`) offers its own
 kernel setup and individual-seat recovery; it does not automatically boot agents
 when it starts the daemon.
@@ -248,6 +368,17 @@ When the agent already runs inside Herdr, the command focuses a space with the
 same view and plan, or creates one if none matches, preserving its config and existing spaces. The
 caller's Herdr endpoint must match the daemon's endpoint; a mismatch is reported
 without opening a window or putting the view in another session.
+
+The shared TUI (`rig tui --shared`) runs in the daemon's tmux server, so its own environment never
+carries the Herdr you are looking at; the markers are on the tmux client attached to it. When you
+open a terminal view from it on Linux, the TUI passes the markers of the client that was active last
+(normally the one that pressed the key) to the command, which then opens the view in that Herdr. The
+chosen client may belong to a different viewer: tmux only counts keys a client types, so a key sent
+by an agent (`send-keys`) or by a control-mode client doesn't count as any client's activity, and the
+view opens in the Herdr of the interactive client that typed last, however long ago. With no client
+attached, more than one client active in the same second, or a client that isn't in Herdr or can't be
+read, nothing is passed and the result is what it was before. Other platforms, and every other way of
+running `rig terminal open`, keep the previous result too.
 
 On Linux, a local graphical display and a supported hosting terminal are required
 (Ghostty, GNOME Terminal, Konsole or xterm). Linux reports a window request; verify
@@ -544,6 +675,16 @@ views. If the provider cannot open, each labelled fallback command joins a diffe
 seat. Keep all returned commands
 complete when sharing them; a created workspace alone does not confirm visibility.
 
+### Built by the community
+
+Tools built around OpenRig are maintained by their authors. We have not tested them;
+this list does not promise support or compatibility with your OpenRig version.
+
+- **[Rig HQ](https://github.com/dmelo/rig-hq)**, by [dmelo](https://github.com/dmelo):
+  a read-only pixel-office viewer for rigs, seats, attention and queue handoffs, as
+  described in the [author's introduction](https://github.com/mvschwarz/openrig/discussions/879).
+  The author reports testing it with OpenRig 0.6.5. See its repository for setup and support.
+
 ## Continue real project work
 
 Return to the same owner with the next outcome, citing the earlier result.
@@ -614,7 +755,7 @@ the lifecycle API without booting a new kernel, then stop the remaining rigs.
 | Shared terminal is absent | Inspect the existing kernel binding and recovery state; use standalone `rig tui` while resolving it. |
 | Viewing terminal was closed | Open the conversations again with `rig terminal open saved:kernel --window`; `rig tui --shared` is only the dashboard fallback if that window cannot open. Do not relaunch the team. |
 | Daemon restarted but tmux survived | Re-read `rig status` and the existing queue; a daemon restart is not a fresh project. |
-| Host reboot lost tmux sessions | Open `rig`, start the daemon if needed (press **S** if it opens on the work views), and select the existing rig and seats. Resume is the default; a fresh conversation needs a separate decision. |
+| Host reboot lost tmux sessions | Starting the daemon restores the kernel by itself when all of its seats were lost; check `rig status`, and if it reports the restore failed, run `rig up kernel --existing`. For other rigs, open `rig`, start the daemon if needed (press **S** if it opens on the work views), and select the existing rig and seats. Resume is the default; a fresh conversation needs a separate decision. |
 | Launch reports no usable snapshot | Inspect the existing rig and retained project files, then follow the same-seat recovery below. |
 | Work is waiting on a prompt or decision | Read the row, transition and named prompt; preserve the obligation until the missing decision arrives. |
 
@@ -645,8 +786,27 @@ This recovery is for the case the reporter hit: the kernel's seats failed and no
 IDs, for example `advisor.lead operator.agent operator.human queue.worker` when all four failed. `--fresh` starts a
 new conversation for each seat you name. Seats you don't name follow their normal recovery policy and may remain
 awaiting a decision if their old conversation can't be resumed. A later `rig daemon start` doesn't retry the failed
-seats by itself: once a kernel exists, startup skips the built-in kernel boot, and `rig status` then reads
-`Kernel: skipped` whatever its seats' state, so check `rig ps --nodes --rig kernel --full`.
+seats by itself: once a kernel exists, startup skips the built-in kernel boot and restores only a kernel whose seats
+were all lost, not seats that failed. `rig status` then reads `Kernel: skipped` unless some of its seats are running
+and ready, so check `rig ps --nodes --rig kernel --full`.
+
+**When every agent stops at once on Ubuntu 22.04.** Ubuntu 22.04's packaged tmux, 3.2a, can exit its whole server
+when it's asked about a pane or session that has just closed. OpenRig checks each seat about once a second, so when a
+seat's session closes, the next check can stop every agent on that tmux server, and tmux reports "server exited
+unexpectedly". This was reproduced with Ubuntu 22.04's `tmux 3.2a-4ubuntu0.3` for a closed pane, a closed session,
+and a closed pane in a window that stayed open. If `tmux -V` prints `tmux 3.2a`, put tmux 3.4 or later first on
+your `PATH`. Newer versions weren't tested against this crash; #980's reporter runs 3.5a, and none of OpenRig's own
+machines runs 3.2a. One way to get one is to build a current release from the tmux project, as that reporter did:
+
+```sh
+sudo apt install build-essential pkg-config bison libevent-dev libncurses-dev
+# in the unpacked release tarball:
+./configure && make && sudo make install   # installs into /usr/local/bin
+```
+
+Then restart the daemon from a shell where `tmux -V` shows the new tmux. A tmux server that's already running keeps
+its version until it exits, so the change applies to servers started afterwards. If a crash already stopped your
+agents, recover as for lost tmux sessions in the table above.
 
 If a snapshot is unavailable, the startup view checks the selected seat's
 retained startup source and authoritative occupant relation. It reports a
@@ -964,6 +1124,37 @@ version cannot apply the change in place, preserve the work and use the supporte
 same-seat stop/resume path after checking its retained policy; do not erase the
 rig or start a duplicate to reset permissions. A resume can reapply the stored
 launch mode, so verify the native mode again before continuing work.
+
+## Optional Mac local-user check
+
+On a Mac shared by multiple OS accounts, `transport.local_user_guard` can reduce
+accidental CLI routing to another account's local daemon. It is **off by default**.
+Enable it with `rig config set transport.local_user_guard true`, or set
+`OPENRIG_TRANSPORT_LOCAL_USER_GUARD=true` in the CLI's environment. Set it to
+`false` to turn it off; no daemon restart is needed for the CLI check.
+
+When enabled, automatic local CLI data requests compare the daemon's reported
+`/healthz` PID and effective UID (`euid`) with two `ps` UID/start observations and
+a second health response, with at most one second of observation per check.
+Only stable agreement on a foreign effective UID stops the request. This does
+not require visibility into another user's socket descriptors. It does not
+stop the daemon, choose another port or retry. Diagnostic health/status checks
+remain available. Older daemons without `euid` remain unknown and are permitted.
+`sudo rig …` uses the caller's **effective** UID, so an enabled check against a
+user-owned daemon refuses when its reported/observed UID differs from root.
+
+Explicit `OPENRIG_URL`/`RIGGED_URL` targets and registered remote hosts retain
+their selected routing, including tunnels. An internally resolved local URL is
+still checked. Default UI and TUI openings are checked before launch; this does
+not police later browser or TUI connections.
+
+Missing, disagreeing, restricted or timed-out evidence **continues today's
+behavior**. This is a partial accidental-routing check, not authenticated user
+isolation: it trusts the daemon's PID/UID report and corroborates that process;
+it does not establish the socket's owner. Identity can change between observation
+and connection, and equal UIDs do not distinguish separate instances belonging
+to one account. The check
+does not add authentication to the daemon or protect direct HTTP clients.
 
 ## Custom settings and precedence
 
