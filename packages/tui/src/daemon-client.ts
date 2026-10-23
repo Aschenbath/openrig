@@ -401,6 +401,11 @@ export class DaemonClient {
   reviewFleet() {
     return this.get(`/api/review/fleet`);
   }
+  /** The mission-control write Steering uses to answer a request (POST /api/mission-control/action). */
+  missionControlAction(input: { verb: "approve" | "answer"; qitemId: string; actorSession: string; questionId?: string; optionId?: string; decision?: string }) {
+    return this.post("/api/mission-control/action", input) as Promise<{ verb: string; qitemId: string; closedQitem: unknown;
+      answer?: { outcome: "recorded" | "answered"; unanswered: string[] } }>;
+  }
   attentionAggregate() {
     return this.get(`/api/queue/attention-aggregate`);
   }

@@ -374,6 +374,7 @@ export function queueRoutes(): Hono {
       nudge?: boolean;
       /** How the sender's identity was established, recorded on the source close as a local handoff records it. */
       identityProvenance?: string | null;
+      humanAlert?: boolean;
     },
     createSuccessor: (forwardBody: Record<string, unknown>) => Promise<{ ok: true; payload: unknown } | { ok: false; response: Response }> =
       (forwardBody) => forwardQueueWrite(c, hostId, "/api/queue/create", forwardBody),
@@ -430,6 +431,7 @@ export function queueRoutes(): Hono {
       ...(body.summary !== undefined ? { summary: body.summary } : {}),
       ...(body.evidenceRef !== undefined ? { evidenceRef: body.evidenceRef } : {}),
       ...(body.nudge !== undefined ? { nudge: body.nudge } : {}),
+      ...(body.humanAlert !== undefined ? { humanAlert: body.humanAlert } : {}),
     };
 
     // (3) Successor-create FIRST — origin-owns-the-record; failure leaves the
@@ -502,6 +504,7 @@ export function queueRoutes(): Hono {
       chainOfRecord?: string[];
       targetRepo?: string;
       humanIntent?: "decision" | "update" | null;
+      humanAlert?: boolean;
       humanDetail?: string | null;
       replyTo?: string | null;
       humanQuestions?: HumanQuestion[] | null; // shape validated by the repository (invalid_human_questions)
@@ -568,6 +571,7 @@ export function queueRoutes(): Hono {
         chainOfRecord: body.chainOfRecord,
         targetRepo: body.targetRepo,
         humanIntent: body.humanIntent,
+        humanAlert: body.humanAlert,
         humanDetail: body.humanDetail,
         replyTo: body.replyTo,
         humanQuestions: body.humanQuestions,
@@ -707,6 +711,7 @@ export function queueRoutes(): Hono {
       summary?: string | null;
       evidenceRef?: string | null;
       nudge?: boolean;
+      humanAlert?: boolean;
       // OPR.0.4.6.MH3 FR-1: the out-of-band host envelope (BR-1). Absent /
       // "" / "local" = today's local transactional path, byte-identical.
       hostId?: string;
@@ -738,6 +743,7 @@ export function queueRoutes(): Hono {
       summary: body.summary,
       evidenceRef: body.evidenceRef,
       nudge: body.nudge,
+      humanAlert: body.humanAlert,
       // The source close is request-authored, so it carries the same stamp the local path records.
       identityProvenance: resolveRecordedProvenance(c, identity),
     };
@@ -764,6 +770,7 @@ export function queueRoutes(): Hono {
         summary: body.summary,
         evidenceRef: body.evidenceRef,
         nudge: (body as { nudge?: boolean }).nudge,
+        humanAlert: body.humanAlert,
         identityProvenance: resolveRecordedProvenance(c, identity), // P21 §4 era-stamp: transport:v1 if the header proved it here, else claimed:v1 (resolveRecordedProvenance degrades)
       });
       const advisory = destinationAdvisory(c, result.created.destinationSession);
@@ -791,6 +798,7 @@ export function queueRoutes(): Hono {
       targetRepo?: string;
       summary?: string | null;
       evidenceRef?: string | null;
+      humanAlert?: boolean;
       // OPR.0.4.6.MH3 FR-1: the out-of-band host envelope (BR-1).
       hostId?: string;
     }>().catch(() => ({} as never));
@@ -819,6 +827,7 @@ export function queueRoutes(): Hono {
       summary: body.summary,
       evidenceRef: body.evidenceRef,
       nudge: body.nudge,
+      humanAlert: body.humanAlert,
       // The source close is request-authored, so it carries the same stamp the local path records.
       identityProvenance: resolveRecordedProvenance(c, identity),
     };
@@ -845,6 +854,7 @@ export function queueRoutes(): Hono {
         summary: body.summary,
         evidenceRef: body.evidenceRef,
         nudge: body.nudge,
+        humanAlert: body.humanAlert,
         identityProvenance: resolveRecordedProvenance(c, identity), // P21 §4 era-stamp: transport:v1 if the header proved it here, else claimed:v1 (resolveRecordedProvenance degrades)
       });
       const advisory = destinationAdvisory(c, result.created.destinationSession);
@@ -1087,8 +1097,10 @@ export function queueRoutes(): Hono {
       updatedSince,
     });
     // Defense-in-depth: refine with the JS predicate so the SQL
-    // LIKE superset cannot leak a malformed destination through.
-    const filtered = items.filter(isAttentionItem);
+    // LIKE superset cannot leak a malformed destination through. An ask to a registered person addressed as a seat or
+    // an alias is a member by its classification, as listAttention selected it.
+    const repo = getRepo(c);
+    const filtered = items.filter((item) => isAttentionItem(item) || repo.isCurrentHumanAsk(item.qitemId));
     return c.json(filtered);
   });
 

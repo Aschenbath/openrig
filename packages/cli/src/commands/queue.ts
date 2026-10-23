@@ -51,7 +51,8 @@ interface DeliveryResultBase {
 /** The gateway (Slack connector) owns delivery; its ledger is the receipt. */
 export interface GatewayDeliveryResult extends DeliveryResultBase {
   receiptSource: "gateway";
-  outcome: "posted" | "transport-failed" | "never-posted" | "still-pending" | "indeterminate";
+  /** not-alerted: an ask created without --alert, so it's on Steering and never sent to Slack. */
+  outcome: "posted" | "transport-failed" | "never-posted" | "still-pending" | "indeterminate" | "not-alerted";
   /** null means no receipt can presently settle connector acceptance. */
   connectorAccepted: boolean | null;
   /** #96: present for a --reply-to update once posted; false = it posted top-level instead. */
@@ -106,7 +107,8 @@ function receiptSourceOf(destination: string | null, row: QueueRow): "gateway" |
  *  with a pane): the row carries the owner notification level the Slack selector keys on, or a
  *  gateway receipt already exists. */
 function gatewayAlsoPosts(row: QueueRow): boolean {
-  return stringField(row, "ownerNotificationLevel") !== null || stringField(row, "deliveryOutcome") !== null;
+  const level = stringField(row, "ownerNotificationLevel");
+  return (level !== null && level !== "RECORD") || stringField(row, "deliveryOutcome") !== null;
 }
 
 /** A terminal destination is a person when the gateway also posts to it or its address is a human seat's. */
@@ -241,6 +243,11 @@ export async function waitForDeliveryOutcome(
     if (receiptSourceOf(destination, row) === "gateway") {
       const outcome = row.deliveryOutcome;
       const gateway = { receiptSource: "gateway" as const, destinationKind: "human" as const, humanReadership: "unknown" as const };
+      // An ask placed on Steering without an alert owes no post, so there's no receipt to wait for.
+      if (outcome == null && stringField(row, "ownerNotificationLevel") === "RECORD") {
+        return { ...gateway, outcome: "not-alerted", connectorAccepted: null,
+          detail: "created without --alert, so not sent to Slack; it's on Steering for the person", nextAction: null };
+      }
       if (outcome === "posted") {
         // #96: a --reply-to update reports whether it joined the earlier item's thread.
         const replyTo = stringField(row, "replyTo");
@@ -760,6 +767,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--target-repo <name>", "PL-007: typed repo scope (must match a repo in the source rig's RigSpec.workspace.repos[])")
     .option("--summary <text>", "Short human-readable subject of the row, shown on every surface that lists it (RECENT, the story, the needs-you view). Say what the work is and why it needs this seat. For a human destination, --body-file is the complete decision brief or update; keep technical continuation in the owning agent row and evidence.")
     .option("--human-intent <intent>", "decision (default) or update: a quiet informational delivery, never an approval request")
+    .option("--alert", "For an ask to a person: also send one Slack alert, for something only they can do or an approval whose wait costs now. Without it the ask waits on Steering, with no Slack alert")
     .option("--human-detail-file <path>", "One explicitly authored supplemental thread reply; keep the complete action/options in --body-file")
     .option("--reply-to <qitemId>", "Post this update into an earlier qitem's Slack thread (requires --human-intent update; posts as a new top-level message instead if that thread can't be used, e.g. it is missing or still has an open human decision; --verify reports why)")
     .option("--human-questions-file <path>", "#193: JSON array of 1-4 questions for a decision, each {id, question, options: [{id, label, recommended?}]} with 2-4 options; Slack shows them as buttons")
@@ -785,6 +793,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       id?: string;
       targetRepo?: string;
       humanIntent?: string;
+      alert?: boolean;
       humanDetailFile?: string;
       replyTo?: string;
       humanQuestionsFile?: string;
@@ -924,6 +933,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           destinationSession: hostResolved.destination,
           body: resolvedBody,
           humanIntent: opts.humanIntent,
+          ...(opts.alert ? { humanAlert: true } : {}),
           humanDetail: opts.humanDetailFile ? await resolveQueueBody({ bodyFile: opts.humanDetailFile }) : undefined,
           replyTo: opts.replyTo,
           humanQuestions,
@@ -1202,6 +1212,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--target-repo <name>", "PL-007: typed repo scope for the new qitem")
     .option("--summary <text>", "OPR.0.4.1.18: short human-readable 1-2 sentence subject of the new qitem — what it is and why this seat — shown on every surface that lists it (RECENT, the story, the needs-you view); --body stays source of truth. Not inherited from the source row. Warned-if-missing.")
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: durable-artifact pointer for the new qitem. Required by the daemon when the new qitem is human-routed; optional otherwise.")
+    .option("--alert", "For a handoff to a person: also send one Slack alert, for something only they can do or an approval whose wait costs now. Without it the item waits on Steering, with no Slack alert")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-nudge", "Suppress the default nudge to the new destination")
     .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
@@ -1219,6 +1230,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       targetRepo?: string;
       summary?: string;
       evidenceRef?: string;
+      alert?: boolean;
       host?: string;
       nudge?: boolean;
       json?: boolean;
@@ -1270,6 +1282,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           body: resolvedBody,
           summary: opts.summary,
           evidenceRef: opts.evidenceRef,
+          ...(opts.alert ? { humanAlert: true } : {}),
           transitionNote: opts.note,
           priority: opts.priority,
           tier: opts.tier,
@@ -1303,6 +1316,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--target-repo <name>", "PL-007: typed repo scope for the new qitem")
     .option("--summary <text>", "OPR.0.4.1.18: short human-readable 1-2 sentence subject of the new qitem — what it is and why this seat — shown on every surface that lists it (RECENT, the story, the needs-you view); --body stays source of truth. Not inherited from the source row. Warned-if-missing.")
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: durable-artifact pointer for the new qitem. Required by the daemon when the new qitem is human-routed; optional otherwise.")
+    .option("--alert", "For a handoff to a person: also send one Slack alert, for something only they can do or an approval whose wait costs now. Without it the item waits on Steering, with no Slack alert")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-nudge", "Suppress the default nudge to the new destination")
     .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
@@ -1320,6 +1334,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       targetRepo?: string;
       summary?: string;
       evidenceRef?: string;
+      alert?: boolean;
       host?: string;
       nudge?: boolean;
       json?: boolean;
@@ -1369,6 +1384,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           body: resolvedBody,
           summary: opts.summary,
           evidenceRef: opts.evidenceRef,
+          ...(opts.alert ? { humanAlert: true } : {}),
           transitionNote: opts.note,
           priority: opts.priority,
           tier: opts.tier,
