@@ -557,6 +557,7 @@ export class StartupOrchestrator {
           const launchResult = await input.adapter.launchHarness(input.binding, {
             name: input.sessionName ?? input.binding.tmuxSession ?? "",
             resumeToken: launchResumeToken,
+            ...(launchResumeToken && input.resumeType ? { resumeType: input.resumeType } : {}),
             ...(input.forkSource && !launchResumeToken ? { forkSource: input.forkSource } : {}),
           });
           if (launchResult.ok) {

@@ -31,8 +31,9 @@ interface CommunityHarnessAdapterDeps {
 /**
  * A community harness, launched from its installed preset (`domain/community-harness-presets.ts`). It types the preset's
  * command into the seat's pane and is ready while the pane runs something other than a shell. That's readiness, not
- * identity: a process alone doesn't prove which session it is. It projects nothing, and refuses resume and fork,
- * which a launch-only preset doesn't support.
+ * identity: a process alone doesn't prove which session it is. It projects nothing and refuses fork. It resumes only a
+ * preset that declares `resume` (with `launch_result`): its launcher is told the conversation to reopen and reports
+ * what it did, and a conversation it says is gone is never replaced by a new one.
  */
 export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
   constructor(readonly runtime: string, private readonly deps: CommunityHarnessAdapterDeps) {}
@@ -56,12 +57,18 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
     };
   }
 
-  async launchHarness(binding: NodeBinding, opts: { name: string; resumeToken?: string; forkSource?: ForkSource }): Promise<HarnessLaunchResult> {
+  async launchHarness(binding: NodeBinding, opts: { name: string; resumeToken?: string; resumeType?: string; forkSource?: ForkSource }): Promise<HarnessLaunchResult> {
     if (opts.forkSource) {
       return { ok: false, error: `Fork is unsupported: community harness "${this.runtime}" is launch-only. Remove session_source for this member.` };
     }
     const found = loadCommunityHarnessPreset(this.runtime, this.deps.presetsDir?.() ?? communityHarnessesDir());
-    if (opts.resumeToken) {
+    const resumeRef = opts.resumeToken?.trim();
+    // Only this harness's own conversation is ever handed to its launcher: a former runtime's id (a Codex thread, say) isn't.
+    if (resumeRef && found.ok && found.preset.resume && opts.resumeType !== `community:${this.runtime}`) {
+      return { ok: false, recovery: "retry_fresh",
+        error: `Resume isn't possible: the saved conversation is a "${opts.resumeType ?? "unknown"}" id, not one community harness "${this.runtime}" reported, so it isn't passed to its launcher. A new conversation starts only where the caller allows a fresh start; a restore stops and asks.` };
+    }
+    if (resumeRef && !(found.ok && found.preset.resume)) {
       // A conversation id its launcher reported earlier doesn't make a launch-only harness resumable: say so, and let the
       // caller start a new conversation as it did before (it never resumes one silently).
       return found.ok && found.preset.launchResult
@@ -78,8 +85,13 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
     if (found.preset.launchResult) {
       try {
         attempt = newLaunchAttempt(session, this.deps.launchResultRoot?.() ?? launchResultRoot());
-        program = `/usr/bin/env OPENRIG_LAUNCH_RESULT=${shellQuote(attempt.file)} OPENRIG_LAUNCH_ATTEMPT=${attempt.attempt} ${program}`;
+        program = `/usr/bin/env OPENRIG_LAUNCH_RESULT=${shellQuote(attempt.file)} OPENRIG_LAUNCH_ATTEMPT=${attempt.attempt}`
+          + `${resumeRef ? ` OPENRIG_RESUME_REF=${shellQuote(resumeRef)}` : ""} ${program}`;
       } catch (error) {
+        // A resume needs its record: without it the launcher can't be told what to reopen, so nothing starts.
+        if (resumeRef) {
+          return { ok: false, error: `Couldn't resume community harness "${this.runtime}": its launch-result folder couldn't be made (${(error as Error).message}); nothing was started.` };
+        }
         storageNote = `community harness "${this.runtime}": its launch identity is unavailable: its launch-result folder couldn't be made (${(error as Error).message})`;
       }
     }
@@ -90,6 +102,21 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
     if (!sent.ok) return { ok: false, error: `Couldn't start community harness "${this.runtime}": ${sent.message}` };
     if (!attempt) return storageNote ? { ok: true, warnings: [storageNote] } : { ok: true };
     const read = await waitForLaunchResult(attempt, this.runtime, { ...this.deps.launchResultWait, root: this.deps.launchResultRoot?.() ?? launchResultRoot() });
+    if (resumeRef) {
+      // A conversation that's gone is never replaced by a new one: nothing started, and the person decides.
+      if (!read.ok && "missing" in read) {
+        return { ok: false, missingConversation: true, error: `Couldn't resume community harness "${this.runtime}": conversation ${resumeRef}: ${read.reason}.` };
+      }
+      // Unconfirmed or different: the seat keeps the conversation it asked for, and the person decides. No retry.
+      if (!read.ok) {
+        return { ok: false, recovery: "attention_required", resumeUnproven: true,
+          error: `Community harness "${this.runtime}": resuming conversation ${resumeRef} isn't confirmed: ${read.reason}. The seat keeps conversation ${resumeRef}; nothing was restarted.` };
+      }
+      if (read.nativeRef !== resumeRef) {
+        return { ok: false, recovery: "attention_required", resumeMismatch: { opened: read.nativeRef },
+          error: `Community harness "${this.runtime}": asked to resume conversation ${resumeRef}, its launcher reports conversation ${read.nativeRef} instead. The seat keeps conversation ${resumeRef}, and OpenRig doesn't switch it to ${read.nativeRef}. Nothing was restarted.` };
+      }
+    }
     return read.ok
       ? { ok: true, resumeToken: read.nativeRef, resumeType: `community:${this.runtime}`, resumeProvenance: "launcher" }
       : { ok: true, warnings: [`community harness "${this.runtime}": its launch identity is unavailable: ${read.reason}`] };

@@ -11,19 +11,20 @@ installed.
 
 ```yaml
 format: 1
-name: cursor                    # must match the file name: lowercase letters, digits and hyphens
-command: openrig-cursor-launch  # one program and its arguments, typed into the seat's pane
+name: example-harness           # must match the file name: lowercase letters, digits and hyphens
+command: example-launch         # one program and its arguments, typed into the seat's pane
 maintainer: Example Maintainer
 limits:                         # what the maintainer says doesn't work
-  - resume unsupported
+  - fork unsupported
 launch_result: true             # optional: the launcher reports the conversation it created (below)
+resume: true                    # optional, needs launch_result; declare it only once your harness's resume is checked
 ```
 
 - **`command`** is a single program and its arguments. Shell syntax such as `|`, `&&`, `;`, redirections or `$(…)`
   is refused: put it in a script and name the script.
 - **Built-in runtime names are reserved.** A preset can't replace `claude-code`, `codex` or the other built-ins.
 - **Unknown fields are refused,** so a preset written for a newer OpenRig says so instead of half-working.
-- **Fork isn't supported, and neither is resume.** Neither is placing skills, guidance or startup files. The seat is
+- **Fork isn't supported, and resume only as described below.** Neither is placing skills, guidance or startup files. The seat is
   called ready while something other than a shell runs in its pane, which says nothing about which conversation it is.
 
 ## Reporting the conversation a launch created (`launch_result: true`)
@@ -52,15 +53,32 @@ The seat still starts, with its identity **unavailable** and the reason named, w
 
 None of these means the conversation is gone.
 
-A reported id doesn't make the harness resumable, and nothing resumes it. A restore stops and asks, as it did before:
-re-run it with `--fresh <seat>` only if you want a new conversation. Elsewhere, a resume says it's unsupported, and a new
-conversation starts only where the caller allows a fresh start.
+A reported id doesn't make the harness resumable on its own. Without `resume: true`, nothing resumes it: a restore
+stops and asks, as it did before (re-run it with `--fresh <seat>` only if you want a new conversation), and elsewhere a
+resume says it's unsupported, and a new conversation starts only where the caller allows a fresh start.
 
 **Good to know:**
 - **The variables are passed with `/usr/bin/env`,** so `launch_result` needs a POSIX system.
 - **A launcher that never writes its record** adds up to 20 seconds to each launch, while OpenRig waits for it.
 - **Records are kept,** one small file per attempt, under `$OPENRIG_HOME/state/launch-results/<session>/`. A record
   larger than 64 KiB isn't read.
+
+## Reopening a reported conversation (`resume: true`)
+
+With `resume: true` as well, a resume (a restore included) starts the launcher with `OPENRIG_RESUME_REF` set to the
+conversation to reopen. The launcher reports what happened in the same attempt's file:
+- **Reopened:** the usual record, with that conversation as `nativeRef`.
+- **Gone:** `{ "format": 1, "attempt": "…", "harness": "cursor", "error": "missing", "producer": "…" }`. The launcher
+  starts nothing. OpenRig reports the conversation missing and starts nothing either: it never replaces it with a new one.
+
+OpenRig also says so plainly when:
+- **no usable record is written:** the resume isn't confirmed. The seat needs attention and keeps the conversation it
+  asked for; nothing is restarted;
+- **the record names a different conversation:** the seat needs attention and keeps the conversation it asked for.
+  OpenRig doesn't switch it to the reported one;
+- **the saved conversation isn't one this harness's launcher reported** (a former runtime's id, say): it isn't passed to
+  the launcher. A restore stops and asks, and elsewhere the resume says it isn't possible;
+- **the record's folder can't be made:** the launcher couldn't be told what to reopen, so nothing starts.
 
 **Not supported for community harnesses:** restarting a seat in place (`rig seat restart` is for Codex seats) and
 switching harness on a running seat. Each says so before anything changes.

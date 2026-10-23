@@ -227,6 +227,8 @@ export interface RuntimeAdapter {
   launchHarness(
     binding: NodeBinding,
     opts: { name: string; resumeToken?: string; forkSource?: ForkSource;
+      /** The saved token's type, when known (a community harness resumes only its own `community:<name>` ids). */
+      resumeType?: string;
       /** Fresh successor in the retired occupant's pane; not an adopt, resume or fork. */
       freshInPlace?: boolean },
   ): Promise<HarnessLaunchResult>;

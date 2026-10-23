@@ -18,6 +18,7 @@ import { readFreshOccupantRelations } from "./fresh-occupant-relation.js";
 import { parseSqliteUtcMs } from "./sqlite-time.js";
 import { communityLaunchOnlyRestoreReason, effectiveRestorePolicy, isOrdinaryTerminalSeat, type RestoreSeatFacts } from "./restore-policy.js";
 import { communityHarnessOf } from "./built-in-runtimes.js";
+import { communityHarnessStopsRestore } from "./community-harness-presets.js";
 import { sessionCommunityHarnessSelect } from "./session-registry.js";
 import { assessSnapshotCurrentOccupants, stoppedSnapshotReason } from "./rehydrate-eligibility.js";
 
@@ -177,9 +178,12 @@ function intendedActionFor(
   }
   const occupant = resolution.kind === "resolved" ? resolution.session : null;
   const policy = effectiveRestorePolicy(seat, occupant?.restorePolicy);
-  // As apply: a community harness is launch-only, so even a reported conversation forecasts a decision, not a resume.
-  if (policy === "resume_if_possible" && occupant && communityHarnessOf(occupant.communityHarness, seat.currentRuntime)) {
-    return { intendedAction: "awaiting-decision", reason: communityLaunchOnlyRestoreReason(seat.currentRuntime, absentHistory.logicalId, absentHistory.rigName) };
+  // As apply: a launch-only community harness (its preset declares no resume) forecasts a decision, not a resume.
+  // The snapshot's saved runtime, as apply reads it.
+  const savedRuntime = seat.savedRuntime ?? seat.currentRuntime;
+  if (policy === "resume_if_possible" && occupant && communityHarnessOf(occupant.communityHarness, savedRuntime)
+    && communityHarnessStopsRestore(savedRuntime, occupant.resumeType, occupant.resumeToken)) {
+    return { intendedAction: "awaiting-decision", reason: communityLaunchOnlyRestoreReason(savedRuntime, absentHistory.logicalId, absentHistory.rigName) };
   }
   const sourceRecorded = !!occupant?.resumeType && occupant.resumeType !== "none";
   if (policy === "resume_if_possible" && sourceRecorded && occupant?.resumeToken) {

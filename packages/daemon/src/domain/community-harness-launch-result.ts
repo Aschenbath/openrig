@@ -16,7 +16,11 @@ const MAX_REF = 512;
 const MAX_RECORD_BYTES = 64 * 1024;
 
 export interface LaunchAttempt { attempt: string; dir: string; file: string }
-export type LaunchResultRead = { ok: true; nativeRef: string; producer: string } | { ok: false; reason: string };
+export type LaunchResultRead =
+  | { ok: true; nativeRef: string; producer: string }
+  /** A resume: the launcher says the conversation it was asked to reopen doesn't exist, and it started nothing. */
+  | { ok: false; missing: true; reason: string }
+  | { ok: false; reason: string };
 
 export function launchResultRoot(): string {
   return getDefaultOpenRigPath(path.join("state", "launch-results"));
@@ -52,6 +56,11 @@ export function readLaunchResult(attempt: LaunchAttempt, harness: string, root: 
   if (record.format !== LAUNCH_RESULT_FORMAT) return unusable(`declares format ${JSON.stringify(record.format ?? null)}; this OpenRig reads format ${LAUNCH_RESULT_FORMAT}`);
   if (record.attempt !== attempt.attempt) return unusable("belongs to another launch attempt");
   if (record.harness !== harness) return unusable(`names harness ${JSON.stringify(record.harness ?? null)}, not "${harness}"`);
+  // A resume the launcher refused because the conversation is gone: it started nothing.
+  if (record.error === "missing") {
+    if (typeof record.producer !== "string" || !record.producer.trim()) return unusable("doesn't name its producer");
+    return { ok: false, missing: true, reason: `its launcher (${record.producer.trim()}) says the conversation doesn't exist, and started nothing` };
+  }
   const ref = record.nativeRef;
   if (typeof ref !== "string" || !ref || ref.length > MAX_REF || /[\s\x00-\x1f\x7f]/.test(ref)) {
     return unusable(`has no usable nativeRef (a non-empty string of at most ${MAX_REF} characters, without spaces or control characters)`);
