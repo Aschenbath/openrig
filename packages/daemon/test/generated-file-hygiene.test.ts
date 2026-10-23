@@ -27,7 +27,7 @@ describe("generated file Git hygiene", () => {
   let root: string;
   let repo: string;
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), "generated-file-hygiene-"));
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "generated-file-hygiene-")));
     repo = path.join(root, "repo"); fs.mkdirSync(repo);
     git(repo, "init", "-q");
     git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial");

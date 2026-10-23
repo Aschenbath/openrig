@@ -26,7 +26,7 @@ function project(root: string, id: string, judge: string, missionsDir = "mission
 }
 
 function fixture(alphaMissions = "missions") {
-  const workspace = fs.mkdtempSync(join(tmpdir(), "proof-catalog-")); fixtures.push(workspace);
+  const workspace = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "proof-catalog-"))); fixtures.push(workspace);
   write(join(workspace, "workspace.yaml"), { projects: [{ id: "alpha", root: "alpha" }, { id: "beta", root: "beta" }] });
   const alpha = project(join(workspace, "alpha"), "alpha", "judge@rig", alphaMissions);
   const beta = project(join(workspace, "beta"), "beta", "judge@rig");
@@ -102,7 +102,7 @@ describe("project-qualified proof scope (#132)", () => {
     expect((await sibling.json()).error).toBe("path_escape");
     const judged = await f.judge("alpha:../../legacy/missions/m0/slices/01-t001", {}, f.legacy.slice);
     expect((await judged.json()).error).toBe("path_escape");
-    const outside = fs.mkdtempSync(join(tmpdir(), "proof-outside-")); fixtures.push(outside);
+    const outside = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "proof-outside-"))); fixtures.push(outside);
     fs.writeFileSync(join(outside, "evidence.md"), "outside");
     fs.symlinkSync(outside, join(f.alpha.slice, "proof/outside"));
     const evidence = await f.judge("alpha:m0/slices/01-t001", { evidence: ["proof/outside/evidence.md"] });
@@ -166,7 +166,7 @@ describe("project-qualified proof scope (#132)", () => {
   });
 
   it("a README-only catalog project under an ancestor project.yaml can't reach evidence outside its own root (CodeRabbit, CWE-22)", async () => {
-    const ws = fs.mkdtempSync(join(tmpdir(), "proof-ancestor-")); fixtures.push(ws);
+    const ws = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "proof-ancestor-"))); fixtures.push(ws);
     // the workspace itself has a project.yaml whose policy would authorise the judge; the catalog project has none
     write(join(ws, "project.yaml"), { kind: "project", metadata: { id: "outer" }, proofPolicy: { judges: ["judge@rig"] } });
     write(join(ws, "workspace.yaml"), { projects: [{ id: "readme-only", root: "readme-only" }] });
@@ -205,7 +205,7 @@ describe("project-qualified proof scope (#132)", () => {
   // Review (2026-10-01): scope readiness agrees with proof. A catalogued project that keeps its contract in README
   // (no SPEC, no project.yaml of its own) sits under a workspace whose own project.yaml has a different judge.
   function readmeProject() {
-    const ws = fs.mkdtempSync(join(tmpdir(), "proof-scopes-")); fixtures.push(ws);
+    const ws = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "proof-scopes-"))); fixtures.push(ws);
     write(join(ws, "project.yaml"), { kind: "project", metadata: { id: "outer" }, proofPolicy: { judges: ["outer@rig"] } });
     write(join(ws, "workspace.yaml"), { projects: [{ id: "readme-only", root: "readme-only" }, { id: "bare", root: "bare" }] });
     const mission = (root: string, policy: object) => {
