@@ -41,18 +41,12 @@ This plugin ships dual-manifest packaging — both `.claude-plugin/` and `.codex
   `CLAUDE_PROJECT_DIR` doesn't follow a `cd`. A Claude started in the seat's own project folder is the same project and
   still acts as the seat. A seat launched before this change has no `OPENRIG_SEAT_PROJECT_DIR` until its next launch, restore
   or handover, and behaves as before until then.
-- **Codex CLI** — Codex loads a plugin only once it's installed through its own marketplace path and enabled. When the
-  daemon manages Codex seats with `runtime.codex.hooks_enabled` on, it installs this plugin with Codex's own commands
-  (`codex plugin marketplace add` for a local marketplace beside the vendored copy, then `codex plugin add
-  openrig-core@openrig`), under the daemon's `CODEX_HOME`.
-  - **What that writes:** Codex's install writes `[marketplaces.openrig]` and `[plugins."openrig-core@openrig"] enabled = true`
-    into that `config.toml`. Codex makes the plugin's skills available to every Codex session on that home.
-  - **Opting out:** set `enabled = false` for the plugin, or `[plugins._default] enabled = false` with no explicit value for
-    it. OpenRig then never installs or reinstalls it, for both the first install and an upgrade. It reads the system, user
-    and legacy managed config files; it can't see profile, project, session-flag, MDM or cloud-managed config.
-  - **Upgrades:** a new vendored version is reinstalled the same way, and only while the plugin isn't disabled.
-  - **Review:** each of the plugin's hooks still needs Codex's exact-hook review before it runs. OpenRig writes no trust
-    and no hook state for them.
+- **Codex CLI** — OpenRig does not automatically install or upgrade this plugin in Codex. A fresh Codex home therefore
+  has the existing four managed activity hooks, but no automatic native plugin or refocus hooks. Seat-selected skills
+  are still projected separately. An already installed
+  plugin and the person's enable/disable choices are left alone.
+  - **Review:** Codex loads an installed, enabled plugin through its own plugin configuration. Each of its hooks remains
+    subject to Codex's exact-hook review. OpenRig writes no trust or hook state for these plugin hooks.
   - **Selected seats only:** every hook in `hooks/codex.json` starts with a shell guard, `test -n "$OPENRIG_SEAT_PROJECT_DIR"
     && test -f "$OPENRIG_NODE" && test -x "$OPENRIG_NODE" || exit 0`, before running anything. OpenRig sets both only for a
     Codex seat whose resolved plugin selection includes this plugin (`OPENRIG_NODE` is the daemon's own absolute Node). So
