@@ -64,8 +64,11 @@ describe("delivery outcome: a resolved notice on a closed row opens no delivery 
   });
 
   it("an ask on Steering without an alert, closed by the person, reads no delivery at all: nothing was owed", async () => {
+    // A person whose Slack subscription is urgent-only.
+    const founder = FOUNDER as { subscriptions?: unknown };
+    founder.subscriptions = [{ destination: { connector: "slack" }, filter: { preset: "urgent-only" } }];
     const item = await repo.create({ sourceSession: "lead@rig", destinationSession: "human-founder@external", body: "decide?",
-      summary: "decision", priority: "routine" as never, humanIntent: "decision" as never } as never);
+      summary: "decision", priority: "routine" as never, humanIntent: "decision" as never } as never).finally(() => { delete founder.subscriptions; });
     const id = (item as unknown as { qitemId: string }).qitemId;
     directReplyClose(id);
     age();
