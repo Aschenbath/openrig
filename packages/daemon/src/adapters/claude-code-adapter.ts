@@ -13,6 +13,7 @@ import type {
 import { resolveConcreteHint } from "../domain/runtime-adapter.js";
 import type { ProjectionPlan, ProjectionEntry } from "../domain/projection-planner.js";
 import { assessNativeResumeProbe } from "../domain/native-resume-probe.js";
+import { resumeProbeEvidence } from "../domain/native-resume-probe-evidence.js";
 import { resolveReadinessTimeoutMs } from "../domain/readiness-timeout.js";
 import { subtreeNamesClaudeExecutable, claudeCommandSessionToken, listNativeProcesses, observeClaudeDelivery, observeClaudePaneProcess, observeClaudePaneRuntime, observeCodexPaneProcess, verifyClaudePaneProcess, verifyCodexPaneProcess, verifyPaneIdleShell, witnessedClaudeVersionLabel, type ClaudeLaunchedProcess, type NativeProcessLister, type VersionLabelWitnessWait } from "../domain/native-process-lineage.js";
 import { mergeManagedBlock, DEFAULT_CLAUDE_MANAGED_BLOCK_FILE, type ClaudeManagedBlockFile } from "../domain/managed-blocks.js";
@@ -604,6 +605,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       if (probe.code === "no_conversation_found") {
         return {
           ok: false,
+          probe: await resumeProbeEvidence(probe, paneContent, this.tmux, tmuxSession),
           error: "Claude resume failed: no conversation found for the requested session",
           recovery: "retry_fresh",
           missingConversation: true,
@@ -620,6 +622,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       if (probe.status === "attention_required") {
         return {
           ok: false,
+          probe: await resumeProbeEvidence(probe, paneContent, this.tmux, tmuxSession),
           error: probe.detail,
           recovery: "attention_required",
           evidence: paneContent.split("\n").slice(-12).join("\n"),
@@ -635,7 +638,8 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         }
         const enterResult = await this.tmux.sendKeys(tmuxSession, ["Enter"]);
         if (!enterResult.ok) {
-          return { ok: false, error: `Claude trust prompt auto-drive failed: ${enterResult.message}` };
+          return { ok: false, error: `Claude trust prompt auto-drive failed: ${enterResult.message}`,
+            probe: await resumeProbeEvidence(probe, paneContent, this.tmux, tmuxSession) };
         }
         await this.sleep(200);
         continue;
@@ -688,10 +692,12 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     if (finalProbe.status === "resumed") {
       return { ok: true };
     }
+    const probeEvidence = await resumeProbeEvidence(finalProbe, finalContent, this.tmux, tmuxSession);
 
     if (finalProbe.status === "attention_required" || finalProbe.code === "claude_auto_identity_required") {
       return {
         ok: false,
+        probe: probeEvidence,
         error: finalProbe.detail,
         recovery: "attention_required",
         evidence: finalContent.split("\n").slice(-12).join("\n"),
@@ -702,6 +708,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     if (finalProbe.code === "no_conversation_found") {
       return {
         ok: false,
+        probe: probeEvidence,
         error: "Claude resume failed: no conversation found for the requested session",
         recovery: "retry_fresh",
         missingConversation: true,
@@ -711,6 +718,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     if (await this.paneReturnedToShell(binding, finalCommand)) {
       return {
         ok: false,
+        probe: probeEvidence,
         error: "Claude resume failed: pane returned to shell instead of entering Claude",
         recovery: "retry_fresh",
       };
@@ -726,11 +734,12 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       return {
         ok: false,
         error: `Claude resume did not finish within ${Math.round(attempts * pollMs / 1000)}s; Claude may still be starting, so the launch was kept`,
+        probe: probeEvidence,
         recovery: "attention_required",
         evidence: finalContent.split("\n").slice(-12).join("\n"),
       };
     }
-    return { ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" };
+    return { ok: false, error: "Claude resume failed: timed out waiting for Claude to become active", probe: probeEvidence };
   }
 
   private projectEntry(entry: ProjectionEntry, cwd: string, managedBlockFile: ClaudeManagedBlockFile, warnings: string[], seatSkillsRoot?: string, seatSkillsRefused?: string): boolean {

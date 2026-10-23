@@ -193,6 +193,7 @@ export type RigEvent =
   // 2026-07-02 founder ruling).
   | { type: "session.resume_token_captured"; rigId: string; nodeId: string; sessionName: string; sessionId: string; runtime: string; outcome: "captured" | "preserved" | "skipped"; resumeType?: string; provenance?: "adoption"; reason?: "missing_sidecar" | "parse_error" | "probe_timeout" | "process_unreadable" | "invalid_token" | "stale_sidecar" | "higher_rank_present"; redacted: true }
   | { type: "seat.attention_cleared"; rigId: string; nodeId: string; sessionName: string; from: string; to: "ready"; clearedBy: "evidence" | "operator_attestation"; evidence?: { kind: string; state?: string; reason?: string }; reason?: string; previousError: string | null }
+  | { type: "seat.attention_clear_refused"; rigId: string; nodeId: string; sessionId: string; sessionName: string; attentionClass: "restore_outcome"; code: string; attemptId?: number; probe?: import("./native-resume-probe-evidence.js").NativeResumeProbeEvidence }
   | { type: "rig.imported"; rigId: string; specName: string; specVersion: string }
   // Package events (cross-rig, no rigId)
   | { type: "package.validated"; packageName: string; valid: boolean }
@@ -233,7 +234,7 @@ export type RigEvent =
   | { type: "pod.deleted"; rigId: string; podId: string }
   | { type: "node.startup_pending"; rigId: string; nodeId: string; startupProof?: StartupProofSelection }
   | { type: "node.startup_ready"; rigId: string; nodeId: string; previousStatus?: "failed" | "attention_required"; submission?: { status: "unverified" | "staged"; reasons: string[]; warning?: string; diagnostics?: StartupSubmissionDiagnostic[] } }
-  | { type: "node.startup_failed"; rigId: string; nodeId: string; error: string; sessionId?: string; freshContextPending?: boolean; forkContextPending?: { parentToken: string; isRestore: boolean }; submissionDiagnostics?: StartupSubmissionDiagnostic[]; stage?: StartupFailureStage; hasPendingWork?: boolean; requestedResumeToken?: string | null; requestedResumeType?: string | null }
+  | { type: "node.startup_failed"; rigId: string; nodeId: string; error: string; sessionId?: string; freshContextPending?: boolean; forkContextPending?: { parentToken: string; isRestore: boolean }; submissionDiagnostics?: StartupSubmissionDiagnostic[]; stage?: StartupFailureStage; hasPendingWork?: boolean; requestedResumeToken?: string | null; requestedResumeType?: string | null; probe?: import("./native-resume-probe-evidence.js").NativeResumeProbeEvidence }
   // OPR.0.4.3.06 — startup proof (challenge-verified orientation). Append-only.
   // `node.startup_challenged` freezes this launch's challenge ground truth
   // (challengeId + contractHash; the expected answer is recomputed, never

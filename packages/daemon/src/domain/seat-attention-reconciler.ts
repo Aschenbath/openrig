@@ -377,7 +377,8 @@ interface ClearAttentionDeps {
         to: "operator_recovered";
         evidence: { tmux: boolean; fgProcess: string; resumeTokenUsed: boolean; paneState: "usable" };
       }
-    | { ok: false; code: string; detail: string }
+    | { ok: false; code: string; detail: string; attemptId?: number;
+        probe?: import("./native-resume-probe-evidence.js").NativeResumeProbeEvidence }
   >;
 }
 
@@ -426,6 +427,15 @@ export class SeatAttentionReconciler {
     if (derivedOutcome?.source === "restore.completed") {
       const reconcile = this.deps.reconcileRestoreOutcome;
       if (!reconcile) {
+        eventBus.emit({
+          type: "seat.attention_clear_refused",
+          rigId: session.rigId,
+          nodeId: session.nodeId,
+          sessionId: session.id,
+          sessionName,
+          attentionClass: "restore_outcome",
+          code: "strict_reconciler_unavailable",
+        });
         return {
           ok: false,
           code: "not_demonstrably_responsive",
@@ -434,6 +444,17 @@ export class SeatAttentionReconciler {
       }
       const restored = await reconcile(session.rigId, session.nodeId);
       if (!restored.ok) {
+        eventBus.emit({
+          type: "seat.attention_clear_refused",
+          rigId: session.rigId,
+          nodeId: session.nodeId,
+          sessionId: session.id,
+          sessionName,
+          attentionClass: "restore_outcome",
+          code: restored.code,
+          ...(restored.attemptId !== undefined ? { attemptId: restored.attemptId } : {}),
+          ...(restored.probe ? { probe: restored.probe } : {}),
+        });
         return {
           ok: false,
           code: "not_demonstrably_responsive",
