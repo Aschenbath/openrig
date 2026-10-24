@@ -24,7 +24,9 @@ import { eligibleQueueBindings, ineligibleBindingDetail, loadLearnedHostBindings
 import { getSelfHostId, resolvesToLocalHost } from "../domain/hosts/fanout-contract.js";
 import { remoteJsonRequest } from "../domain/hosts/remote-daemon-http.js";
 import type { SettingsStore } from "../domain/user-settings/settings-store.js";
-import { deriveCurrentWork, deriveCurrentWorkChoice, deriveRole, deriveWorkCandidates, type RoleOrientation } from "../domain/current-work.js";
+import { deriveCurrentWork, deriveCurrentWorkChoice, deriveRole, deriveWorkCandidates, type CurrentWorkRow, type MissionsRootResolver, type RoleOrientation } from "../domain/current-work.js";
+import { listProjects, projectCatalogPaths } from "../domain/workspace/project-read.js";
+import { readProjectCatalog } from "../domain/workspace/project-catalog.js";
 import type { WhoamiService } from "../domain/whoami-service.js";
 import type Database from "better-sqlite3";
 import { HumanModeService } from "../domain/gateway/human-operating-modes.js";
@@ -967,19 +969,61 @@ export function queueRoutes(): Hono {
     } catch {
       missionsRoot = null;
     }
+    // Catalogued projects own their missions roots only when exactly one project
+    // tag names a healthy catalog entry. Every other project-tag case falls back
+    // to the configured root and records why, so whoami never turns an unusable
+    // catalog hint into a confident wrong-project answer.
+    let catalogStatus: "missing" | "usable" | "unavailable" = "missing";
+    let projectMissionsRoots = new Map<string, { root: string | null; error?: string }>();
+    let catalogPath: string | null = null;
+    try {
+      catalogPath = projectCatalogPaths(c).catalog;
+    } catch {
+      // No workspace root configured: there is no catalog to consult.
+      catalogPath = null;
+    }
+    if (catalogPath) try {
+      const entries = readProjectCatalog(catalogPath);
+      if (entries) {
+        catalogStatus = "usable";
+        projectMissionsRoots = new Map(listProjects(c).projects.map((project) => [project.id, {
+          root: project.error ? null : project.missionsRoot,
+          error: project.error,
+        }]));
+      }
+    } catch {
+      catalogStatus = "unavailable";
+    }
+    const currentWorkRoot: MissionsRootResolver = (row: CurrentWorkRow) => {
+      const projectIds = [...new Set((row.tags ?? []).flatMap((tag) => tag.split(",").map((part) => part.trim()))
+        .filter((tag) => tag.startsWith("project:") && tag.slice("project:".length).trim())
+        .map((tag) => tag.slice("project:".length).trim()))];
+      if (projectIds.length === 0) return { root: missionsRoot };
+      if (projectIds.length !== 1) {
+        return { root: missionsRoot, reason: `multiple project tags (${projectIds.join(", ")}); used configured root` };
+      }
+      const projectId = projectIds[0]!;
+      if (catalogStatus !== "usable") {
+        return { root: missionsRoot, reason: `project:${projectId} could not be used because the workspace catalog is ${catalogStatus === "missing" ? "not configured" : "unavailable"}; used configured root` };
+      }
+      const project = projectMissionsRoots.get(projectId);
+      if (!project) return { root: missionsRoot, reason: `project:${projectId} is not in the project catalogue; used configured root` };
+      if (project.error || !project.root) return { root: missionsRoot, reason: `project:${projectId} is unavailable in the project catalogue; used configured root` };
+      return { root: project.root };
+    };
     // Deliberately NOT position.asDestination.recent: that is a capped, mixed-state display
     // projection, so a second in-progress baton past the cap would be invisible and the
     // ambiguity refusal would degrade into a confident wrong answer. The derivation reads
     // the unbounded in-progress set, which makes it independent of recentLimit.
     const inProgress = repo.listInProgressForDestination(session);
-    const derived = deriveCurrentWork(inProgress, missionsRoot);
+    const derived = deriveCurrentWork(inProgress, currentWorkRoot);
     const lookups = {
       getRow: (qitemId: string) => repo.getById(qitemId) ?? null,
       continuationOf: (qitemId: string) => repo.currentParkContinuation(qitemId),
     };
     // When no single work node is settled, the plain answer names every in-progress
     // candidate and asks the agent to choose, rather than a count alone.
-    const choice = deriveCurrentWorkChoice(derived, inProgress, missionsRoot, lookups);
+    const choice = deriveCurrentWorkChoice(derived, inProgress, currentWorkRoot, lookups, missionsRoot);
     const choiceField = choice ? { currentWorkChoice: choice } : {};
     let role: RoleOrientation = { state: "unknown", reason: "calling node unavailable", files: [] };
     try {
@@ -999,8 +1043,12 @@ export function queueRoutes(): Hono {
       const nextTruncated = next.length > WORK_CANDIDATE_LIST_LIMIT;
       const workCandidates = deriveWorkCandidates(
         [...inProgress, ...held.slice(0, WORK_CANDIDATE_LIST_LIMIT), ...next.slice(0, WORK_CANDIDATE_LIST_LIMIT)],
+        currentWorkRoot,
+        {
+          getRow: (qitemId) => repo.getById(qitemId) ?? null,
+          continuationOf: (qitemId) => repo.currentParkContinuation(qitemId),
+        },
         missionsRoot,
-        lookups,
       );
       return c.json({ ...position, ...derived, ...choiceField, role,
         // heldAndNextTruncated stays for trace scripts that predate the per-list flags.
