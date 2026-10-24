@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Command } from "commander";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, renameSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, realpathSync, renameSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
@@ -13,6 +13,7 @@ import {
   type DestroyDeps,
 } from "../src/destroy-helpers.js";
 import { destroyCommand } from "../src/commands/destroy.js";
+import { readRecordedTmuxServerArgs } from "../src/tmux-attachment.js";
 
 function captureLogs(fn: () => Promise<void>): Promise<{ logs: string[]; exitCode: number | undefined }> {
   return new Promise(async (resolve) => {
@@ -66,7 +67,9 @@ describe("destroy helpers", () => {
 
   it("resolves the effective socket before stopping or deleting state and passes it to every session kill", async () => {
     const args = ["-S", join(tmpDir, "selected.sock")];
-    const deps = makeDestroyDeps({ resolveTmuxServerArgs: vi.fn(() => args) });
+    writeFileSync(join(tmpDir, "tmux-server.json"), JSON.stringify({ version: 1, home: realpathSync(tmpDir),
+      mode: "isolated", pinned: true, socketPath: args[1] }));
+    const deps = makeDestroyDeps({ resolveTmuxServerArgs: vi.fn(readRecordedTmuxServerArgs) });
     const plan = buildDestroyPlan("all", false, { stateRoot: tmpDir, dbPath: join(tmpDir, "db"),
       transcriptsPath: join(tmpDir, "transcripts"), daemonHost: "localhost", daemonPort: 7433 }, deps);
     plan.managedTmuxSessions = ["seat"];
@@ -77,14 +80,28 @@ describe("destroy helpers", () => {
       .toBeLessThan(vi.mocked(deps.stopDaemon).mock.invocationCallOrder[0]!);
   });
 
-  it("leaves daemon, sessions and state intact if its server record cannot be read", async () => {
-    const deps = makeDestroyDeps({ resolveTmuxServerArgs: () => { throw new Error("unreadable server record"); } });
+  it("leaves daemon, sessions and state intact if its pinned server record is missing", async () => {
+    writeFileSync(join(tmpDir, "tmux-server.initialized"), "openrig-tmux-pinned-v1\n");
+    const deps = makeDestroyDeps({ resolveTmuxServerArgs: readRecordedTmuxServerArgs });
     const plan = buildDestroyPlan("all", false, { stateRoot: tmpDir, dbPath: join(tmpDir, "db"),
       transcriptsPath: join(tmpDir, "transcripts"), daemonHost: "localhost", daemonPort: 7433 }, deps);
-    await expect(executeDestroy(plan, deps)).rejects.toThrow("unreadable server record");
+    await expect(executeDestroy(plan, deps)).rejects.toThrow("Missing tmux server record");
     expect(deps.stopDaemon).not.toHaveBeenCalled();
     expect(deps.killTmuxSession).not.toHaveBeenCalled();
     expect(deps.removePath).not.toHaveBeenCalled();
+  });
+
+  it.each(["missing", "malformed", "stale"])("keeps inherited cleanup on tmux's current server with a %s advisory record", async state => {
+    if (state === "malformed") writeFileSync(join(tmpDir, "tmux-server.json"), "{");
+    if (state === "stale") writeFileSync(join(tmpDir, "tmux-server.json"), JSON.stringify({ version: 1,
+      home: realpathSync(tmpDir), mode: "inherit", pinned: false, socketPath: join(tmpDir, "old.sock") }));
+    const deps = makeDestroyDeps({ resolveTmuxServerArgs: readRecordedTmuxServerArgs });
+    const plan = buildDestroyPlan("all", false, { stateRoot: tmpDir, dbPath: join(tmpDir, "db"),
+      transcriptsPath: join(tmpDir, "transcripts"), daemonHost: "localhost", daemonPort: 7433 }, deps);
+    plan.managedTmuxSessions = ["seat"];
+    await executeDestroy(plan, deps);
+    expect(deps.stopDaemon).toHaveBeenCalled();
+    expect(deps.killTmuxSession).toHaveBeenCalledExactlyOnceWith("seat", []);
   });
 
   it("buildBackupPath appends timestamp and resolves collisions", () => {

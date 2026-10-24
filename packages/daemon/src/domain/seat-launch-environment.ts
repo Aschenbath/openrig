@@ -7,7 +7,7 @@ import { shellQuote } from "../adapters/shell-quote.js";
 // Explicit public launch metadata, not a prefix/denylist over credential names.
 // Provider keys and OPENRIG_ACTIVITY_HOOK_TOKEN keep their non-typed channel.
 export const SEAT_PUBLIC_ENV_KEYS = [
-  "OPENRIG_HOME", "OPENRIG_URL", "OPENRIG_HOST", "OPENRIG_PORT",
+  "OPENRIG_HOME", "OPENRIG_DB", "TMUX_TMPDIR", "OPENRIG_URL", "OPENRIG_HOST", "OPENRIG_PORT",
   "OPENRIG_NODE_ID", "OPENRIG_SESSION_NAME", "OPENRIG_RUNTIME",
   "OPENRIG_OCCUPANT_GENERATION", "OPENRIG_TRANSCRIPTS_LINES",
   "OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS",
@@ -142,7 +142,22 @@ export class SeatLaunchEnvironment {
       // assignments preserve shell lookup; /usr/bin/env would bypass it.
       if (target.runtime === "claude-code") {
         const assignments = Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`);
-        return `${assignments.join(" ")} PATH=${shellQuote(binDir)}:"$PATH" ${command}`;
+        const launch = `${assignments.join(" ")} PATH=${shellQuote(binDir)}:"$PATH" ${command}`;
+        // ksh calls a function without exporting a leading assignment that isn't already
+        // exported, so it keeps the form above, where every assignment reaches Claude.
+        if (!["bash", "zsh", "sh", "dash"].includes(shell)) return launch;
+        // A file command must replace the staging subshell so tmux observes
+        // Claude as the foreground process. Keep aliases/functions intact and
+        // pass the original leading assignments through a subshell-local function.
+        // The constant eval defers function-name parsing until alias lookup is ruled out.
+        return [
+          'if _openrig_claude_executable=$(command -v claude) && [ -f "$_openrig_claude_executable" ] && [ -x "$_openrig_claude_executable" ]; then',
+          '  case "$_openrig_claude_executable" in',
+          "    */*) eval 'claude() { exec \"$_openrig_claude_executable\" \"$@\"; }' ;;",
+          '  esac',
+          'fi',
+          launch,
+        ].join("\n");
       }
       const assignments = Object.entries(env).map(([key, value]) => shellQuote(`${key}=${value}`));
       return `/usr/bin/env ${assignments.join(" ")} PATH=${shellQuote(binDir)}:"$PATH" ${command}`;

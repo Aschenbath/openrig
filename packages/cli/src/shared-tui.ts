@@ -9,7 +9,9 @@ interface SharedTuiClient {
 
 /** Resolve the terminal on the selected instance, not a remembered tmux name. */
 export async function sharedTuiTarget(client: SharedTuiClient = new DaemonClient()): Promise<TmuxAttachment> {
-  await assertLocalTmux(client, "Shared attachment uses local tmux. The selected daemon's instance identity could not be confirmed locally; run rig tui --shared on that daemon's machine. Standalone rig tui can use this remote connection.");
+  if (client.baseUrl && !["localhost", "127.0.0.1", "[::1]"].includes(new URL(client.baseUrl).hostname)) {
+    throw new Error("Shared attachment uses local tmux. Run rig tui --shared on the selected daemon's machine; standalone rig tui can use this remote connection.");
+  }
   const rigs = await client.get<Array<{ rigId: string; rigName?: string; name?: string }>>("/api/ps");
   if (rigs.status >= 400) throw new Error(`Cannot read rigs (HTTP ${rigs.status}); run rig status.`);
   const kernels = rigs.data.filter((r) => (r.rigName ?? r.name) === "kernel");
@@ -20,12 +22,14 @@ export async function sharedTuiTarget(client: SharedTuiClient = new DaemonClient
     logicalId: string; runtime: string | null;
     canonicalSessionName: string | null; tmuxAttachCommand: string | null;
     tmuxServerArgs?: string[];
+    tmuxServerMode?: "inherit" | "isolated";
   }>>(`/api/rigs/${encodeURIComponent(kernel.rigId)}/nodes`);
   if (nodes.status >= 400) throw new Error(`Cannot read kernel terminals (HTTP ${nodes.status}); run rig status.`);
   const terminal = nodes.data.find((n) => n.logicalId === "operator.human" && n.runtime === "terminal");
   if (!terminal?.canonicalSessionName || !terminal.tmuxAttachCommand) {
     throw new Error("The kernel has no bound shared terminal. Inspect rig ps --nodes --rig kernel; restore the existing terminal rather than launching another kernel. Standalone: rig tui.");
   }
+  await assertLocalTmux(client, terminal.tmuxServerMode, "Shared attachment uses local tmux. The selected daemon's instance identity could not be confirmed locally; run rig tui --shared on that daemon's machine. Standalone rig tui can use this remote connection.");
   return { session: terminal.canonicalSessionName, serverArgs: readTmuxServerArgs(terminal.tmuxServerArgs) };
 }
 

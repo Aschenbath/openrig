@@ -26,6 +26,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { writeRuntimeStubs } from "../../../../test/stub-runtimes.js";
 
 /**
  * Inherited environment variables that redirect the CLI/daemon client at a
@@ -279,7 +280,7 @@ export interface HermeticScaffold {
 }
 
 export interface PrepareHermeticEnvOptions {
-  /** Base environment to derive the clean child env from. Defaults to process.env. */
+  /** Base environment to derive the clean child env from. Explicit provider roots are preserved; defaults to process.env. */
   baseEnv?: EnvLike;
   /**
    * The A3-R3 injected clock. When set, the scaffold's child env carries
@@ -334,6 +335,9 @@ export function prepareHermeticEnv(opts: PrepareHermeticEnvOptions = {}): Hermet
   for (const dir of [home, openrigHome, stateDir, tmuxTmpDir, tmuxServerDir, tmuxWrapperDir]) {
     mkdirSync(dir, { recursive: true });
   }
+  // codex and claude resolve to stubs inside the scaffold, so a scenario daemon never runs the host's
+  // real binaries (they can hang under a scratch HOME). Native Codex e2e tests use their own harness.
+  const runtimeStubDir = writeRuntimeStubs(root);
 
   // Test-only command seam: every child `tmux` call gets one explicit private
   // socket. TMUX_TMPDIR remains for compatibility, but is never the selector.
@@ -363,6 +367,11 @@ process.exit(result.status ?? 1);
   // additional server that ordinary scaffold cleanup would leave running.
   delete env.OPENRIG_TMUX_SERVER;
   delete env.RIGGED_TMUX_SERVER;
+  // Inherited provider roots belong to the runner; explicit ones are test inputs.
+  if (opts.baseEnv === undefined) {
+    for (const name of ["CODEX_HOME", "CLAUDE_CONFIG_DIR"]) delete env[name];
+  }
+  delete env.OPENRIG_E2E_REAL_CODEX;
   // Scrub any injected-clock var (defense in depth behind the fail-closed guard) so
   // only an explicit injectClockNow can set it below — never an inherited value.
   for (const name of TEST_CLOCK_ENV_VARS) delete env[name];
@@ -376,7 +385,7 @@ process.exit(result.status ?? 1);
   // -S socket is the identity-bearing half, so a missing directory cannot make a
   // later invocation fall back to the operator's default server.
   env.TMUX_TMPDIR = tmuxTmpDir;
-  env.PATH = `${tmuxWrapperDir}${delimiter}${originalPath}`;
+  env.PATH = [tmuxWrapperDir, runtimeStubDir, originalPath].filter(Boolean).join(delimiter);
   // Forced-local: never resolve/attach the shared fleet kernel.
   env.OPENRIG_NO_KERNEL = "1";
   // A3-R3 injected clock: the ONLY sanctioned way OPENRIG_TEST_CLOCK_NOW is set —

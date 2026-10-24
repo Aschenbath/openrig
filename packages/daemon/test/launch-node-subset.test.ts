@@ -1,6 +1,9 @@
 // OPR.0.3.4.11 — launchNodeSubset tests: managed partial restore for held seats.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type Database from "better-sqlite3";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
@@ -89,6 +92,7 @@ describe("RestoreOrchestrator.launchNodeSubset", () => {
     return { rigId: rig.id, nodeIds: [n1.id, n2.id] };
   }
 
+  /** Capture the supplied private roster and startup contexts for subset-launch checks. */
   function seedSnapshot(rigId: string, nodeIds: string[], nodeStartupContext: Record<string, unknown> = {}) {
     const sessions = nodeIds.map((nid, i) => ({
       nodeId: nid,
@@ -116,6 +120,21 @@ describe("RestoreOrchestrator.launchNodeSubset", () => {
     const snap = snapshotRepo.createSnapshot(rigId, "manual", data);
     return snap.id;
   }
+
+  it.each([
+    ["codex", "claude-code"],
+    ["claude-code", "codex"],
+  ])("saved startup %s stops live %s before subset launch", async (saved, live) => {
+    const { rigId, nodeIds } = seedPodAwareRig();
+    const snapshotId = seedSnapshot(rigId, nodeIds, { [nodeIds[0]!]: emptyStartupContext(saved) });
+    db.prepare("UPDATE nodes SET runtime = ? WHERE id = ?").run(live, nodeIds[0]);
+    const before = db.prepare("SELECT * FROM sessions ORDER BY id").all();
+    const result = await orchestrator.launchNodeSubset(rigId, ["dev.driver"], { snapshotId });
+    expect(result.ok).toBe(true); // The subset envelope reports individual launch outcomes.
+    expect(result.launched?.[0]).toMatchObject({ status: "awaiting-decision", error: "No session was started for this seat. Restore a snapshot whose saved startup runtime matches the seat's current runtime." });
+    expect(tmux.createSession).not.toHaveBeenCalled();
+    expect(db.prepare("SELECT * FROM sessions ORDER BY id").all()).toEqual(before);
+  });
 
   it("returns rig_not_found for unknown rig", async () => {
     const result = await orchestrator.launchNodeSubset("nonexistent", ["dev.driver"]);
@@ -328,6 +347,42 @@ describe("RestoreOrchestrator.launchNodeSubset", () => {
     expect(payload.reason).toBe("excluded_from_subset");
   });
 
+  it("doesn't hold a non-target seat joined with rig attach as an external CLI, since it has no tmux session to check", async () => {
+    const { rigId, nodeIds } = seedPodAwareRig();
+    seedSnapshot(rigId, nodeIds);
+    sessionRegistry.updateBinding(nodeIds[1]!, { attachmentType: "external_cli", externalSessionName: "guard-desktop@test-rig" });
+    const claimed = sessionRegistry.registerClaimedSession(nodeIds[1]!, "guard-desktop@test-rig");
+
+    await orchestrator.launchNodeSubset(rigId, ["dev.driver"]);
+
+    expect(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'node.held'").get()).toEqual({ n: 0 });
+    expect(db.prepare("SELECT status FROM sessions WHERE id = ?").get(claimed.id)).toEqual({ status: "running" });
+    expect(tmux.hasSession).not.toHaveBeenCalledWith("guard-desktop@test-rig");
+  });
+
+  it("leaves a targeted seat joined with rig attach as an external CLI attached, and still launches the tmux target beside it", async () => {
+    const { rigId, nodeIds } = seedPodAwareRig();
+    seedSnapshot(rigId, nodeIds, { [nodeIds[0]!]: emptyStartupContext("claude-code"), [nodeIds[1]!]: emptyStartupContext("codex") });
+    sessionRegistry.updateBinding(nodeIds[1]!, { attachmentType: "external_cli", externalSessionName: "guard-desktop@test-rig" });
+    const claimed = sessionRegistry.registerClaimedSession(nodeIds[1]!, "guard-desktop@test-rig");
+    const claude = readyAdapter("claude-code");
+    const codex = readyAdapter("codex");
+
+    const result = await orchestrator.launchNodeSubset(rigId, ["dev.driver", "dev.guard"], { adapters: { "claude-code": claude, codex } });
+
+    // Nothing is launched in the attached app's place, and its claim and binding are as they were.
+    expect(codex.launchHarness).not.toHaveBeenCalled();
+    expect(db.prepare("SELECT status FROM sessions WHERE id = ?").get(claimed.id)).toEqual({ status: "running" });
+    expect(sessionRegistry.getBindingForNode(nodeIds[1]!)).toMatchObject({ attachmentType: "external_cli", externalSessionName: "guard-desktop@test-rig" });
+    // A tmux session that happens to share the claim's name can't make it read as already running.
+    expect(tmux.hasSession).not.toHaveBeenCalledWith("guard-desktop@test-rig");
+    expect(claude.launchHarness).toHaveBeenCalledOnce();
+    expect(result.launched).toEqual([
+      expect.objectContaining({ logicalId: "dev.driver", status: "fresh-primed" }),
+      expect.objectContaining({ logicalId: "dev.guard", status: "left_attached", error: expect.stringContaining("rig unclaim guard-desktop@test-rig") }),
+    ]);
+  });
+
   it("uses operator hold reason when provided", async () => {
     const { rigId, nodeIds } = seedPodAwareRig();
     seedSnapshot(rigId, nodeIds);
@@ -376,6 +431,26 @@ describe("RestoreOrchestrator.launchNodeSubset", () => {
     Object.assign(data.sessions[0], fields);
     db.prepare("UPDATE snapshots SET data = ? WHERE id = ?").run(JSON.stringify(data), snapshotId);
   }
+
+  it.each([[true, "To resume its conversation"], [false, "start nothing and ask for a decision"]] as const)(
+    "offers a community harness's idle seat the resume command only when its preset declares resume (resume=%s)", async (resumes, advice) => {
+      const saved = process.env["OPENRIG_HOME"];
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "subset-community-"));
+      try {
+        process.env["OPENRIG_HOME"] = home;
+        fs.mkdirSync(path.join(home, "community-harnesses"));
+        fs.writeFileSync(path.join(home, "community-harnesses", "synth-harness.yaml"),
+          `format: 1\nname: synth-harness\ncommand: synth-launch\nmaintainer: Example\nlimits: []\nlaunch_result: true\n${resumes ? "resume: true\n" : ""}`);
+        const { rigId, session, snapshotId } = seedPreservedShell("synth-harness");
+        sessionRegistry.recordCommunityHarnessSelection(session.id, "synth-harness");
+        setSavedSession(snapshotId, { communityHarness: "synth-harness", resumeType: "community:synth-harness", resumeToken: "chat-123", restorePolicy: "resume_if_possible" });
+        const result = await orchestrator.launchNodeSubset(rigId, ["dev.driver"]);
+        expect(result.launched![0]).toMatchObject({ status: "attention_required", error: expect.stringContaining(advice) });
+      } finally {
+        if (saved === undefined) delete process.env["OPENRIG_HOME"]; else process.env["OPENRIG_HOME"] = saved;
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
 
   it.each(["claude-code", "codex", "pi", "omp"])("reports an exited %s agent without replacing its preserved shell", async (runtime) => {
     const { rigId, nodeIds, session } = seedPreservedShell(runtime);

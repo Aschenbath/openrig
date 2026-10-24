@@ -76,15 +76,16 @@ describe.skipIf(!nativeAvailable)("daemon tmux server selection with a real stub
       const id = rigs.find(row => row.rigName === "scn-baton")!.rigId;
       const response = await fetch(`${active.baseUrl}/api/rigs/${id}/nodes`);
       expect(response.ok).toBe(true);
-      return { id, rows: await response.json() as Array<{ canonicalSessionName: string; tmuxServerArgs: string[]; tmuxAttachCommand: string }> };
+      return { id, rows: await response.json() as Array<{ canonicalSessionName: string; tmuxServerArgs: string[]; tmuxServerMode: string; tmuxAttachCommand: string }> };
     };
 
-    expect(await status()).toMatchObject({ mode: "inherit", socketPath: personal, migrationPending: false });
+    expect(await status()).toMatchObject({ mode: "inherit", socketPath: personal, executionArgs: [], migrationPending: false });
     await rig(["up", staged.topologyPath, "--json", "--yes"]);
     const oldPane = native(personal, ["display-message", "-p", "-t", `=${SEAT}:`, "#{pane_id}:#{pane_pid}"]);
     expect(oldPane).toMatch(/^%\d+:\d+$/);
     const initialNodes = await inventory();
     expect(initialNodes.rows.map(row => row.canonicalSessionName)).toContain(SEAT);
+    expect(initialNodes.rows.find(row => row.canonicalSessionName === SEAT)!.tmuxServerMode).toBe("inherit");
     expect(native(personal, ["show-environment", "-t", `=${SEAT}`, "OPENRIG_HOME"]))
       .toBe(`OPENRIG_HOME=${realpathSync(scaffold.openrigHome)}`);
     const configured = await rig(["config", "set", "terminal.tmux_server", "isolated"]);
@@ -100,7 +101,7 @@ describe.skipIf(!nativeAvailable)("daemon tmux server selection with a real stub
     expect(native(personal, ["list-sessions", "-F", "#{session_name}"])).toBe("personal");
     await active.restart();
     const selected = await status();
-    expect(selected).toMatchObject({ mode: "isolated", migrationPending: false, blockingSessions: [] });
+    expect(selected).toMatchObject({ mode: "isolated", executionArgs: selected.serverArgs, migrationPending: false, blockingSessions: [] });
     expect(selected.socketPath).not.toBe(personal);
     // Restore the deliberately stopped team. The stub has no provider resume
     // history, so explicitly request a fresh seat within the same generation.
@@ -118,8 +119,10 @@ describe.skipIf(!nativeAvailable)("daemon tmux server selection with a real stub
     expect(nodes.id).toBe(initialNodes.id);
     expect(nodes.rows).toHaveLength(1);
     expect(nodes.rows[0]!.tmuxServerArgs).toEqual(selected.serverArgs);
+    expect(nodes.rows[0]!.tmuxServerMode).toBe("isolated");
     expect(nodes.rows[0]!.tmuxAttachCommand).toContain(selected.socketPath!);
     const preview = await (await fetch(`${active.baseUrl}/api/terminal/preview?view=scn-baton&provider=herdr`)).json();
+    expect(preview.tmux).toMatchObject({ mode: "isolated", socketPath: selected.socketPath });
     expect(preview.composed.localTmuxServer).toEqual(selected.serverArgs);
     expect(preview.composed.opened[0].paneCommand).toContain(selected.socketPath!);
 

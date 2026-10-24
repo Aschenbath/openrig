@@ -84,6 +84,40 @@ describe("SelfAttachService", () => {
       .toMatchObject({ ok: true, attachmentType: "external_cli" });
   });
 
+  it.each([undefined, "/another/server"])("keeps inherited self-attach compatible with a missing or different socket: %s", async socketPath => {
+    const service = new SelfAttachService({ db, rigRepo, podRepo, sessionRegistry, eventBus,
+      tmuxServer: { socketPath: "/selected/server", mode: "inherit" } });
+    const rig = rigRepo.createRig("socket-fixture");
+    const pod = podRepo.createPod(rig.id, "dev", "Dev");
+    const node = rigRepo.addNode(rig.id, "dev.existing", { runtime: "stub", podId: pod.id });
+    const context = { attachmentType: "tmux" as const, tmuxSession: "raw-existing", tmuxSocketPath: socketPath };
+    expect(await service.attachToNode({ rigId: rig.id, logicalId: node.logicalId, context }))
+      .toMatchObject({ ok: true, attachmentType: "tmux" });
+    expect(await service.attachToPod({ rigId: rig.id, podNamespace: "dev", memberName: "new", runtime: "stub",
+      context: { ...context, tmuxSession: "raw-new" } })).toMatchObject({ ok: true, attachmentType: "tmux" });
+    expect(sessionRegistry.getBindingForNode(node.id)?.tmuxSession).toBe("raw-existing");
+    expect(rigRepo.getRig(rig.id)!.nodes).toHaveLength(2);
+    expect(sessionRegistry.getSessionsForRig(rig.id)).toHaveLength(2);
+  });
+
+  it("retains the registry's address-conflict protection when inherited socket checks are skipped", async () => {
+    const service = new SelfAttachService({ db, rigRepo, podRepo, sessionRegistry, eventBus,
+      tmuxServer: { socketPath: "/selected/server", mode: "inherit" } });
+    const rig = rigRepo.createRig("socket-fixture");
+    const pod = podRepo.createPod(rig.id, "dev", "Dev");
+    rigRepo.addNode(rig.id, "dev.first", { runtime: "stub", podId: pod.id });
+    const second = rigRepo.addNode(rig.id, "dev.second", { runtime: "stub", podId: pod.id });
+    const context = { attachmentType: "tmux" as const, tmuxSession: "shared-session", tmuxSocketPath: "/another/server" };
+    expect(await service.attachToNode({ rigId: rig.id, logicalId: "dev.first", context })).toMatchObject({ ok: true });
+    expect(await service.attachToNode({ rigId: rig.id, logicalId: "dev.second", context }))
+      .toMatchObject({ ok: false, code: "address_conflict" });
+    expect(await service.attachToPod({ rigId: rig.id, podNamespace: "dev", memberName: "new", runtime: "stub", context }))
+      .toMatchObject({ ok: false, code: "address_conflict" });
+    expect(sessionRegistry.getBindingForNode(second.id)).toBeNull();
+    expect(rigRepo.getRig(rig.id)!.nodes).toHaveLength(2);
+    expect(sessionRegistry.getSessionsForRig(rig.id)).toHaveLength(1);
+  });
+
   it("attachToNode binds the current raw agent as external_cli", async () => {
     const rig = rigRepo.createRig("rigged-buildout");
     const node = rigRepo.addNode(rig.id, "orch1.lead", {

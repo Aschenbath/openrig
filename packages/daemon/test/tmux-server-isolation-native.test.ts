@@ -47,7 +47,7 @@ describe.skipIf(!nativeAvailable)("an explicit tmux server survives an inherited
       const selected = await selectTmuxServer({ home, mode: "isolated", registeredSessions: [],
         env: { TMUX: `${personal},1,0`, TMUX_TMPDIR: root } });
       selectedSockets.push(selected.socketPath!);
-      const adapter = new TmuxAdapter(execCommand, undefined, execArgvCommand, selected.serverArgs);
+      const adapter = new TmuxAdapter(execCommand, undefined, execArgvCommand, selected.executionArgs);
       expect(await adapter.createSession("operator@kernel", root, { OPENRIG_HOME: home, OPENRIG_TEST_MARKER: tag }))
         .toMatchObject({ ok: true });
       expect(native(selected.socketPath!, ["show-environment", "-t", "=operator@kernel", "OPENRIG_TEST_MARKER"]))

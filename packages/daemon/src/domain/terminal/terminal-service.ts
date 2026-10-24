@@ -60,8 +60,10 @@ export const DEFAULT_PROVIDER: TerminalProviderName = "herdr";
 const DEFAULT_PROVIDER_ORDER: readonly TerminalProviderName[] = ["herdr", "cmux"];
 
 export interface OpenViewRequest {
-  /** Provider name. Omitted: the first of herdr, then cmux, that is available and alive; herdr when neither is. */
+  /** Provider name. With no session, omission selects the first available, live provider: herdr, then cmux. */
   provider?: string;
+  /** An explicit provider session; omission retains the daemon's configured endpoint. */
+  session?: string;
   /** The view argument: a rig name | `mission:<id>` | `slice:<id>` | a saved-view id. */
   view: string;
   /** Preview fingerprint. A changed membership/layout must be previewed again. */
@@ -72,6 +74,8 @@ export interface OpenViewRequest {
 
 export interface TerminalPreview {
   provider: string;
+  session?: string;
+  tmux?: TmuxServerSelection;
   view: string;
   planId: string;
   composed: ComposedView;
@@ -98,11 +102,16 @@ export interface ProviderStatusReport {
 export interface TerminalStatusResult {
   providers: ProviderStatusReport[];
   tmux?: TmuxServerSelection;
+  session?: string;
+  error?: string;
+  code?: string;
 }
 
 export interface TerminalServiceDeps {
   /** Resolve a provider name to its adapter, or null for an unknown name. */
   resolveProvider(name: string): TerminalProvider | null;
+  /** Resolve an explicit session without altering the default provider instance. */
+  resolveSessionProvider?(name: string, session: string): TerminalProvider | null;
   /** The saved-views store (read paths only from this service). */
   viewsStore: Pick<TerminalViewsStore, "get" | "list">;
   /** Live seats of a rig BY NAME; null when no such rig is known (vs [] = a known-but-empty rig). */
@@ -159,6 +168,22 @@ export class TerminalService {
 
   constructor(private readonly deps: TerminalServiceDeps) {}
 
+  private selectProvider(req: Pick<OpenViewRequest, "provider" | "session">): {
+    name: string; provider: TerminalProvider; session?: string;
+  } | OpenViewResult {
+    const name = (req.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
+    const defaultProvider = this.deps.resolveProvider(name);
+    if (!defaultProvider) return errorResult(name, "unknown_provider", `unknown provider '${name}' — expected herdr or cmux`);
+    if (req.session === undefined) return { name, provider: defaultProvider };
+    const session = typeof req.session === "string" ? req.session.trim() : "";
+    if (!session || session === "." || session === ".." || /[\\/\x00-\x1f\x7f]/.test(session)) {
+      return errorResult(name, "invalid_terminal_session", "session must be one non-empty session name, not a socket path.");
+    }
+    const provider = this.deps.resolveSessionProvider?.(name, session);
+    return provider ? { name, provider, session }
+      : errorResult(name, "unsupported_terminal_session", `Provider '${name}' does not support selecting a named session. Use herdr with --session <name>.`);
+  }
+
   /** Resolved once, so a preview and the open that follows compose the same pane commands. */
   private resolveLocalTmux(): Promise<string | undefined> {
     this.localTmux ??= (async () => {
@@ -174,10 +199,10 @@ export class TerminalService {
 
   /** An omitted provider takes the first in DEFAULT_PROVIDER_ORDER that is available and alive. With neither, it stays
    *  herdr, whose honest failure carries the direct attach commands. A named provider is used as named, errors and all.
-   *  This picks only which provider; choosing a herdr session belongs inside the herdr provider. */
+   *  A named session stays on herdr without probing default-provider availability. */
   private async providerNameFor(req: OpenViewRequest): Promise<{ name: string; fellBack: boolean }> {
     const named = req.provider?.trim();
-    if (named) return { name: named, fellBack: false };
+    if (named || req.session !== undefined) return { name: named || DEFAULT_PROVIDER, fellBack: false };
     for (const name of DEFAULT_PROVIDER_ORDER) {
       const candidate = this.deps.resolveProvider(name);
       if (!candidate) continue;
@@ -193,26 +218,22 @@ export class TerminalService {
   /** Open a view in the chosen provider. Always returns the one shared result shape. */
   async openView(req: OpenViewRequest): Promise<OpenViewResult> {
     const { name: providerName, fellBack } = await this.providerNameFor(req);
-    const provider = this.deps.resolveProvider(providerName);
-    if (!provider) {
-      return errorResult(
-        providerName,
-        "unknown_provider",
-        `unknown provider '${providerName}' — expected herdr or cmux`,
-      );
-    }
+    const selected = this.selectProvider({ ...req, provider: providerName });
+    if ("ok" in selected) return selected;
+    const { provider, session } = selected;
 
     const composed = await this.resolveComposed(req.view, provider.panesPerPage, req.viewportColumns);
     if ("code" in composed) return errorResult(providerName, composed.code, composed.error);
-    const planId = this.planId(providerName, composed);
+    const planId = this.planId(providerName, composed, session);
     if (req.expectedPlan !== undefined && req.expectedPlan !== planId) {
-      return errorResult(providerName, "preview_changed", "View membership or layout changed. Refresh the preview before Open; nothing was launched.");
+      return errorResult(providerName, "preview_changed", "View membership, layout or provider session changed. Refresh the preview before Open; nothing was launched.");
     }
     const notes = composed.kernelLayout ? [`Default kernel view: ${composed.kernelLayout}.`] : [];
     if (fellBack) notes.push(`Herdr isn't available here (not installed or not answering), so this view uses ${providerName}.`);
     if (composed.kernelLayout && composed.opened.length === 0) {
       return {
         ...errorResult(providerName, "kernel_seats_unavailable", `No kernel conversations are attachable: ${composed.absent.map(member => `${member.seat} (${member.reason})`).join("; ")}`),
+        ...(session !== undefined ? { session } : {}),
         absent: composed.absent, degraded: composed.degraded, notes,
       };
     }
@@ -225,7 +246,7 @@ export class TerminalService {
     if (!composed.kernelLayout && composed.opened.some(pane => !pane.readOnly)) {
       notes.push("The shared dashboard is the overview; the team's lead pane is where you can talk about the work. Check the opened seats and any absent or degraded seats above. Can you see the team? A created workspace or a capture alone does not confirm what is visible on your screen.");
     }
-    return notes.length ? { ...result, notes: [...notes, ...(result.notes ?? [])] } : result;
+    return { ...result, ...(session !== undefined ? { session } : {}), ...(notes.length ? { notes: [...notes, ...(result.notes ?? [])] } : {}) };
   }
 
   private async resolveComposed(viewArg: string, panesPerPage?: number, viewportColumns?: number): Promise<ComposedTerminalView | { code: string; error: string }> {
@@ -244,18 +265,21 @@ export class TerminalService {
     return resolved.kernelLayout ? { ...composed, kernelLayout: resolved.kernelLayout, columns: resolved.columns, spaceLabel: KERNEL_SPACE_LABEL } : composed;
   }
 
-  private planId(provider: string, composed: ComposedView): string {
-    return createHash("sha256").update(JSON.stringify({ provider, composed, grids: composed.pages.map(page => buildGridRoot(page, composed.columns)) })).digest("hex");
+  private planId(provider: string, composed: ComposedView, session?: string): string {
+    return createHash("sha256").update(JSON.stringify({ provider, ...(session !== undefined ? { session } : {}), composed, grids: composed.pages.map(page => buildGridRoot(page, composed.columns)) })).digest("hex");
   }
 
   /** Passive: inventory, local has-session and provider probe only. Never openView. */
   async previewView(req: OpenViewRequest): Promise<TerminalPreview | OpenViewResult> {
     const { name: providerName } = await this.providerNameFor(req);
-    const provider = this.deps.resolveProvider(providerName);
-    if (!provider) return errorResult(providerName, "unknown_provider", `unknown provider '${providerName}'`);
+    const selected = this.selectProvider({ ...req, provider: providerName });
+    if ("ok" in selected) return selected;
+    const { provider, session } = selected;
     const composed = await this.resolveComposed(req.view, provider.panesPerPage, req.viewportColumns);
     if ("code" in composed) return errorResult(providerName, composed.code, composed.error);
-    return { provider: providerName, view: req.view, composed, grids: composed.pages.map(page => buildGridRoot(page, composed.columns)), planId: this.planId(providerName, composed), status: await provider.status() };
+    const tmux = daemonTmuxServerInfo();
+    return { provider: providerName, ...(session !== undefined ? { session } : {}), ...(tmux ? { tmux } : {}), view: req.view, composed,
+      grids: composed.pages.map(page => buildGridRoot(page, composed.columns)), planId: this.planId(providerName, composed, session), status: await provider.status() };
   }
 
   /** List saved views + the rig names openable as derived views. */
@@ -290,7 +314,14 @@ export class TerminalService {
   }
 
   /** Provider availability + liveness (doctor). Unknown named provider → empty report for it. */
-  async status(providerName?: string): Promise<TerminalStatusResult> {
+  async status(providerName?: string, session?: string): Promise<TerminalStatusResult> {
+    const tmux = daemonTmuxServerInfo();
+    if (session !== undefined) {
+      const selected = this.selectProvider({ provider: providerName, session });
+      if ("ok" in selected) return { providers: [], error: selected.error, code: selected.code };
+      return { session: selected.session, ...(tmux ? { tmux } : {}), providers: [{ name: selected.name,
+        status: await selected.provider.status(), liveness: await selected.provider.liveness() }] };
+    }
     const names: string[] = providerName ? [providerName] : ["herdr", "cmux"];
     const providers: ProviderStatusReport[] = [];
     for (const name of names) {
@@ -305,7 +336,6 @@ export class TerminalService {
       }
       providers.push({ name, status: await p.status(), liveness: await p.liveness() });
     }
-    const tmux = daemonTmuxServerInfo();
     return { providers, ...(tmux ? { tmux } : {}) };
   }
 

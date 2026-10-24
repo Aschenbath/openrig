@@ -43,6 +43,14 @@ function appWith(svc: ProviderService | null): Hono {
 }
 
 describe("provider routes", () => {
+  it("move reports are queue items now, not the removed event-log record: no setting gates them, and there's no /moves/:id", async () => {
+    const app = appWith(stubService);
+    // This app wires no queue, so the report routes say so rather than answering a disabled-feature 409.
+    expect((await app.request("/api/provider/moves")).status).toBe(503);
+    expect((await app.request("/api/provider/moves", { method: "POST", body: "{}" })).status).toBe(503);
+    expect((await app.request("/api/provider/moves/m-1")).status).toBe(404);
+  });
+
   it("GET /status returns the whole four-block model", async () => {
     const res = await appWith(stubService).request("/api/provider/status");
     expect(res.status).toBe(200);

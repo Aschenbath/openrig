@@ -68,9 +68,10 @@ system-level invariants.
 14. Restore outcome states are a fixed set (`RestoreNodeResult.status`,
     `types.ts:475`): `resumed`, `rebuilt`, `fresh-primed`,
     `awaiting-decision`, `attention_required`, `failed`, plus
-    `operator_recovered` (set only by later reconciliation) and `fresh`
-    (retained only for the legacy continuity-restoring skip path). `rebuilt` =
-    new process assembled from artifacts.
+    `operator_recovered` (set only by later reconciliation), `fresh`
+    (retained only for the legacy continuity-restoring skip path) and
+    `left_attached` (a seat joined with `rig attach` as an external CLI, which
+    restore leaves as it is). `rebuilt` = new process assembled from artifacts.
 15. Restore honesty: a failed resume stops loudly as `awaiting-decision`, with
     the blank session rolled back and no session running
     (`restore-orchestrator.ts:1055`). No automatic fresh fallback. Fresh launch
@@ -221,7 +222,18 @@ SSE delivery surfaces include the following. The daemon has **11**
 `git grep -l 'streamSSE(' -- packages/daemon/src/routes | wc -l`).
 
 - `GET /api/events` — global stream of all events (`server.ts:730`
-  `app.route("/api/events", eventsRoute)`).
+  `app.route("/api/events", eventsRoute)`); `?rigId=` keeps one rig's. Each
+  event's SSE `id` is its `seq`. Before going live, a connection replays
+  stored events, read and written 500 at a time (`routes/events.ts`):
+  - with a `Last-Event-ID` header (an `EventSource` sends it when it
+    reconnects), every event after that `seq`, whatever `replay` says;
+  - otherwise `?replay=<n>`: the newest `n` events (of the rig, with
+    `rigId`); `replay=0` starts from now; `replay=all`, no `replay`, a
+    count past the log's size, or any other value, replays the whole log.
+
+  Either way the replay ends at the newest event stored as the connection
+  subscribes; the events stored meanwhile were buffered and follow it, each
+  once and in order, before the stream goes live.
 - `GET /api/stream/watch` — new stream items (`routes/stream.ts:194`).
 - `GET /api/queue/watch` — queue/inbox coordination events
   (`routes/queue.ts:1054`, with a `/sse` alias at `:1055`).
@@ -266,9 +278,15 @@ Intentional limits that still describe the shipped system:
 5. `rig ask` transcript search prefers `rg`, falls back to `grep -E`
    (`history-query.ts:252`, `:267`); quality/perf varies by backend.
 6. Chat is rig-scoped only — no cross-rig channels or DMs.
-7. `--verify` on `rig send` checks pane content for message visibility, not
-   agent acknowledgement: it compares occurrences of the message's first 40
-   characters before and after the send (`session-transport.ts:1605`–`1608`).
+7. `--verify` on `rig send` reports what the pane shows, not agent
+   acknowledgement. By default it compares the message (whole for a
+   header-carrying send, the first 40 characters for a raw one) in captures
+   before and after the send, leaving out the current input box; with
+   `transport.verify_input_box` on, Claude Code and Codex sends are verified
+   only for a seat proven idle before the paste and on input-box evidence; a
+   busy or unknown seat reads unconfirmed (`transport-and-transcripts.md` §3
+   step 5).
+   When it cannot confirm, it reports `rendered-unconfirmed`, not a failure.
 8. Terminal node readiness is shell-ready only — no service health probes.
 9. Managed-app service surfaces are descriptive only — OpenRig does not
    auto-inject service URLs/tokens into agent prompts beyond authored

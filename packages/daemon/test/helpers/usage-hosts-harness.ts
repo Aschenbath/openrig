@@ -43,6 +43,8 @@ export interface ClaudePlan {
   orgId?: string | null;
   email?: string | null;
   fail?: { reason: "binary_not_found" | "not_logged_in" | "auth_status_failed"; detail: string };
+  /** Answer after this long (real time). */
+  delayMs?: number;
 }
 
 export type HostShape =
@@ -65,11 +67,15 @@ export interface UsageHostOptions {
   now?: () => string;
   /** Answer GET /api/provider/status and /api/config only after this long (real time). */
   slowReadMs?: number;
+  /** For a hub: the fetch its calls to other hosts go through (the daemon's remoteFetchImpl seam). */
+  remoteFetch?: typeof fetch;
   /** Rewrite this host's JSON answers on /api/provider/* and /api/config (a malformed, oversized or echoing host). */
   rewrite?: (path: string, body: unknown) => unknown;
 }
 
 const toEpoch = (iso: string) => Math.floor(Date.parse(iso) / 1000);
+// Keep the default fixture clock before its fixed reset; elapsed-time checks still use real timers.
+const DEFAULT_NOW = "2026-10-13T23:30:00.000Z";
 export const DEFAULT_RESET = "2026-10-20T00:00:00.000Z";
 
 export class UsageHost {
@@ -80,6 +86,8 @@ export class UsageHost {
   claude: ClaudePlan;
   samples: ClaudeWindowSample[];
   readonly settings: SettingsStore;
+  /** False: the provider service is unwired, so its routes answer 503. */
+  wired = true;
   private readonly hangs: Array<() => void> = [];
   private server!: ServerType;
   url = "";
@@ -105,7 +113,7 @@ export class UsageHost {
   }
 
   private now(): string {
-    return (this.opts.now ?? (() => new Date().toISOString()))();
+    return (this.opts.now ?? (() => DEFAULT_NOW))();
   }
 
   private async readCodex(): Promise<CodexUsageReadOutcome> {
@@ -136,6 +144,7 @@ export class UsageHost {
   private async readClaude(): Promise<UsageReadOutcome<ClaudeAuthAnswer>> {
     this.claudeReads += 1;
     const plan = this.claude;
+    if (plan.delayMs) await new Promise((r) => setTimeout(r, plan.delayMs));
     if (plan.fail) return { ok: false, at: this.now(), reason: plan.fail.reason, detail: plan.fail.detail };
     return {
       ok: true,
@@ -179,7 +188,8 @@ export class UsageHost {
       if (slow && c.req.method === "GET" && (c.req.path === "/api/provider/status" || c.req.path === "/api/config")) {
         await new Promise((r) => setTimeout(r, slow));
       }
-      c.set("providerService" as never, svc as never);
+      if (this.wired) c.set("providerService" as never, svc as never);
+      if (this.opts.remoteFetch) c.set("remoteFetchImpl" as never, this.opts.remoteFetch as never);
       c.set("settingsStore" as never, this.settings as never);
       if (registry) {
         c.set("hostRegistryLoader" as never, ((): HostRegistryLoadResult =>
@@ -252,3 +262,68 @@ export async function closedPortUrl(): Promise<string> {
   await host.close();
   return url;
 }
+
+/** The served facts a person must see, in the CLI and the TUI alike: identities, hosts, times, levels and freshness with reasons, notes, failures. */
+export function usageAcrossHostsFacts(view: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  const add = (v: unknown) => { if (typeof v === "string" && v.length > 0) out.push(v); };
+  for (const h of view["hosts"] as Array<Record<string, unknown>>) {
+    for (const k of ["hostId", "error", "usageReason", "readAt"]) add(h[k]);
+    for (const leg of Object.values((h["lastRefresh"] ?? {}) as Record<string, Record<string, unknown>>)) for (const k of ["at", "reason", "detail"]) add(leg[k]);
+  }
+  for (const s of view["skipped"] as Array<Record<string, unknown>>) { add(s["hostId"]); add(s["reason"]); }
+  for (const g of view["items"] as Array<Record<string, unknown>>) {
+    for (const n of g["notes"] as string[]) add(n);
+    for (const o of g["observations"] as Array<Record<string, unknown>>) {
+      add(o["hostId"]);
+      add(o["readAt"]);
+      const row = o["row"] as Record<string, unknown>;
+      const id = (row["identity"] ?? {}) as Record<string, unknown>;
+      for (const k of ["accountId", "workspaceId", "limitId", "email", "orgId"]) add(id[k]);
+      add(row["unavailableReason"]);
+      for (const w of row["windows"] as Array<Record<string, unknown>>) for (const k of ["window", "resetsAt", "observedAt", "level", "levelReason", "freshness", "freshnessReason"]) add(w[k]);
+      const last = row["lastRefresh"] as Record<string, unknown> | null;
+      if (last?.["outcome"] === "failed") for (const k of ["at", "reason", "detail"]) add(last[k]);
+    }
+  }
+  for (const group of (view["seatAccounts"] ?? []) as Array<Record<string, unknown>>) {
+    add(group["hostId"]);
+    for (const seat of group["seats"] as Array<Record<string, unknown>>) {
+      for (const k of ["seatSession", "runtime"]) add(seat[k]);
+      const c = seat["configured"] as Record<string, unknown>;
+      for (const k of ["profileRef", "recordedAt", "home", "homeNote", "reason"]) add(c[k]);
+      for (const n of (seat["registryNotes"] ?? []) as string[]) add(n);
+      add((seat["allowance"] as Record<string, unknown>)["reason"]);
+      // The observed line as the CLI chooses it: a difference first, whatever windowsSampled or withheld say.
+      const o = (seat["observed"] ?? {}) as Record<string, unknown>;
+      const differs = (o["differsFrom"] ?? []) as string[];
+      if (differs.length) { add(`differs from ${differs.join(", ")}`); add(o["note"]); }
+      else if (o["windowsSampled"] === true) add(o["lastSampledAt"]);
+      else if (o["windowsSampled"] !== false) add(o["note"]);
+    }
+  }
+  return [...new Set(out)];
+}
+
+/** Served seat accounts in each observed shape: today's producer's four, and a difference with windowsSampled false,
+ *  absent or alongside withheld, which the daemon also accepts. Both views' parity tests serve these. */
+export const SEAT_SHAPES: Array<Record<string, unknown>> = [
+  { seatSession: "seat-sampled@r", rigName: "r", runtime: "claude-code",
+    configured: { source: "registry", profileRef: "work-a", recordedAt: "2026-10-12T10:00:00Z", profileSaved: false },
+    registryNotes: ["a registry note"], allowance: { linked: false, reason: "seat allowance reason" },
+    observed: { windowsSampled: true, lastSampledAt: "2026-10-13T23:01:00Z" } },
+  { seatSession: "seat-differs@r", rigName: "r", runtime: "claude-code",
+    configured: { source: "default_login", home: "/home/fixture", homeNote: "the fixture's home note" },
+    allowance: { linked: false, reason: "seat allowance reason" },
+    observed: { windowsSampled: true, lastSampledAt: "2026-10-13T23:02:00Z", differsFrom: ["peer-a@r"], note: "possibly a different login" } },
+  { seatSession: "seat-unsampled@r", rigName: "r", runtime: "codex", configured: { source: "unknown", reason: "no registry row" },
+    allowance: { linked: false, reason: "seat allowance reason" }, observed: { windowsSampled: false } },
+  { seatSession: "seat-withheld@r", rigName: "r", runtime: "claude-code", configured: { source: "unknown", reason: "no registry row" },
+    allowance: { linked: false, reason: "seat allowance reason" }, observed: { withheld: true, note: "observation withheld: 2 seats share it" } },
+  { seatSession: "seat-false-differs@r", rigName: "r", runtime: "claude-code", configured: { source: "unknown", reason: "no registry row" },
+    allowance: { linked: false, reason: "seat allowance reason" }, observed: { windowsSampled: false, differsFrom: ["peer-b@r"], note: "false-sampled note" } },
+  { seatSession: "seat-absent-differs@r", rigName: "r", runtime: "claude-code", configured: { source: "unknown", reason: "no registry row" },
+    allowance: { linked: false, reason: "seat allowance reason" }, observed: { differsFrom: ["peer-c@r", "peer-d@r"] } },
+  { seatSession: "seat-withheld-differs@r", rigName: "r", runtime: "claude-code", configured: { source: "unknown", reason: "no registry row" },
+    allowance: { linked: false, reason: "seat allowance reason" }, observed: { withheld: true, differsFrom: ["peer-e@r"], note: "withheld-differs note" } },
+];

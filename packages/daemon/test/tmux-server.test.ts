@@ -43,6 +43,7 @@ describe("the daemon's tmux server", () => {
   it("names a socket anywhere else, or another user's, with -S", () => {
     expect(tmuxServerArgs({ TMUX: "/srv/sockets/team,9,1" }, 501)).toEqual(["-S", "/srv/sockets/team"]);
     expect(tmuxServerArgs({ TMUX: "/srv/sockets/team ,9,1" }, 501)).toEqual(["-S", "/srv/sockets/team "]);
+    expect(tmuxServerArgs({ TMUX: "/srv/sockets/team,shared,9,1" }, 501)).toEqual(["-S", "/srv/sockets/team,shared"]);
     expect(tmuxServerArgs({ TMUX: "/tmp/tmux-501/person,123,0" }, 502)).toEqual(["-S", "/tmp/tmux-501/person"]);
   });
 

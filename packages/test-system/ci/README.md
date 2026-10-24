@@ -76,6 +76,13 @@ content, and capture resolving a seat by member-name prefix). The read-only inst
 can't carry them, so they stay per-PR evidence outside CI. A green run here shows the
 passing leg only.
 
+The existing `daemon-restart` case also connects the installed `rig mcp serve` over
+stdio, using its shipped SDK. It checks whoami with a configured stub seat and with
+none, queue create/show attribution, the missing-item daemon code in structured
+content, and the four server instruction lines. The captured MCP results and direct
+daemon error readback are in the case report. Both MCP children close before teardown;
+this adds no container, YAML verb, provider client or model call.
+
 The other library scenarios are **unadmitted**. Several need step-time `emit`,
 `policy`, `mutate`, or `restore`. Others have incomplete assertions or setup:
 clean-lifecycle has no post-down residue assertion, ps-scope neither brings up its
@@ -129,3 +136,11 @@ The script removes only its named containers. If SSH becomes unavailable, it
 reports incomplete cleanup with the exact name for later reconciliation; no remote
 cleanup can be guaranteed through a broken connection. It never prunes shared
 images or other agents' containers.
+
+## Refocus context regression controls
+
+`refocus-parked` runs the real typed blocked-row setup, daemon `queue whoami`, shipped refocus hook and trace. The `hook_context` observation carries the hook's exact raw JSON stdout and its parsed `additionalContext`; pane text is not evidence. The emit step switches the work packet on (`packet: true`), so the healthy context must show the row under `HELD WORK (blocked; this is not next)` with its blocker, and never the slice as current work. The same fresh scenario runs healthy, seeded, healthy. Its fault substitutes a scratch Python launcher for this hook's trace child, verifies the packet carried exactly that one real held row, then moves it into the candidates as the seat's current work and runs the real trace. The hook's own emitted context must then fail step4, rendering the held row's slice as `WORK FROM QUEUE EVIDENCE`. An unrelated timeout/action failure or mere exit1 is rejected. `refocus-parked-off` is the packet-off control (`packet: false`): the same parked row keeps today's labelled root fallback. `refocus-active` claims the equivalent typed row and requires that work node's intent with no fallback. The emitter gives the hook its selectable 20 s budget, since these scenarios assert content, not latency.
+
+These are controlled hook invocations against the actual scenario daemon, not native Claude/Codex hook scheduling or agent consumption. Fixtures and fault launchers stay under the scenario scaffold; installed hooks are unchanged. The pre-existing queue-durability and passing-only cases are retained.
+
+Managed-compaction coverage uses `managed-compaction-effect.test.ts` in ordinary daemon CI instead: the shipped compact route deliberately refuses `runtime:stub`, and the precompact seam exposes a keyed marker rather than a daemon stream event. The bounded helper fallback drives the real enforcer's command through a stub input model (recorded Claude2.1.282 success792/paste850-851) into the real precompact hook. Healthy and851-character seeded controls assert marker presence/absence, rather than a submit receipt or pane token. This is not native compaction or an installed `rig compact` journey. No runtime filter or ordinary-send behavior changes.

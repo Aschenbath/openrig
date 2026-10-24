@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3";
 import { classifyPaneActivity, SessionTransport } from "../src/domain/session-transport.js";
 import { SeatStructuralActivityService } from "../src/domain/seat-structural-activity-service.js";
@@ -199,7 +199,11 @@ const modeBars = [
   ["plan", "⏸ plan mode on (shift+tab to cycle)"],
   ["default", "? for shortcuts"],
 ] as const;
-const warningSets = [[update], [focus], [weekly], [update, focus]];
+// #1641: an update banner (reported on Claude 2.1.293) and the context hint (native text from Build's
+// Claude seats; reported as the last line on another seat) below the mode bar.
+const updateBanner = "Update available! Run: mise upgrade claude";
+const clearHint = "new task? /clear to save 324.1k tokens";
+const warningSets = [[update], [focus], [weekly], [update, focus], [updateBanner], [clearHint], [update, updateBanner]];
 // Native, from a Claude seat running a hook mid-turn (2026-10-05): the timer follows a hook label.
 const hookRow = "✽ Sketching… (running PostToolUse hook · 3m 12s · ↓ 7.9k tokens)";
 function modePane(hint: string, trailers: string[], composer = "❯\u00a0", before = "● Ready.\n\n✻ Crunched for 2s") {
@@ -248,11 +252,33 @@ describe("#808: Claude permission-mode footers below status warnings", () => {
   it.each(modeBars)("still requires the complete input frame: %s", (_name, hint) => {
     expect(classifyPaneActivity(modePane(hint, [update, focus]).replaceAll(border, "")).state).toBe("unknown");
   });
+
+  // #1641's capture as the reporter posted it (OpenRig 0.6.5, Claude Code 2.1.293): the empty prompt sits fourth from the bottom.
+  it("reads the reported capture with the update banner last as idle", () => {
+    const reported = [
+      "Waiting for further instructions.",
+      "",
+      "✻ Crunched for 7m 29s · done 2:09 AM",
+      "",
+      "──────────────────────────────────────────── fixer@example ─",
+      "❯",
+      "───────────────────────────────────────────────────────────",
+      "  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent",
+      "                                    Update available! Run: mise upgrade claude",
+      "",
+    ].join("\n");
+    expect(classifyPaneActivity(reported)).toMatchObject({ state: "agent_idle", reason: "idle_prompt", evidence: "❯" });
+    expect(classifyPaneActivity(reported.replace("Update available! Run: mise upgrade claude", clearHint)))
+      .toMatchObject({ state: "agent_idle", reason: "idle_prompt", evidence: "❯" });
+  });
 });
 
 describe("first guarded Claude send with retained warning-shaped composer", () => {
   let db: Database.Database | undefined;
-  afterEach(() => { db?.close(); db = undefined; });
+  // These cases test readiness, not capture speed. Only the poll/paste sleep advances
+  // the deadline and its race timer, so runner load cannot discard a valid observation.
+  beforeEach(() => { vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] }); });
+  afterEach(() => { vi.useRealTimers(); db?.close(); db = undefined; });
 
   function setup(content: string, event = "SessionStart", ageMs = 16_000, priorGeneration = false) {
     db = createFullTestDb();
@@ -292,7 +318,7 @@ describe("first guarded Claude send with retained warning-shaped composer", () =
       sendText, sendKeys,
     } as unknown as TmuxAdapter;
     const transport = new SessionTransport({ db, rigRepo: repo, sessionRegistry: registry,
-      tmuxAdapter: tmux, agentActivityStore: store, now: () => now, sleep: async () => undefined, waitForIdlePollMs: 1 });
+      tmuxAdapter: tmux, agentActivityStore: store, now: () => now, sleep: async ms => { await vi.advanceTimersByTimeAsync(ms); }, waitForIdlePollMs: 1 });
     return { transport, store, name, sendText, sendKeys };
   }
 
