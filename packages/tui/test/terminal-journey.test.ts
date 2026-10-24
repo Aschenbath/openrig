@@ -145,7 +145,7 @@ describe("terminal browser → preview → explicit Open", () => {
     expect(text).not.toContain("ssh -t -t");
     expect(text).toContain("viewer@other.example");
     expect(text).toContain("seat with spaces");
-    expect(text).toContain("env OPENRIG_HOST_SELECTED=local rig terminal attach --read-only --");
+    expect(text).toContain("tmux attach -r -t");
     expect(effects).toEqual([]);
   });
 
