@@ -1963,6 +1963,16 @@ export class QueueRepository {
     return registry.ok && resolveRegisteredHumanAddress(destination, registry.entities) !== null;
   }
 
+  /** The asked person, when a different registered person is acting on what was asked of them; else null. An agent, the
+   *  asked person under another spelling, and an ask to no registered person aren't someone else. */
+  askedSomeoneElse(actorSession: string, askedSession: string | null | undefined): string | null {
+    const registry = this.loadHumanRegistryFn();
+    if (!registry.ok) return null;
+    const asked = resolveRegisteredHumanAddress(askedSession, registry.entities);
+    const actor = resolveRegisteredHumanAddress(actorSession, registry.entities);
+    return asked && actor && actor !== asked ? asked : null;
+  }
+
   private validateReplyTo(replyTo: string, humanIntent: QueueCreateInput["humanIntent"]): void {
     if (humanIntent !== "update") {
       throw new QueueRepositoryError("reply_to_requires_update", "replyTo is accepted only with humanIntent update; a decision keeps its own thread so its reply stays unambiguous.");
