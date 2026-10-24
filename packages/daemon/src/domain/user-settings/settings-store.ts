@@ -66,6 +66,7 @@ export function resolveLegacyTopologyRigsRoot(): string {
 export const SETTINGS_VALID_KEYS = [
   "daemon.port",
   "daemon.host",
+  "daemon.db_conflict",
   // OPR.0.4.6.MH1 FR-1 — the persisted host-selection pointer, ONE
   // static key, lockstep with cli/src/config-store.ts VALID_KEYS (the
   // twins parity test pins both). Default "local" (unset ≡ local host).
@@ -250,6 +251,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   // compatibility. New typed keys use OPENRIG_* only.
   "daemon.port": { primary: "OPENRIG_PORT", legacy: "RIGGED_PORT" },
   "daemon.host": { primary: "OPENRIG_HOST", legacy: "RIGGED_HOST" },
+  "daemon.db_conflict": { primary: "OPENRIG_DAEMON_DB_CONFLICT" },
   "db.path": { primary: "OPENRIG_DB", legacy: "RIGGED_DB" },
   "transcripts.enabled": { primary: "OPENRIG_TRANSCRIPTS_ENABLED", legacy: "RIGGED_TRANSCRIPTS_ENABLED" },
   "transcripts.path": { primary: "OPENRIG_TRANSCRIPTS_PATH", legacy: "RIGGED_TRANSCRIPTS_PATH" },
@@ -354,6 +356,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
 const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "daemon.port": ["daemon", "port"],
   "daemon.host": ["daemon", "host"],
+  "daemon.db_conflict": ["daemon", "dbConflict"],
   "db.path": ["db", "path"],
   "transcripts.enabled": ["transcripts", "enabled"],
   "transcripts.path": ["transcripts", "path"],
@@ -646,6 +649,7 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
   switch (key) {
     case "daemon.port": return 7433;
     case "daemon.host": return "127.0.0.1";
+    case "daemon.db_conflict": return "warn";
     case "db.path": return path.join(path.dirname(DEFAULT_CONFIG_PATH), "openrig.sqlite");
     case "transcripts.enabled": return true;
     case "transcripts.path": return path.join(path.dirname(DEFAULT_CONFIG_PATH), "transcripts");
@@ -812,6 +816,9 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
     if (raw !== "inherit" && raw !== "isolated") {
       throw new Error(`Invalid value for terminal.tmux_server: must be "inherit" or "isolated", got "${raw}"`);
     }
+  },
+  "daemon.db_conflict": (raw) => {
+    if (raw !== "warn" && raw !== "stop") throw new Error("daemon.db_conflict must be warn or stop");
   },
   "transcripts.lines": (raw, value) => {
     if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 1_000_000) {

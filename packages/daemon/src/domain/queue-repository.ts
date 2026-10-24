@@ -13,6 +13,7 @@ import type { QueueWakeFacts } from "./draft-aware-delivery.js";
 import { derivePickup, type PickupReceipt } from "./queue-pickup.js";
 import { lastMeaningfulTransition, readWaitingView, type WaitingView, type WaitingActivityReader } from "./queue-waiting.js";
 import { wrapPaneEnvelope } from "../lib/pane-envelope.js";
+import { isBoundTerminalSeat } from "./terminal-seat.js";
 import { renderQueueHandoffNudge } from "./queue-nudge-text.js";
 import { getSelfHostId } from "./hosts/fanout-contract.js";
 import { parseSessionName, isHumanSeatSessionRef } from "./session-name.js";
@@ -1596,6 +1597,16 @@ export class QueueRepository {
     if (destClass.class === "unroutable") {
       return { classified: "failed", nudgeResult: destClass.teaching };
     }
+    // A terminal seat runs a shell or a TUI, not an agent. Typed wake text would run there as a
+    // command line (it carries the row's summary), and nothing there can claim the row. So nothing
+    // is typed; the row stays queued and visible. `failed:` keeps it on the wake ladder, whose
+    // retries come back here and type nothing before it escalates.
+    if (isBoundTerminalSeat(this.db, destinationSession)) {
+      return {
+        classified: "failed",
+        nudgeResult: `failed:terminal-seat: '${destinationSession}' is a terminal seat (runtime: terminal), not an agent, so no wake was typed into it and nothing there can claim this row. The row stays queued; route it to an agent seat.`,
+      };
+    }
     const stampISO = new Date().toISOString();
     let text: string;
     if (prebuiltText !== undefined) {
@@ -1649,6 +1660,30 @@ export class QueueRepository {
       }
       return { classified: "failed", nudgeResult: `failed:${msg}` };
     }
+  }
+
+  /** First committed return of a direct ask, including pre-shared-ID Slack replies. */
+  getHumanAnswer(qitemId: string, actorSession: string): QueueItem | null {
+    const ask = this.getById(qitemId);
+    if (!this.hasReplyToColumn || !ask || ask.destinationSession !== actorSession
+      || ask.humanIntent === "update" || !this.isPersonAddress(actorSession)) return null;
+    const row = this.db.prepare(`SELECT qitem_id FROM queue_items
+      WHERE reply_to = ? AND source_session = ? AND destination_session = ?
+        AND (EXISTS (SELECT 1 FROM json_each(queue_items.tags) WHERE value = 'human-answer')
+          OR (qitem_id LIKE 'qitem-slack-inbound-%' AND COALESCE(summary, '') NOT LIKE '[Recovered after gap] %'))
+      ORDER BY ts_created, rowid LIMIT 1`).get(qitemId, actorSession, ask.sourceSession) as { qitem_id: string } | undefined;
+    return row ? this.getById(row.qitem_id) : null;
+  }
+
+  /** The lookup and create's insert run synchronously before its first delivery await.
+   * Every new surface uses the same ID; old IDs and their original bodies remain intact. */
+  async createHumanAnswer(input: QueueCreateInput & { inboundReplyTo: string }): Promise<QueueItem> {
+    const existing = this.getHumanAnswer(input.inboundReplyTo, input.sourceSession);
+    if (existing) return existing;
+    return this.create({ ...input,
+      qitemId: `qitem-human-answer-${createHash("sha256").update(input.inboundReplyTo).digest("hex").slice(0, 20)}`,
+      tags: [...new Set([...(input.tags ?? []), "human-answer"])],
+    });
   }
 
   async create(input: QueueCreateInput): Promise<QueueItem & {
