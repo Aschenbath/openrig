@@ -9,6 +9,7 @@ import { streamDispositionsSchema } from "./migrations/129_stream_dispositions.j
 import { streamSubscriptionsSchema } from "./migrations/130_stream_subscriptions.js";
 import { streamRetentionFloorSchema } from "./migrations/131_stream_retention_floor.js";
 import { seatRuntimeSwitchesSchema } from "./migrations/132_seat_runtime_switches.js";
+import { streamReaderActionsSchema } from "./migrations/133_stream_reader_actions.js";
 import { seatIdentityProcessEvidenceSchema } from "./migrations/135_seat_identity_process_evidence.js";
 import { bindingsSessionsSchema } from "./migrations/002_bindings_sessions.js";
 import { eventsSchema } from "./migrations/003_events.js";
@@ -264,5 +265,6 @@ export const ALL_MIGRATIONS: Migration[] = [
   streamSubscriptionsSchema,
   streamRetentionFloorSchema,
   seatRuntimeSwitchesSchema,
+  streamReaderActionsSchema,
   seatIdentityProcessEvidenceSchema,
 ];
