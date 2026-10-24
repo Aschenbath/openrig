@@ -183,7 +183,7 @@ describe("the composer gives a local tile the same attach as an argv", () => {
     expect(v.opened.map((p) => [p.paneCommand, p.attachArgv])).toEqual([
       ["'/usr/bin/tmux' -L 'openrig' attach -t 'a@r'", ["/usr/bin/tmux", "-L", "openrig", "attach", "-t", "a@r"]],
       ["'/usr/bin/tmux' -L 'openrig' attach -r -t 'b@r'", ["/usr/bin/tmux", "-L", "openrig", "attach", "-r", "-t", "b@r"]],
-      ["ssh -t 'admin@vm1.local' 'env OPENRIG_HOST_SELECTED=local rig terminal attach -- '\"'\"'s@r'\"'\"''", undefined],
+      ["ssh -t 'admin@vm1.local' 'tmux attach -t '\"'\"'s@r'\"'\"''", undefined],
     ]);
   });
 });

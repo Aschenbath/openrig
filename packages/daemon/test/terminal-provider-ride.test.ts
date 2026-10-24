@@ -92,14 +92,14 @@ describe("view-composer partition vectors", () => {
     expect(v.opened[0]!.readOnly).toBe(true);
   });
 
-  it("ssh host resolves the remote daemon's server with a terminal and preserves read-only", () => {
-    const rw = composeView("v", [member({ seat: "s@r", host: "vm1", tmuxSession: "s@r" })], ctxWith([SSH_HOST]));
+  it("an isolated view resolves the remote daemon's server with a terminal and preserves read-only", () => {
+    const rw = composeView("v", [member({ seat: "s@r", host: "vm1", tmuxSession: "s@r" })], { ...ctxWith([SSH_HOST]), localTmuxServerMode: "isolated" });
     expect(rw.opened[0]!.paneCommand).toBe("ssh -t 'admin@vm1.local' 'env OPENRIG_HOST_SELECTED=local rig terminal attach -- '\"'\"'s@r'\"'\"''");
 
-    const ro = composeView("v", [member({ seat: "s@r", host: "vm1", readOnly: true })], ctxWith([SSH_HOST]));
+    const ro = composeView("v", [member({ seat: "s@r", host: "vm1", readOnly: true })], { ...ctxWith([SSH_HOST]), localTmuxServerMode: "isolated" });
     expect(ro.opened[0]!.paneCommand).toBe("ssh -t 'admin@vm1.local' 'env OPENRIG_HOST_SELECTED=local rig terminal attach --read-only -- '\"'\"'s@r'\"'\"''");
 
-    const nouser = composeView("v", [member({ seat: "s@r", host: "vm2" })], ctxWith([SSH_HOST_NO_USER]));
+    const nouser = composeView("v", [member({ seat: "s@r", host: "vm2" })], { ...ctxWith([SSH_HOST_NO_USER]), localTmuxServerMode: "isolated" });
     expect(nouser.opened[0]!.paneCommand).toBe("ssh -t '10.0.0.9' 'env OPENRIG_HOST_SELECTED=local rig terminal attach -- '\"'\"'s@r'\"'\"''");
   });
 
@@ -111,7 +111,7 @@ describe("view-composer partition vectors", () => {
     const v = composeView("v", [member({ seat: "s@r", host: "evil", tmuxSession: "s@r" })], ctxWith([NASTY]));
     expect(v.opened).toHaveLength(1);
     // single-quoted, embedded quote POSIX-escaped ('\'') — metacharacters are literal.
-    expect(v.opened[0]!.paneCommand).toBe("ssh -t 'u'\"'\"'x@a b; rm -rf /' 'env OPENRIG_HOST_SELECTED=local rig terminal attach -- '\"'\"'s@r'\"'\"''");
+    expect(v.opened[0]!.paneCommand).toBe("ssh -t 'u'\"'\"'x@a b; rm -rf /' 'tmux attach -t '\"'\"'s@r'\"'\"''");
     // the dangerous run never becomes its own shell word:
     expect(v.opened[0]!.paneCommand).not.toContain("; rm -rf / tmux");
   });

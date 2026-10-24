@@ -9,7 +9,8 @@
 //                      absolute path when the context carries one)
 //   view-only / cross-rig (read-only)
 //                    → `tmux attach -r -t <session>`
-//   ssh host         → `ssh -t <dest> ... rig terminal attach [--read-only] -- <session>`
+//   ssh host         → `ssh -t <dest> ... tmux attach [-r] -t <session>` in inherit mode;
+//                      isolated views use the remote `rig terminal attach` to resolve its server
 //   http host        → NO pane; honest-degrade { seat, host, reason }
 //   dead / no session → absent[] (named, never silently dropped)
 //
@@ -74,6 +75,9 @@ export interface ComposeContext {
    * Absent or empty → no flags, unchanged. Remote panes resolve their server on that host.
    */
   localTmuxServer?: readonly string[];
+  /** Effective mode of the viewing instance. Inherit keeps plain remote tmux;
+   *  isolated opts SSH tiles into remote instance-aware attachment. */
+  localTmuxServerMode?: "inherit" | "isolated";
 }
 
 /** POSIX single-quote a string so session names / targets are shell-inert in the composed command. */
@@ -166,9 +170,12 @@ export function composeView(
         });
         continue;
       }
-      // Resolve on that host: neither a local socket nor a guessed default can
-      // identify a remote instance's dedicated tmux server.
-      const remoteCommand = `env OPENRIG_HOST_SELECTED=local rig terminal attach${m.readOnly ? " --read-only" : ""} -- ${shellQuote(m.tmuxSession)}`;
+      // Keep the legacy SSH path until the viewing instance opts into isolation.
+      // An isolated view resolves the server on the remote host; local socket
+      // flags are never sent there, and a failed lookup cannot fall back to a namesake.
+      const remoteCommand = ctx.localTmuxServerMode === "isolated"
+        ? `env OPENRIG_HOST_SELECTED=local rig terminal attach${m.readOnly ? " --read-only" : ""} -- ${shellQuote(m.tmuxSession)}`
+        : `tmux attach ${attachFlag}-t ${shellQuote(m.tmuxSession)}`;
       opened.push({
         seat: m.seat,
         ...(m.runtime ? { runtime: m.runtime } : {}),

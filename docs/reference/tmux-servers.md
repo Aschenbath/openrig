@@ -107,10 +107,15 @@ instance identity with the local durable identity before using local terminal
 tools. A loopback URL through a port forward does not bypass this isolation check;
 use the matching `OPENRIG_HOME` on the daemon's machine. Inherited servers retain
 the existing local-host checks without requiring a matching durable identity.
-SSH view tiles run `rig terminal attach`
-on the remote host, using that host's local instance and socket; both the remote
-CLI and daemon must support this command. The remote shell must select the right
-`OPENRIG_HOME` when using a custom home. Local socket paths are never sent to it.
+SSH view tiles follow the viewing instance's effective mode. In `inherit`, they
+keep `ssh -t ... tmux attach`, including `-r` for read-only views; the remote host
+needs only tmux. In `isolated`, they run `rig terminal attach` on the remote host,
+using that host's local instance and socket; both the remote CLI and daemon must
+support this command. The remote shell must select the right `OPENRIG_HOME` when
+using a custom home. Local socket paths are never sent to it, and an isolated
+attachment failure does not fall back to a same-named default-server session.
+An inherited view does not discover an isolated remote instance's socket; use
+the remote instance's `rig terminal attach` directly for that mixed setup.
 
 Discovery and adoption see the selected server. Existing sessions on another
 server are not imported automatically. `rig attach --self` reports its current
