@@ -191,6 +191,24 @@ export function assessNativeResumeProbe(
   }
 
   if (runtime === "codex") {
+    if (looksLikeCodexLoginPrompt(paneContent)) {
+      // A wrapper must be verified and resampled before old chrome can prove readiness or drive a menu.
+      if (paneCommand !== "codex" && input.codexProcessVerified !== true) {
+        const shell = SHELL_COMMANDS.has(paneCommand);
+        return {
+          status: shell ? "failed" : "inconclusive",
+          code: shell ? "returned_to_shell" : "awaiting_runtime",
+          detail: shell
+            ? "The probe pane returned to a shell instead of staying inside the runtime."
+            : "Codex did not report an explicit failure, but an interactive conversation has not been observed.",
+        };
+      }
+      return {
+        status: "attention_required",
+        code: "login_required",
+        detail: "Codex is waiting for you to sign in or configure provider credentials before the session can become interactive.",
+      };
+    }
     if (/requires a newer version of Codex/i.test(paneContent.replace(/\s+/g, " "))) {
       return {
         status: "attention_required", code: "codex_client_incompatible",
@@ -451,6 +469,43 @@ function looksLikeCodexAuthRefusal(paneContent: string): boolean {
     paneContent.includes("Please sign in again")
     || paneContent.includes("Please log out and sign in again")
   );
+}
+
+function looksLikeCodexLoginPrompt(paneContent: string): boolean {
+  const lines = paneContent.trimEnd().split(/\r?\n/);
+  let welcome = -1;
+  let fence = "";
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!;
+    const marker = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (marker) {
+      if (!fence) fence = marker[1]!;
+      else if (marker[1]![0] === fence[0] && marker[1]!.length >= fence.length && !marker[2]!.trim()) fence = "";
+      welcome = -1;
+    } else if (!fence && line === "  Welcome to Codex, OpenAI's command-line coding agent") {
+      welcome = index;
+    }
+  }
+  if (welcome < 0) return false;
+  const current = lines.slice(welcome + 1);
+  if (hasCodexComposer(current.join("\n"))) return false;
+  const panel = current.map(line => line.trim()).filter(Boolean);
+
+  // Read the current complete panel only: a later prompt or menu must not lend an old login picker its footer.
+  if (panel[0] === "Choose how you want to use Codex." && panel.indexOf("Press enter to continue") === panel.length - 1) {
+    const choices = panel.flatMap(line => {
+      const choice = /^(> )?(\d+)\. (.+)$/.exec(line);
+      return choice ? [{ selected: !!choice[1], number: Number(choice[2]), label: choice[3] }] : [];
+    });
+    const labels = ["Sign in with ChatGPT", "Sign in with Device Code", "Use an OpenAI API key", "Use Amazon Bedrock"];
+    return choices.length >= 2 && choices.filter(choice => choice.selected).length === 1
+      && choices.every((choice, index) => choice.number === index + 1 && labels.includes(choice.label!));
+  }
+  return panel[0] === "> Use your own OpenAI API key for usage-based billing"
+    && panel.includes("Paste or type your API key below.")
+    && panel.some(line => /^╭API key─+╮$/.test(line))
+    && panel.indexOf("Press enter to save") === panel.length - 2
+    && panel.at(-1) === "Press esc to go back";
 }
 
 function looksLikeCodexTrustPrompt(paneContent: string): boolean {
