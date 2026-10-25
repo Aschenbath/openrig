@@ -206,6 +206,8 @@ export interface ClassifyPaneOptions {
   /** Opted-in typing guards retain styling and cursor evidence for this read. */
   composerSnapshot?: ComposerSnapshot;
   runtime?: string | null;
+  /** Only the managed compaction's post-compaction turn boundary: see SendOptions.postCompactTurnBoundary. */
+  postCompactTurnBoundary?: boolean;
 }
 
 /** The current Claude footer follows the input frame; earlier examples are history or draft text. */
@@ -214,6 +216,14 @@ function findClaudeFooterIndex(lines: string[]): number {
   while (bar >= 0 && (!lines[bar]!.trim() || CLAUDE_STATUS_WARNINGS.some(pattern => pattern.test(lines[bar]!.trim())))) bar--;
   return bar;
 }
+
+// Claude's task-list rows, the only rows it draws between a live status row and the input box. Its renderer marks pending,
+// in-progress and completed tasks with figures' small squares and tick (◻ ◼ ✔, or □ ■ √ where the terminal lacks them);
+// an older checkbox list used ☐ ☒.
+const CLAUDE_TASK_ROW = /^\s*(?:⎿\s+)?[◻◼✔□■√☐☒]\s/;
+// Claude's tool and hook output: a "⎿" row, or its continuation indented past that gutter. A reply's own text continues
+// two columns in, under its "●".
+const CLAUDE_OUTPUT_ROW = /^(?: {2}⎿ | {5,}\S)/;
 
 function findClaudeComposer(paneContent: string, options: ClassifyPaneOptions = {}) {
   // Preserve columns: a multiline draft may contain indented border/prompt text.
@@ -245,6 +255,7 @@ function findClaudeComposer(paneContent: string, options: ClassifyPaneOptions = 
 
   let liveStatus: string | null = null;
   let headSeen = false;
+  let outputOnly = true;
   for (let i = statusStart; i >= 0; i--) {
     if (!lines[i]!.startsWith(indent)) break;
     const line = lines[i]!.slice(indent.length);
@@ -259,8 +270,9 @@ function findClaudeComposer(paneContent: string, options: ClassifyPaneOptions = 
     // Indented task rows can follow the live status. A newer unindented output
     // or completed status ends this block; do not revive an older work row.
     if (!/^\s/.test(line)) { headSeen = true; break; }
+    if (CLAUDE_TASK_ROW.test(line) || !CLAUDE_OUTPUT_ROW.test(line)) outputOnly = false;
   }
-  return { text: prompt.slice(indent.length), bar: lines[bar]!.trim(), framed, hasWarnings: bar < lines.length - 1, supportedWarningFooter, modeFooter, headSeen, liveStatus };
+  return { text: prompt.slice(indent.length), bar: lines[bar]!.trim(), framed, hasWarnings: bar < lines.length - 1, supportedWarningFooter, modeFooter, headSeen, liveStatus, outputOnly };
 }
 
 const unknown = (unknownReason: string, cursor?: ComposerSnapshot["cursor"]): ComposerInput => ({ state: "unknown", rows: [], columns: 0, cursorAtEnd: false, collapsedPaste: null, unknownReason, ...(cursor ? { cursor } : {}) });
@@ -585,8 +597,15 @@ export function classifyPaneActivity(paneContent: string, options: ClassifyPaneO
   if (claudeComposer?.liveStatus) {
     return { state: "agent_active", reason: "mid_work_pattern", evidence: claudeComposer.liveStatus };
   }
+  // Right after a managed compaction the rows above the input box are indented compaction and hook output, so the status
+  // head is out of this window and the read stays unknown until the screen changes. For that one send, a complete framed
+  // empty box with its mode footer, and no live status in view, is idle, but only while every row above it is that output.
+  // A tall task list can push a live status out of the window, and Claude hides its status while it streams a reply, so
+  // task rows or reply text in view may be a seat that is working.
+  const postCompactEmptyBox = options.postCompactTurnBoundary === true && claudeComposer?.framed === true &&
+    claudeComposer.modeFooter && claudeComposer.outputOnly && IDLE_PROMPT_PATTERNS.some((pattern) => pattern.test(claudeComposer.text));
   // Unframed status evidence can veto idle, but warnings require a complete input frame to prove it.
-  if (claudeComposer && (!claudeComposer.headSeen || (claudeComposer.hasWarnings && !claudeComposer.framed))) {
+  if (claudeComposer && !postCompactEmptyBox && (!claudeComposer.headSeen || (claudeComposer.hasWarnings && !claudeComposer.framed))) {
     return { state: "unknown", reason: "no_activity_signal", evidence: truncateEvidence(lastLine) };
   }
   // An empty prompt row is not an empty box: authored text can start on a continuation row.
@@ -690,6 +709,8 @@ export async function probeSessionActivity(input: {
   composerSnapshot?: () => Promise<ComposerSnapshot | null>;
   /** The seat's community harness (`communityHarnessOf`): its idle-looking screen reads unknown. */
   communityHarness?: string | null;
+  /** See ClassifyPaneOptions.postCompactTurnBoundary. */
+  postCompactTurnBoundary?: boolean;
 }): Promise<AgentActivity> {
   // Capture routing and observation labels must share the entry context. The
   // caller may reuse/mutate its input while hasSession is pending.
@@ -809,6 +830,7 @@ export async function probeSessionActivity(input: {
     const classifyOptions = {
       timerlessStatusIsLive: input.timerlessStatusIsLive === true,
       currentClaudeDialogueOnly: input.currentClaudeDialogueOnly === true,
+      postCompactTurnBoundary: input.postCompactTurnBoundary === true,
     };
     let classification = communityHarnessPaneActivity(classifyPaneActivity(paneContent ?? "", { ...classifyOptions,
       composerSnapshot: snapshot ?? undefined, runtime }), input.communityHarness);
@@ -1628,6 +1650,10 @@ export interface SendOpts {
    *  latest hook may predate the state that matters, such as a post-compact drain whose newest hook
    *  can be the Stop from before /compact. */
   readinessFromPaneOnly?: boolean;
+  /** Internal, for the managed compaction's post-compaction turn boundary only. The rows above the input box are then
+   *  indented compaction output, so the pane classifier can't see the status head; a complete, framed, empty Claude box
+   *  with its mode footer and no live status reads idle for this send. Every other send keeps unknown as never idle. */
+  postCompactTurnBoundary?: boolean;
   // OPR.0.4.1.10 — interactive-prompt / permission guard.
   // `dangerouslyInteract` is the ONLY override of the prompt/permission guard (force does NOT bypass
   // it). It requires `reason` and writes an auditable `transport.prompt_override` record before the
@@ -2527,6 +2553,7 @@ export class SessionTransport {
       binding: { sessionName, nodeId: meta.nodeId, occupant: meta.occupant, pane: meta.pane },
       privateInput: opts.dangerouslyInteract === true,
       readinessFromPaneOnly: opts.readinessFromPaneOnly === true,
+      postCompactTurnBoundary: opts.postCompactTurnBoundary === true,
       signal: callerSignal(opts), cancelledBy: "caller",
     });
     if (!preWait.ok) {
@@ -2777,6 +2804,7 @@ export class SessionTransport {
         binding: observed?.binding,
         privateInput: opts?.dangerouslyInteract === true,
         readinessFromPaneOnly: opts?.readinessFromPaneOnly === true,
+        postCompactTurnBoundary: opts?.postCompactTurnBoundary === true,
         signal: callerSignal(opts), cancelledBy: "caller",
       });
       waitEvidence = {
@@ -2836,6 +2864,7 @@ export class SessionTransport {
           privateInput: opts.dangerouslyInteract === true,
           binding: observed?.binding,
           readinessFromPaneOnly: opts.readinessFromPaneOnly === true,
+          postCompactTurnBoundary: opts.postCompactTurnBoundary === true,
           signal: callerSignal(opts), cancelledBy: "caller",
         });
         waitEvidence = {
@@ -2861,6 +2890,7 @@ export class SessionTransport {
           attachmentType: sessionMeta.attachmentType,
           binding: observed?.binding,
           readinessFromPaneOnly: opts.readinessFromPaneOnly === true,
+          postCompactTurnBoundary: opts.postCompactTurnBoundary === true,
         }, opts.dangerouslyInteract === true);
         if (recheck.state !== "idle") {
           const late: { reason: string; error: string } =
@@ -3256,6 +3286,7 @@ export class SessionTransport {
     privateInput?: boolean;
     binding?: ObservedBinding;
     readinessFromPaneOnly?: boolean;
+    postCompactTurnBoundary?: boolean;
     // Optional display value for timeout messages. The deadline always comes
     // from timeoutMs; when set, expiry reports this value instead, so a
     // re-wait running on a leftover budget still names the configured wait.
@@ -3348,7 +3379,7 @@ export class SessionTransport {
    *  caller's cancellation. Null when the deadline or the cancellation wins; the abandoned observation is ignored,
    *  never delivered on. */
   private async observeReadinessWithin(
-    input: { sessionName: string; runtime: string | null; attachmentType: string | null; binding?: ObservedBinding; readinessFromPaneOnly?: boolean; privateInput?: boolean },
+    input: { sessionName: string; runtime: string | null; attachmentType: string | null; binding?: ObservedBinding; readinessFromPaneOnly?: boolean; postCompactTurnBoundary?: boolean; privateInput?: boolean },
     remainingMs: number,
     cancel?: AbortSignal,
   ): Promise<AgentActivity | null> {
@@ -3417,6 +3448,7 @@ export class SessionTransport {
     attachmentType: string | null;
     binding?: ObservedBinding;
     readinessFromPaneOnly?: boolean;
+    postCompactTurnBoundary?: boolean;
   }, privateInput = false): Promise<AgentActivity> {
     const now = this.now();
     const composerSnapshot = this.tmuxAdapter.deliveryGuard?.needsInputCheck(input.sessionName)
@@ -3512,6 +3544,7 @@ export class SessionTransport {
       binding: input.binding,
       // Pane-only readiness must not send into a status row whose timer hasn't appeared yet.
       timerlessStatusIsLive: input.readinessFromPaneOnly === true,
+      postCompactTurnBoundary: input.postCompactTurnBoundary === true,
     });
     // A Codex empty-composer placeholder is also on screen while Codex streams with its status
     // row hidden, so a placeholder-only idle verdict must not override a display-fresh (<5min)
