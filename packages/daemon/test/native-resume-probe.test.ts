@@ -13,6 +13,76 @@ const currentUpdatePrompt = fs.readFileSync(new URL("./fixtures/codex-update-0.1
 // Codex's own rust-v0.156.1 snapshot at b412ff32c417f855c2b2d1581b77058eed87c84b:
 // https://github.com/openai/codex/blob/b412ff32c417f855c2b2d1581b77058eed87c84b/codex-rs/tui/src/onboarding/snapshots/codex_tui__onboarding__trust_directory__tests__renders_snapshot_for_git_repo.snap
 const currentTrustPrompt = fs.readFileSync(new URL("./fixtures/codex-trust-0.156.1.txt", import.meta.url), "utf8");
+const firstLoginPrompt = fs.readFileSync(new URL("./fixtures/codex-first-login.txt", import.meta.url), "utf8");
+const apiKeyLoginPrompt = fs.readFileSync(new URL("./fixtures/codex-api-key-login.txt", import.meta.url), "utf8");
+const narrowFirstLoginPrompt = fs.readFileSync(new URL("./fixtures/codex-first-login-80x24.txt", import.meta.url), "utf8");
+const managedFirstLoginPrompts = ["codex-first-login-no-daemon.txt", "codex-first-login-no-daemon-80x24.txt", "codex-api-key-login-no-daemon.txt"]
+  .map(name => fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
+
+describe("Codex first-login readiness", () => {
+  it.each([
+    firstLoginPrompt,
+    firstLoginPrompt.replace("> 1.", "  1.").replace("  2.", "> 2."),
+    firstLoginPrompt.replace("> 1.", "  1.").replace("  3.", "> 3."),
+    firstLoginPrompt.replace("> 1.", "  1.").replace("  4.", "> 4."),
+    apiKeyLoginPrompt,
+    narrowFirstLoginPrompt,
+    ...managedFirstLoginPrompts,
+  ])("identifies the current sign-in screen as login_required", (paneContent) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "codex", paneContent }))
+      .toMatchObject({ status: "attention_required", code: "login_required" });
+  });
+
+  it("identifies a first-login picker under a verified native process wrapper", () => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "bash", paneContent: firstLoginPrompt,
+      codexProcessVerified: true }))
+      .toMatchObject({ status: "attention_required", code: "login_required" });
+  });
+
+  it.each(["bash", "zsh", "node"])("does not infer a live login from an unverified %s pane", (paneCommand) => {
+    for (const paneContent of [firstLoginPrompt, ...managedFirstLoginPrompts]) {
+      const probe = assessNativeResumeProbe({ runtime: "codex", paneCommand, paneContent });
+      expect(probe.code).not.toBe("login_required");
+      expect(probe.status).not.toBe("resumed");
+    }
+  });
+
+  it.each([
+    "The guide says Sign in with ChatGPT or Provide your own API key.",
+    firstLoginPrompt.replace("> 1.", "  1."),
+    firstLoginPrompt.replace("  Press enter to continue", ""),
+    apiKeyLoginPrompt.replace("  Press enter to save", ""),
+    firstLoginPrompt.split("\n").map(line => `> ${line}`).join("\n"),
+    firstLoginPrompt.split("\n").map(line => `    ${line}`).join("\n"),
+    `\`\`\`text\n${firstLoginPrompt}\`\`\``,
+    `\`\`\`text\n${firstLoginPrompt}`,
+    `${firstLoginPrompt}\n› Explain this sign-in screen\n  gpt-5.4 default · /project`,
+    `${firstLoginPrompt}\nOpenAI Codex (v0.164.0)\n› Ask Codex to do anything`,
+    `${firstLoginPrompt}\n› New task\nPress enter to continue`,
+    `${firstLoginPrompt.replace("  Press enter to continue", "")}\n› New task\nPress enter to continue`,
+    `${apiKeyLoginPrompt}\n› New task\nPress enter to save\nPress esc to go back`,
+  ])("does not turn prose, an incomplete panel or dismissed history into a login gate", (paneContent) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "codex", paneContent }).code)
+      .not.toBe("login_required");
+  });
+
+  it.each([
+    [currentTrustPrompt, "trust_gate"],
+    [currentUpdatePrompt, "update_gate"],
+  ])("keeps a newer native menu authoritative after a first-login picker", (panel, code) => {
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "codex", paneContent: `${firstLoginPrompt}\n${panel}` }).code)
+      .toBe(code);
+  });
+
+  it.each(["bash", "node"])("keeps an unverified first-login screen out of stale update automation under %s", (paneCommand) => {
+    const oldUpdate = "Update available!\n  1. Update now\n  2. Skip once\n  3. Skip until next version\n";
+    const paneContent = `${oldUpdate}\n${managedFirstLoginPrompts[2]}`;
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand, paneContent }))
+      .toMatchObject({ code: paneCommand === "bash" ? "returned_to_shell" : "awaiting_runtime" });
+    expect(assessNativeResumeProbe({ runtime: "codex", paneCommand, paneContent, codexProcessVerified: true }))
+      .toMatchObject({ status: "attention_required", code: "login_required" });
+  });
+});
 
 describe("default-path consent", () => {
   it.each([CLAUDE_BYPASS_CONSENT, CLAUDE_BYPASS_CONSENT.replace("    No, exit\n  ❯ Yes, I accept", "  ❯ No, exit\n    Yes, I accept")])("recognizes the current consent menu", screen => {
