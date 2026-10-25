@@ -68,6 +68,7 @@ const codexHookTrust = createRequire(import.meta.url)("../../assets/plugins/open
 import { listNativeProcesses, observeCodexPaneProcess, observeCodexForkProcess, verifyCodexPaneProcess, verifyPaneIdleShell, type NativeProcessRow } from "../domain/native-process-lineage.js";
 import { recordSeatSkillWrite, seatPluginSkillsLossNote, seatProjectionComplete, seatSkillWriteRefusal } from "../domain/seat-skill-storage.js";
 import { codexPluginContentHash, planOwnedCodexContentApproval, recordOwnedCodexApproval } from "../domain/codex-owned-plugin-trust.js";
+import { findTomlTable, opensTomlTable, parseTomlRoot, tomlDefines, tomlTableHeaderPath } from "../domain/toml-tables.js";
 
 // Shared by all probes of ONE launch, never reset by a delayed screen or an
 // ambiguous transport result. A separately requested launch gets a new attempt.
@@ -1865,11 +1866,13 @@ function hashContent(content: string): string {
 }
 
 function upsertCodexProjectTrust(content: string, projectPath: string): string {
+  const path = ["projects", projectPath];
   const header = `[projects.${JSON.stringify(projectPath)}]`;
   const lines = content.length > 0 ? content.split("\n") : [];
-  const headerIndex = lines.findIndex((line) => line.trim() === header);
+  const headerIndex = findTomlTable(lines, path);
 
   if (headerIndex === -1) {
+    if (tomlDefines(content, path)) return content;
     const trimmed = content.trimEnd();
     const prefix = trimmed.length > 0 ? `${trimmed}\n\n` : "";
     return `${prefix}${header}\ntrust_level = "trusted"\n`;
@@ -1986,17 +1989,19 @@ export function computeCodexHookTrust(
 /**
  * OPR.0.4.3.33 — idempotent, non-clobbering, section-scoped writer for a single
  * `[hooks.state."<key>"] trusted_hash = "<hash>"` record. Mirrors upsertCodexProjectTrust:
- * find/create the exact table header, splice ONLY its `trusted_hash` line, leave every other
+ * find the table by its key in any spelling (or create it), splice ONLY its `trusted_hash` line, leave every other
  * `[hooks.state]` / `[projects]` entry and the managed hook block byte-identical. Same key+hash
  * ⇒ no-op. Only called for our authored inline or verified owned plugin keys (never blanket trust).
  */
 export function upsertCodexHookTrust(content: string, key: string, hash: string, field: "trusted_hash" | "trusted_content_hash" = "trusted_hash"): string {
+  const path = ["hooks", "state", key];
   const header = `[hooks.state.${JSON.stringify(key)}]`;
   const trustLine = `${field} = ${JSON.stringify(hash)}`;
   const lines = content.length > 0 ? content.split("\n") : [];
-  const headerIndex = lines.findIndex((line) => line.trim() === header);
+  const headerIndex = findTomlTable(lines, path);
 
   if (headerIndex === -1) {
+    if (tomlDefines(content, path)) return content;
     const trimmed = content.trimEnd();
     const prefix = trimmed.length > 0 ? `${trimmed}\n\n` : "";
     return `${prefix}${header}\n${trustLine}\n`;
@@ -2198,10 +2203,11 @@ function openRigInlineGroupIndex(document: unknown, event: string): number {
 
 /** Write `enabled = false` into one `[hooks.state."<key>"]` table (the trust write creates it first). */
 function upsertCodexHookDisabled(content: string, key: string): string {
+  const path = ["hooks", "state", key];
   const header = `[hooks.state.${JSON.stringify(key)}]`;
   const lines = content.split("\n");
-  const at = lines.findIndex((line) => line.trim() === header);
-  if (at < 0) return `${content.replace(/\n*$/, "")}\n\n${header}\nenabled = false\n`;
+  const at = findTomlTable(lines, path);
+  if (at < 0) return tomlDefines(content, path) ? content : `${content.replace(/\n*$/, "")}\n\n${header}\nenabled = false\n`;
   let end = lines.length;
   for (let i = at + 1; i < lines.length; i++) if (lines[i]!.trim().startsWith("[")) { end = i; break; }
   const enabledAt = lines.findIndex((line, i) => i > at && i < end && /^\s*enabled\s*=/.test(line));
@@ -2222,18 +2228,19 @@ function rekeyCodexHookState(state: CodexHookState, prefix: string, newIndexOf: 
   return next;
 }
 
-/** The same move on config.toml's text: rename each moved group's `[hooks.state."<key>"]` header, and drop a removed
- *  group's table. Other spellings aren't touched; the caller compares the parsed result before writing. */
+/** The same move on config.toml's text: rename each moved group's `[hooks.state.<key>]` header (any key spelling), and
+ *  drop a removed group's table. An inline or dotted entry isn't touched; the caller compares the parsed result before writing. */
 function rekeyCodexHookStateText(content: string, prefix: string, newIndexOf: (index: number) => number | null): string {
   const out: string[] = [];
   let dropping = false;
-  for (const line of content.split("\n")) {
+  const lines = content.split("\n");
+  const root = parseTomlRoot(lines);
+  for (const [at, line] of lines.entries()) {
     const trimmed = line.trim();
     if (trimmed.startsWith("[")) {
       dropping = false;
-      const quoted = /^\[hooks\.state\.(".*")\]$/.exec(trimmed)?.[1];
-      let key: string | undefined;
-      try { key = quoted ? JSON.parse(quoted) as string : undefined; } catch { key = undefined; }
+      const path = tomlTableHeaderPath(trimmed);
+      const key = path?.length === 3 && path[0] === "hooks" && path[1] === "state" && opensTomlTable(lines, at, root) ? path[2] : undefined;
       const tail = key?.startsWith(prefix) ? /^(\d+):(\d+)$/.exec(key.slice(prefix.length)) : null;
       if (tail) {
         const index = newIndexOf(Number(tail[1]));

@@ -152,6 +152,53 @@ describe("OPR.0.4.3.33 — upsertCodexHookTrust (idempotent, non-clobbering, sec
     // the OTHER state entry's hash was NOT touched
     expect(out.match(/sha256:other/g)?.length).toBe(1);
   });
+
+  // #2029: Codex saves its tables with literal-quoted keys. A second table for the same key is a duplicate key, and
+  // Codex then refuses to start, so the writer finds the table by key.
+  it("updates a literal-quoted table Codex saved, in place, without adding a duplicate", () => {
+    const out = upsertCodexHookTrust(`[hooks.state.'${KEY}']\ntrusted_hash = 'sha256:old'\n`, KEY, HASH);
+    expect(out.match(/^\[hooks\.state\./gm)?.length).toBe(1);
+    expect((parseToml(out) as { hooks: { state: Record<string, { trusted_hash: string }> } }).hooks.state[KEY]!.trusted_hash).toBe(HASH);
+  });
+
+  it("leaves a key defined another way (an inline table) as it is rather than add a duplicate", () => {
+    const existing = `[hooks.state]\n'${KEY}' = { trusted_hash = 'sha256:old' }\n`;
+    expect(upsertCodexHookTrust(existing, KEY, HASH)).toBe(existing);
+  });
+
+  // A table example inside a person's multi-line instructions isn't a table: it stays exact, and the real one is written.
+  it("leaves a single-quoted table example inside a multi-line string alone and writes the real table", () => {
+    const existing = `developer_instructions = """\n[hooks.state.'${KEY}']\ntrusted_hash = 'example only'\n"""\n`;
+    const out = upsertCodexHookTrust(existing, KEY, HASH);
+    const parsed = parseToml(out) as { developer_instructions: string; hooks: { state: Record<string, { trusted_hash: string }> } };
+    expect(parsed.developer_instructions).toBe((parseToml(existing) as { developer_instructions: string }).developer_instructions);
+    expect(parsed.hooks.state[KEY]!.trusted_hash).toBe(HASH);
+  });
+
+  // Appending can't make an unreadable config readable, and would stack another table on every launch.
+  it("leaves a config that doesn't parse exactly as it is", () => {
+    const existing = `model = "gpt-6"\nmodel = "gpt-6.1"\n\n[hooks.state.'${KEY}']\ntrusted_hash = 'sha256:old'\n`;
+    expect(() => parseToml(existing)).toThrow();
+    expect(upsertCodexHookTrust(existing, KEY, HASH)).toBe(existing);
+  });
+
+  // The probe header's name is one the document doesn't already have, so a person's own key or table of that name can't
+  // stand in for it.
+  it.each(['"""', "'''"])("leaves a table example in %s instructions alone beside a root key named like the probe", (quote) => {
+    const existing = `openrig-header-probe-2 = 'personal'\ndeveloper_instructions = ${quote}\n[hooks.state.'${KEY}']\ntrusted_hash = 'example only'\n${quote}\n`;
+    const out = upsertCodexHookTrust(existing, KEY, HASH);
+    const parsed = parseToml(out) as Record<string, any>;
+    expect(parsed.developer_instructions).toBe((parseToml(existing) as Record<string, any>).developer_instructions);
+    expect(parsed["openrig-header-probe-2"]).toBe("personal");
+    expect(parsed.hooks.state[KEY].trusted_hash).toBe(HASH);
+  });
+
+  it("finds the real table when the document already has a table named like the probe", () => {
+    const existing = `[hooks.state.'${KEY}']\ntrusted_hash = 'sha256:old'\n\n[openrig-header-probe-0]\nkept = true\n`;
+    const out = upsertCodexHookTrust(existing, KEY, HASH);
+    expect(out).toBe(existing.replace("trusted_hash = 'sha256:old'", `trusted_hash = "${HASH}"`));
+    expect((parseToml(out) as Record<string, any>)["openrig-header-probe-0"]).toEqual({ kept: true });
+  });
 });
 
 describe("OPR.0.4.3.33 — provisioning-seam coupling (ensureCodexActivityHooks pre-trusts our 4 hooks)", () => {
@@ -177,6 +224,18 @@ describe("OPR.0.4.3.33 — provisioning-seam coupling (ensureCodexActivityHooks 
     // scope: exactly 4 hooks.state tables, no more, no wildcard/blanket entry
     expect(cfg.match(/^\[hooks\.state\./gm)?.length).toBe(4);
     expect(cfg).not.toContain('[hooks.state."*"]');
+  });
+
+  // #2029: after "Trust all", Codex saves hook state with literal-quoted keys. The next launch updates those tables;
+  // a second table for each key is a duplicate key, and Codex then refuses to start.
+  it("finds the literal-quoted trust tables Codex saved and adds no duplicate", () => {
+    const saved = EVENTS.map(ev => `[hooks.state.'${PROVISIONAL_FIXTURE[ev].key}']\ntrusted_hash = 'sha256:old'\n`).join("\n");
+    const fs = mockCodexFs({ [RELAY]: "// relay", [CONFIG]: saved });
+    makeAdapter(fs).ensureCodexActivityHooks();
+    const cfg = fs._store[CONFIG]!;
+    const parsed = parseToml(cfg) as { hooks: { state: Record<string, { trusted_hash: string }> } };
+    for (const ev of EVENTS) expect(parsed.hooks.state[PROVISIONAL_FIXTURE[ev].key]!.trusted_hash).toBe(PROVISIONAL_FIXTURE[ev].hash);
+    expect(cfg.match(/^\[hooks\.state\./gm)?.length).toBe(4);
   });
 
   it.each(EVENTS)("trusts the authored %s group at its real position without changing a person's trust", (event) => {

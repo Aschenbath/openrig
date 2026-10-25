@@ -1984,6 +1984,46 @@ describe("Codex runtime adapter", () => {
     expect(content).not.toContain('[mcp_servers.context7]');
   });
 
+  // #2029: Codex saves project trust with literal-quoted keys. Finding the table by key means no second table for the
+  // same project, which Codex rejects as a duplicate key and then refuses to start.
+  it.each([
+    ["a literal-quoted table Codex saved", "[projects.'/tmp/workspace']\ntrust_level = 'trusted'\n", 1],
+    ["an inline entry", "[projects]\n'/tmp/workspace' = { trust_level = 'trusted' }\n", 0],
+  ])("deliverStartup reuses %s for the project's trust and adds no duplicate", async (_name, existing, tables) => {
+    const fs = mockFs({ "/home/tester/.codex/config.toml": existing });
+    const fsWithHome = { ...fs, homedir: "/home/tester" };
+    const adapter = new CodexRuntimeAdapter({ tmux: mockTmux(), fsOps: fsWithHome });
+
+    await adapter.deliverStartup([], makeBinding("/tmp/workspace"));
+
+    const content = (fsWithHome as unknown as { _store: Record<string, string> })._store["/home/tester/.codex/config.toml"]!;
+    expect((parseToml(content) as Record<string, any>).projects["/tmp/workspace"].trust_level).toBe("trusted");
+    expect(content.match(/^\[projects\.['"]\/tmp\/workspace['"]\]/gm)?.length ?? 0).toBe(tables);
+  });
+
+  it("deliverStartup leaves a project-table example in a person's multi-line instructions exact and writes the real trust", async () => {
+    const existing = `developer_instructions = """\n[projects.'/tmp/workspace']\ntrust_level = 'example only'\n"""\n`;
+    const fs = mockFs({ "/home/tester/.codex/config.toml": existing });
+    const fsWithHome = { ...fs, homedir: "/home/tester" };
+    await new CodexRuntimeAdapter({ tmux: mockTmux(), fsOps: fsWithHome }).deliverStartup([], makeBinding("/tmp/workspace"));
+    const parsed = parseToml((fsWithHome as unknown as { _store: Record<string, string> })._store["/home/tester/.codex/config.toml"]!) as Record<string, any>;
+    expect(parsed.developer_instructions).toBe((parseToml(existing) as Record<string, any>).developer_instructions);
+    expect(parsed.projects["/tmp/workspace"].trust_level).toBe("trusted");
+  });
+
+  // An earlier OpenRig's double-quoted table beside Codex's own is a duplicate Codex won't start with. Each launch leaves it
+  // exactly as it is, so removing the extra table once is the whole repair.
+  it("deliverStartup leaves a config that doesn't parse (#2029's duplicate project table) byte-identical, launch after launch", async () => {
+    const existing = "[projects.'/tmp/workspace']\ntrust_level = 'trusted'\n\n[projects.\"/tmp/workspace\"]\ntrust_level = \"trusted\"\n";
+    expect(() => parseToml(existing)).toThrow();
+    const fs = mockFs({ "/home/tester/.codex/config.toml": existing });
+    const fsWithHome = { ...fs, homedir: "/home/tester" };
+    const adapter = new CodexRuntimeAdapter({ tmux: mockTmux(), fsOps: fsWithHome });
+    await adapter.deliverStartup([], makeBinding("/tmp/workspace"));
+    await adapter.deliverStartup([], makeBinding("/tmp/workspace"));
+    expect((fsWithHome as unknown as { _store: Record<string, string> })._store["/home/tester/.codex/config.toml"]).toBe(existing);
+  });
+
   it("applies codex_config_fragment runtime resources to the global Codex config idempotently", async () => {
     const fs = mockFs({
       "/agents/base/runtime/codex-config.toml": [
