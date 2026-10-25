@@ -1,4 +1,5 @@
 import nodePath from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { effortPrecedence, readSeatEffort } from "./seat-effort.js";
 import type Database from "better-sqlite3";
 import {
@@ -823,6 +824,14 @@ export class PodRigInstantiator {
           this.deps.rigRepo.addEdge(materializedRigId, fromId, toId, edge.kind);
         }
 
+        const layers = this.deps.rigRepo.getRigStartupLayers(materializedRigId) ?? { root: nodePath.resolve(rigRoot) };
+        this.deps.rigRepo.setRigStartupLayers(materializedRigId, { ...layers, materializedSources: [
+          ...(layers.materializedSources ?? []),
+          { root: nodePath.resolve(rigRoot), spec: rigSpec,
+            nodeIds: nodeResults.map(result => logicalIdToNodeId.get(result.logicalId)!),
+            ...(opts?.cwdOverride ? { cwdOverride: opts.cwdOverride } : {}) },
+        ] });
+
         persistedEvents.push(this.deps.eventBus.persistWithinTransaction({
           type: "topology.roster_recorded",
           rigId: materializedRigId,
@@ -881,6 +890,78 @@ export class PodRigInstantiator {
       }
       return { ok: false, code: "materialize_error", message: err instanceof Error ? err.message : String(err) };
     }
+  }
+
+  /** Ordinary single-seat launch can start a never-occupied materialized member.
+   * Reuse the original declaration and launch effect; history always stays on restore. */
+  async launchFirstMaterializedNode(rigId: string, nodeId: string): Promise<{
+    ok: boolean; rigId: string; nodeId: string; logicalId: string; code?: string;
+    error?: string; sessionName?: string; warnings?: string[];
+  } | null> {
+    const guard = this.deps.tmuxAdapter?.deliveryGuard;
+    if (guard && !guard.ownsLifecycle(nodeId)) {
+      return guard.lifecycle([nodeId], () => this.launchFirstMaterializedNode(rigId, nodeId));
+    }
+    const rig = this.deps.rigRepo.getRig(rigId);
+    const node = rig?.nodes.find(entry => entry.id === nodeId);
+    const source = this.deps.rigRepo.getRigStartupLayers(rigId)?.materializedSources?.find(entry => entry.nodeIds.includes(nodeId));
+    if (!rig || !node || !source) return null;
+    const pristine = () => !this.deps.sessionRegistry.getBindingForNode(nodeId)
+      && !this.deps.sessionRegistry.getSessionsForRig(rigId).some(session => session.nodeId === nodeId)
+      && !this.db.prepare("SELECT 1 FROM node_startup_context WHERE node_id = ?").get(nodeId);
+    if (!pristine()) return null;
+    const failure = (code: string, error: string) => ({ ok: false, rigId, nodeId, logicalId: node.logicalId, code, error });
+    const context = this.findMemberContext(source.spec, node.logicalId);
+    if (!context) return failure("selection_changed", "The seat no longer matches its recorded member identity; inspect the rig before launching.");
+    // The declaration supplies startup content; an ordinary launch uses saved seat settings.
+    // Leave policy refs out of this synthetic spec so launchBinding uses saved provenance,
+    // rather than treating an old declaration as a fresh request to reapply its permissions.
+    const contract = () => {
+      const liveRig = this.deps.rigRepo.getRig(rigId);
+      const live = liveRig?.nodes.find(entry => entry.id === nodeId);
+      if (!liveRig || !live) return null;
+      return { name: liveRig.rig.name, logicalId: live.logicalId, podId: live.podId,
+        member: { ...context.member, agentRef: live.agentRef ?? "", profile: live.profile ?? "default", runtime: live.runtime ?? "",
+          model: live.model ?? undefined, effort: live.effort ?? undefined, advisor: live.advisor ?? undefined,
+          codexConfigProfile: live.codexConfigProfile ?? undefined, cwd: live.cwd ?? context.member.cwd,
+          env: live.env ?? undefined, restorePolicy: live.restorePolicy ?? undefined, sessionSource: live.sessionSource ?? undefined,
+          permissionPolicy: undefined },
+        effortChoice: live.effortChoice ?? null, env: this.deps.rigRepo.getRigEnv(rigId),
+        policyRef: live.permissionPolicy ?? null, rigPolicyRef: this.deps.rigRepo.getRigPermissionPolicy(rigId),
+        policy: this.deps.rigRepo.getNodePolicyProvenance(nodeId), rigPolicy: this.deps.rigRepo.getRigPolicyProvenance(rigId) };
+    };
+    const saved = contract()!;
+    const selected = { ...source.spec, name: saved.name, env: saved.env ?? undefined, permissionPolicy: undefined,
+      pods: [{ ...context.pod, members: [saved.member], edges: [] }], edges: [] };
+    const inherited = saved.policy ? { ...saved.policy, ref: saved.policy.nodeRef ?? saved.rigPolicy?.rigRef ?? "none",
+      resolvedTarget: saved.policy.resolvedTarget ?? undefined, declaringDir: saved.policy.declaringDir ?? undefined }
+      : this.inheritedPermissionPolicy(rigId);
+    const preflight = await preflightValidatedSpec(selected, { rigRoot: source.root,
+      fsOps: this.deps.fsOps, skillsRoot: this.resolveSkillsRoot(), ...this.systemWorldResolutionContext(),
+      inheritedPermissionPolicy: inherited, exec: this.deps.exec, claudeActivityAssets: this.deps.claudeActivityAssets });
+    if (!preflight.ready) return failure("preflight_failed", preflight.errors.join("; "));
+    const name = deriveCanonicalSessionName(context.pod.id, saved.member.id, saved.name);
+    try { await this.deps.tmuxAdapter?.startServer(); }
+    catch { return failure("target_liveness_unknown", "The tmux server could not be started; nothing was launched. Check rig doctor and the daemon’s tmux server, then retry."); }
+    const probe = await this.deps.tmuxAdapter?.probeSession(name);
+    if (probe?.state === "present") return failure("target_session_present", `Session "${name}" is present; nothing was launched. Inspect it with rig capture ${name} before choosing whether to stop it.`);
+    if (probe?.state !== "absent") return failure("target_liveness_unknown", `Could not determine whether session "${name}" exists; nothing was launched. Check rig doctor and the daemon's tmux server, then retry.`);
+    if (!pristine() || !isDeepStrictEqual(contract(), saved)) {
+      return failure("selection_changed", "The seat identity, occupancy or launch settings changed during first-start checks; inspect its status and retry.");
+    }
+    const changed = (["agentRef", "profile", "runtime", "model", "effort", "advisor", "codexConfigProfile"] as const)
+      .filter(key => !isDeepStrictEqual(saved.member[key] ?? null, context.member[key] ?? null));
+    const changes: string[] = [...changed];
+    if (saved.effortChoice && saved.effortChoice !== (context.member.effort ?? null)) changes.push("saved effort choice");
+    if (saved.policyRef !== (context.member.permissionPolicy ?? null)
+      || saved.rigPolicyRef !== (source.spec.permissionPolicy ?? null)) changes.push("permission policy");
+    const launched = await this.launchValidatedSpec(selected, source.root, rigId);
+    if (!launched.ok) return failure(launched.code, "message" in launched ? launched.message : launched.errors.join("; "));
+    const result = launched.result.nodes[0]!;
+    if (changes.length) preflight.warnings.push(`First start uses the seat's current saved ${changes.join(", ")} instead of the materialized declaration.`);
+    return { ok: result.status === "launched", rigId, nodeId, logicalId: node.logicalId,
+      ...(result.status !== "launched" ? { code: result.status, error: result.error } : {}),
+      sessionName: result.sessionName, warnings: [...preflight.warnings, ...(launched.result.warnings ?? [])] };
   }
 
   async launchMaterialized(
