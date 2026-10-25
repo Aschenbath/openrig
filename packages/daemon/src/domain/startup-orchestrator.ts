@@ -231,6 +231,8 @@ type StartupDeliveryInput = StartupInput & {
   lastSubmissionUnconfirmedReason?: string;
   /** Claude only: the runtime refused an earlier startup turn (an expired login, say), so later inputs are held. */
   refusedTurn?: ReadinessResult;
+  /** A later input was pasted before the refusal appeared; its submission is uncertain, so never replay it. */
+  refusedWithStagedInput?: boolean;
   /** How many startup inputs were held after that refusal, and so are still owed. */
   heldInputs?: number;
   /** A one-shot (non-idempotent) startup action was typed, so the startup must not be delivered again as a whole. */
@@ -675,9 +677,9 @@ export class StartupOrchestrator {
     // if readiness later fails. Failed launches and resume/adopt retain history.
     const isFreshLaunch = continuityOutcome === "fresh" && (!input.skipHarnessLaunch || input.continueFreshStartup === true);
     // Once a startup turn was refused, the result says what's owed, whatever error comes later. Continuing replays the
-    // whole fresh startup, so it's offered only for a fresh start (not a restore) that typed no one-shot action.
+    // whole fresh startup, so don't offer it for a restore, a possibly delivered one-shot, or an uncertain staged input.
     const owed = (also: string[] = [], refused = deliveryInput.refusedTurn) => refused
-      ? this.owedStartup(deliveryInput, refused, continuityOutcome, isFreshLaunch && !input.isRestore && !deliveryInput.oneShotSent, also) : null;
+      ? this.owedStartup(deliveryInput, refused, continuityOutcome, isFreshLaunch && !input.isRestore && !deliveryInput.oneShotSent && !deliveryInput.refusedWithStagedInput, also) : null;
     const shouldChallenge = isFreshLaunch
       && input.adapter.runtime !== "terminal" && startupProof.mode === "authenticated";
     if (isFreshLaunch && !shouldChallenge) {
@@ -1204,10 +1206,14 @@ export class StartupOrchestrator {
     const held = input.heldInputs
       ? `${input.heldInputs} later startup input${input.heldInputs === 1 ? " wasn't" : "s weren't"} sent. ` : "";
     const why = input.oneShotSent ? "a one-shot startup action already ran and must not run twice"
+      : input.refusedWithStagedInput ? "the next startup input may still be in the input box"
       : "this start was a restore, and continuing delivers a fresh start's context";
     return this.fail(input, "attention_required", [
       refused.reason ?? "The runtime refused a startup turn.",
       ...also,
+      ...(input.refusedWithStagedInput ? [
+        `OpenRig pasted the next startup input in ${input.binding.tmuxSession} but didn't press Enter, because Claude had refused the turn before it. It may still be in the input box, so don't resend it.${continuity !== "fresh" ? " Check the pane; clear it or send it after signing in." : ""}`,
+      ] : []),
       continuable
         ? `${held}The seat hasn't read its startup context. Continuing delivers the whole startup again, the refused turn included.`
         : continuity !== "fresh"
@@ -1245,6 +1251,13 @@ export class StartupOrchestrator {
     }
 
     await this.sleep(200);
+    // The previous turn can refuse after the pre-paste check. Leave our new paste alone rather than submitting it
+    // into that refusal. It is already typed, not an unsent input, and must not be replayed by seat continue.
+    if (input.adapter.runtime === "claude-code" && sendOrder > 1 && (input.refusedTurn ??= await this.refusedTurn(input))) {
+      input.refusedWithStagedInput = true;
+      input.lastSubmissionUnconfirmedReason = UNCONFIRMED_STAGED;
+      return null;
+    }
     const submitResult = await this.tmuxAdapter.sendKeys(tmuxSession, ["Enter"]);
     if (!submitResult.ok) {
       return { error: (submitResult as { message?: string }).message ?? "unknown" };
