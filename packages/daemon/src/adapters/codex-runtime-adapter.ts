@@ -1,4 +1,5 @@
 import { codexEnvelopeArgs } from "../domain/codex-rebuild-permissions.js";
+import { codexMemberEnvelope, observeCodexEnvelope, readProfileFingerprint, type CodexProfileObservation, type ProfileFingerprint } from "../domain/codex-member-permissions.js";
 import { operationalLaunchArg } from "./kernel-authority.js";
 import nodePath from "node:path";
 import fs from "node:fs";
@@ -165,6 +166,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   // so no real codex subprocess runs. Contract not weakened — production uses
   // the real probe by default.
   private verifyProfilePreflight: (profile: string, cwd: string, home?: string) => Promise<CodexProfileProbeResult>;
+  private profileFingerprint: (path: string) => Promise<ProfileFingerprint>;
   // #69: whether the installed Codex supports --no-daemon. Startup wires the real probe;
   // absent (unit tests, other embedders) keeps the existing invocation unchanged.
   private detectDaemonSupport?: CodexDaemonSupportDetector;
@@ -217,6 +219,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     /** Match the daemon's prerequisite probe even if the pane's login shell rewrites PATH. */
     launchPath?: string;
     verifyProfilePreflight?: (profile: string, cwd?: string, home?: string) => Promise<CodexProfileProbeResult>;
+    /** The setter's optional profile hash; defaults to a bounded, non-blocking read. */
+    profileFingerprint?: (path: string) => Promise<ProfileFingerprint>;
     detectDaemonSupport?: CodexDaemonSupportDetector;
     readNetworkDefault?: CodexNetworkDefaultReader;
     resolveGitAddDirs?: CodexGitAddDirResolver;
@@ -248,6 +252,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     this.fs = deps.fsOps;
     this.codexHome = deps.codexHome;
     this.seatHome = deps.seatHome;
+    this.profileFingerprint = deps.profileFingerprint ?? readProfileFingerprint;
     this.launchPath = deps.launchPath;
     this.detectDaemonSupport = deps.detectDaemonSupport;
     this.readNetworkDefault = deps.readNetworkDefault;
@@ -985,6 +990,31 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return this.verifyResumeLaunch(tmuxSession, updatePrompt, { resumeToken, ...(home ? { home } : this.ownHomeOpt({ nodeId })) });
   }
 
+  /** The setter's check of a profile, in the config home this seat's launches use: its own CODEX_HOME, else the
+   *  daemon's, resolved as launch resolves it. An absent file is reported, not refused: Codex loads a missing profile as
+   *  an empty layer. A real load failure fails here as it does at launch. */
+  async observeProfile(profile: string, cwd: string, nodeId: string): Promise<CodexProfileObservation> {
+    const observedAt = new Date().toISOString();
+    const home = this.homeFor({ nodeId });
+    const own = this.ownHome({ nodeId });
+    if (!home) {
+      return { vantage: "unestablished", home: null, file: "unverified", load: "not_run", observedAt,
+        detail: "Neither this seat's env: nor the daemon sets CODEX_HOME, so this seat's pane keeps its own; OpenRig didn't check the profile there. Each launch still runs the native profile check." };
+    }
+    const path = nodePath.join(home, `${profile}.config.toml`);
+    // The hash is optional evidence, read without blocking; the native loader check below decides.
+    const print = await this.profileFingerprint(path).catch((error: unknown): ProfileFingerprint => ({ state: "unreadable", reason: (error as Error).message }));
+    const base = { vantage: "configured_codex_home" as const, home, file: print.state,
+      ...(print.state === "present" ? { sha256: print.sha256 } : {}), observedAt };
+    let probe: CodexProfileProbeResult;
+    // Only a confirmed native load failure is refused; a check that couldn't run is reported, not refused.
+    try { probe = await (own ? this.verifyProfilePreflight(profile, cwd, own) : this.verifyProfilePreflight(profile, cwd)); }
+    catch (error) { return { ...base, load: "not_run", detail: `The native profile check couldn't run (${(error as Error).message}); each launch runs it again.` }; }
+    if (!probe.ok) return { ...base, load: "failed", detail: `${probe.error}${probe.migrationHint ? `\n  Fix: ${probe.migrationHint}` : ""}` };
+    const unread = print.state === "unreadable" ? ` Its bytes weren't read for a hash (${print.reason}).` : "";
+    return { ...base, load: "ok", detail: print.state === "absent" ? `${path} is absent; Codex loads it as an empty layer, so base config applies.` : `${path} loads.${unread}` };
+  }
+
   /** Launch flags shared by fresh, fork and resume, decided once per launch. With `running`, the probed and
    *  prepared parts come from the running Codex instead, and no Codex process is started to decide them. */
   private async prepareLaunch(binding: NodeBinding, name: string, running: RunningCodexLaunch | undefined,
@@ -1007,14 +1037,15 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     const effortArg = effort ? ` -c ${shellQuote(`model_reasoning_effort="${effort}"`)}` : "";
     const profile = binding.codexConfigProfile?.trim();
     const profileArg = profile ? ` -p ${shellQuote(profile)}` : "";
-    const posture = binding.codexRebuildPermissions
-      ? profileArg + codexEnvelopeArgs(binding.codexRebuildPermissions)
+    // A handover rebuild's observed predecessor envelope, else the seat's own envelope, replaces the posture decision.
+    const memberEnvelope = binding.codexRebuildPermissions || !binding.codexPermissions ? undefined : codexMemberEnvelope(binding.codexPermissions);
+    const envelope = binding.codexRebuildPermissions ?? memberEnvelope;
+    const posture = envelope
+      ? profileArg + codexEnvelopeArgs(envelope)
       : codexPostureArg(profileArg, process.env, binding.launchPosture);
-    const appliedLaunch: AppliedLaunchObservation = binding.codexRebuildPermissions
-      ? { runtime: "codex", axis: "sandbox", state: "observed", value: binding.codexRebuildPermissions.sandboxPolicy.type,
-          reason: "emitted_launch_arguments", ...(binding.codexRebuildPermissions.approvalPolicy === "never" ? { approvalPolicy: "never" } : {}) }
-      : observeCodexSandbox(posture);
-    const postureArg = posture + operationalLaunchArg(this.runtime, binding);
+    const appliedLaunch: AppliedLaunchObservation = envelope ? observeCodexEnvelope(envelope) : observeCodexSandbox(posture);
+    // The seat's envelope is not full access, so a policy's full_bypass extras don't follow it.
+    const postureArg = posture + operationalLaunchArg(this.runtime, memberEnvelope ? { ...binding, kernelAuthority: false, launchPosture: undefined } : binding);
 
     if (running) {
       // The running Codex already loaded its profile; drift in -p is the caller's to compare.
@@ -1043,8 +1074,9 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
     // Codex rejects writable --add-dir roots under a read-only sandbox. Only
     // suppress OpenRig's generated roots when later project layers cannot make it writable.
-    const suppressAutoAddDirs = Boolean(!binding.codexRebuildPermissions && profile
-      && posture === profileArg && this.profileRemainsReadOnly(profile, binding.cwd, home));
+    // A seat envelope states its sandbox: read-only gets no generated roots; workspace-write keeps them.
+    const suppressAutoAddDirs = memberEnvelope ? memberEnvelope.sandboxPolicy.type === "read-only"
+      : Boolean(!binding.codexRebuildPermissions && profile && posture === profileArg && this.profileRemainsReadOnly(profile, binding.cwd, home));
     // Issue #121: fresh, resume and fork get the same git metadata dirs, so a restored or forked seat can still commit.
     // A rebuild keeps the writable roots its observed envelope names instead.
     const gitDirArg = binding.codexRebuildPermissions || suppressAutoAddDirs
@@ -1052,7 +1084,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     // The seat's own topology folder, so it can keep its LEARNED.md and recap: the same launches and the same suppression.
     const seatFolder = binding.codexRebuildPermissions || suppressAutoAddDirs ? undefined : this.prepareSeatFolder?.(name);
     const seatFolderArg = seatFolder ? ` --add-dir ${shellQuote(seatFolder)}` : "";
-    const teamWorkspaceArg = !binding.codexRebuildPermissions && binding.teamPermissionDefault && !profile
+    const teamWorkspaceArg = !envelope && binding.teamPermissionDefault && !profile
       && appliedLaunch.state === "observed" && appliedLaunch.value === "workspace-write"
       ? codexTeamWorkspaceArg(this.prepareTeamWorkspace, name) : "";
     const queueStateDirArg = binding.codexRebuildPermissions || suppressAutoAddDirs
@@ -1065,8 +1097,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
     const daemonOptOut = daemonSupport?.kind === "supported";
     const daemonArg = daemonOptOut ? " --no-daemon" : "";
-    // #275: on the plain floor, network access unless Codex reports an opt-out or policy.
-    const networkArg = binding.codexRebuildPermissions ? ""
+    // #275: on the plain floor, network access unless Codex reports an opt-out or policy. An envelope states its own.
+    const networkArg = envelope ? ""
       : await codexNetworkDefaultArg(own && this.readNetworkDefault ? ((cwd: string) => this.readNetworkDefault!(cwd, own)) : this.readNetworkDefault, appliedLaunch, binding.cwd, name);
 
     // The launch facts keep the probed daemon choice, so a printed recovery command can repeat it; no probe, no fact.

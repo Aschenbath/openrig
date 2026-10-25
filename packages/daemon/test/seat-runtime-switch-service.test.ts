@@ -249,6 +249,77 @@ describe("live seat runtime switch", () => {
     expect(nodeRow()).toMatchObject({ runtime: "codex", codex_config_profile: "deep", advisor: null });
   });
 
+  describe("a retained Codex envelope on the way back to Codex", () => {
+    // A narrow envelope kept while the seat ran Claude, under a policy that would bypass approvals and the sandbox.
+    const envelope = { sandbox: "read-only", approval: "on-request" };
+    const storedEnvelope = () => (db.prepare("SELECT codex_permissions_json j FROM nodes WHERE id = ?").get(nodeId) as { j: string | null }).j;
+    let codex: RuntimeAdapter;
+    beforeEach(() => {
+      db.prepare(`UPDATE nodes SET runtime = 'claude-code', codex_config_profile = NULL, codex_permissions_json = ?,
+        permission_policy = 'builtin:yolo', policy_origin = 'builtin', policy_launch_posture = 'full_bypass' WHERE id = ?`).run(JSON.stringify(envelope), nodeId);
+      codex = adapter("codex");
+    });
+
+    it("inherit: the Codex successor launches with the envelope, not the policy's posture alone, and the seat keeps it", async () => {
+      const svc = service({ runtimeAdapters: { codex, "claude-code": adapter("claude-code") } });
+      successorConfirms(svc);
+      expect(await svc.setRuntime({ seatRef: SEAT, runtime: "codex", reason: "back to Codex" })).toMatchObject({ ok: true, to: "codex" });
+      // The staged successor's own binding carries the envelope, which the Codex adapter emits in place of the posture.
+      expect(codex.launchHarness).toHaveBeenCalledWith(expect.objectContaining({ codexPermissions: envelope }), expect.objectContaining({ name: SEAT }));
+      expect(JSON.parse(storedEnvelope()!)).toEqual(envelope);
+    });
+
+    it("an explicit target mode replaces it: the successor launches with the mode, and the commit clears the envelope and says so", async () => {
+      const svc = service({ runtimeAdapters: { codex, "claude-code": adapter("claude-code") } });
+      const plan = await svc.setRuntime({ seatRef: SEAT, runtime: "codex", permissionMode: "floor", reason: "preview", dryRun: true });
+      expect(plan).toMatchObject({ ok: true, permission: { mode: "floor", source: "explicit" } });
+      expect((plan as { dropped: unknown[] }).dropped).toContainEqual({ setting: "codex permission envelope", value: JSON.stringify(envelope) });
+      expect(JSON.parse(storedEnvelope()!)).toEqual(envelope);
+      successorConfirms(svc);
+      expect(await svc.setRuntime({ seatRef: SEAT, runtime: "codex", permissionMode: "floor", reason: "back to Codex at the floor" }))
+        .toMatchObject({ ok: true, to: "codex", permission: { mode: "floor", source: "explicit" } });
+      expect(codex.launchHarness).toHaveBeenCalledWith(expect.objectContaining({ launchPosture: "floor" }), expect.objectContaining({ name: SEAT }));
+      expect((codex.launchHarness as ReturnType<typeof vi.fn>).mock.calls[0]![0].codexPermissions).toBeUndefined();
+      expect(storedEnvelope()).toBeNull();
+      expect(new NativePermissionStore(db).read(nodeId)).toMatchObject({ runtime: "codex", mode: "floor" });
+      const event = db.prepare("SELECT payload FROM events WHERE type = 'seat.runtime_changed'").get() as { payload: string };
+      expect(JSON.parse(event.payload)).toMatchObject({ permissionSelection: "floor", replaced: { codexPermissions: envelope } });
+    });
+
+    it("a read error while clearing the envelope rolls the whole commit back, so no mode is recorded beside the envelope", async () => {
+      const svc = service({ runtimeAdapters: { codex, "claude-code": adapter("claude-code") } });
+      const prepare = db.prepare.bind(db);
+      let failClearingRead = false;
+      vi.spyOn(db, "prepare").mockImplementation(((sql: string) => {
+        if (failClearingRead && sql === "SELECT codex_permissions_json FROM nodes WHERE id = ?") throw Object.assign(new Error("disk I/O error"), { code: "SQLITE_IOERR" });
+        return prepare(sql);
+      }) as typeof db.prepare);
+      // The successor confirms, and the commit's read of the envelope then fails.
+      onSleep = () => {
+        const row = openSwitch();
+        if (row?.phase !== "preparing" || !handoverTyped()) return;
+        failClearingRead = true;
+        svc.confirm({ seatRef: SEAT, switchId: row.id, note: "ready", actorSession: SEAT, generation: row.successor_generation });
+      };
+      const result = await svc.setRuntime({ seatRef: SEAT, runtime: "codex", permissionMode: "floor", reason: "back to Codex at the floor" });
+      failClearingRead = false;
+      expect(result).toMatchObject({ ok: false, code: "runtime_switch_failed", committed: false, message: expect.stringContaining("disk I/O error") });
+      expect(JSON.parse(storedEnvelope()!)).toEqual(envelope);
+      expect(new NativePermissionStore(db).read(nodeId)).toBeNull();
+      expect(nodeRow().runtime).toBe("claude-code");
+      expect(sessionRegistry.getBindingForNode(nodeId)).toMatchObject({ tmuxPane: "%0" });
+    });
+
+    it("a switch that doesn't commit leaves the envelope and the seat's permission choice as they were", async () => {
+      const result = await service({ runtimeAdapters: { codex, "claude-code": adapter("claude-code") } })
+        .setRuntime({ seatRef: SEAT, runtime: "codex", permissionMode: "floor", reason: "limit", confirmTimeoutMs: 10_000 });
+      expect(result).toMatchObject({ ok: false, code: "runtime_switch_failed", committed: false });
+      expect(JSON.parse(storedEnvelope()!)).toEqual(envelope);
+      expect(new NativePermissionStore(db).read(nodeId)).toBeNull();
+      expect(nodeRow().runtime).toBe("claude-code");
+    });
+  });
+
   it("without a confirmation in time nothing changes: the current occupant keeps the seat and its claim, and the staged successor is retired", async () => {
     const claimed = await queueRepo.create({ sourceSession: "orch-lead@seat-rig", destinationSession: SEAT, body: "review" });
     queueRepo.claim({ qitemId: claimed.qitemId, destinationSession: SEAT });
