@@ -62,9 +62,11 @@ it("a 24-rig landing fetches names only; a selected rig never reads unrelated in
   expect(calls.filter(c => c.startsWith("/api/queue/list")).sort()).toEqual([
     "/api/queue/list?attention=1", "/api/queue/list?state=blocked", "/api/queue/list?state=in-progress", "/api/queue/list?state=pending&limit=50",
   ]);
-  // The rig Table renders the HEALTH summary, so it reads the health projection once; no other rig's data.
+  // The rig Table reads health once without fetching other rigs' node inventories.
   expect(calls.filter(c => c.startsWith("/api/health"))).toEqual(["/api/health?limit=200"]);
   expect(calls).toHaveLength(9);
+  expect(snap.health).toMatchObject({ availability: "loaded", total: 0, records: [] });
+  expect(renderScreen(view.get(), snap, { cols: 220, rows: 60 }).lines.join("\n")).toContain("no findings served; not a healthy verdict");
 });
 
 it.each(["overview", "graph", "health"] as const)("a drilled rig on the %s tab reads no seat queue lists", async (viewTab) => {
