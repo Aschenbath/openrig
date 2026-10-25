@@ -755,7 +755,7 @@ export class CodexInPlaceRestart {
       }
       reports.push({ logicalId: row.logical_id, sessionName: row.tmux_session, home,
         effect: home === "same"
-          ? `Not restarted; account unverified. Shares home ${codexHome}, so it may take the new account at its next start or token refresh.`
+          ? `Not restarted; account unverified. Shares home ${codexHome}: if the home's login changed, it keeps its current login only until its next token refresh, when Codex stops it with "signed in to another account" until it's restarted. Signing in again there would replace the home's login.`
           : home === "different" ? "Not restarted; uses a different Codex home." : "Not restarted; account unverified; its Codex home could not be observed." });
     }
     return reports;

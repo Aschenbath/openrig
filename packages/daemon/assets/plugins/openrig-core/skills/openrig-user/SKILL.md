@@ -1016,6 +1016,26 @@ in `CODEX_HOME` (default `~/.codex`). A seat that names its own home in `env:` r
 Seats may share a home. OpenRig writes its own settings (Codex hooks, managed `config.toml` and plugin; Claude's
 first-run trust settings) into the seat's home.
 
+### Move one Codex seat to another login
+
+For a Codex seat on Linux. The login must already be saved in the Codex home the seat runs on (`rig seat status <seat>`
+shows it). Claude seats, other operating systems, and moving a seat to another home aren't supported by this command
+yet: say so instead of improvising.
+
+1. **Save each login once, in that home:** `CODEX_HOME=<home> codex login` (the person signs in), then
+   `CODEX_HOME=<home> rig auth save <name>`. `rig auth list --codex-home <home>` lists them.
+2. **Check:** `rig provider precheck --seat <seat> --to-account <name>` shows the home, what the seat is doing, and every
+   peer on that home. A refusal says what's missing, and nothing changes.
+3. **Move:** `rig provider switch --seat <seat> --to-account <name>`. It saves the home's current login as
+   `before-switch-<time>`, activates the chosen one, and restarts the seat in place on the same conversation. If the
+   current login can't be saved first, nothing changes. Peers on the home aren't restarted. Each keeps its current login
+   only until its next token refresh, when Codex stops it with "signed in to another account". Run the printed
+   `rig seat restart <peer> --keep-conversation --reason "..."` for each to move it too. Don't sign in again in that home: that replaces
+   the login you just switched to.
+4. **Confirm:** after the seat completes a real tool-using turn, run the printed
+   `rig seat restart <seat> --keep-conversation --verify --expect-account <its Account line>`. Until then the move is
+   unconfirmed. An uncertain restart is reported; never restart it a second time.
+
 ### Manage subscriptions across a fleet (when the person asks you to)
 
 **This applies only when the person has asked you to manage their subscriptions.** Otherwise, don't take this job on. Installing or upgrading OpenRig appoints no agent, launches no bundle and starts no
@@ -1041,7 +1061,8 @@ and there's no threshold to obey.
 - **The Observatory is optional:** it can show readings, but you don't need it to rotate.
 
 **The unit is a Codex home, with every seat on it.** Moving some seats on a shared home to a different account, and
-moving Claude seats, aren't supported moves yet: say so instead of improvising.
+moving Claude seats, aren't supported moves yet: say so instead of improvising. A Codex seat with a home of its own
+moves alone, with `rig provider switch --seat` (above).
 
 0. **Load the person's account policy.**
    - It's the context pack named `account-policy`: check `rig context list` for it, then read it with
