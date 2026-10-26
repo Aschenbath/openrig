@@ -314,7 +314,8 @@ import { RigSpecCodec as PodRigSpecCodec } from "./rigspec-codec.js";
 import { RigSpecSchema as PodRigSpecSchema, VALID_EDGE_KINDS } from "./rigspec-schema.js";
 import { rigPreflight, preflightValidatedSpec } from "./rigspec-preflight.js";
 import { resolveAgentRef, type AgentResolverFsOps } from "./agent-resolver.js";
-import { resolveAdvisorModel, resolveNodeConfig, selectedPluginPaths } from "./profile-resolver.js";
+import { resolveAdvisorModel, selectedPluginPaths, type ResolutionResult } from "./profile-resolver.js";
+import { resolveNodeConfigAsync, withNodeConfigResolver } from "./profile-resolution-worker.js";
 import { resolveStartup } from "./startup-resolver.js";
 import { isCommunityHarnessRuntime } from "./built-in-runtimes.js";
 import { planProjection, claudeConflictTargetPath, projectionConflictWarnings, filterProtectedProjections, type ProjectionPlan } from "./projection-planner.js";
@@ -1354,7 +1355,7 @@ export class PodRigInstantiator {
     const resolved = resolveAgentRef(member.agentRef, rigRoot, this.deps.fsOps);
     if (!resolved.ok) return refuse(resolved.code === "validation_failed" ? resolved.errors.join("; ") : resolved.error);
     if (!node.resolvedSpecHash || resolved.resolved.hash !== node.resolvedSpecHash) return refuse("Agent source hash differs from the failed first start.");
-    const config = resolveNodeConfig({ baseSpec: resolved.resolved, importedSpecs: resolved.imports, collisions: resolved.collisions,
+    const config = await resolveNodeConfigAsync({ baseSpec: resolved.resolved, importedSpecs: resolved.imports, collisions: resolved.collisions,
       profileName: member.profile, specRoot: rigRoot, member, pod, rig: this.withRigStartupLayers(rigSpec, this.rigStartupLayers(rigSpec, rigRoot, rigId)),
       skillsRoot: this.resolveSkillsRoot(), ...this.systemWorldResolutionContext() });
     if (!config.ok) return refuse(config.errors.join("; "));
@@ -1611,8 +1612,10 @@ export class PodRigInstantiator {
       rollbackServices = hookResult.rollback;
     }
 
-    // Phase 2: Process members in launch order
-    for (const { pod, member, podId, qualifiedId } of memberEntries) {
+    // Phase 2: Process members in launch order. Reuse one worker, but no scanScope:
+    // an earlier member's startup can change the skills a later member resolves.
+    await withNodeConfigResolver(async resolveConfig => {
+      for (const { pod, member, podId, qualifiedId } of memberEntries) {
 
         // Terminal fast-path: skip agent resolution and profile resolution
         if (member.agentRef === "builtin:terminal") {
@@ -1634,7 +1637,7 @@ export class PodRigInstantiator {
         }
 
         // Resolve node config (profile + precedence)
-        const configResult = resolveNodeConfig({
+        const configResult = await resolveConfig({
           baseSpec: resolveResult.resolved,
           importedSpecs: resolveResult.imports,
           collisions: resolveResult.collisions,
@@ -1739,6 +1742,7 @@ export class PodRigInstantiator {
           sessionName: launched.sessionName,
         });
       }
+    });
 
     // Create pod-local edges (after all members created)
     for (const pod of rigSpec.pods) {
@@ -2331,7 +2335,7 @@ export class PodRigInstantiator {
      *  projection targets instead of protecting them. Absent = protect (safe default). */
     force?: boolean;
     resolveResult?: ReturnType<typeof resolveAgentRef> extends infer T ? T : never;
-    configResult?: ReturnType<typeof resolveNodeConfig> extends infer T ? T : never;
+    configResult?: ResolutionResult;
     /** The first-start retry's member carries only retained fields, not the launch additions: keep the ones the first
      *  start recorded rather than read an empty request as "none". */
     keepRecordedAdditions?: boolean;
@@ -2349,7 +2353,7 @@ export class PodRigInstantiator {
     }
 
     const rigLayers = this.rigStartupLayers(input.rigSpec, input.rigRoot, input.rigId);
-    const configResult = input.configResult ?? resolveNodeConfig({
+    const configResult = input.configResult ?? await resolveNodeConfigAsync({
       baseSpec: resolveResult.resolved,
       importedSpecs: resolveResult.imports,
       collisions: resolveResult.collisions,
