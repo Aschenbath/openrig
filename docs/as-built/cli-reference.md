@@ -478,6 +478,7 @@ the sections that were not read are `null`.
 | `rig slack channel-map remove <match>` | — | `--reason <reason>`<br>`--actor <actor>` |
 | `rig slack enable` | — | `--reason <reason>`<br>`--actor <actor>` |
 | `rig slack disable` | — | `--reason <reason>` **required**<br>`--actor <actor>` |
+| `rig slack post-open-asks` | — | `--reason <reason>`<br>`--wait <seconds>`<br>`--actor <actor>`<br>`--json` |
 | `rig slack outbound` | — | `--json` |
 | `rig slack inbound` | — | — |
 
