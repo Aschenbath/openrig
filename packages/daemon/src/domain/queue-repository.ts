@@ -20,6 +20,10 @@ import { getSelfHostId } from "./hosts/fanout-contract.js";
 import { parseSessionName, isHumanSeatSessionRef } from "./session-name.js";
 import { parseReplyToChoice, formatReplyToChoice, describeReplyToFallback, REPLY_TO_CHOICE_ACTOR, type ReplyToChoice } from "./reply-to-choice.js";
 import { classifyDestination, type DestinationClass } from "./gateway/destination-resolver.js";
+import { join } from "node:path";
+import { SettingsStore } from "./user-settings/settings-store.js";
+import { hostedWakeFor, type RosterWake } from "./rosters.js";
+import { ringHostedWake } from "./hosted-wake.js";
 import { effectiveGateRoles } from "./gate-predicate.js";
 import {
   computeClosureRequiredAt,
@@ -91,6 +95,8 @@ const AUTO_UNPARK_WAKE_TAG = "queue:auto-unpark:blocker";
  *  handoff: it keeps that source when it's replayed later. Send, broadcast, queue create and the cross-host forward never
  *  set it from a request; the trusted local outbox recorder (/api/queue/outbox/record) accepts caller tags by design. */
 const WAKE_TRIGGER_OPENRIG_TAG = "queue:wake-trigger:openrig";
+/** On a wake intent whose ring a hosted member's trigger accepted: recovery doesn't ring that intent again. */
+const HOSTED_WAKE_ACCEPTED_TAG = "queue:hosted-wake-accepted";
 
 /** Who triggered a wake, which is its source at the seat's interruption level: an agent's create or handoff nudge, or
  *  OpenRig's own scheduling on an agent's row (ladder retries, an auto-unpark, boot recovery, health re-presentation). */
@@ -545,6 +551,17 @@ export function defaultParkWakeMessage(qitemId: string): string {
   return `Wake timer fired for parked qitem ${qitemId}. Resume the recorded continuation and update the row.`;
 }
 
+/** A hosted member's trigger, from the authored rosters (`<workspace.root>/rosters`) on this host. Null when it declares
+ *  none, or when the rosters or this host's id can't be read: the member then stays unroutable, and its person is told. */
+function defaultHostedWake(destination: string): RosterWake | null {
+  try {
+    const root = new SettingsStore().resolveOne("workspace.root").value;
+    return typeof root === "string" && root ? hostedWakeFor(destination, join(root, "rosters"), getSelfHostId()) : null;
+  } catch {
+    return null;
+  }
+}
+
 export class QueueRepositoryError extends Error {
   readonly code: string;
   readonly meta: Record<string, unknown> | undefined;
@@ -915,6 +932,9 @@ export class QueueRepository {
   private readonly loadHumanRegistryFn: () => LoadResult;
   /** Registered shared channels (0.7.3): `<id>@external` participants whose rows post to their Slack channel. */
   private readonly sharedChannelsFn: () => ReadonlyArray<{ address: string }>;
+  /** A hosted member's trigger, from the authored rosters on this host. */
+  private readonly hostedWakeFn: (destination: string) => RosterWake | null;
+  private readonly hostedWakeFetch: typeof fetch | undefined;
   /** OPR.0.4.6.WF3 FR-6 — injected by startup (never imported): the
    *  workflow domain's is-live-frontier-packet predicate. */
   private readonly workflowFrontierPredicate:
@@ -956,6 +976,8 @@ export class QueueRepository {
       resolveSessionAddresses?: (name: string) => string[];
       loadHumanRegistry?: () => LoadResult;
       sharedChannels?: () => ReadonlyArray<{ address: string }>;
+      hostedWake?: (destination: string) => RosterWake | null;
+      hostedWakeFetch?: typeof fetch;
     }
   ) {
     this.db = db;
@@ -970,6 +992,8 @@ export class QueueRepository {
     this.resolveSessionAddresses = opts?.resolveSessionAddresses ?? ((name) => [name]);
     this.loadHumanRegistryFn = opts?.loadHumanRegistry ?? (() => loadHumanRegistry());
     this.sharedChannelsFn = opts?.sharedChannels ?? (() => sharedChannelAddresses());
+    this.hostedWakeFn = opts?.hostedWake ?? defaultHostedWake;
+    this.hostedWakeFetch = opts?.hostedWakeFetch;
     this.hasTargetRepoColumn = detectQueueColumn(db, "target_repo");
     this.hasSummaryColumn = detectQueueColumn(db, "summary");
     this.hasHumanIntentColumn = detectQueueColumn(db, "human_intent");
@@ -1393,6 +1417,12 @@ export class QueueRepository {
     // The level can change while this send waits for the seat's lease. Under the lease, each member is admitted again with
     // its own source and urgency; only those with the first member's outcome go with this send, and the others go back
     // to their state before this claim (never marked delivered, held or failed) for their own delivery.
+    // A hosted member's trigger already accepted the ring for exactly these intents (tagged below): recovery doesn't ring
+    // it again, since each ring can start a run. Any other wake rings: a new intent, or one claimed but never sent.
+    if (group.every((entry) => entry.tags?.includes(HOSTED_WAKE_ACCEPTED_TAG))) {
+      for (const entry of group) this.outbox.finalizeDelivery(entry.outboxId, "indeterminate");
+      return "indeterminate";
+    }
     const released: OutboxEntry[] = [];
     const recheckMembers = group.length < 2 ? undefined : (holds: (input: import("./seat-delivery-guard.js").AdmissionInput) => boolean, held: boolean) => {
       const keep = group.filter((entry, i) => {
@@ -1429,6 +1459,12 @@ export class QueueRepository {
       const wakeEvent = this.db.transaction(() => {
         this.recordNudgeAttempt(qitemId, nudgeResult);
         this.outbox!.finalizeDelivery(intent.outboxId, finalState);
+        // The acceptance belongs to this intent, so recovery can tell this wake already rang.
+        if (outcome.nudgeResult.startsWith("wake-accepted:")) {
+          this.db.prepare(`UPDATE outbox_entries SET tags = json_insert(COALESCE(tags, '[]'), '$[#]', ?)
+            WHERE outbox_id = ? AND NOT EXISTS (SELECT 1 FROM json_each(COALESCE(outbox_entries.tags, '[]')) WHERE value = ?)`)
+            .run(HOSTED_WAKE_ACCEPTED_TAG, intent.outboxId, HOSTED_WAKE_ACCEPTED_TAG);
+        }
         if (!blockerRef) return null;
 
         const item = this.getByIdOrThrow(qitemId);
@@ -1662,6 +1698,12 @@ export class QueueRepository {
     }
     if (destClass.class === "unroutable") {
       return { classified: "failed", nudgeResult: destClass.teaching };
+    }
+    // A hosted member with a trigger: ring it. Accepted is indeterminate, never verified: pickup is its claim.
+    if (destClass.class === "hosted") {
+      const row = this.getById(qitemId);
+      return ringHostedWake({ qitemId, destination: destinationSession, summary: row?.summary ?? null, source: sourceSession ?? row?.sourceSession ?? null },
+        destClass.wake, { fetchImpl: this.hostedWakeFetch });
     }
     // A terminal seat runs a shell or a TUI, not an agent. Typed wake text would run there as a
     // command line (it carries the row's summary), and nothing there can claim the row. So nothing
@@ -4304,6 +4346,7 @@ export class QueueRepository {
         return loaded.ok ? loaded.entities : null;
       })(),
       hasTerminalTransport: (dest) => this.hasTerminalTransport(dest),
+      hostedWake: (dest) => this.hostedWakeFn(dest),
     });
   }
 
