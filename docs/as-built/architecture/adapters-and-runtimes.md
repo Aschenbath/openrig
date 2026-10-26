@@ -356,6 +356,20 @@ and stays on Herdr when neither is (`providerNameFor`,
 `terminal-service.ts:175`); a named provider is used as named. These place existing tmux
 sessions in views; they do not launch harnesses.
 
+`RexAdapter` (`rex-adapter.ts`) opens a view as a new Rex session through
+the `rex` CLI (`rex --autostart=false api call <method> -`, `rex-transport.ts`):
+it creates an empty session (`session.create`), adds one window per grid page
+(`session.new_window`), and checks the tiles once after a short wait. It is used only when named;
+the CLI and TUI name it when they run inside Rex (`openRexView`,
+`packages/cli/src/terminal-window-rex.ts`), and an omitted provider never picks
+it. It refuses with `rex_unavailable` when the Rex server does not answer.
+Discovery (`server.version` and `server.status`) has a 1 s budget, and
+`status()` and `liveness()` share one probe. A request whose reply is lost (a
+timeout, a killed client, an unreadable reply) is `unknown`, not failed: the
+adapter never closes a session on it and reports `rex_outcome_unknown`.
+Herdr and Rex build their layout trees from one grid helper
+(`buildTileGrid`, `tile-layout.ts`).
+
 ### Tmux server selection
 
 Before reconciliation, `startup.ts` calls `selectTmuxServer` in
@@ -374,8 +388,10 @@ transports, including its direct probe/cleanup calls. They are empty for ordinar
 names the server for attachments. The opt-in control client uses the same execution
 arguments for its connection, probes and fallback commands. The same startup choice feeds node
 inventory, `TerminalService.status()` and previews, composed panes, shared TUI attachment and
-CLI viewer management. SSH panes resolve the remote instance through its own
-`rig terminal attach`. For isolation, self-attachment checks the caller's socket before binding;
+CLI viewer management. Inherited SSH panes retain the remote-tmux replacement
+wrapper and plain recovery command without requiring remote OpenRig. Isolated
+SSH panes resolve the remote instance through its own `rig terminal attach`.
+For isolation, self-attachment checks the caller's socket before binding;
 offline destruction reads the persisted socket before removing state.
 
 See [tmux server selection](../../reference/tmux-servers.md) for configuration

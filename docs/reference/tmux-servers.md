@@ -108,8 +108,11 @@ tools. A loopback URL through a port forward does not bypass this isolation chec
 use the matching `OPENRIG_HOME` on the daemon's machine. Inherited servers retain
 the existing local-host checks without requiring a matching durable identity.
 SSH view tiles follow the viewing instance's effective mode. In `inherit`, they
-keep `ssh -t ... tmux attach`, including `-r` for read-only views; the remote host
-needs only tmux. In `isolated`, they run `rig terminal attach` on the remote host,
+use remote tmux through `ssh -t`, including `-r` for read-only views, and keep the
+bounded, identity-checked reattachment when a seat's session is replaced. The
+remote host needs only tmux and a POSIX shell, not OpenRig. Copyable recovery
+commands remain plain `ssh -t ... tmux attach`. In `isolated`, tiles run
+`rig terminal attach` on the remote host,
 using that host's local instance and socket; both the remote CLI and daemon must
 support this command. The remote shell must select the right `OPENRIG_HOME` when
 using a custom home. Local socket paths are never sent to it, and an isolated

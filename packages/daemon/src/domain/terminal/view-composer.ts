@@ -5,12 +5,12 @@
 // partition rules live here, in one testable pure function, so no provider
 // re-implements them:
 //
-//   local live       → `tmux attach -t <session>` (tmux = the daemon-resolved
-//                      absolute path when the context carries one)
+//   local live       → bounded, identity-pinned tmux reattach command
+//                      (tmux = the daemon-resolved absolute executable)
 //   view-only / cross-rig (read-only)
-//                    → `tmux attach -r -t <session>`
-//   ssh host         → `ssh -t <dest> ... tmux attach [-r] -t <session>` in inherit mode;
-//                      isolated views use the remote `rig terminal attach` to resolve its server
+//                    → the same reattach command with read-only `-r`
+//   ssh host         → `ssh -t <dest> <reattach command>` using remote tmux in inherit mode;
+//                      isolated views use remote `rig terminal attach` to resolve its server
 //   http host        → NO pane; honest-degrade { seat, host, reason }
 //   dead / no session → absent[] (named, never silently dropped)
 //
@@ -19,6 +19,7 @@
 // (ssh vs http vs unknown) is resolved through the operator's read-only hosts
 // registry via the injected `resolveHost`.
 
+import { tileAttachArgv } from "./tile-attach.js";
 import type { HostEntry } from "../hosts/hosts-registry-reader.js";
 import type {
   AbsentSeat,
@@ -170,17 +171,21 @@ export function composeView(
         });
         continue;
       }
-      // Keep the legacy SSH path until the viewing instance opts into isolation.
-      // An isolated view resolves the server on the remote host; local socket
-      // flags are never sent there, and a failed lookup cannot fall back to a namesake.
-      const remoteCommand = ctx.localTmuxServerMode === "isolated"
+      // Inherit keeps remote tmux (no remote rig dependency), including main's
+      // identity-pinned replacement handling. Isolated views resolve the remote
+      // instance; local socket flags never cross SSH and lookup failure cannot fall back.
+      const isolated = ctx.localTmuxServerMode === "isolated";
+      const recoveryCommand = isolated
         ? `env OPENRIG_HOST_SELECTED=local rig terminal attach${m.readOnly ? " --read-only" : ""} -- ${shellQuote(m.tmuxSession)}`
         : `tmux attach ${attachFlag}-t ${shellQuote(m.tmuxSession)}`;
+      const remoteCommand = isolated ? recoveryCommand
+        : tileAttachArgv("tmux", [], m.tmuxSession, m.readOnly).map(shellQuote).join(" ");
       opened.push({
         seat: m.seat,
         ...(m.runtime ? { runtime: m.runtime } : {}),
         label: m.label,
         paneCommand: `ssh -t ${shellQuote(dest)} ${shellQuote(remoteCommand)}`,
+        recoveryCommand: `ssh -t ${shellQuote(dest)} ${shellQuote(recoveryCommand)}`,
         readOnly: m.readOnly,
       });
       continue;
@@ -203,12 +208,14 @@ export function composeView(
       });
       continue;
     }
+    const attachArgv = tileAttachArgv(ctx.localTmux ?? "tmux", ctx.localTmuxServer ?? [], m.tmuxSession, m.readOnly);
     opened.push({
       seat: m.seat,
       ...(m.runtime ? { runtime: m.runtime } : {}),
       label: m.label,
-      paneCommand: `${localTmux} attach ${attachFlag}-t ${shellQuote(m.tmuxSession)}`,
-      attachArgv: [ctx.localTmux ?? "tmux", ...(ctx.localTmuxServer ?? []), "attach", ...(m.readOnly ? ["-r"] : []), "-t", m.tmuxSession],
+      paneCommand: attachArgv.map(shellQuote).join(" "),
+      recoveryCommand: `${localTmux} attach ${attachFlag}-t ${shellQuote(m.tmuxSession)}`,
+      attachArgv,
       readOnly: m.readOnly,
     });
   }

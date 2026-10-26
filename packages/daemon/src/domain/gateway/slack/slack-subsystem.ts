@@ -39,6 +39,7 @@ import { envelopeChannel, forwardChannelProblems, makeEnvelopeForwarder } from "
 import type { HostRegistryLoadResult } from "../../hosts/hosts-registry-reader.js";
 import { startSocketInbound, type SocketInboundHandle, type WsLike } from "./socket-inbound.js";
 import { HUMAN_ALERT_TAG, loadHumanRegistry, resolveSlackHandle } from "../human-registry.js";
+import { sharedChannelAddresses, sharedChannelFor } from "../participants.js";
 import { hasLiveHumanGate, isBlockerLive, type QueueRepository } from "../../queue-repository.js";
 import { formatReplyToChoice, REPLY_TO_CHOICE_ACTOR, REPLY_TO_CHAIN_LIMIT, type ReplyToChoice } from "../../reply-to-choice.js";
 import { parseSessionName } from "../../session-name.js";
@@ -97,6 +98,9 @@ export function makeHumanReplyResolver(
     const source = queueRepo.getById(input.qitemId);
     if (source?.humanIntent === "update") return "not-applicable";
     if (!contract) return "not-applicable";
+    // A different person's reply to a question parked on someone else already reached the agent as their own message
+    // (the inbound row, linked to the question). It doesn't resume the question, which stays parked on its person.
+    if (source?.state === "blocked" && queueRepo.askedSomeoneElse(input.actorSession, source.blockedOn)) return "not-applicable";
     const uncertainDecision = `${input.decision}\n\n---\nOpenRig timing context (Slack reply ${JSON.stringify([input.actorSession, input.messageTs ?? null])}): This reply resumed the question, but its ordering against the posted question could not be confirmed. Resuming is not approval; read the person's words in context.`;
     // An acknowledgement retry must not resolve again. Match this reply's durable
     // context, not an older episode's generic resolved marker.
@@ -292,6 +296,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   const registrySurface: RegistrySurface = opts.registry ?? { loadHumanRegistry, resolveSlackHandle };
   const ports = makeQueuePorts(opts.queueRepo, {
     loadHumanRegistry: () => registrySurface.loadHumanRegistry(opts.home),
+    sharedChannels: () => sharedChannelAddresses(opts.home),
   });
   // OPR.0.5.6.1 — the one engine consult (AM-F5: the gateway consults the
   // engine BEFORE dispatch). Null = destination is not a registered human;
@@ -329,7 +334,9 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   // default. The seat is the row's agent side (queue-access projects it into sourceSession for
   // requests, blocked items and resolved decisions alike); an aggregate digest has none and
   // posts to the default. Only called when outbound is ready, so the default is set.
-  const channelFor = (p: OutboundPostPayload): string => resolveOutboundChannel(cfg, p.sourceSession) ?? cfg.channel!;
+  // A post to a registered shared channel goes to that channel (0.7.3); a reply there already follows its root's channel.
+  const channelFor = (p: OutboundPostPayload): string =>
+    sharedChannelFor(p.destinationSession, opts.home)?.channelId ?? resolveOutboundChannel(cfg, p.sourceSession) ?? cfg.channel!;
 
   // OPR.0.5.6.14 — a failed post writes the transport-failed ledger transition so the
   // undelivered surface (and --verify) can name the gateway's error instead of guessing
