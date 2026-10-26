@@ -503,6 +503,33 @@ describe("GET /api/review/rig (OPR.0.4.4.22)", () => {
     expect(body.settledProvenance).toContain("0 handoffs today");
   });
 
+  it.each([
+    { runtime: "claude-code", newer: "running", older: "unknown", glyph: "active" },
+    { runtime: "claude-code", newer: "unknown", older: "idle", glyph: "unknown" },
+    { runtime: "codex", newer: "running", older: "idle", glyph: "idle" },
+  ] as const)("review telemetry keeps $runtime ordering when $older arrives after newer $newer", async ({ runtime, newer, older, glyph }) => {
+    insert({ id: "q-order", dest: "driver@r", tags: ["slice:20-x"], summary: "tracked work" });
+    db.prepare("INSERT INTO rigs (id, name) VALUES ('rig-order', 'rig-order')").run();
+    db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime) VALUES ('node-order', 'rig-order', 'driver', ?)").run(runtime);
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES ('sess-order', 'node-order', 'driver@r', 'running')").run();
+    const eventBus = new EventBus(db);
+    for (const [index, state] of [newer, older].entries()) {
+      eventBus.emit({ type: "agent.activity", rigId: "rig-order", nodeId: "node-order", sessionName: "driver@r", runtime,
+        activity: { state, reason: state === "unknown" ? "usage_limit" : state, evidenceSource: "runtime_hook", evidence: null,
+          rawEvent: state === "unknown" ? "StopFailure" : state === "running" ? "UserPromptSubmit" : "Stop",
+          sampledAt: NOW, eventAt: new Date(Date.parse(NOW) - (index + 1) * 1000).toISOString() } });
+    }
+    const indexer = new SliceIndexer({ slicesRoot: ws.root, additionalSliceRoots: [], dogfoodEvidenceRoot: null, db });
+    const activityStore = new AgentActivityStore({ db, eventBus, now: () => new Date(NOW) });
+    const gatherer = new ReviewGatherer({ db, indexer, gitRepoPath: null, activityStore, now: () => NOW });
+    const activityApp = new Hono();
+    activityApp.use("*", async (c, next) => { c.set("reviewGatherer" as never, gatherer); await next(); });
+    activityApp.route("/api/review", reviewRoutes());
+    const body = await (await activityApp.request("/api/review/rig")).json();
+    expect(body.agents.rows.find((row: { sessionName: string }) => row.sessionName === "driver@r"))
+      .toMatchObject({ runtime, stateGlyph: glyph });
+  });
+
   it("idempotent: two requests over unchanged inputs return byte-identical bodies", async () => {
     insert({ id: "q-1", dest: "a@r", tags: ["slice:s"], summary: "s" });
     const a = await (await app.request("/api/review/rig")).text();

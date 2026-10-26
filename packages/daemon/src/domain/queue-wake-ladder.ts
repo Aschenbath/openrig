@@ -961,14 +961,15 @@ export function classifyPromptAfterRefusal(
 export function makePromptStateReader(deps: {
   db: Database.Database;
   getSeatState?: (nodeId: string) => Pick<ArbitratedSeatState, "activity" | "needsInput" | "needsInputEvidence"> | null | undefined;
-  getLatestHook?: (sessionName: string) => AgentActivity | null | undefined;
+  getLatestHook?: (sessionName: string, runtime: string | null) => AgentActivity | null | undefined;
 }): (destination: string, refusedAt: string) => "blocked" | "clear" | "unknown" {
   return (destination, refusedAt) => {
     const nodeId = resolveSessionNodeId(deps.db, destination);
     const verdict = classifyPromptAfterRefusal(nodeId ? deps.getSeatState?.(nodeId) : null, refusedAt);
     if (verdict !== "unknown" || !nodeId) return verdict;
     const node = deps.db.prepare("SELECT runtime FROM nodes WHERE id = ?").get(nodeId) as { runtime: string | null } | undefined;
-    const hook = deps.getLatestHook?.(destination), runtime = node?.runtime ?? null;
+    const runtime = node?.runtime ?? null;
+    const hook = deps.getLatestHook?.(destination, runtime);
     if (latestHookWaitsOnPerson(hook, runtime) || latestHookPermissionPending(hook, runtime)) return "blocked";
     if (
       (runtime === "codex" || runtime === "claude-code") && hook?.rawEvent === "PermissionPromptCleared" &&
