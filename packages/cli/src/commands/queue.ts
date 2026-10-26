@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { randomBytes } from "node:crypto";
 import { Command, InvalidArgumentError } from "commander";
-import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, DaemonResponseError } from "../client.js";
+import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, DaemonResponseError, type DaemonResponse } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { readOpenRigEnv } from "../openrig-compat.js";
 import { sessionRigOf, isHumanSeatSessionRef } from "../session-name.js";
@@ -10,7 +10,7 @@ import { enumArg, positiveIntArg } from "../cli-error.js";
 import type { StatusDeps } from "./status.js";
 import { resolveContextRef } from "../context-resolve.js";
 import { shellQuote } from "../cross-host-executor.js";
-import { loadHostRegistry, resolveHost } from "../host-registry.js";
+import { loadHostRegistry, resolveHost, resolveRemoteBearer } from "../host-registry.js";
 import { loadHostBindings } from "../host-bindings.js";
 import { omittedReadField, readView } from "../read-view.js";
 import { buildWriteReceipt, compactOutputEnabled, type ReceiptContext } from "../queue-receipt.js";
@@ -332,7 +332,8 @@ async function withClient<T>(
       // render owns the 3-part fact/consequence/action + the io exit (response-integrity
       // contract). One render authority, layered context — never a swallowed exit.
       const where = hostContext ? ` (routing to host '${hostContext}')` : "";
-      console.error(`queue transport failure${where}: ${err.message}`);
+      const what = err instanceof DaemonTimeoutError ? "queue request got no answer in time" : "queue transport failure";
+      console.error(`${what}${where}: ${err.message}`);
       console.error("The write outcome is INDETERMINATE if the request may have reached a daemon — reconcile by ID before any retry.");
     }
     throw err;
@@ -440,6 +441,15 @@ function remoteHostOf(hostId: string | undefined): string | undefined {
   return hostId && hostId !== "local" ? hostId : undefined;
 }
 
+/** A cross-host queue write waits for the selected daemon's own answer. That daemon gives the remote 10 s
+ *  (`QUEUE_FORWARD_TIMEOUT_MS` in the daemon's routes/queue.ts), so waiting only the client's 5 s default
+ *  turns a slow remote's answer into an unknown outcome. */
+const CROSS_HOST_QUEUE_WRITE_TIMEOUT_MS = 15_000;
+
+function crossHostWriteOptions(hostId: string | undefined): { timeoutMs: number } | undefined {
+  return remoteHostOf(hostId) ? { timeoutMs: CROSS_HOST_QUEUE_WRITE_TIMEOUT_MS } : undefined;
+}
+
 /** The daemon's own rule (`resolvesToLocalHost`): a `--host` naming the selected
  *  daemon's selfHostId took the local path, so its receipt must not call the row
  *  remote. Read only for a receipt; an unreadable id leaves the host unconfirmed. */
@@ -452,6 +462,95 @@ async function settleReceiptHost(client: DaemonClient, receipt: ReceiptContext):
   } catch { /* An unreadable id must not change or fail the write's output. */ }
   if (selfHostId === receipt.remoteHost) return { ...receipt, remoteHost: undefined };
   return selfHostId === undefined ? { ...receipt, remoteHostUnconfirmed: true } : receipt;
+}
+
+/** How long the one read-back of a create with an unknown outcome waits for its answer. */
+const CREATE_READ_BACK_TIMEOUT_MS = 10_000;
+
+/** What a create sent, for telling its row from another with the same ID. `claimedSource` is the body's source, which the
+ *  daemon records only when the request carries no sender; `remoteHost` is the host it was sent to with `--host`. */
+interface SentCreate { destinationSession: string; claimedSource: string | undefined; body: string; remoteHost: string | undefined }
+
+/** The daemon's host id: null when it reports none, undefined when it can't be read. */
+async function daemonSelfHostId(client: DaemonClient): Promise<string | null | undefined> {
+  try {
+    const health = await client.get<{ selfHostId?: unknown }>("/healthz", { timeoutMs: 1_000 });
+    if (health.status !== 200) return undefined;
+    return typeof health.data?.selfHostId === "string" && health.data.selfHostId ? health.data.selfHostId : null;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The source the daemon this client reached stores for the create, by its own rules: the sender this client sent, trimmed and
+ *  without a trailing `@<that daemon's host id>` (canonicalSenderSession), or with no sender the body's claimed source, trimmed.
+ *  A forwarded create's source then gains the forwarding daemon's host id (stampSelfHostSuffix), unless its origin was marked
+ *  unknown. Undefined when that host id is needed and can't be read. */
+async function storedSourceOf(client: DaemonClient, sent: SentCreate): Promise<string | undefined> {
+  const { session, originUnknown } = await client.senderIdentity();
+  const source = (session ?? sent.claimedSource)?.trim();
+  if (!source) return undefined;
+  const parts = source.split("@");
+  const canonicalizes = session !== undefined && parts.length === 3 && parts.every(Boolean);
+  const stamps = sent.remoteHost !== undefined && !originUnknown;
+  if (!canonicalizes && !(stamps && parts.length === 2)) return source;
+  const selfId = await daemonSelfHostId(client);
+  if (selfId === undefined) return undefined;
+  const canonical = canonicalizes && parts[2] === selfId ? `${parts[0]}@${parts[1]}` : source;
+  // The daemon forwards only to another host (resolvesToLocalHost): a target naming its own id is a local create, unstamped.
+  const forwarded = stamps && sent.remoteHost !== selfId;
+  return forwarded && selfId && canonical.split("@").length === 2 ? `${canonical}@${selfId}` : canonical;
+}
+
+/** Which field shows a stored row isn't this create, by the rule the daemon applies to a create whose ID already exists
+ *  (the same destination and source, compared exactly), plus the body, which that rule reports as not saved. "unread" when
+ *  the source this create would have can't be established. Null when the row is this create. */
+function notThisCreate(row: Record<string, unknown>, sent: SentCreate, storedSource: string | undefined): "destination" | "unread" | "source" | "body" | null {
+  if (row.destinationSession !== sent.destinationSession) return "destination";
+  if (storedSource === undefined) return "unread";
+  if (row.sourceSession !== storedSource) return "source";
+  if (row.body !== sent.body) return "body";
+  return null;
+}
+
+/** A create whose answer didn't arrive, or arrived unreadable, may still have committed. Read the row back once by the ID it
+ *  was sent with, from the daemon that holds it: this one for a local row, the destination's registered daemon for a
+ *  cross-host one. Only a row that is this create counts as committed; anything else leaves the outcome unknown. It never
+ *  sends the create again. */
+async function readBackCreate(deps: QueueDeps, client: DaemonClient, hostId: string | undefined, qitemId: string, sent: SentCreate): Promise<{ row: Record<string, unknown> | null; note: string }> {
+  const remote = remoteHostOf(hostId);
+  const where = remote ? ` on host '${remote}'` : "";
+  let reader = client;
+  let options: { timeoutMs: number; headers?: Record<string, string> } = { timeoutMs: CREATE_READ_BACK_TIMEOUT_MS };
+  if (remote) {
+    const registry = loadHostRegistry();
+    const match = registry.ok ? resolveHost(registry.registry, remote, loadHostBindings().bindings) : undefined;
+    if (!match?.ok || match.host.transport !== "http") {
+      const why = match?.ok ? "its entry in this CLI's host registry is SSH, not a daemon URL" : "it isn't in this CLI's host registry";
+      return { row: null, note: `This CLI couldn't read the row back from host '${remote}' (${why}).` };
+    }
+    const bearer = resolveRemoteBearer(match.host);
+    if (!bearer.ok) return { row: null, note: `This CLI couldn't read the row back from host '${remote}' (${bearer.error}).` };
+    reader = deps.clientFactory(match.host.url);
+    if (bearer.token) options = { ...options, headers: { Authorization: `Bearer ${bearer.token}` } };
+  }
+  try {
+    const res = await reader.get<Record<string, unknown>>(`/api/queue/${encodeURIComponent(qitemId)}`, options);
+    if (res.status === 200 && res.data?.qitemId === qitemId) {
+      const differs = notThisCreate(res.data, sent, await storedSourceOf(client, sent));
+      if (differs === "unread") {
+        return { row: null, note: `Row ${qitemId}${where} exists, but this CLI couldn't read this daemon's host id to tell whether its source is this create's, so the outcome is still unknown.` };
+      }
+      if (differs) {
+        return { row: null, note: `Row ${qitemId}${where} exists but isn't this create (its ${differs} differs), so the outcome is still unknown. Don't reuse this ID for other work.` };
+      }
+      return { row: res.data, note: `The create committed after all: row ${qitemId}${where} (read back by its ID).` };
+    }
+    if (res.status === 404) return { row: null, note: `No row ${qitemId}${where} yet (read back once by its ID); it may still commit.` };
+    return { row: null, note: `Reading row ${qitemId}${where} back answered ${res.status}, so the outcome is still unknown.` };
+  } catch (err) {
+    return { row: null, note: `Reading row ${qitemId}${where} back didn't answer (${(err as Error).message}), so the outcome is still unknown.` };
+  }
 }
 
 async function printWriteResult(client: DaemonClient, json: boolean, body: unknown, status: number, receipt: ReceiptContext | null): Promise<void> {
@@ -658,6 +757,19 @@ function resolveCurrentSession(explicit: string | undefined, optionName: string)
   if (session) return session;
 
   console.error(`--${optionName} is required when OPENRIG_SESSION_NAME is not set`);
+  process.exitCode = 1;
+  return undefined;
+}
+
+/** For a verb whose actor is the seat's own identity (the X-OpenRig-Session header the CLI sets from OPENRIG_SESSION_NAME),
+ *  where the named flag is deprecated and ignored: the error names what actually sets the actor, never the flag. */
+function requireSeatSession(ignoredFlag: string): string | undefined {
+  const session = readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME");
+  if (session) return session;
+
+  console.error(`OPENRIG_SESSION_NAME is not set, so there's no seat to act as. Run this from a managed seat, or set ` +
+    `OPENRIG_SESSION_NAME to the seat's session name (for example dev-impl@my-rig). --${ignoredFlag} is ignored: the ` +
+    "actor is the seat's own identity.");
   process.exitCode = 1;
   return undefined;
 }
@@ -927,7 +1039,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
         const receipt = writeReceipt(opts.full, {
           verb: "create", nudgeSuppressed: opts.nudge === false, idGiven: opts.id !== undefined, remoteHost: remoteHostOf(hostResolved.hostId),
         });
-        const res = await client.post<Record<string, unknown>>("/api/queue/create", {
+        const res: DaemonResponse<Record<string, unknown>> | Error = await client.post<Record<string, unknown>>("/api/queue/create", {
           ...(managedSource === undefined ? { sourceSession: source } : {}),
           qitemId,
           destinationSession: hostResolved.destination,
@@ -948,20 +1060,61 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           // OPR.0.4.6.MH3 FR-1: the out-of-band host envelope (omitted for
           // plain local writes — the local path stays byte-identical).
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
-        }).catch((error: unknown) => {
+        }, crossHostWriteOptions(hostResolved.hostId)).catch((error: unknown) => (error instanceof Error ? error : new Error(String(error))));
+        const sent: SentCreate = { destinationSession: hostResolved.destination, claimedSource: managedSource === undefined ? source : undefined, body: resolvedBody,
+          remoteHost: remoteHostOf(hostResolved.hostId) };
+        // Every create that's answered with a row ends here: its warning, --verify's delivery, and the output.
+        const finish = async (created: Record<string, unknown>, status: number) => {
+          const createWarning = created?.createWarning as { code?: unknown; message?: unknown } | undefined;
+          if (status < 400 && createWarning?.code === "qitem_body_not_saved" && typeof createWarning.message === "string") {
+            console.error(`Warning: ${createWarning.message}`);
+          }
+          // An ask to a shared channel was accepted; nothing there will answer it (0.7.3).
+          const advisories = Array.isArray(created?.advisories) ? created.advisories as Array<{ code?: unknown; message?: unknown }> : [];
+          for (const advisory of advisories) {
+            if (status < 400 && advisory.code === "shared_channel_correspondence" && typeof advisory.message === "string") console.error(`Warning: ${advisory.message}`);
+          }
+          if (opts.verify && status < 400) {
+            const createdId = typeof created.qitemId === "string" ? created.qitemId : null;
+            const delivery = createdId
+              ? await waitForDeliveryOutcome(client, createdId, deps.deliveryVerify, { destinationSession: hostResolved.destination, nudge: opts.nudge })
+              : unreadableDeliveryResult(null, hostResolved.destination, {}, "create response did not include a qitem id; delivery cannot be correlated");
+            await printWriteResult(client, opts.json ?? false, { ...created, qitemId: createdId, persisted: true, delivery }, status, receipt);
+            return;
+          }
+          await printWriteResult(client, opts.json ?? false, created, status, receipt);
+        };
+        if (res instanceof Error) {
           // A pre-header disconnect can follow a committed create. Preserve the
           // typed error, but do not let the shared renderer assert nondelivery.
-          if (error instanceof DaemonConnectionError) error.writeOutcome = "unknown";
-          if (error instanceof DaemonConnectionError || error instanceof DaemonResponseError) {
+          if (res instanceof DaemonConnectionError) res.writeOutcome = "unknown";
+          // No answer in time, a lost connection, or a response lost or unreadable after its headers: the create may have
+          // committed, so read it back once by its ID.
+          if (res instanceof DaemonTimeoutError || res instanceof DaemonConnectionError || res instanceof DaemonResponseError) {
+            const late = await readBackCreate(deps, client, hostResolved.hostId, qitemId, sent);
+            console.error(late.note);
+            if (late.row) {
+              await finish(late.row, 200);
+              return;
+            }
+          }
+          if (res instanceof DaemonConnectionError || res instanceof DaemonResponseError) {
             // Keep the shared typed error/exit path, including --json, while
             // supplying the identity missing from an unreadable/late response.
-            error.message += ` ${recovery}`;
+            res.message += ` ${recovery}`;
           }
-          throw error;
-        });
+          throw res;
+        }
         if (res.status >= 400 && res.data?.outcome === "indeterminate") {
           // Forwarded writes may return a structured unknown outcome rather
-          // than throw. Preserve that failure and expose the same recovery ID.
+          // than throw: read the row back once from the destination before reporting it.
+          const late = await readBackCreate(deps, client, hostResolved.hostId, qitemId, sent);
+          console.error(late.note);
+          if (late.row) {
+            await finish(late.row, 200);
+            return;
+          }
+          // Preserve that failure and expose the same recovery ID.
           printResult(opts.json ?? false, { ...res.data, qitemId, recovery }, res.status);
           return;
         }
@@ -969,20 +1122,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
         if (refusal) console.error(`No row was created: ${refusal}`);
         const hint = hostSubstitutionHint(res.status, res.data, opts.destination, opts.host, hostResolved, `, keeping --id ${shellQuote(qitemId)}`);
         if (hint) console.error(hint);
-        const createWarning = res.data?.createWarning as { code?: unknown; message?: unknown } | undefined;
-        if (res.status < 400 && createWarning?.code === "qitem_body_not_saved" && typeof createWarning.message === "string") {
-          console.error(`Warning: ${createWarning.message}`);
-        }
-        if (opts.verify && res.status < 400) {
-          const created = res.data;
-          const qitemId = typeof created.qitemId === "string" ? created.qitemId : null;
-          const delivery = qitemId
-            ? await waitForDeliveryOutcome(client, qitemId, deps.deliveryVerify, { destinationSession: hostResolved.destination, nudge: opts.nudge })
-            : unreadableDeliveryResult(null, hostResolved.destination, {}, "create response did not include a qitem id; delivery cannot be correlated");
-          await printWriteResult(client, opts.json ?? false, { ...created, qitemId, persisted: true, delivery }, res.status, receipt);
-          return;
-        }
-        await printWriteResult(client, opts.json ?? false, res.data, res.status, receipt);
+        await finish(res.data, res.status);
       }, hostResolved.hostId !== undefined, hostResolved.hostId);
     });
 
@@ -995,7 +1135,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .action(async (qitemId: string, opts: { destination?: string; json?: boolean; full?: boolean }) => {
       // P21 I3 reconcile: the claimant is DERIVED from the seat env — --destination deprecated + ignored,
       // no body claim. Verify the env (the header source) or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "destination")) return;
+      if (!requireSeatSession("destination")) return;
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/claim`, {});
@@ -1013,7 +1153,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .action(async (qitemId: string, opts: { destination?: string; reason: string; json?: boolean; full?: boolean }) => {
       // P21 I3 reconcile: the releaser is DERIVED from the seat env — --destination deprecated + ignored,
       // no body claim. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "destination")) return;
+      if (!requireSeatSession("destination")) return;
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/unclaim`, {
@@ -1025,11 +1165,11 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
 
   cmd
     .command("update <qitemId>")
-    .description("Append a note and/or mutate qitem state. A note without --state never changes row state. state=done REQUIRES --closure-reason (one of: handed_off_to, denied, canceled, no-follow-on, escalation, superseded). To wait for another qitem, use rig queue block <id> --on <child>. Closure ≠ acceptance: handed_off_to records delivery to the next stage; acceptance is the next stage's verdict on its own qitem, not this closure.")
+    .description("Append a note and/or mutate qitem state. A note without --state never changes row state. state=done REQUIRES --closure-reason (one of: handed_off_to, denied, canceled, no-follow-on, escalation, superseded). To cancel a row: --state done --closure-reason canceled. To wait for another qitem, use rig queue block <id> --on <child>. Closure ≠ acceptance: handed_off_to records delivery to the next stage; acceptance is the next stage's verdict on its own qitem, not this closure.")
     .option("--actor <session>", "(deprecated, ignored) the actor is derived from the seat env (X-OpenRig-Session); P21 I3 made the update route derive it from the transport header")
     .option("--state <state>", "New state: pending | in-progress | done | blocked | failed | denied | canceled | handed-off")
     .option("--reopen", "Explicitly acknowledge a deliberate terminal-to-active repair; requires --state and --note")
-    .option("--closure-reason <reason>", "Required for state=done; also 'superseded' on state=canceled (with --closure-target = the successor) records a supersession, distinct from an abandoned cancel")
+    .option("--closure-reason <reason>", "Required for state=done. --state canceled takes no reason, except 'superseded' (with --closure-target = the successor), which records a supersession, distinct from an abandoned cancel")
     .option("--closure-target <target>", "Required for handed_off_to, escalation, and superseded; blocked_on park records use state=blocked with --blocked-on")
     .option("--resolution <text>", "The outcome, stored on the row and shown by rig queue show. Needs --state done, canceled, denied, failed or handed-off, and non-blank text. Stored when the update closes an open row, after anything the row already has (a fallback line, an earlier outcome); a row that is already closed keeps what it has")
     .option("--blocked-on <blocker>", "For state=blocked: the blocker — a qitem id (must exist and be live), a human seat (FR-6 park; requires summary + evidence_ref), or a typed non-qitem gate 'fold:<what>' / 'auth:<what>' / 'external:<what>'")
@@ -1074,7 +1214,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       // P21 I3 reconcile: the actor is DERIVED from the seat env (X-OpenRig-Session, stamped by
       // DaemonClient) — --actor is deprecated + ignored, no body actorSession. Verify the env (the
       // header source) or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal). Matches `resolve`.
-      if (!resolveCurrentSession(undefined, "actor")) return;
+      if (!requireSeatSession("actor")) return;
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/update`, {
@@ -1138,7 +1278,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     }) => {
       // P21 I3 reconcile: actor DERIVED from the seat env (X-OpenRig-Session) — --actor deprecated +
       // ignored, no body actorSession. Verify the env, else the daemon returns 400 actor_required (no seat identity to record). Matches `resolve`.
-      if (!resolveCurrentSession(undefined, "actor")) return;
+      if (!requireSeatSession("actor")) return;
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/update`, {
@@ -1162,8 +1302,8 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
   // in-progress on the SAME item) — never a closure, never a new owner.
   cmd
     .command("resolve <qitemId>")
-    .description("Resolve a leg-1 parked qitem (state=blocked on a human seat): records the decision text durably in queue_transitions, unparks blocked -> in-progress, and nudges the owner. Non-closure.")
-    .requiredOption("--decision <text>", "The human's decision text (non-empty; lands in transition_note + the audit row)")
+    .description("Resolve a qitem blocked on a human seat or a typed gate (external:, fold:, auth:): records the decision or satisfaction evidence durably, unparks blocked -> in-progress, and nudges the owner. Non-closure; qitem dependencies are not resolved by this command.")
+    .requiredOption("--decision <text>", "The human decision or typed-gate satisfaction evidence (non-empty; lands in transition_note + the audit row)")
     .option("--actor <session>", "(deprecated, ignored) resolver is derived from the seat env (X-OpenRig-Session)")
     .option("--bearer <token>", "Operator bearer token for the mission-control write gate (or set OPENRIG_AUTH_BEARER_TOKEN; loopback daemons without a configured bearer need none)")
     .option("--no-notify", "Skip the best-effort owner nudge (the unpark still commits)")
@@ -1178,7 +1318,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       // P21: the resolver is DERIVED from the seat env (X-OpenRig-Session, stamped by DaemonClient) —
       // --actor is deprecated + ignored. The pre-check verifies the env (the header source); else the
       // daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "actor")) return;
+      if (!requireSeatSession("actor")) return;
       const deps = getDeps();
       const bearer = opts.bearer ?? process.env.OPENRIG_AUTH_BEARER_TOKEN;
       await withClient(deps, async (client) => {
@@ -1238,7 +1378,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     }) => {
       // P21 I3 reconcile: the handing-off seat is DERIVED from the seat env (X-OpenRig-Session) —
       // --from deprecated + ignored, no body fromSession. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "from")) return;
+      if (!requireSeatSession("from")) return;
       // slice-08 OPR.0.4.7.8 — body-input parity. Resolve through the shipped
       // resolveQueueBody ONLY when a body source is supplied; neither preserves
       // today's source-body default (POST body undefined). Both/invalid reject
@@ -1290,7 +1430,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           targetRepo: opts.targetRepo,
           nudge: opts.nudge,
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
-        });
+        }, crossHostWriteOptions(hostResolved.hostId));
         const hint = hostSubstitutionHint(res.status, res.data, opts.to, opts.host, hostResolved);
         if (hint) console.error(hint);
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, {
@@ -1342,7 +1482,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     }) => {
       // P21 I3 reconcile: the handing-off seat is DERIVED from the seat env (X-OpenRig-Session) —
       // --from deprecated + ignored, no body fromSession. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "from")) return;
+      if (!requireSeatSession("from")) return;
       // slice-08 OPR.0.4.7.8 — body-input parity (same contract as handoff):
       // resolve only when a body source is supplied; neither keeps the
       // source-body default; both/invalid reject before daemon contact.
@@ -1392,7 +1532,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           targetRepo: opts.targetRepo,
           nudge: opts.nudge,
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
-        });
+        }, crossHostWriteOptions(hostResolved.hostId));
         const hint = hostSubstitutionHint(res.status, res.data, opts.to, opts.host, hostResolved);
         if (hint) console.error(hint);
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, {
@@ -1791,7 +1931,7 @@ Examples:
       }
       // P21 I3 reconcile: the sender is DERIVED from the seat env (X-OpenRig-Session) — --sender
       // deprecated + ignored, no body senderSession. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "sender")) return;
+      if (!requireSeatSession("sender")) return;
       const deps = getDeps();
       const tags = opts.tags ? opts.tags.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
       await withClient(deps, async (client) => {

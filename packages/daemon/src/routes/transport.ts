@@ -1,7 +1,10 @@
 import { Hono } from "hono";
-import { CAPTURE_INPUT_BOX_DEADLINE_MS, type SessionTransport, type TargetSpec } from "../domain/session-transport.js";
+import { CAPTURE_INPUT_BOX_DEADLINE_MS, CAPTURE_READABLE_BUDGET_MS, type SessionTransport, type TargetSpec } from "../domain/session-transport.js";
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 import { requireSenderIdentity, transportSenderSession } from "./require-sender-identity.js";
+import { OCCUPANT_GENERATION_HEADER, runtimeSwitchCustodyRefusal } from "./runtime-switch-custody.js";
+import { runtimeSwitchCommittedSince, runtimeSwitchSummary } from "../domain/seat-runtime-switch-service.js";
+import type Database from "better-sqlite3";
 import type { OutboxHandler } from "../domain/outbox-handler.js";
 import { wrapPaneEnvelope } from "../lib/pane-envelope.js";
 
@@ -95,6 +98,10 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     if (body.typeWithoutChecking && (!body.dangerouslyInteract || !body.reason?.trim())) return c.json({ ok: false, reason: "invalid_dangerously_interact",
       error: "--type-without-checking requires --dangerously-interact and --reason. No text was sent." }, 400);
     const derivedActor = transportSenderSession(c) ?? null;
+    // Slice 16: a runtime switch's own predecessor or not-yet-committed successor doesn't send as the seat.
+    const db = c.get("db" as never) as Database.Database;
+    const switchHeld = runtimeSwitchCustodyRefusal(db, derivedActor, c.req.header(OCCUPANT_GENERATION_HEADER));
+    if (switchHeld) return c.json(switchHeld.body, switchHeld.status);
 
     // Check for ambiguity first
     const resolved = await transport.resolveSessions({ session: body.session });
@@ -104,6 +111,17 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     }
 
     const exactText = typeof body.exactText === "string" ? body.exactText : undefined;
+    // Slice 16: a seat that is switching runtime takes no input until its switch ends. Rather than wait behind the
+    // switch's lease (its whole confirmation window), the send is held at once, like any held send, and says why.
+    const target = resolved.sessions.length === 1 ? resolved.sessions[0]!.sessionName : null;
+    const switching = target ? runtimeSwitchSummary(db, { session: target }) : null;
+    if (target && switching && (switching.phase === "preparing" || switching.phase === "confirmed")) {
+      return c.json({ ok: true, sessionName: target, outcome: "retained", sent: false, verified: false, reason: "runtime_switch_in_progress",
+        runtimeSwitch: switching,
+        warning: `${target} is switching runtime (${switching.from} -> ${switching.to}, switch ${switching.id}) until about ${switching.deadlineAt}. Send it again after the switch; it then reaches whoever holds the seat.` });
+    }
+    const sendStartedAt = new Date().toISOString();
+
     const result = await transport.send(body.session, body.text ?? "", {
       deliveryId: body.deliveryId,
       verify: body.verify,
@@ -168,6 +186,12 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
         pane_in_mode: 409,
       };
       const status = (statusMap[result.reason ?? ""] ?? 500) as 400 | 404 | 409 | 500 | 502 | 503;
+      // A send that waited while its seat switched runtime: say so, and that it needs sending again.
+      const moved = result.reason === "guard_target_changed" && result.sent === false && target ? runtimeSwitchCommittedSince(db, target, sendStartedAt) : null;
+      if (moved) {
+        Object.assign(result, { runtimeSwitch: moved,
+          error: `${result.error ?? "The seat changed while this send waited."} ${target} moved to ${moved.to} (runtime switch ${moved.id}) while this send waited, so nothing was typed. Send it again to reach its new occupant.` });
+      }
       return c.json(result, status);
     }
 
@@ -216,10 +240,18 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       pod?: string;
       lines?: number;
       inputBox?: boolean;
+      readable?: { width?: unknown; height?: unknown };
     }>();
     // Read an agent seat's input box only when the request asks: `rig capture` and the MCP tool do; send --verify and
-    // walk read only the pane text.
+    // walk read only the pane text. The same readers learn when a pane is too small to show a prompt.
     const inputBox = body.inputBox === true;
+    const promptPane = inputBox;
+    // `rig capture --readable` / `--size WxH`: read a small seat at that size, then give its window back.
+    const dimension = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 1000;
+    if (body.readable !== undefined && !(dimension(body.readable?.width) && dimension(body.readable?.height))) {
+      return c.json({ ok: false, error: "readable needs a width and height, whole numbers from 1 to 1000" }, 400);
+    }
+    const readable = body.readable ? { width: body.readable.width as number, height: body.readable.height as number } : undefined;
 
     // Multi-target: rig or pod
     if (body.rig || body.pod) {
@@ -234,9 +266,12 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
 
       // One budget for the whole fan-out's input-box reads, so slow tmux adds at most that to the request.
       const inputBoxBudget = { remainingMs: CAPTURE_INPUT_BOX_DEADLINE_MS };
+      // And one for readable reads, so a fan-out of small seats returns inside the CLI's wait.
+      const readableBudget = { remainingMs: CAPTURE_READABLE_BUDGET_MS };
       const results = [];
       for (const session of resolved.sessions) {
-        const result = await transport.capture(session.sessionName, { lines: body.lines, inputBox, inputBoxBudget });
+        const result = await transport.capture(session.sessionName, { lines: body.lines, inputBox, inputBoxBudget, promptPane,
+          ...(readable ? { readable, readableBudget } : {}) });
         results.push(result);
       }
       return c.json({ results });
@@ -247,7 +282,7 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       return c.json({ error: "Provide session, rig, or pod to capture" }, 400);
     }
 
-    const result = await transport.capture(body.session, { lines: body.lines, inputBox });
+    const result = await transport.capture(body.session, { lines: body.lines, inputBox, promptPane, ...(readable ? { readable } : {}) });
     if (!result.ok) {
       const statusMap: Record<string, number> = {
         session_missing: 404,
@@ -296,6 +331,9 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     if (body.typeWithoutChecking && (!body.dangerouslyInteract || !body.reason?.trim())) return c.json({ ok: false, reason: "invalid_dangerously_interact",
       error: "--type-without-checking requires --dangerously-interact and --reason. No text was sent." }, 400);
     const derivedActor = transportSenderSession(c) ?? null;
+    // Slice 16: a runtime switch's own predecessor or not-yet-committed successor doesn't send as the seat.
+    const switchHeld = runtimeSwitchCustodyRefusal(c.get("db" as never) as Database.Database, derivedActor, c.req.header(OCCUPANT_GENERATION_HEADER));
+    if (switchHeld) return c.json(switchHeld.body, switchHeld.status);
 
     // P21 I4 (orch ruling from specimen 5 — the false "From: pm-lead" the incident acted upon): the
     // From: line rendered into every recipient's terminal MUST DERIVE from the transport identity, never

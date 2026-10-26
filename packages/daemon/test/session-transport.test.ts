@@ -22,6 +22,7 @@ import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js"
 import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_guard.js";
 import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 import { EventBus } from "../src/domain/event-bus.js";
+import { QueueRepository } from "../src/domain/queue-repository.js";
 import { getNodeInventory } from "../src/domain/node-inventory.js";
 import type { TmuxAdapter, TmuxResult } from "../src/adapters/tmux.js";
 import { createFullTestDb } from "./helpers/test-app.js";
@@ -494,6 +495,7 @@ function mockTmux(overrides?: Partial<{
   sendText: (target: string, text: string) => Promise<TmuxResult>;
   sendKeys: (target: string, keys: string[]) => Promise<TmuxResult>;
   capturePaneContent: (paneId: string, lines?: number) => Promise<string | null>;
+  listPanes: (sessionName: string) => Promise<Array<{ id: string }>>;
   getPaneCommand: (paneId: string) => Promise<string | null>;
   isPaneInMode: (paneId: string) => Promise<boolean | null>;
   cancelPaneMode: (target: string) => Promise<TmuxResult>;
@@ -512,7 +514,7 @@ function mockTmux(overrides?: Partial<{
     killSession: async () => ({ ok: true as const }),
     listSessions: async () => [],
     listWindows: async () => [],
-    listPanes: async () => [],
+    listPanes: overrides?.listPanes ?? (async () => []),
     startPipePane: async () => ({ ok: true as const }),
     stopPipePane: async () => ({ ok: true as const }),
     getPanePid: async () => null,
@@ -575,6 +577,41 @@ describe("SessionTransport", () => {
     sessionRegistry.updateBinding(node.id, { tmuxSession: "r00-legacy-worker-a" });
     return { rig, node, session };
   }
+
+  it("community contract: a successful queue wake passes through the transport once", async () => {
+    const { session } = seedCanonicalRig("synth");
+    sessionRegistry.recordCommunityHarnessSelection(session.id, "synth");
+    let screen = "custom harness screen";
+    const sendText = vi.fn(async (_target: string, text: string) => { screen = text; return { ok: true as const }; });
+    const sendKeys = vi.fn(async () => ({ ok: true as const }));
+    const transport = createTransport(mockTmux({ getPaneCommand: async () => "node", capturePaneContent: async () => screen, sendText, sendKeys }),
+      { sleep: async () => {} });
+    const queue = new QueueRepository(db, new EventBus(db), { transport, validateRig: () => true });
+    const item = await queue.create({ sourceSession: "sender@my-rig", destinationSession: "dev-impl@my-rig", body: "assigned task", nudge: false });
+    await queue.maybeNudge(item.qitemId, item.destinationSession, true, item.sourceSession);
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(sendText.mock.calls[0]![1]).toContain(item.qitemId);
+    expect(sendKeys).toHaveBeenCalledTimes(1);
+    expect(sendKeys.mock.calls[0]).toEqual(["dev-impl@my-rig", ["Enter"]]);
+    expect(queue.getById(item.qitemId)?.lastNudgeResult).toBe("verified");
+  });
+
+  it.each([
+    ["a shell", "bash", "shell prompt", "target_runtime_unverified"],
+    ["a numbered choice", "node", "› 1. Yes, continue\n  2. No, cancel\n\nPress enter to continue", "target_needs_input"],
+  ])("community contract: refuses %s without pasting text or pressing Enter", async (_label, command, screen, reason) => {
+    const { session } = seedCanonicalRig("synth");
+    sessionRegistry.recordCommunityHarnessSelection(session.id, "synth");
+    const sendText = vi.fn(async () => ({ ok: true as const }));
+    const sendKeys = vi.fn(async () => ({ ok: true as const }));
+    const transport = createTransport(mockTmux({ getPaneCommand: async () => command,
+      capturePaneContent: async () => screen, sendText, sendKeys }));
+    const result = await transport.send("dev-impl@my-rig", "ordinary work");
+    expect(result).toMatchObject({ ok: false, reason });
+    expect(result.sent).not.toBe(true);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendKeys).not.toHaveBeenCalled();
+  });
 
   function seedExternalCliRig() {
     const rig = rigRepo.createRig("rigged-buildout");
@@ -1160,8 +1197,8 @@ describe("SessionTransport", () => {
 
   // Test 7: send with mid-work detected → DELIVER WITH ADVISORY (OPR.0.4.3.28 fast-follow —
   // mid_work downgraded from a hard refuse to a non-blocking advisory; busy is not a block).
-  it("send with mid-work detected DELIVERS with a non-blocking advisory (not a refusal)", async () => {
-    seedCanonicalRig();
+  it.each(["codex", "claude-code"])("%s send with mid-work detected DELIVERS with a non-blocking advisory (not a refusal)", async (runtime) => {
+    seedCanonicalRig(runtime);
     const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
     const tmux = mockTmux({
       capturePaneContent: async () => "Working on task...\n⠋ Processing files\nesc to interrupt",
@@ -1173,6 +1210,13 @@ describe("SessionTransport", () => {
     expect(result.ok).toBe(true);
     expect(result.warning).toContain("mid-task");
     expect(result.warning).toContain("busy is advisory");
+    if (runtime === "codex") {
+      expect(result.warning).toContain("joins its running turn and may redirect it");
+      expect(result.warning).toContain("--wait-for-idle <seconds>");
+    } else {
+      expect(result.warning).not.toContain("joins its running turn");
+      expect(result.warning).not.toContain("--wait-for-idle");
+    }
     expect(sendTextSpy).toHaveBeenCalled();
   });
 
@@ -1715,6 +1759,62 @@ describe("SessionTransport", () => {
     expect(result.activity).toMatchObject({ state: "needs_input", reason: "selection_prompt" });
     expect(capture).toHaveBeenCalledTimes(1);
     expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it("uses the recorded pane when a fresh Claude hook checks a split session", async () => {
+    const { node } = seedCanonicalRig();
+    sessionRegistry.updateBinding(node.id, { tmuxPane: "%7" });
+    const eventBus = new EventBus(db);
+    const agentActivityStore = new AgentActivityStore({ db, eventBus });
+    agentActivityStore.recordHookEvent({
+      runtime: "claude-code",
+      sessionName: "dev-impl@my-rig",
+      hookEvent: "UserPromptSubmit",
+    });
+    const captures: string[] = [];
+    const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
+    const tmux = mockTmux({
+      listPanes: async () => [{ id: "%7" }],
+      capturePaneContent: async (target) => {
+        captures.push(target);
+        return target === "%7"
+          ? "2 new MCP servers found in this project\nSelect any you wish to enable.\nMCP servers may execute code or access system resources. All tool calls\nrequire approval. Learn more in the MCP documentation.\n❯ [✔] dummy1\n  [✔] dummy2\n     Enable selected\nSpace to select · Esc to reject all"
+          : "idle prompt\n❯ ";
+      },
+      sendText: sendTextSpy,
+    });
+    const transport = createTransport(tmux, { agentActivityStore, eventBus });
+
+    const result = await transport.send("dev-impl@my-rig", "hello");
+
+    expect(result).toMatchObject({ ok: false, reason: "target_needs_input" });
+    expect(captures).toContain("%7");
+    expect(captures).not.toContain("dev-impl@my-rig");
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it("uses the recorded pane for Codex foreground verification in a split session", async () => {
+    const { node } = seedCanonicalRig("codex");
+    sessionRegistry.updateBinding(node.id, { tmuxPane: "%7" });
+    const paneCommands: string[] = [];
+    const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
+    const tmux = mockTmux({
+      getPaneCommand: async (target) => {
+        paneCommands.push(target);
+        return target === "%7" ? "-codex" : "-bash";
+      },
+      capturePaneContent: async () => "idle prompt\n❯ ",
+      sendText: sendTextSpy,
+    });
+    const transport = createTransport(tmux);
+
+    const result = await transport.send("dev-impl@my-rig", "hello");
+
+    expect(result.ok).toBe(true);
+    expect(result.reason).not.toBe("target_runtime_unverified");
+    expect(paneCommands).toContain("%7");
+    expect(paneCommands).not.toContain("dev-impl@my-rig");
+    expect(sendTextSpy).toHaveBeenCalledTimes(1);
   });
 
   it("keeps busy sends advisory when a fresh Claude working hook has no visible prompt", async () => {

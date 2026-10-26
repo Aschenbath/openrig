@@ -6,7 +6,8 @@
 //   - reads are unbounded (the B5 lesson: a default limit silently truncates a large backlog).
 
 import type { QueueRepository, QueueItem as RepoQueueItem } from "../../queue-repository.js";
-import { loadHumanRegistry, resolveRegisteredHumanAddress, type LoadResult, type HumanFragment } from "../human-registry.js";
+import { loadHumanRegistry, registeredPeople, resolveRegisteredHumanAddress, type LoadResult, type HumanFragment } from "../human-registry.js";
+import { sharedChannelAddresses } from "../participants.js";
 import type { HumanQuestion } from "../../human-questions.js";
 import { ownerNotificationLevelAtLeast, type OwnerNotificationLevel, type QueueTransition } from "../../queue-transition-log.js";
 
@@ -23,6 +24,8 @@ export interface QueueItem {
   humanDetail?: string | null;
   replyTo?: string | null;
   humanQuestions?: HumanQuestion[] | null;
+  /** Posted into a registered shared channel (0.7.3): nobody there can answer, so its questions show as text. */
+  sharedChannel?: boolean;
   summary?: string | null;
   body?: string | null;
   evidenceRef?: string | null;
@@ -75,10 +78,19 @@ export interface OutboundQueuePort {
   listHumanAlerts(filter: AlertFilterOpts): Promise<QueueItem[]>;
 }
 
-function project(q: RepoQueueItem, transition: QueueTransition, entities: readonly HumanFragment[]): QueueItem | null {
+/** One open ask's current episode for `rig slack post-open-asks`: posted (it has its receipt) and eligible (at or above
+ *  the posting floor, as recorded) say whether Slack still owes it a post. */
+export interface OpenAskEpisode {
+  item: QueueItem;
+  posted: boolean;
+  eligible: boolean;
+}
+
+function project(q: RepoQueueItem, transition: QueueTransition, entities: readonly HumanFragment[], channels: ReadonlyArray<{ address: string }> = []): QueueItem | null {
   const r = q as unknown as Record<string, unknown>;
   let destinationSession: string | null = null;
   let sourceSession: string | null = null;
+  let sharedChannel = false;
   if (transition.ownerNotificationKind === "human-decision-resolved") {
     destinationSession = resolveRegisteredHumanAddress(transition.actorSession, entities);
     sourceSession = q.destinationSession;
@@ -86,7 +98,12 @@ function project(q: RepoQueueItem, transition: QueueTransition, entities: readon
     destinationSession = resolveRegisteredHumanAddress(q.blockedOn, entities);
     sourceSession = q.destinationSession;
   } else {
+    // A row addressed to a person, or to a registered shared channel (posted into that channel; 0.7.3).
     destinationSession = resolveRegisteredHumanAddress(q.destinationSession, entities);
+    if (!destinationSession) {
+      destinationSession = channels.find((channel) => channel.address === q.destinationSession)?.address ?? null;
+      sharedChannel = destinationSession !== null;
+    }
     sourceSession = q.sourceSession;
   }
   if (!destinationSession) return null;
@@ -101,6 +118,7 @@ function project(q: RepoQueueItem, transition: QueueTransition, entities: readon
     humanDetail: q.humanDetail,
     replyTo: q.replyTo ?? null,
     humanQuestions: q.humanQuestions ?? null,
+    ...(sharedChannel ? { sharedChannel } : {}),
     summary: (r.summary as string | null) ?? null,
     body: (r.body as string | null) ?? null,
     evidenceRef: (r.evidenceRef as string | null) ?? null,
@@ -139,8 +157,35 @@ export async function seedBacklogAsHistory(opts: {
  *  no `-A` scope trap (list() here is repository-wide), no bounded-body N+1 (rows carry bodies). */
 export function makeQueuePorts(
   queueRepo: QueueRepository,
-  opts: { loadHumanRegistry?: () => LoadResult } = {},
-): InboundQueuePort & OutboundQueuePort {
+  opts: { loadHumanRegistry?: () => LoadResult; sharedChannels?: () => ReadonlyArray<{ address: string }> } = {},
+): InboundQueuePort & OutboundQueuePort & { listOpenAsks(filter: AlertFilterOpts): Promise<OpenAskEpisode[]> } {
+  /** Each active row's current owner-notification episode, projected to its person or shared channel. Posted episodes
+   *  are skipped unless asked for (the alert sweep never wants them). Null when nobody is registered. */
+  const currentEpisodes = (includePosted: boolean): Array<{ item: QueueItem; posted: boolean }> | null => {
+    // Nobody registered yet isn't a broken registry: rows to a registered shared channel still post (0.7.3).
+    const people = registeredPeople((opts.loadHumanRegistry ?? (() => loadHumanRegistry()))());
+    if (!people) return null;
+    const channels = (opts.sharedChannels ?? (() => sharedChannelAddresses()))();
+    // Avoid building waiting/recovery views for rows with no unposted owner notification.
+    // Keep list(activeOnly)'s selection, ordering and cap; this remains an O(N) ID scan.
+    const ids = queueRepo.db.prepare(
+      `SELECT qitem_id FROM queue_items
+       WHERE state IN ('pending', 'in-progress', 'blocked')
+       ORDER BY CASE WHEN state IN ('pending', 'in-progress', 'blocked') THEN 0 ELSE 1 END, ts_created DESC
+       LIMIT ?`,
+    ).all(1000000) as Array<{ qitem_id: string }>;
+    return ids.flatMap(({ qitem_id: qitemId }) => {
+      const transition = queueRepo.transitionLog.latestOwnerNotificationForQitem(qitemId);
+      if (!transition) return [];
+      const notificationKey = `${qitemId}:${transition.transitionId}`;
+      const posted = queueRepo.transitionLog.hasOwnerNotificationReceipt(qitemId, notificationKey);
+      if (posted && !includePosted) return [];
+      const row = queueRepo.getById(qitemId);
+      if (!row) return [];
+      const item = project(row, transition, people, channels);
+      return item ? [{ item, posted }] : [];
+    });
+  };
   return {
     getQitem: (qitemId) => queueRepo.getById(qitemId),
     getHumanAnswer: (qitemId, actorSession) => queueRepo.getHumanAnswer(qitemId, actorSession),
@@ -164,27 +209,13 @@ export function makeQueuePorts(
       return (created as unknown as { qitemId: string }).qitemId;
     },
     async listHumanAlerts(filter: AlertFilterOpts): Promise<QueueItem[]> {
-      const registry = (opts.loadHumanRegistry ?? (() => loadHumanRegistry()))();
-      if (!registry.ok) return [];
-      // Avoid building waiting/recovery views for rows with no unposted owner notification.
-      // Keep list(activeOnly)'s selection, ordering and cap; this remains an O(N) ID scan.
-      const ids = queueRepo.db.prepare(
-        `SELECT qitem_id FROM queue_items
-         WHERE state IN ('pending', 'in-progress', 'blocked')
-         ORDER BY CASE WHEN state IN ('pending', 'in-progress', 'blocked') THEN 0 ELSE 1 END, ts_created DESC
-         LIMIT ?`,
-      ).all(1000000) as Array<{ qitem_id: string }>;
-      const projected = ids.flatMap(({ qitem_id: qitemId }) => {
-        const transition = queueRepo.transitionLog.latestOwnerNotificationForQitem(qitemId);
-        if (!transition) return [];
-        const notificationKey = `${qitemId}:${transition.transitionId}`;
-        if (queueRepo.transitionLog.hasOwnerNotificationReceipt(qitemId, notificationKey)) return [];
-        const row = queueRepo.getById(qitemId);
-        if (!row) return [];
-        const item = project(row, transition, registry.entities);
-        return item ? [item] : [];
-      });
-      return filterHumanAlerts(projected, filter);
+      return filterHumanAlerts((currentEpisodes(false) ?? []).map(({ item }) => item), filter);
+    },
+    /** Every open ask (a human-required episode, posted or not, at any level), each marked posted and eligible. */
+    async listOpenAsks(filter: AlertFilterOpts): Promise<OpenAskEpisode[]> {
+      return (currentEpisodes(true) ?? [])
+        .filter(({ item }) => item.ownerNotificationKind === "human-required")
+        .map(({ item, posted }) => ({ item, posted, eligible: filterHumanAlerts([item], filter).length === 1 }));
     },
   };
 }

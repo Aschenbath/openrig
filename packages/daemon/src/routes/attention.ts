@@ -11,14 +11,18 @@ import { listProjects, insideProject, projectMission, type ProjectRead } from ".
 import { readMissionReadiness } from "../domain/proof/judgments.js";
 import { WorkflowInstanceStore } from "../domain/workflow-instance-store.js";
 import { WorkflowStepTrailLog } from "../domain/workflow-step-trail-log.js";
+import { feedPerspective } from "../domain/feed-perspective.js";
+import { UNNAMED_PRIMARY_USER } from "../domain/mission-control/mission-control-write-contract.js";
 
 export function attentionRoutes(): Hono {
   const app = new Hono();
   app.get("/", c => {
     const wanted = c.req.query("item");
     const result: AttentionRead = { scope: "instance", readAt: new Date().toISOString(), items: [], sources: [], detail: null, detailError: null };
+    // Whether an item is in the queue this Feed shows; an item opened by id is shown in full whatever the view.
+    let inView = (_recipient: string | null | undefined): boolean => true;
     const add = (item: AttentionItem, lines: () => string[], files: () => Array<{ label: string; path: string }> = () => []) => {
-      if (!result.items.some(i => i.id === item.id)) result.items.push(item);
+      if (!result.items.some(i => i.id === item.id) && inView(item.recipient)) result.items.push(item);
       if (wanted === item.id) result.detail = { item, lines: lines(), files: files() };
     };
     const unavailable = (source: string, error: unknown) => result.sources.push({ source, state: "unavailable", detail: error instanceof Error ? error.message : String(error) });
@@ -29,6 +33,10 @@ export function attentionRoutes(): Hono {
     } catch (e) { unavailable("project catalog", e); }
     const queue = c.get("queueRepo" as never) as QueueRepository | undefined;
     const posture = c.get("operatingPosture" as never) as OperatingPostureService | undefined;
+    // The Feed's perspective, whose queue it shows (`view`). With no person registered the Feed is as before.
+    const view = feedPerspective(queue, c.req.query("view"));
+    if (view.perspective) result.perspective = view.perspective;
+    inView = view.inView;
     try {
       if (!queue) throw new Error("Queue repository unavailable");
       const rows = queue.listAttention({ limit: 1001 });
@@ -54,14 +62,17 @@ export function attentionRoutes(): Hono {
         const deps = queue.db.prepare("SELECT summary, qitem_id FROM queue_items WHERE blocked_on = ? AND state IN ('pending','in-progress','blocked') ORDER BY ts_created DESC LIMIT 101").all(q.qitemId) as Array<{ summary: string | null; qitem_id: string }>;
         const unblocks = isHumanSeatSessionRef(q.blockedOn ?? "") ? q.summary || "The blocked task (inspect the request)" : deps.length ? deps.slice(0, 100).map(d => d.summary || "An unnamed dependent task").join("; ") + (deps.length > 100 ? "; more dependents omitted" : "") : "No dependent task recorded; inspect the request for its intended outcome.";
         const toPerson = isHumanSeatSessionRef(q.destinationSession) || asked.has(q.qitemId);
+        // A shared channel never acts: on its ask or park the person at the terminal does, as the daemon records it.
+        const actorFor = (address: string) => queue.isSharedChannel(address) ? UNNAMED_PRIMARY_USER : address;
         const questions = q.humanQuestions?.length ? q.humanQuestions : null;
         const unanswered = questions ? unansweredQuestions(questions, q.humanAnswers ?? {}).length : 0;
         const item: AttentionItem = { id: `queue:${q.qitemId}`, kind: "action", recipient: toPerson ? q.destinationSession : q.blockedOn,
           // An ask addressed to the person is answered on this row, as them: Steering's Approve, or, for an ask with questions,
           // mission control's answer (a choice, their own words, or sending a complete set's recorded answers back), which
           // Approve would close without returning. They can also open the asker's terminal (Chat). A row parked on them is
-          // resolved another way, so it carries neither.
-          ...(toPerson && q.state === "pending" ? { answer: { verb: questions ? "answer" as const : "approve" as const, actorSession: q.destinationSession } } : {}),
+          // resolved with their decision in words, which unparks it for its owner.
+          ...(toPerson && q.state === "pending" ? { answer: { verb: questions ? "answer" as const : "approve" as const, actorSession: actorFor(q.destinationSession) } } : {}),
+          ...(!toPerson && q.state === "blocked" && q.blockedOn && isHumanSeatSessionRef(q.blockedOn) ? { answer: { verb: "resolve" as const, actorSession: actorFor(q.blockedOn) } } : {}),
           ...(toPerson ? { asker: q.sourceSession } : {}),
           ...(questions ? { humanQuestions: questions, humanAnswers: q.humanAnswers ?? {} } : {}),
           summary: q.summary || q.body.trim().split(/\r?\n/).find(Boolean) || "Request summary unavailable", urgency: q.priority, unblocks, at: q.tsUpdated, scope: p ? `project ${p.id}` : "instance · project unknown", project: p ? { id: p.id, root: p.root } : null, source: `/api/queue/${encodeURIComponent(q.qitemId)}` };
