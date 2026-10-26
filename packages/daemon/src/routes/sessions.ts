@@ -753,7 +753,9 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
     }
     try {
       const pid = await tmuxAdapter?.getPanePid?.(binding.tmuxPane);
-      if (!pid || pid !== identity.evidence.observedPid) {
+      // A shell or launcher can be the pane root; legacy verdicts only recorded one PID.
+      const verifiedPanePid = identity.evidence.observedPanePid ?? identity.evidence.observedPid;
+      if (!pid || pid !== verifiedPanePid) {
         return c.json({ error: "record_identity_unverified", message: `The bound pane for '${sessionName}' no longer matches its verified occupant.` }, 409);
       }
       const live = await resolveLiveCodexThreadId(binding.tmuxPane, {
