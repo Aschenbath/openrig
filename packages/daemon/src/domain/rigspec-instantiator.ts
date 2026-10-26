@@ -495,6 +495,11 @@ class GenerationChanged extends Error {
   }
 }
 
+/** Worker failures must reach the existing member-failure cleanup and retry refusal paths. */
+function failedLaunchResolution(error: unknown): ResolutionResult {
+  return { ok: false, errors: [`Profile resolution failed: ${String(error)}`] };
+}
+
 export class PodRigInstantiator {
   readonly db: Database.Database;
   private deps: PodInstantiatorDeps;
@@ -1357,7 +1362,7 @@ export class PodRigInstantiator {
     if (!node.resolvedSpecHash || resolved.resolved.hash !== node.resolvedSpecHash) return refuse("Agent source hash differs from the failed first start.");
     const config = await resolveNodeConfigAsync({ baseSpec: resolved.resolved, importedSpecs: resolved.imports, collisions: resolved.collisions,
       profileName: member.profile, specRoot: rigRoot, member, pod, rig: this.withRigStartupLayers(rigSpec, this.rigStartupLayers(rigSpec, rigRoot, rigId)),
-      skillsRoot: this.resolveSkillsRoot(), ...this.systemWorldResolutionContext() });
+      skillsRoot: this.resolveSkillsRoot(), ...this.systemWorldResolutionContext() }).catch(failedLaunchResolution);
     if (!config.ok) return refuse(config.errors.join("; "));
     // A seat whose first start failed before Advisor support recorded no Advisor, though its unchanged agent spec (the
     // hash above) may name one. Its retry keeps the launch it recorded: no Advisor, stored and launched alike. Any
@@ -1649,7 +1654,7 @@ export class PodRigInstantiator {
           rig: rigSpec,
           skillsRoot: this.resolveSkillsRoot(),
           ...this.systemWorldResolutionContext(),
-        });
+        }).catch(failedLaunchResolution);
         if (!configResult.ok) {
           nodeResults.push({ logicalId: qualifiedId, status: "failed", error: configResult.errors.join("; ") });
           continue;
@@ -2365,7 +2370,7 @@ export class PodRigInstantiator {
       rig: this.withRigStartupLayers(input.rigSpec, rigLayers),
       skillsRoot: this.resolveSkillsRoot(),
       ...this.systemWorldResolutionContext(),
-    });
+    }).catch(failedLaunchResolution);
     if (!configResult.ok) {
       return { status: "failed", error: configResult.errors.join("; ") };
     }

@@ -7,6 +7,7 @@ import { execFileSync, fork, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import { resolveNodeConfig, type ResolutionContext } from "../src/domain/profile-resolver.js";
 import { resolveNodeConfigAsync, withNodeConfigResolver } from "../src/domain/profile-resolution-worker.js";
 import { preflightValidatedSpec } from "../src/domain/rigspec-preflight.js";
@@ -291,6 +292,98 @@ describe("profile resolution outside the daemon request thread", () => {
       await new Promise<void>(resolve => server.close(() => resolve()));
       db.close();
       if (gate) expect(exitCode).toBe(0);
+    }
+  });
+
+  it.each([
+    ["instantiate", "error"], ["instantiate", "exit"], ["materialized", "error"], ["retry", "error"],
+  ] as const)("returns a launch failure when the worker faults during %s (%s)", async (mode, fault) => {
+    const ctx = fixture();
+    const root = ctx.homedir!;
+    mkdirSync(join(root, "agent"));
+    writeFileSync(join(root, "agent", "agent.yaml"), "name: worker\nversion: '1.0.0'\nresources:\n  skills: []\nprofiles:\n  default:\n    uses:\n      skills: []\n");
+    if (mode === "instantiate") ctx.pod.members.push({ ...ctx.member, id: "later" });
+    const yaml = RigSpecCodec.serialize(ctx.rig);
+    const db = createFullTestDb();
+    let projectionBlocked = mode === "retry";
+    const adapter: RuntimeAdapter = {
+      runtime: "codex",
+      listInstalled: vi.fn(async () => []),
+      project: vi.fn(async () => ({ projected: [], skipped: [], failed: projectionBlocked ? [{ effectiveId: "fixture", error: "fixture projection failure" }] : [] })),
+      deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+      checkReady: vi.fn(async () => ({ ready: true })),
+      launchHarness: vi.fn(async () => ({ ok: true })),
+    };
+    const tmux = mockTmuxAdapter();
+    const f = createTestApp(db, { tmux, adapters: { codex: adapter },
+      podInstantiatorFsOps: { exists: existsSync, readFile: path => readFileSync(path, "utf8") } });
+    let armed = false;
+    let triggered = false;
+    const postMessage = Worker.prototype.postMessage;
+    const send = vi.spyOn(Worker.prototype, "postMessage").mockImplementation(function (this: Worker, ...args: Parameters<Worker["postMessage"]>) {
+      if (armed) {
+        armed = false;
+        triggered = true;
+        if (fault === "exit") { void this.terminate(); return; }
+        // Make the real worker throw in resolution, after preflight has succeeded.
+        const message = args[0];
+        args[0] = { ...message, context: { ...message.context, baseSpec: { ...message.context.baseSpec, spec: null } } };
+      }
+      postMessage.call(this, ...args);
+    });
+    try {
+      if (mode === "instantiate") {
+        const previous = f.rigRepo.createRig("test");
+        const rollback = vi.fn(async () => {});
+        tmux.probeSession = vi.fn(async () => ({ state: "absent" as const }));
+        const result = await f.podInstantiator.instantiate(yaml, root, { prelaunchHook: async () => {
+          expect(db.prepare("SELECT archived_at FROM rigs WHERE id = ?").get(previous.id))
+            .toEqual({ archived_at: expect.any(String) });
+          armed = true;
+          return { ok: true, rollback };
+        } }).catch(error => ({ ok: false as const, code: "unexpected_exception", message: String(error) }));
+        expect(rollback).toHaveBeenCalledTimes(1);
+        expect(db.prepare("SELECT id, archived_at FROM rigs").all()).toEqual([{ id: previous.id, archived_at: null }]);
+        expect(db.prepare("SELECT COUNT(*) AS count FROM pods").get()).toEqual({ count: 0 });
+        expect(result).toMatchObject({ ok: false, code: "instantiate_error", message: expect.stringContaining("Profile resolution failed:") });
+        if (result.ok) throw new Error("Worker failure unexpectedly launched a rig");
+        expect(result.message).toContain("dev.worker:");
+        expect(result.message).toContain("dev.later:");
+        expect(result.message).toContain(fault === "exit" ? "Profile resolution worker exited" : "profiles");
+      } else {
+        const materialized = await f.podInstantiator.materialize(yaml, root);
+        expect(materialized.ok).toBe(true);
+        if (!materialized.ok) throw new Error("Fixture did not materialize");
+        const rigId = materialized.result.rigId;
+        const nodeId = f.rigRepo.getRig(rigId)!.nodes[0]!.id;
+        if (mode === "retry") {
+          expect(await f.podInstantiator.launchMaterialized(yaml, root, rigId))
+            .toMatchObject({ ok: true, result: { nodes: [{ status: "failed" }] } });
+          tmux.probeSession = vi.fn(async () => ({ state: "absent" as const }));
+          const lifecycle = new SeatLifecycleService({ ...f, db, tmuxAdapter: tmux });
+          expect((await lifecycle.cleanSeat({ seatRef: "dev-worker@test", reason: "Failed projection; fixture shell has exited" })).ok).toBe(true);
+          projectionBlocked = false;
+        }
+        const before = f.rigRepo.getRig(rigId);
+        const sessions = f.sessionRegistry.getSessionsForRig(rigId);
+        armed = true;
+        if (mode === "retry") {
+          expect(await f.podInstantiator.retryFirstStart(rigId, nodeId, {
+            id: "worker", agent_ref: "local:agent", profile: "default", runtime: "codex", cwd: root,
+          }, root)).toMatchObject({ ok: false, code: "first_start_retry_refused", message: expect.stringContaining("Profile resolution failed:") });
+        } else {
+          expect(await f.podInstantiator.launchMaterialized(yaml, root, rigId))
+            .toMatchObject({ ok: true, result: { nodes: [{ status: "failed", error: expect.stringContaining("Profile resolution failed:") }] } });
+        }
+        expect(f.rigRepo.getRig(rigId)).toEqual(before);
+        expect(f.sessionRegistry.getSessionsForRig(rigId)).toEqual(sessions);
+        expect(f.sessionRegistry.getBindingForNode(nodeId)).toBeNull();
+      }
+      expect(triggered).toBe(true);
+      expect(adapter.launchHarness).not.toHaveBeenCalled();
+    } finally {
+      send.mockRestore();
+      db.close();
     }
   });
 

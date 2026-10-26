@@ -138,6 +138,11 @@ their resolution. This adds worker startup and context-copy costs; it does not
 reuse the preflight result or cache configuration between requests. The helper's
 existing synchronous fallback for a deleted process working directory remains.
 
+Worker errors become configuration-failure results. Apply can then follow the
+existing all-members-failed cleanup, including service rollback and restoration
+of replaced generations. Materialized launches report a failed member, and
+first-start retries refuse before writing retained state.
+
 `profile-resolution-worker.test.ts` holds a real fallback scan open with a FIFO,
 requires an HTTP health response while that FIFO is still blocked, then checks
 that the selected skill reaches projection. It covers all three launch paths and
