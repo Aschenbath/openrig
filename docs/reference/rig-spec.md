@@ -806,7 +806,7 @@ Startup blocks can appear at three levels: rig, pod, and member. They are merged
 | `orientation` | string | no | — | Set to `role` to identify a per-seat role file for `rig queue whoami --json` and refocus. Does not change delivery or replay startup. |
 | `delivery_hint` | string | no | `auto` | How the file is delivered. One of: `auto`, `guidance_merge`, `skill_install`, `send_text`. |
 | `required` | boolean | no | `true` | Whether startup fails if this file cannot be delivered. |
-| `applies_on` | string[] | no | `[fresh_start, restore]` | When this file is delivered. Subset of: `fresh_start`, `restore`. |
+| `applies_on` | string[] | no | `[fresh_start, restore]` | When this file is delivered. Subset of: `fresh_start`, `restore`. An exact resume of the saved conversation delivers none, apart from putting back a missing managed guidance block. |
 
 #### Delivery Hints
 
@@ -824,8 +824,8 @@ Startup blocks can appear at three levels: rig, pod, and member. They are merged
 | `type` | string | yes | — | Action type. One of: `slash_command`, `send_text`, `startup_proof`. Note: `shell` is explicitly NOT supported in v1. |
 | `value` | string | yes | — | Command/text to send, or `authenticated` / `none` for `startup_proof`. |
 | `phase` | string | no | `after_files` | When to execute text/commands. One of: `after_files` (after startup files are delivered), `after_ready` (after harness readiness check passes). Proof selection is resolved before projection regardless of phase. |
-| `idempotent` | boolean | yes | — | Whether this action is safe to replay on restore. **Required field.** Non-idempotent actions must NOT include `restore` in `applies_on`. |
-| `applies_on` | string[] | no | `[fresh_start, restore]` | When this action runs. Subset of: `fresh_start`, `restore`. |
+| `idempotent` | boolean | yes | — | Whether this action is safe to run again on a restore without the earlier conversation or a retried start. **Required field.** Non-idempotent actions must NOT include `restore` in `applies_on`. |
+| `applies_on` | string[] | no | `[fresh_start, restore]` | When this action runs. Subset of: `fresh_start`, `restore`. An exact resume of the saved conversation runs none (see the startup guide). |
 
 ### Startup proof selection
 

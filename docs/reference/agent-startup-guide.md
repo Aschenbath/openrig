@@ -355,10 +355,12 @@ declaration isn't changed either; update it separately if a future recreation sh
 Each startup file and action specifies when it applies:
 - `fresh_start` — delivered when a new conversation starts: the first launch, `rig seat launch --fresh`,
   `rig seat continue`, and seats restored with `--fresh`
-- `restore` — delivered when a seat is restored, including a restore whose resume falls back to a fresh conversation
+- `restore` — delivered when a seat is restored without its earlier conversation: a restore whose resume falls back to a fresh conversation, or a retried start
 - Default: `[fresh_start, restore]` (both)
 
-Use this to avoid re-sending context that the agent already has from its resumed conversation. For example, a one-time project briefing might only apply on `fresh_start`, while identity grounding should apply on both.
+**An exact resume delivers neither.** When a restore reopens the seat's saved conversation (`rig up <rig> --existing` with a resume token), OpenRig types no startup actions and delivers no startup files, `restore` ones included: the conversation already has them, and typing them again would add turns to it. The one exception: a managed guidance block missing from the guidance file is put back before the harness starts.
+
+Use this to avoid re-sending context that a fresh conversation doesn't need twice. For example, a one-time project briefing might only apply on `fresh_start`, while identity grounding should apply on both, so a seat that comes back fresh gets it again.
 
 ---
 
@@ -422,6 +424,11 @@ Each value is typed into the harness's input and submitted, so it is a prompt or
 Types are `send_text`, `slash_command` and `startup_proof` (see "Startup proof" above); `shell` is refused.
 `idempotent` is required, and an action that isn't idempotent must not list `restore` in `applies_on`. Both phases
 run after the harness is ready: `after_files` (the default) after the post-launch files, then `after_ready`.
+
+**Don't rename a managed Claude seat.** OpenRig starts every Claude seat with `--name <session>`, on a fresh start and on
+every resume, and its own reads of the seat use that name: context usage and managed compaction read the status-line
+record Claude saves under it, and the input box is recognized by the name on its border. A startup `/rename` to another
+name breaks those reads until the next resume puts the session name back.
 
 ### Current Support Matrix
 
