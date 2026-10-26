@@ -284,13 +284,14 @@ export class PsProjectionService {
           ? this.seatActivity.getSeatStateBySession(session)
           : null;
         const hook = this.agentActivity && session
-          ? this.agentActivity.getLatestForNode({ sessionName: session, now: nowDate })
+          ? this.agentActivity.getLatestForNode({ sessionName: session, now: nowDate,
+            order: node.runtime === "claude-code" ? "source" : "arrival" })
           : null;
         // The row's served activity: a live hook, else the cached pane reading. A confirmed-missing session serves
         // neither, as on the row.
         const structural = this.structuralActivity && session ? this.structuralActivity.getStructuralActivity(session) : null;
         const activity = identityVerdictConfirmsSessionMissing(node.identityVerdict) ? null
-          : hookOrPaneActivity(hook, structural)?.activity ?? hook;
+          : hookOrPaneActivity(hook, structural, false, node.runtime)?.activity ?? hook;
         if (seatNeedsAttention(node, activity, arbitratedNeedsInputSignal(arbitrated))) attentionCount++;
       }
 

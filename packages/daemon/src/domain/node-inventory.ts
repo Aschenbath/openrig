@@ -13,6 +13,7 @@ import type { RuntimeAdapter } from "./runtime-adapter.js";
 import type { ContextUsageStore } from "./context-usage-store.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import type { AgentActivityStore } from "./agent-activity-store.js";
+import { isClaudeRateLimitHook } from "./provider/claude-interruption.js";
 import type { SeatActivityService } from "./seat-activity-service.js";
 import { deriveDisplayActivity, type ArbitratedSeatState, type EvidenceRungId } from "./activity-taxonomy.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
@@ -1283,7 +1284,8 @@ export function attachTerminalActivityAndWork(
     const work = countAssignedWorkForEntry(entry, assignedByDest);
     const arbitratedNeedsInput = arbitratedNeedsInputSignal(arb);
     const hook = entry.canonicalSessionName
-      ? deps.agentActivity?.getLatestForNode({ sessionName: entry.canonicalSessionName, now }) ?? null : null;
+      ? deps.agentActivity?.getLatestForNode({ sessionName: entry.canonicalSessionName, now,
+        order: entry.runtime === "claude-code" ? "source" : "arrival" }) ?? null : null;
     return {
       ...entry,
       terminalActive,
@@ -1417,13 +1419,14 @@ export function hookOrPaneActivity(
   structural: StructuralObservation | null,
   /** A positive idle hook gives way to a current complete idle frame (D2). */
   idleYieldsToFrame = false,
+  runtime?: string | null,
 ): { source: "hook" | "limit" | "pane"; activity: AgentActivity } | null {
   // Running/needs_input hooks keep their meaning.
   if (hookActivity && hookActivity.state !== "unknown" && !(hookActivity.state === "idle" && idleYieldsToFrame)) {
     return { source: "hook", activity: hookActivity };
   }
 
-  // #763: a typed provider-interruption row (at_limit) is positive evidence
+  // A typed provider-interruption row (Codex at_limit or Claude StopFailure/rate_limit) is positive evidence
   // even though its state is unknown by construction (it must never count
   // as waiting-on-a-person). Deliver it instead of the cached pane reading
   // so a limited seat shows the limit, not idle — but only while current.
@@ -1431,7 +1434,11 @@ export function hookOrPaneActivity(
   // Only a strictly newer, current attention observation outranks it.
   // A demoted row (aged out or generation-mismatched) falls through to the
   // structural reading like any other stale hook.
-  if (hookActivity?.rawEvent === "at_limit" && hookActivity.stale !== true && !(
+  if (hookActivity && (
+    hookActivity.rawEvent === "at_limit"
+    || (hookActivity.runtime === runtime
+      && isClaudeRateLimitHook(hookActivity.runtime, hookActivity.rawEvent, hookActivity.rawSubtype))
+  ) && hookActivity.stale !== true && !(
     structural?.state === "attention" &&
     Date.parse(structural.observedAt) > Date.parse(hookActivity.eventAt ?? "")
   )) {
@@ -1598,6 +1605,7 @@ export async function attachAgentActivity(
     const hookActivity = deps.activityStore?.getLatestForNode({
       sessionName: entry.canonicalSessionName,
       now: sampledAt,
+      order: entry.runtime === "claude-code" ? "source" : "arrival",
     });
     // Reuse the existing cached capture. Only a complete supported idle frame, bound to this
     // target and started in a later second than the last write, distinguishes idle redraw from resumed work.
@@ -1617,7 +1625,7 @@ export async function attachAgentActivity(
 
     // An idle hook alone still yields to motion (D2); when a current complete idle frame exists, report
     // that frame's provenance instead.
-    const resolved = hookOrPaneActivity(hookActivity, structural, motionRunning && currentIdleFrame);
+    const resolved = hookOrPaneActivity(hookActivity, structural, motionRunning && currentIdleFrame, entry.runtime);
     if (resolved?.source === "hook") return { ...entry, agentActivity: withMotion(resolved.activity) };
     if (resolved?.source === "limit") return { ...entry, agentActivity: resolved.activity };
     if (resolved?.source === "pane") return { ...entry, agentActivity: withMotion(resolved.activity, currentIdleFrame) };
