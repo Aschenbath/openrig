@@ -30,6 +30,7 @@ const PARENT_SESSION = Object.fromEntries([...PARENT_SESSION_ENV_KEYS, "CLAUDE_E
 const SELECTED = {
   CLAUDE_CONFIG_DIR: "/configured/claude",
   CODEX_HOME: "/configured/codex",
+  XDG_RUNTIME_DIR: "/configured/runtime",
 };
 // Configuration the daemon and the tmux server carry that a seat isn't given: none of it is in the selected baseline,
 // and this test names no provider credential in recovery.provider_auth_env_allowlist.
@@ -56,7 +57,13 @@ describe.runIf(process.platform === "linux")("seat environment from a daemon sta
   // already carries the parent identity is running before the daemon starts.
   it.each(["daemon", "existing"] as const)("seats receive none of the parent session's identity variables, the selected configuration, and nothing else the tmux server carries (tmux server: %s)", async (server) => {
     const scaffold = prepareHermeticEnv({
-      baseEnv: { HOME: process.env.HOME, PATH: process.env.PATH, TERM: "xterm", ...PARENT_SESSION, ...SELECTED, ...NOT_SELECTED },
+      baseEnv: {
+        HOME: process.env.HOME, PATH: process.env.PATH, TERM: "xterm",
+        // These belong to the terminal that started the daemon. A seat must get
+        // the identity tmux supplies to its pane instead (#2041).
+        TERM_PROGRAM: "parent-terminal", TERM_PROGRAM_VERSION: "parent-version",
+        ...PARENT_SESSION, ...SELECTED, ...NOT_SELECTED,
+      },
     });
     scaffolds.push(scaffold);
     const tmux = (args: string[], env: Record<string, string | undefined> = process.env) =>
@@ -79,6 +86,8 @@ describe.runIf(process.platform === "linux")("seat environment from a daemon sta
         .trim().split("\n").map((line) => line.split(" ") as [string, string]);
       const seatPanes = panes.filter(([session]) => session.includes("scn-baton"));
       expect(seatPanes.length).toBeGreaterThan(0);
+      const tmuxVersion = (await tmux(["display-message", "-p", "#{version}"])).stdout.trim();
+      expect(tmuxVersion).not.toBe("");
 
       for (const [, pid] of seatPanes) {
         const env = environOf(pid);
@@ -91,6 +100,11 @@ describe.runIf(process.platform === "linux")("seat environment from a daemon sta
           PATH: scaffold.env.PATH,
           HOME: scaffold.home,
           OPENRIG_HOME: scaffold.openrigHome,
+          // Keep the runtime socket directory without discovering the person's
+          // session bus, and retain tmux's own terminal identity through env -i.
+          DBUS_SESSION_BUS_ADDRESS: "disabled:",
+          TERM_PROGRAM: "tmux",
+          TERM_PROGRAM_VERSION: tmuxVersion,
         });
       }
 
