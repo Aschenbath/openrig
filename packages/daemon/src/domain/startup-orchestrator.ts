@@ -159,6 +159,8 @@ export function isSeatSkillsBootstrapLine(file: Pick<ResolvedStartupFile, "path"
 }
 
 export interface StartupInput {
+  /** Explicit history startup checks its exact source after awaited preparation. */
+  beforeNativeLaunch?: () => boolean;
   /** Internal attempt state: a launch input may already have reached the harness, so it cannot be replayed. */
   firstInputPassed?: boolean;
   rigId: string;
@@ -576,11 +578,15 @@ export class StartupOrchestrator {
             launchPrompt = this.composeInitialSessionPrompt(deliveryInput, identityAction, postLaunchFiles,
               launchChallenge?.promptBlock ?? null, input.includeDurableObligations);
           }
+          if (input.beforeNativeLaunch && !input.beforeNativeLaunch()) {
+            return this.fail(input, "attention_required", ["The selected seat, settings or history changed after preparation; native resume was not dispatched."], undefined, false, undefined, false, "harness_launch", true);
+          }
           const launchResult = await input.adapter.launchHarness(input.binding, {
             name: input.sessionName ?? input.binding.tmuxSession ?? "",
             ...(launchPrompt ? { firstInputText: launchPrompt.prompt } : {}),
             resumeToken: launchResumeToken,
             ...(launchResumeToken && input.resumeType ? { resumeType: input.resumeType } : {}),
+            ...(input.beforeNativeLaunch ? { beforeNativeDispatch: input.beforeNativeLaunch } : {}),
             ...(input.forkSource && !launchResumeToken ? { forkSource: input.forkSource } : {}),
           });
           if (launchResult.firstInput) {

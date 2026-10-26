@@ -401,7 +401,7 @@ export function seatCommand(depsOverride?: SeatDeps & { readStdin?: () => Promis
         process.exitCode = 1;
         return;
       }
-      const deps = getDeps(); const daemon = await getDaemonStatus(deps.lifecycleDeps);
+      const deps = getDeps(); const daemon = await getDaemonStatus(deps.lifecycleDeps, { cleanupStaleState: false });
       if (!daemonStatusGuard(daemon)) return;
       const client = deps.clientFactory(getDaemonUrl(daemon));
       const path = `/api/startup/${encodeURIComponent(opts.rig)}/nodes/${encodeURIComponent(opts.nodeId)}/history`;

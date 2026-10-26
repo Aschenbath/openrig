@@ -1002,7 +1002,11 @@ export class TmuxAdapter {
       if (!text.ok) return text;
       const enter = await this.sendKeys(target, ["Enter"], beforeInput);
       if (!enter.ok) {
-        await this.sendKeys(target, ["C-c"]);
+        if (!beforeInput) await this.sendKeys(target, ["C-c"]);
+        else {
+          try { beforeInput(); await this.sendKeys(target, ["C-c"], beforeInput); }
+          catch { /* The target changed; do not clear another occupant's input. */ }
+        }
         return enter;
       }
       // The receiver now owns removal. Unlinking here races shell startup.

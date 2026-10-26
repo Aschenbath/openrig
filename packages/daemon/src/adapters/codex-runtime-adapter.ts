@@ -858,7 +858,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
 
   async launchHarness(
     binding: NodeBinding,
-    opts: { name: string; resumeToken?: string; forkSource?: import("../domain/runtime-adapter.js").ForkSource },
+    opts: { name: string; resumeToken?: string; forkSource?: import("../domain/runtime-adapter.js").ForkSource; beforeNativeDispatch?: () => boolean },
   ): Promise<HarnessLaunchResult> {
     if (!binding.tmuxSession) {
       return { ok: false, error: "No tmux session bound — cannot launch Codex harness" };
@@ -933,7 +933,11 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       ? this.resumeCore(prepared, opts.resumeToken, binding)
       : `codex${daemonArg}${postureArg}${networkArg} -C ${shellQuote(binding.cwd)}${gitDirArg}${seatFolderArg}${queueStateDirArg}${modelArg}${effortArg}`;
 
-    const textResult = await this.tmux.sendShellCommand(binding.tmuxSession, await this.seatCommand(binding, cmd));
+    const staged = await this.seatCommand(binding, cmd);
+    if (opts.beforeNativeDispatch && !opts.beforeNativeDispatch()) return { ok: false, error: "Selected history changed during Codex launch preparation; no native command was sent.", recovery: "attention_required" };
+    const textResult = opts.beforeNativeDispatch
+      ? await this.tmux.sendShellCommand(binding.tmuxSession, staged, () => { if (!opts.beforeNativeDispatch!()) throw new Error("Selected history changed before Codex input"); })
+      : await this.tmux.sendShellCommand(binding.tmuxSession, staged);
     if (!textResult.ok) {
       return { ok: false, error: `Failed to send launch command: ${textResult.message}` };
     }

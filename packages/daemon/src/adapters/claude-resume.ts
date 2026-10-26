@@ -78,6 +78,7 @@ export class ClaudeResumeAdapter {
     // OPR.0.7.0.9: the seat's own launch additions (copies in its seat storage); absent → byte-identical.
     launchAdditions?: SeatLaunchAdditions,
     claudePermissions?: ClaudePermissionRules,
+    beforeNativeDispatch?: () => boolean,
   ): Promise<ResumeResult> {
     if (!this.canResume(resumeType, resumeToken)) {
       return { ok: false, code: "no_resume", message: "Claude resume not available" };
@@ -113,29 +114,37 @@ export class ClaudeResumeAdapter {
     const cmd = managed ? managed.command(["--permission-mode", selectedPermissionMode!, ...launchArgs, ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []), ...(advisor ? ["--advisor", advisor] : []), ...additionArgs, "--resume", resumeToken!], claudeResumeLaunchEnv(resumeToken!))
       : `${claudeResumeLaunchPrefix(resumeToken!)}${claudeClassicRendererEnvPrefix(process.env)}claude ${permissionMode}${modelArg}${effortArg}${advisorArg}${additionArg} --resume ${shellQuote(resumeToken!)}`;
 
+    const assertSelected = beforeNativeDispatch ? () => { if (!beforeNativeDispatch()) throw new Error("Selected history changed before Claude resume input"); } : undefined;
+    const beforeManagedInput = beforeNativeDispatch ? () => { assertSelected?.(); managed?.assertCurrent?.(); } : managed?.assertCurrent;
+
     const sendClassic = async () => {
       if (!this.options.seatLaunchEnvironment) {
         if (seatToken) tokenWarnings.push(this.options.claudeManagedLaunch?.tokenNotApplied?.(nodeId!, seatToken.ref, "this launch path can't run the token step") ?? claudeSeatTokenFallbackNotice(seatToken.ref, "this launch path can't run the token step"));
-        return this.tmux.sendText(tmuxSessionName, cmd);
+        if (beforeNativeDispatch && !beforeNativeDispatch()) return { ok: false as const, code: "selection_changed", message: "Selected history changed before Claude resume input" };
+        return assertSelected ? this.tmux.sendText(tmuxSessionName, cmd, assertSelected) : this.tmux.sendText(tmuxSessionName, cmd);
       }
       const staged = await this.options.seatLaunchEnvironment.command(tmuxSessionName, cmd, { runtime: "claude-code", nodeId,
         ...(seatToken ? { claudeTokenStep: seatToken.step } : {}) });
       if (seatToken && !staged.includes(seatToken.step)) {
         tokenWarnings.push(this.options.claudeManagedLaunch?.tokenNotApplied?.(nodeId!, seatToken.ref, "the seat's pane shell can't run the token step") ?? claudeSeatTokenFallbackNotice(seatToken.ref, "the seat's pane shell can't run the token step"));
       }
-      return this.tmux.sendShellCommand(tmuxSessionName, staged, undefined, { sourceInPane: true });
+      if (beforeNativeDispatch && !beforeNativeDispatch()) return { ok: false as const, code: "selection_changed", message: "Selected history changed before Claude resume input" };
+      return assertSelected ? this.tmux.sendShellCommand(tmuxSessionName, staged, assertSelected, { sourceInPane: true })
+        : this.tmux.sendShellCommand(tmuxSessionName, staged, undefined, { sourceInPane: true });
     };
-    const textResult = managed ? await this.tmux.sendShellCommand(tmuxSessionName, cmd, managed.assertCurrent) : await sendClassic();
+    if (beforeNativeDispatch && !beforeNativeDispatch()) return { ok: false, code: "attention_required", message: "Selected history changed during Claude resume preparation; no native command was sent." };
+    const textResult = managed ? await this.tmux.sendShellCommand(tmuxSessionName, cmd, beforeManagedInput) : await sendClassic();
     if (!textResult.ok) {
       // sendText failed — nothing in the buffer, no cleanup needed
       return { ok: false, code: "resume_failed", message: textResult.message };
     }
 
-    const keyResult = managed || this.options.seatLaunchEnvironment ? { ok: true as const } : await this.tmux.sendKeys(tmuxSessionName, ["Enter"]);
+    const keyResult = managed || this.options.seatLaunchEnvironment ? { ok: true as const }
+      : await (assertSelected ? this.tmux.sendKeys(tmuxSessionName, ["Enter"], assertSelected) : this.tmux.sendKeys(tmuxSessionName, ["Enter"]));
     if (!keyResult.ok) {
       // Partial failure: command text is in the buffer but Enter failed.
       // Best-effort cleanup: send C-c to clear the typed command.
-      await this.tmux.sendKeys(tmuxSessionName, ["C-c"]);
+      if (!beforeNativeDispatch || beforeNativeDispatch()) await this.tmux.sendKeys(tmuxSessionName, ["C-c"], assertSelected);
       return { ok: false, code: "resume_failed", message: keyResult.message };
     }
 

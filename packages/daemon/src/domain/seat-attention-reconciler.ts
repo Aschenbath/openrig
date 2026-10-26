@@ -148,6 +148,8 @@ export async function rebindAndVerifyPaneIdentity(input: {
    *  A caller that re-runs the check in a polling loop passes false until the attempt whose text it shows. */
   explainFailure?: boolean;
   now?: () => Date;
+  /** Selected-history restore fences its exact launched binding after awaited observations. */
+  assertCurrent?: () => boolean;
 }): Promise<PaneIdentityReconcileResult> {
   const observedAt = (input.now ?? (() => new Date()))().toISOString();
   const identityStore = new SeatIdentityStore(input.db);
@@ -158,6 +160,7 @@ export async function rebindAndVerifyPaneIdentity(input: {
     return { ok: false, detail: `tmux pane lookup failed: ${(error as Error).message}` };
   }
   if (panes.length !== 1) {
+    if (input.assertCurrent && !input.assertCurrent()) return { ok: false, detail: "Selected seat changed during native proof" };
     const registeredPane = input.sessionRegistry.getBindingForNode(input.nodeId)?.tmuxPane ?? null;
     identityStore.upsert({
       nodeId: input.nodeId,
@@ -271,6 +274,7 @@ export async function rebindAndVerifyPaneIdentity(input: {
   // Persist the replacement pane before the verdict so both records describe
   // the same current binding. A non-green verdict remains applicable and
   // therefore keeps the public topology in attention_required.
+  if (input.assertCurrent && !input.assertCurrent()) return { ok: false, detail: "Selected seat changed during native proof" };
   input.sessionRegistry.updateBinding(input.nodeId, {
     tmuxSession: input.sessionName,
     tmuxPane: pane.id,

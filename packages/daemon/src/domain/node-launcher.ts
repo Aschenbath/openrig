@@ -28,6 +28,11 @@ export type LaunchResult =
   | { ok: false; code: string; message: string };
 
 interface LaunchOpts {
+  /** Startup selected-history only: refuse a same-name replacement. */
+  expectedNodeId?: string;
+  beforeEffect?: () => boolean;
+  /** Selected startup only: the seat must still have no claimant before its new row is registered. */
+  beforeRegistration?: () => boolean;
   sessionName?: string;
   cwd?: string;
   /**
@@ -138,10 +143,20 @@ export class NodeLauncher {
     if (!node) {
       return { ok: false, code: "node_not_found", message: `Node ${logicalId} not found in rig` };
     }
+    const selectedRegistrationAllowed = () => !opts?.expectedNodeId || (
+      !!this.rigRepo.getRig(rigId)?.nodes.some(current => current.id === node.id && current.logicalId === logicalId)
+      && !!opts.beforeEffect?.() && !!opts.beforeRegistration?.()
+    );
+    if (opts?.expectedNodeId && (node.id !== opts.expectedNodeId || !opts.beforeEffect?.())) {
+      return { ok: false, code: "selection_changed", message: "The selected node or history changed before launch." };
+    }
 
     const guard = this.tmuxAdapter.deliveryGuard;
     if (guard && !guard.ownsLifecycle(node.id)) {
       return guard.lifecycle([node.id], () => this.launchNode(rigId, logicalId, opts));
+    }
+    if (!selectedRegistrationAllowed()) {
+      return { ok: false, code: "selection_changed", message: "The selected node or history changed before launch." };
     }
 
     // A kept pane keeps its binding through the takeover, so the delivery guard can still resolve it.
@@ -169,6 +184,9 @@ export class NodeLauncher {
 
     // 3. Reserve the source-bound occupant generation before the process starts. Reservation is
     // side-effect-free and fail-open: an unavailable ledger yields null and the launch remains valid.
+    if (!selectedRegistrationAllowed()) {
+      return { ok: false, code: "selection_changed", message: "The selected node or history changed before launch." };
+    }
     const occupantGeneration = this.sessionRegistry.reserveOccupantGeneration();
 
     // Create tmux session with OpenRig identity env vars. A duplicate is a
@@ -196,11 +214,21 @@ export class NodeLauncher {
       OPENRIG_OCCUPANT_GENERATION: occupantGeneration ?? undefined,
     });
     const openRigEnv = launchEnv(opts?.env);
+    if (!selectedRegistrationAllowed()) {
+      return { ok: false, code: "selection_changed", message: "The selected node or history changed before launch." };
+    }
     const tmuxResult = opts?.keepPane
       ? await this.takeOverPane(sessionName, opts.keepPane, sessionCwd, openRigEnv)
       : await this.tmuxAdapter.createSession(sessionName, sessionCwd, openRigEnv);
     if (!tmuxResult.ok) {
       return { ok: false, code: tmuxResult.code, message: tmuxResult.message };
+    }
+    // A replacement during the awaited terminal creation must never receive
+    // this attempt's new session row. The pane's present owner cannot be
+    // proved after this await, so leave it for reconciliation rather than
+    // killing a same-name replacement.
+    if (!selectedRegistrationAllowed()) {
+      return { ok: false, code: "selection_changed_after_creation", message: "The selected node or history changed during terminal creation. The terminal outcome needs inspection." };
     }
 
     // The session's own non-fatal warnings (#771: the parent-session identity cleanup).
@@ -224,6 +252,9 @@ export class NodeLauncher {
     // with session+binding; an unresolved pane gets a durable named verdict in
     // that same transaction rather than carrying an unexplained NULL forward.
     const paneObservation = opts?.keepPane ? { ok: true as const, pane: opts.keepPane } : await observeSolePane(this.tmuxAdapter, sessionName);
+    if (!selectedRegistrationAllowed()) {
+      return { ok: false, code: "selection_changed_after_creation", message: "The selected node or history changed during pane observation. The terminal outcome needs inspection." };
+    }
 
     // 3a2. OPR.0.4.6.02 S1 — apply the daemon's tmux option defaults to the
     // JUST-CREATED session via the shared applier (mouse/status session-scope
@@ -256,10 +287,16 @@ export class NodeLauncher {
     }
 
     // 4. DB transaction: session + binding + event (atomic)
+    if (!selectedRegistrationAllowed()) {
+      return { ok: false, code: "selection_changed_after_creation", message: "The selected node or history changed before registration. The terminal outcome needs inspection." };
+    }
     let persistedEvent: PersistedEvent;
     let createdSessionId: string | null = null;
     try {
       const txn = this.db.transaction(() => {
+        // This synchronous check and the writes share one transaction. A self-attach
+        // that won an awaited boundary keeps its binding; it is never compensated.
+        if (!selectedRegistrationAllowed()) return null;
         const session = this.sessionRegistry.registerSession(
           node.id,
           sessionName,
@@ -288,7 +325,9 @@ export class NodeLauncher {
           sessionName,
         });
       });
-      persistedEvent = txn();
+      const event = txn();
+      if (!event) return { ok: false, code: "selection_changed_after_creation", message: "The selected node gained another occupant before registration. The terminal outcome needs inspection." };
+      persistedEvent = event;
     } catch (err) {
       // DB failed — best-effort tmux cleanup
       // Only a session this launch created is removed. A kept pane is the person's own, with its scrollback, so it's left

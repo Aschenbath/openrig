@@ -246,6 +246,8 @@ export interface RuntimeAdapter {
       firstInputText?: string;
       /** The saved token's type, when known (a community harness resumes only its own `community:<name>` ids). */
       resumeType?: string;
+      /** Explicit selected-history startup rechecks identity at the adapter's actual input boundary. */
+      beforeNativeDispatch?: () => boolean;
       /** Fresh successor in the retired occupant's pane; not an adopt, resume or fork. */
       freshInPlace?: boolean },
   ): Promise<HarnessLaunchResult>;
