@@ -14,7 +14,7 @@ import { execFileSync } from "node:child_process";
 import YAML from "yaml";
 import { findFrontmatterBlock } from "../frontmatter.js";
 import type Database from "better-sqlite3";
-import { sessionMemberLabel } from "../session-name.js";
+import { isHumanSeatSessionRef, sessionMemberLabel } from "../session-name.js";
 import type { SliceIndexer, SliceRecord } from "../slices/slice-indexer.js";
 import { parseScopeTags } from "../slices/qitem-membership.js";
 import {
@@ -40,7 +40,6 @@ import { readSliceReadiness, readMissionReadiness } from "../proof/judgments.js"
 import { readProofArtifacts } from "./proof-io.js";
 import { evaluateStepDeadline } from "../workflow-deadline.js";
 import type { AgentActivityStore } from "../agent-activity-store.js";
-import { isHumanSeatSession } from "../human-route-enforcer.js";
 import { resolveNodeFileVia } from "../scope/node-file.js";
 
 export interface ReviewGathererDeps {
@@ -54,6 +53,15 @@ export interface ReviewGathererDeps {
   activityStore?: AgentActivityStore | null;
   /** Injected clock so composition stays reproducible in tests. */
   now?: () => string;
+  /** Who a queue address is: a person (a legacy human seat, or a registered person's own address or alias) or a
+   *  registered shared channel, as the queue knows them. A shared channel takes correspondence, so its rows never need
+   *  anyone in NEEDS YOU. Absent: a person is the lexical human-class form and no address is a shared channel. */
+  participants?: ReviewParticipants;
+}
+
+export interface ReviewParticipants {
+  isPerson(address: string): boolean;
+  isSharedChannel(address: string): boolean;
 }
 
 interface QitemRow {
@@ -71,6 +79,20 @@ interface QitemRow {
 }
 
 const ACTIVE_STATES = ["pending", "in-progress", "claimed", "blocked", "handed-off"];
+
+const LEXICAL_PARTICIPANTS: ReviewParticipants = { isPerson: isHumanSeatSessionRef, isSharedChannel: () => false };
+
+interface ParticipantView {
+  person(address: string | null): boolean;
+  channel(address: string | null): boolean;
+}
+
+/** NEEDS YOU's rule: a human-gate tier, a row to a person, or a row parked on one. A row sent to or parked on a shared
+ *  channel never is, whatever its tier: a channel takes correspondence, not decisions. */
+function needsPerson(view: ParticipantView, r: { tier: string | null; destination_session: string; state: string; blocked_on: string | null }): boolean {
+  if (view.channel(r.destination_session) || (r.state === "blocked" && view.channel(r.blocked_on))) return false;
+  return r.tier === "human-gate" || view.person(r.destination_session) || (r.state === "blocked" && view.person(r.blocked_on));
+}
 
 /** OPR.0.4.6.WF4 Q6 — the ● (agent-leg) workflow-identity stamp, derived from
  *  the item's OWN STRUCTURED TAGS (`workflow:<name>` / `instance:<id>` /
@@ -105,6 +127,7 @@ export class ReviewGatherer {
   private readonly gitRepoPath: string | null;
   private readonly activityStore: AgentActivityStore | null;
   private readonly now: () => string;
+  private readonly participants: ReviewParticipants;
 
   constructor(deps: ReviewGathererDeps) {
     this.db = deps.db;
@@ -112,6 +135,24 @@ export class ReviewGatherer {
     this.gitRepoPath = deps.gitRepoPath ?? null;
     this.activityStore = deps.activityStore ?? null;
     this.now = deps.now ?? (() => new Date().toISOString());
+    this.participants = deps.participants ?? LEXICAL_PARTICIPANTS;
+  }
+
+  /** One read's view of who the queue's addresses are, each address asked once. A shared channel is never a person. */
+  private participantView(): ParticipantView {
+    const channels = new Map<string, boolean>();
+    const people = new Map<string, boolean>();
+    const channel = (address: string | null): boolean => {
+      if (!address) return false;
+      if (!channels.has(address)) channels.set(address, this.participants.isSharedChannel(address));
+      return channels.get(address)!;
+    };
+    const person = (address: string | null): boolean => {
+      if (!address) return false;
+      if (!people.has(address)) people.set(address, !channel(address) && this.participants.isPerson(address));
+      return people.get(address)!;
+    };
+    return { person, channel };
   }
 
   composeSlice(name: string): ComposedSliceReview | null {
@@ -385,6 +426,7 @@ export class ReviewGatherer {
       }>;
       const now = new Date(nowIso);
       const out: WorkflowExceptionInput[] = [];
+      const view = this.participantView();
       for (const row of instances) {
         let frontier: string[] = [];
         try {
@@ -429,14 +471,14 @@ export class ReviewGatherer {
         );
         const item = this.db
           .prepare(
-            `SELECT qitem_id, destination_session, tier, ts_created, summary
+            `SELECT qitem_id, destination_session, tier, ts_created, summary, state, blocked_on
              FROM queue_items
              WHERE state IN ('pending','in-progress','blocked')
                AND tags LIKE ? AND tags LIKE ?
              ORDER BY ts_created DESC LIMIT 1`,
           )
           .get(`%"instance:${row.instance_id}"%`, `%"workflow-exception"%`) as
-          | { qitem_id: string; destination_session: string; tier: string | null; ts_created: string; summary: string | null }
+          | { qitem_id: string; destination_session: string; tier: string | null; ts_created: string; summary: string | null; state: string; blocked_on: string | null }
           | undefined;
         out.push({
           instanceId: row.instance_id,
@@ -452,8 +494,8 @@ export class ReviewGatherer {
             ? {
                 qitemId: item.qitem_id,
                 destinationSession: item.destination_session,
-                humanRouted:
-                  item.tier === "human-gate" || /^human(?:-[A-Za-z0-9._-]+)?@(kernel|host)$/.test(item.destination_session),
+                // As NEEDS YOU reads it, so a packet listed there isn't also an awareness row.
+                humanRouted: needsPerson(view, item),
                 createdAtIso: item.ts_created,
                 summary: item.summary,
               }
@@ -496,14 +538,13 @@ export class ReviewGatherer {
                 blocked_on, closure_required_at${hasEvidenceRef ? ", evidence_ref" : ""}
          FROM queue_items
          WHERE state IN (${ACTIVE_STATES.map(() => "?").join(",")})
-           AND (${likeKeys.map(() => "tags LIKE ?").join(" OR ")})
-           AND (tier = 'human-gate'
-                OR destination_session LIKE 'human%'
-                OR (state = 'blocked' AND blocked_on LIKE 'human%'))`,
+           AND (${likeKeys.map(() => "tags LIKE ?").join(" OR ")})`,
       )
       .all(...ACTIVE_STATES, ...likeKeys.map((key) => `%${key}%`)) as Array<QitemRow & { evidence_ref?: string | null }>;
+    const view = this.participantView();
     return rows
       .filter((r) => {
+        if (!needsPerson(view, r)) return false;
         // Row-level canonical confirm (authoritative over the prefilter).
         const scopes = parseScopeTags(r.tags);
         if (tagIsSlice && !sliceKeys.some((key) => scopes.slices.has(key))) return false;
@@ -563,8 +604,9 @@ export class ReviewGatherer {
       )
       .all(...ACTIVE_STATES) as QitemRow[];
     const bySession = new Map<string, { rows: QitemRow[]; slices: Set<string> }>();
+    const view = this.participantView();
     for (const r of rows) {
-      if (isHumanSeatSession(r.destination_session)) continue;
+      if (view.person(r.destination_session) || view.channel(r.destination_session)) continue;
       const scopes = parseScopeTags(r.tags);
       const rowSlices = [...scopes.slices];
       // Membership (canonical): a row belongs when it carries one of the
@@ -630,8 +672,9 @@ export class ReviewGatherer {
       .all(todayStartIso, ...ACTIVE_STATES) as QitemRow[];
     const known = new Set(holders.map((h) => h.sessionName));
     const recent = new Map<string, { latest: QitemRow; slices: Set<string> }>();
+    const view = this.participantView();
     for (const r of rows) {
-      if (isHumanSeatSession(r.destination_session)) continue;
+      if (view.person(r.destination_session) || view.channel(r.destination_session)) continue;
       const owner = physicalSessionName(this.db, r.destination_session);
       if (known.has(owner)) continue;
       let tags: string[] = [];
@@ -728,13 +771,11 @@ export class ReviewGatherer {
         `SELECT qitem_id, ts_created, ts_updated, destination_session, state, priority, tier, tags, ${summaryCol},
                 blocked_on, closure_required_at${hasEvidenceRef ? ", evidence_ref" : ""}
          FROM queue_items
-         WHERE state IN (${ACTIVE_STATES.map(() => "?").join(",")})
-           AND (tier = 'human-gate'
-                OR destination_session LIKE 'human%'
-                OR (state = 'blocked' AND blocked_on LIKE 'human%'))`,
+         WHERE state IN (${ACTIVE_STATES.map(() => "?").join(",")})`,
       )
       .all(...ACTIVE_STATES) as Array<QitemRow & { evidence_ref?: string | null }>;
-    return rows.map((r) => {
+    const view = this.participantView();
+    return rows.filter((r) => needsPerson(view, r)).map((r) => {
       // OPR.0.4.6.WF4 Q6 — stamp the ● workflow pointer from the item's own
       // tags; OMITTED for non-workflow rows (byte-identity-by-omission).
       const workflow = workflowRefFromTags(r.tags);
