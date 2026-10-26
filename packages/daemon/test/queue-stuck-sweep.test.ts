@@ -93,6 +93,8 @@ describe("S02 standing stuck sweep — both halves, routed findings, quiet-but-o
       isRegisteredHost: () => false,
       // Hermetic default: no operator agent configured, whatever this machine's settings say.
       resolveRecoveryAgentSeat: () => null,
+      // Hermetic default: no operator seat either.
+      resolveOperatorSeat: () => null,
       ...overrides,
     });
     return { mod, status, result };
@@ -363,7 +365,7 @@ describe("S02 standing stuck sweep — both halves, routed findings, quiet-but-o
     ["operator-admin@kernel", "operator-admin@kernel"],
     ["  operator-admin@kernel  ", "operator-admin@kernel"],
     ["", null],
-    ["human-founder@external", null],
+    ["human-person@external", null],
     ["human@kernel", null],
     ["not a session", null],
   ])("the operator agent setting %j resolves to %j", async (value, expected) => {
@@ -407,6 +409,55 @@ describe("S02 standing stuck sweep — both halves, routed findings, quiet-but-o
     const [finding] = await findingsFor(row.qitemId);
     expect(finding!.destinationSession).toBe("worker@r");
     expect(finding!.body).toContain("no live recovery seat is available");
+  });
+
+  // A hosted member (no terminal, not a person) can't be woken, so its finding addressed to it would reach nobody.
+  // Real topology: rig r with one bound seat, lead@r, that hands grok@r (no node) its work.
+  async function mkUnroutableRow(): Promise<QueueItem> {
+    db.prepare("INSERT INTO rigs (id, name) VALUES ('rig-r', 'r')").run();
+    db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime, cwd) VALUES ('node-lead', 'rig-r', 'lead', 'claude-code', '/tmp')").run();
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status, created_at) VALUES ('sess-lead', 'node-lead', 'lead@r', 'running', '2026-07-02 12:00:00')").run();
+    db.prepare("INSERT INTO bindings (id, node_id, attachment_type, tmux_session, tmux_pane) VALUES ('bind-lead', 'node-lead', 'tmux', 'lead@r', '%1')").run();
+    expect(repo.classifyDestinationOf("lead@r").class).toBe("pane-bound");
+    const row = await repo.create({ sourceSession: "lead@r", destinationSession: "grok@r", body: "work" });
+    const recorded = repo.classifyDestinationOf("grok@r");
+    expect(recorded.class).toBe("unroutable");
+    if (recorded.class === "unroutable") setNudgeResult(row.qitemId, recorded.teaching, new Date());
+    return row;
+  }
+
+  it("work for an address with no wake route (a hosted member) is told to the person, and says why", async () => {
+    const row = await mkUnroutableRow();
+    await runSweep({ resolveOperatorSeat: () => "person@external", resolveRecoveryAgentSeat: () => "operator-admin@kernel" });
+    const [finding] = await findingsFor(row.qitemId);
+    expect(finding!.destinationSession).toBe("person@external");
+    expect(finding!.body).toContain("grok@r has no wake route on this daemon (no terminal, not a person). If it's a hosted member, it sees this work only when it next checks, so ask it to; otherwise fix the address. This finding goes to person@external, the operator seat (workspace.operator_seat_name), a person");
+
+    // Once the member checks in and claims it, the sweep closes the finding itself.
+    repo.claim({ qitemId: row.qitemId, destinationSession: "grok@r" });
+    await runSweep({ resolveOperatorSeat: () => "person@external" });
+    expect((await findingsFor(row.qitemId))[0]!.state).toBe("done");
+  });
+
+  it("with no person as the operator seat, the finding for an address with no wake route goes to the row's creator", async () => {
+    const row = await mkUnroutableRow();
+    await runSweep({ resolveOperatorSeat: () => "approver@r", resolveRecoveryAgentSeat: () => "operator-admin@kernel" });
+    const [finding] = await findingsFor(row.qitemId);
+    expect(finding!.destinationSession).toBe("lead@r");
+    expect(finding!.body).toContain("This finding goes to lead@r, the row's creator");
+  });
+
+  it("a seat launched after its wake found no route keeps its own finding, and its wake", async () => {
+    const row = await mkUnroutableRow();
+    // The member was added before it launched; now it has a terminal.
+    db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime, cwd) VALUES ('node-grok', 'rig-r', 'grok', 'claude-code', '/tmp')").run();
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status, created_at) VALUES ('sess-grok', 'node-grok', 'grok@r', 'running', '2026-07-02 12:05:00')").run();
+    db.prepare("INSERT INTO bindings (id, node_id, attachment_type, tmux_session, tmux_pane) VALUES ('bind-grok', 'node-grok', 'tmux', 'grok@r', '%2')").run();
+    expect(repo.classifyDestinationOf("grok@r").class).toBe("pane-bound");
+    await runSweep({ resolveOperatorSeat: () => "person@external" });
+    const [finding] = await findingsFor(row.qitemId);
+    expect(finding!.destinationSession).toBe("grok@r");
+    expect(finding!.body).not.toContain("has no wake route");
   });
 
   it("a verdict from before the seat's relaunch, or no verdict, doesn't count as missing", () => {
@@ -490,6 +541,8 @@ describe("S02 standing stuck sweep — both halves, routed findings, quiet-but-o
     expect(finding.evidenceRef).toBe(`rig queue show ${row.qitemId}`);
     expect(repo.getById(finding.evidenceRef!.slice("rig queue show ".length))?.body).toBe(row.body);
     expect(finding.destinationSession).toBe(destinationSession);
+    // Its creator can't be reached either, so the finding stays, and says so.
+    expect(finding.body).toContain("No person, creator or operator agent that can be reached is available");
     expect(finding.lastNudgeResult).toMatch(/^unroutable:/);
     expect(sent).toEqual([]);
 
