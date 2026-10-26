@@ -419,7 +419,11 @@ export class SeatAttentionReconciler {
     // The latest runtime hook still says the seat waits on a person (an approval, a picker, an elicitation) and nothing
     // newer was recorded. A prompt declined or answered with no hook after it reads that way for good, and sends stay
     // refused while the pane can't show the prompt ended. Only someone who saw it end can say so.
-    const hook = agentActivityStore.getLatestForNode({ nodeId: session.nodeId, sessionName });
+    const hook = agentActivityStore.getLatestForNode({
+      nodeId: session.nodeId,
+      sessionName,
+      order: session.runtime === "claude-code" ? "source" : "arrival",
+    });
     const hookClassActive = latestHookWaitsOnPerson(hook, session.runtime) || latestHookPermissionPending(hook, session.runtime);
 
     if (!startupClassActive && !derivedOutcome && !identityClassActive && !hookClassActive) {
@@ -609,6 +613,7 @@ export class SeatAttentionReconciler {
     const activity = agentActivityStore.getLatestForNode({
       nodeId: session.nodeId,
       sessionName,
+      order: session.runtime === "claude-code" ? "source" : "arrival",
     });
 
     if (activity && activity.stale !== true && POSITIVE_STATES.has(activity.state)) {

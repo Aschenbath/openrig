@@ -220,7 +220,10 @@ export function startWakeLadderScheduler(deps: {
       readPromptState: makePromptStateReader({
         db,
         getSeatState: (nodeId) => deps.seatActivityService?.getSeatState(nodeId),
-        getLatestHook: (sessionName) => deps.agentActivityStore?.getLatestForNode({ sessionName }),
+        getLatestHook: (sessionName, runtime) => deps.agentActivityStore?.getLatestForNode({
+          sessionName,
+          order: runtime === "claude-code" ? "source" : "arrival",
+        }),
       }),
       ...(deps.providerService
         ? { getProviderReadModel: () => deps.providerService!.getReadModel() }

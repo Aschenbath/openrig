@@ -3118,7 +3118,7 @@ export class SessionTransport {
         if (readiness.reason === OPENCLAW_TURN_NOT_RECOVERED) {
           sendAdvisory = [sendAdvisory, `OpenClaw refused its last local turn and OpenRig hasn't recovered it; this message submits a new turn. Inspect it with rig capture ${sessionName}.`].filter(Boolean).join(" ");
         } else {
-          const linkDiagnosis = await this.diagnoseProducerLink(sessionName);
+          const linkDiagnosis = await this.diagnoseProducerLink(sessionName, sessionMeta.runtime);
           sendAdvisory = [sendAdvisory, `producer-link: ${linkDiagnosis} — activity could not be determined (${readiness.reason}); sent anyway (telemetry is advisory).`].filter(Boolean).join(" ");
         }
         // fall through to the send below.
@@ -3586,6 +3586,7 @@ export class SessionTransport {
     const hookActivity = this.agentActivityStore?.getLatestForNode({
       sessionName: input.sessionName,
       now,
+      order: input.runtime === "claude-code" ? "source" : "arrival",
     });
     const permissionPending = latestHookPermissionPending(hookActivity, input.runtime);
     if (hookActivity && permissionPending && this.hookFreshForSend(hookActivity, now)) {
@@ -3635,7 +3636,8 @@ export class SessionTransport {
       }
       // OPR.0.4.3.28 Part A — a stale-but-latest `idle` hook (older than the 15s
       // send window but still within the 5-min store window, so stale!==true) is
-      // SENDABLE. getLatestForNode returns the single newest event by seq, so a
+      // SENDABLE. getLatestForNode returns the newest event in the runtime's
+      // order (source time for Claude, arrival sequence for other runtimes), so a
       // latest hook still `idle` proves no newer activity exists (had the seat
       // started work, the latest hook would be UserPromptSubmit/PermissionRequest).
       // A stale NON-idle hook (running/needs_input >15s) still falls through to
@@ -3726,7 +3728,7 @@ export class SessionTransport {
   // producer chain is broken + the next step, instead of an opaque
   // `no_activity_signal`. NEVER surfaces a token value — env checks are
   // presence-only, and the store carries no token.
-  private async diagnoseProducerLink(sessionName: string): Promise<string> {
+  private async diagnoseProducerLink(sessionName: string, runtime: string | null): Promise<string> {
     // Link 1 — the relay's prerequisites: the daemon URL, the activity token, and the runtime
     // (without OPENRIG_RUNTIME the relay builds no payload and posts nothing). Only the tmux SESSION
     // environment is inspected; the agent process's own environment is not read, and an env-prefixed
@@ -3801,7 +3803,11 @@ export class SessionTransport {
     if (!store) {
       return withEnv(`daemon-ingest link DOWN — the activity store is not configured on this daemon (ingest returns 503)`);
     }
-    const latest = store.getLatestForNode({ sessionName, now: this.now() });
+    const latest = store.getLatestForNode({
+      sessionName,
+      now: this.now(),
+      order: runtime === "claude-code" ? "source" : "arrival",
+    });
     if (!latest || latest.evidenceSource !== "runtime_hook") {
       return withEnv(`no activity hook is stored for this seat — which link failed is not identified: the relay may never have posted (it needs OPENRIG_RUNTIME, the relay URL and the token in the agent process), Codex hook-trust may be uncleared, or ingest may have rejected posts (401 token mismatch, 503 unconfigured)`);
     }

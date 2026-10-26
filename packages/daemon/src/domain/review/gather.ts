@@ -677,7 +677,11 @@ export class ReviewGatherer {
       let idleSinceIso: string | null = a.idleSinceIso;
       if (this.activityStore) {
         try {
-          const activity = this.activityStore.getLatestForNode({ sessionName: a.sessionName, now: new Date(nowIso) });
+          const activity = this.activityStore.getLatestForNode({
+            sessionName: a.sessionName,
+            now: new Date(nowIso),
+            order: runtime === "claude-code" ? "source" : "arrival",
+          });
           if (activity?.state === "running") {
             idle = false;
             idleSinceIso = null;
