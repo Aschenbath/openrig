@@ -14,10 +14,17 @@ import type { NodeBinding } from "../src/domain/runtime-adapter.js";
 import { NO_SESSION_BUS } from "../src/domain/seat-runtime-dir.js";
 import { SEAT_ENV_KEYS_VAR } from "../src/domain/seat-env.js";
 import { shellQuote } from "../src/adapters/shell-quote.js";
+import { createFullTestDb } from "./helpers/test-app.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { SessionRegistry } from "../src/domain/session-registry.js";
+import { EventBus } from "../src/domain/event-bus.js";
+import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
 
 // No provider, tmux or startup. Config-selection cases execute only a private
 // fake Claude through the generated shell command; other child calls are mocked.
-vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
+vi.mock("node:child_process", async importOriginal => ({
+  ...await importOriginal<typeof import("node:child_process")>(), execFile: vi.fn(),
+}));
 // Simulate eligibility for inert fixtures; path resolution/stat/replacement use
 // private real files. Config-selection cases additionally execute their fake.
 vi.mock("node:fs", async importOriginal => {
@@ -62,7 +69,7 @@ function fixture() {
   const deps: Record<string,unknown> = { rigRepo: { db }, sessionRegistry: { db }, eventBus, tmuxAdapter: tmux, runtimeAdapters: { "claude-code": adapter } };
   // Use the production route constructor and its actual adapter/service wiring.
   const service = seatLifecycleService({ get: key => deps[key] });
-  vi.spyOn(service as any, "resolveSeat").mockReturnValue({ nodeId: "node", entry: { runtime: "claude-code", cwd } });
+  vi.spyOn(service as any, "resolveSeat").mockReturnValue({ nodeId: "node", entry: { rigId: "rig", runtime: "claude-code", cwd } });
   vi.spyOn(service as any, "describe").mockReturnValue({ nodeId: "node", rigId: "rig", logicalId: "owner", rigName: "rig" });
   vi.mocked(execFile).mockImplementation(((file: string, _args: string[], options: any, done: any) => {
     expect(file).toBe(executable); expect(options.cwd).toBe(cwd); expect(options.env.PATH).toBe(path.join(cwd,"bin") + path.delimiter + daemonBin);
@@ -353,6 +360,39 @@ else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(paneNames)}
     expect(f.db.prepare("SELECT mode FROM node_permission_selections").get()).toEqual({ mode: "auto" });
     expect(f.db.prepare("SELECT COUNT(*) n FROM events").get()).toEqual({ n: 1 }); expect(f.calls).toEqual([]);
     expect(JSON.stringify(f.db.prepare("SELECT * FROM events").all())).not.toContain(f.env.ANTHROPIC_API_KEY);
+  });
+  it("keeps node-ID permission saves bound to the real Claude generation check during help", async () => {
+    const f = fixture();
+    const db = createFullTestDb(); open.push(db);
+    const rigRepo = new RigRepository(db), registry = new SessionRegistry(db), eventBus = new EventBus(db);
+    const rig = rigRepo.createRig("node-rig");
+    const node = rigRepo.addNode(rig.id, "worker", { runtime: "claude-code", cwd: f.cwd });
+    registry.registerSession(node.id, "worker@node-rig");
+    registry.updateBinding(node.id, { attachmentType: "tmux", tmuxSession: "worker@node-rig", tmuxPane: "%1" });
+    const managed = new ClaudeManagedLaunch(db, f.env, f.renderer);
+    const service = new SeatLifecycleService({ db, rigRepo, sessionRegistry: registry, eventBus, tmuxAdapter: f.tmux,
+      runtimeAdapters: { "claude-code": { claudeManagedLaunch: managed } as never } });
+    const choice = { nodeId: node.id, mode: "auto", actor: "operator", reason: "reviewed native choice" };
+    let replaceDuringHelp = true;
+    vi.mocked(execFile).mockImplementation(((file: string, _args: string[], options: any, done: any) => {
+      expect(file).toBe(f.executable);
+      expect(options.cwd).toBe(f.cwd);
+      if (replaceDuringHelp) {
+        replaceDuringHelp = false;
+        registry.registerSession(node.id, "worker-next@node-rig", "handover");
+      }
+      done(null, help);
+    }) as any);
+
+    expect(await service.setPermissions(choice)).toMatchObject({ ok: false, code: "permission_selection_refused" });
+    expect(db.prepare("SELECT * FROM node_permission_selections WHERE node_id=?").all(node.id)).toEqual([]);
+    expect(db.prepare("SELECT * FROM events WHERE type='node.permissions_changed'").all()).toEqual([]);
+
+    // A fresh request prepares against the current generation and can save the choice.
+    expect(await service.setPermissions(choice)).toMatchObject({ ok: true, changed: true, seat: { nodeId: node.id, rigId: rig.id } });
+    expect(db.prepare("SELECT mode, actor FROM node_permission_selections WHERE node_id=?").get(node.id)).toEqual({ mode: "auto", actor: "operator" });
+    expect(db.prepare("SELECT COUNT(*) n FROM events WHERE type='node.permissions_changed'").get()).toEqual({ n: 1 });
+    expect(f.calls).toEqual([]);
   });
   it("does not try a daemon executable just because its vocabulary is newer", async () => {
     const f = fixture(); vi.stubEnv("PATH", f.daemonBin);

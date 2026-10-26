@@ -99,6 +99,9 @@ interface ResolvedSeat {
   nodeId: string;
 }
 
+/** Setting writes can address either a legacy seat name or one immutable node ID. */
+export type SeatSettingTarget = { seatRef: string; nodeId?: never } | { nodeId: string; seatRef?: never };
+
 export interface SeatRefusal {
   ok: false;
   code:
@@ -370,13 +373,13 @@ export class SeatLifecycleService {
     }
   }
 
-  async setModel(input: { seatRef: string; model: string; reason: string; operator?: string | null }): Promise<SetModelResult> {
+  async setModel(input: SeatSettingTarget & { model: string; reason: string; operator?: string | null }): Promise<SetModelResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     if (!input.model?.trim()) {
       return { ok: false, code: "missing_model", message: "A target model id is required (--model)." };
     }
-    const resolved = this.resolveSeat(input.seatRef);
+    const resolved = this.resolveSettingTarget(input);
     if ("code" in resolved) return resolved;
 
     const model = input.model.trim();
@@ -521,7 +524,7 @@ export class SeatLifecycleService {
   /** OPR.0.7.0.7 — save one seat's effort for its next managed continuation. Like set-model it
    *  validates, writes, and persists an audited event in the same transaction; it never restarts
    *  the seat or touches its peers, model or account. `effort: null` clears the explicit choice. */
-  async setEffort(input: { seatRef: string; effort: string | null; reason: string; operator?: string | null }): Promise<SetEffortResult> {
+  async setEffort(input: SeatSettingTarget & { effort: string | null; reason: string; operator?: string | null }): Promise<SetEffortResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     const requested = input.effort === null ? null : input.effort.trim();
@@ -532,12 +535,12 @@ export class SeatLifecycleService {
         return { ok: false, code: "invalid_effort", message: `"${requested}" isn't an effort level: use the runtime's level name, such as low, medium or high.` };
       }
     }
-    const resolved = this.resolveSeat(input.seatRef);
+    const resolved = this.resolveSettingTarget(input);
     if ("code" in resolved) return resolved;
     const seat = this.describe(resolved);
     const runtime = resolved.entry.runtime ?? "unknown";
     if (runtime !== "claude-code" && runtime !== "codex" && runtime !== "pi") {
-      return { ok: false, code: "effort_unsupported_runtime", message: `Seat "${input.seatRef}" runs ${runtime}; reasoning effort applies to claude-code, codex and pi seats only.` };
+      return { ok: false, code: "effort_unsupported_runtime", message: `Seat "${this.settingTargetLabel(input)}" runs ${runtime}; reasoning effort applies to claude-code, codex and pi seats only.` };
     }
 
     const from = this.readEffort(seat.nodeId);
@@ -567,7 +570,7 @@ export class SeatLifecycleService {
       if (refused) return refused;
       if (persisted) this.eventBus.notifySubscribers(persisted);
       if (!changed) {
-        return { ok: false, code: "effort_unavailable", message: `The effort choice for seat "${input.seatRef}" was not saved (no node row was updated); nothing changed.` };
+        return { ok: false, code: "effort_unavailable", message: `The effort choice for seat "${this.settingTargetLabel(input)}" was not saved (no node row was updated); nothing changed.` };
       }
     }
     const saved = this.readEffort(seat.nodeId) ?? from;
@@ -747,7 +750,7 @@ export class SeatLifecycleService {
     return probe.state === "present" ? { state: "yes" } : { state: "no", detail: "tmux session absent" };
   }
 
-  async setPermissions(input: { seatRef: string; mode?: string; rules?: unknown; codexPermissions?: unknown; codexProfile?: string; reason: string; actor: string }): Promise<
+  async setPermissions(input: SeatSettingTarget & { mode?: string; rules?: unknown; codexPermissions?: unknown; codexProfile?: string; reason: string; actor: string }): Promise<
     | { ok: true; seat: SeatDescriptor; from: unknown; to: unknown; changed: boolean; effect: string; replaced?: unknown; observation?: unknown }
     | SeatRefusal
   > {
@@ -755,14 +758,15 @@ export class SeatLifecycleService {
     const required = this.requireReason(input.reason);
     if (required) return required;
     if (!input.actor.trim()) return { ok: false, code: "permission_selection_refused", message: "Sender identity is required for permission audit." };
-    const resolved = this.resolveSeat(input.seatRef);
+    const resolved = this.resolveSettingTarget(input);
     if ("code" in resolved) return resolved;
     const seat = this.describe(resolved);
     const runtime = resolved.entry.runtime ?? "unknown";
     const choices = [input.mode, input.rules, input.codexPermissions, input.codexProfile].filter(value => value !== undefined).length;
     if (choices !== 1) return { ok: false, code: "permission_selection_refused", message: "Choose exactly one of mode, rules, codex permissions or codex profile." };
     if (input.codexPermissions !== undefined) return this.setCodexPermissions(seat, runtime, input.codexPermissions, input.actor.trim(), input.reason.trim());
-    if (input.codexProfile !== undefined) return this.setCodexProfile(seat, runtime, input.codexProfile, resolved.entry.cwd ?? undefined, input.actor.trim(), input.reason.trim());
+    if (input.codexProfile !== undefined) return this.setCodexProfile(seat, runtime, input.codexProfile, resolved.entry.cwd ?? undefined,
+      input.actor.trim(), input.reason.trim(), input.nodeId !== undefined);
     if (input.rules !== undefined) {
       if (runtime !== "claude-code") return { ok: false, code: "permission_selection_refused", message: "claude_permissions is only supported for claude-code seats." };
       try {
@@ -799,6 +803,13 @@ export class SeatLifecycleService {
       const store = new NativePermissionStore(this.db);
       let persisted: PersistedEvent | null = null;
       const result = this.db.transaction(() => {
+        if (dynamic && input.nodeId !== undefined) {
+          // Claude preparation awaits; an exact node target must still belong to an active rig.
+          const available = this.db.prepare(`SELECT 1 FROM nodes n JOIN rigs r ON r.id = n.rig_id
+            WHERE n.id = ? AND r.archived_at IS NULL`).get(seat.nodeId);
+          if (!available) return { ok: false as const, code: "seat_not_found" as const,
+            message: `Node "${seat.nodeId}" no longer exists in an active rig.`, guidance: SEAT_LOOKUP_GUIDANCE };
+        }
         launch?.assertCurrent();
         const currentRuntime = this.db.prepare("SELECT runtime FROM nodes WHERE id = ?").get(seat.nodeId) as { runtime: string } | undefined;
         if (currentRuntime?.runtime !== runtime) throw new Error("Seat runtime changed while checking native options; selection was not changed.");
@@ -860,7 +871,8 @@ export class SeatLifecycleService {
 
   /** A Codex seat's named profile. It doesn't replace a retained conversation's approval; an envelope does. The check
    *  speaks only for the config home this seat's launches use, and a real load failure keeps the previous profile. */
-  private async setCodexProfile(seat: SeatDescriptor, runtime: string, value: string, cwd: string | undefined, actor: string, reason: string):
+  private async setCodexProfile(seat: SeatDescriptor, runtime: string, value: string, cwd: string | undefined, actor: string, reason: string,
+    exactNodeTarget: boolean):
     Promise<{ ok: true; seat: SeatDescriptor; from: unknown; to: unknown; changed: boolean; effect: string; observation?: unknown } | SeatRefusal> {
     if (runtime !== "codex") return { ok: false, code: "permission_selection_refused", message: "A Codex profile is only supported for codex seats." };
     const name = value.trim();
@@ -870,8 +882,9 @@ export class SeatLifecycleService {
     }
     const observer = this.runtimeAdapters["codex"] as unknown as Partial<CodexProfileObserver> | undefined;
     // The check is evidence: if it fails unexpectedly, record that instead of failing the request.
-    const observed = to !== null && cwd && observer?.observeProfile
-      ? await observer.observeProfile(to, cwd, seat.nodeId).catch((error: unknown) => ({ vantage: "unestablished" as const, home: null, file: "unverified" as const,
+    const checksProfile = to !== null && cwd && observer?.observeProfile;
+    const observed = checksProfile
+      ? await observer!.observeProfile!(to, cwd, seat.nodeId).catch((error: unknown) => ({ vantage: "unestablished" as const, home: null, file: "unverified" as const,
         load: "not_run" as const, detail: `The profile check couldn't run (${(error as Error).message}); each launch runs the native check.`, observedAt: new Date().toISOString() }))
       : undefined;
     if (observed?.load === "failed") {
@@ -880,6 +893,12 @@ export class SeatLifecycleService {
     try {
       let persisted: PersistedEvent | null = null;
       const result = this.db.transaction(() => {
+        if (exactNodeTarget && checksProfile) {
+          const available = this.db.prepare(`SELECT 1 FROM nodes n JOIN rigs r ON r.id = n.rig_id
+            WHERE n.id = ? AND r.archived_at IS NULL`).get(seat.nodeId);
+          if (!available) return { ok: false as const, code: "seat_not_found" as const,
+            message: `Node "${seat.nodeId}" no longer exists in an active rig.`, guidance: SEAT_LOOKUP_GUIDANCE };
+        }
         const row = this.db.prepare("SELECT codex_config_profile FROM nodes WHERE id = ? AND runtime = 'codex'").get(seat.nodeId) as { codex_config_profile: string | null } | undefined;
         if (!row) throw new Error("Seat runtime changed; the profile was not changed.");
         const from = row.codex_config_profile;
@@ -911,7 +930,7 @@ export class SeatLifecycleService {
    *  resume and launches that read the seat's stored state use that provenance, while a launch from a
    *  spec that declares a policy re-applies the spec's. The ref is validated exactly as a spec
    *  member's is; the running process is untouched. */
-  async setPolicy(input: { seatRef: string; ref: string; reason: string; actor: string }): Promise<SetPolicyResult> {
+  async setPolicy(input: SeatSettingTarget & { ref: string; reason: string; actor: string }): Promise<SetPolicyResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     const invalid = validatePermissionPolicyRef(input.ref, "permission_policy");
@@ -926,7 +945,7 @@ export class SeatLifecycleService {
         guidance: "Use builtin:<name> or none here, or declare the custom ref in the rig spec.",
       };
     }
-    const resolved = this.resolveSeat(input.seatRef);
+    const resolved = this.resolveSettingTarget(input);
     if ("code" in resolved) return resolved;
     const seat = this.describe(resolved);
     if (resolved.entry.runtime === "terminal") {
@@ -2167,6 +2186,21 @@ export class SeatLifecycleService {
       `SELECT id, session_name, status, origin, ${sessionCommunityHarnessSelect(this.db, "sessions")} AS community_harness FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1`,
     ).get(nodeId) as LatestSessionRow | undefined;
     return row ?? null;
+  }
+
+  private settingTargetLabel(target: SeatSettingTarget): string {
+    return target.nodeId === undefined ? target.seatRef : target.nodeId;
+  }
+
+  private resolveSettingTarget(target: SeatSettingTarget): ResolvedSeat | SeatRefusal {
+    if (target.nodeId === undefined) return this.resolveSeat(target.seatRef);
+    const nodeId = target.nodeId.trim();
+    if (!nodeId) return { ok: false, code: "seat_ref_required", message: "node ID is required", guidance: SEAT_LOOKUP_GUIDANCE };
+    const row = this.db.prepare(`SELECT n.rig_id FROM nodes n JOIN rigs r ON r.id = n.rig_id
+      WHERE n.id = ? AND r.archived_at IS NULL`).get(nodeId) as { rig_id: string } | undefined;
+    const entry = row && getNodeInventory(this.db, row.rig_id).find(candidate => candidate.nodeId === nodeId);
+    if (!entry) return { ok: false, code: "seat_not_found", message: `Node "${nodeId}" not found in an active rig.`, guidance: SEAT_LOOKUP_GUIDANCE };
+    return { entry, nodeId };
   }
 
   /** The ONE resolution path, mirroring SeatStatusService.findMatches semantics
