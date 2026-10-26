@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { ConfigStore } from "../config-store.js";
+import { mcpPresenceFilePath, readPresence } from "../mcp-presence.js";
 import { parseRoster, readRosters, type Roster, type RosterMember, type RosterWake } from "@openrig/daemon/rosters";
 
 // One roster parser, shared with the daemon (a hosted member's wake route reads the same files).
@@ -14,6 +15,8 @@ export interface RosterInventory {
   readAt: string;
   nodes: Row[];
   sources: Row[];
+  /** This host's id, from the local daemon's own nodes; null when it has none to read it from. */
+  localHostId?: string | null;
 }
 const object = (v: unknown): v is Row => !!v && typeof v === "object" && !Array.isArray(v);
 const text = (v: unknown): string | null => typeof v === "string" && v.trim() ? v : null;
@@ -23,6 +26,7 @@ const text = (v: unknown): string | null => typeof v === "string" && v.trim() ? 
 const fields = "rigId,logicalId,canonicalSessionName,hostSelfId,runtime,model,modelObservation,sessionStatus,agentActivity";
 export async function readRosterInventory(): Promise<RosterInventory> {
   const nodes: Row[] = [], sources: Row[] = [];
+  let localHostId: string | null = null;
   for (const remote of [false, true]) {
     const argv = [fileURLToPath(new URL("../index.js", import.meta.url)), "ps", "--no-cleanup", "--nodes", "-A", "--json", "--fields", fields,
       ...(remote ? ["--all-hosts"] : [])];
@@ -36,6 +40,7 @@ export async function readRosterInventory(): Promise<RosterInventory> {
       const entries = Array.isArray(data) ? data : object(data) ? data.entries ?? data.items : null;
       if (!Array.isArray(entries)) throw new Error("ps returned no node array");
       nodes.push(...entries.filter(object));
+      if (!remote) localHostId = entries.filter(object).map((n) => text(n.hostSelfId)).find((id) => id !== null) ?? null;
       sources.push({ scope, status: result.error || result.stderr.trim() ? "partial" : "ok",
         ...(object(data) && Array.isArray(data.hosts) ? { hosts: data.hosts } : {}),
         ...(result.stderr.trim() ? { warning: result.stderr.trim() } : {}),
@@ -44,7 +49,7 @@ export async function readRosterInventory(): Promise<RosterInventory> {
       sources.push({ scope, status: "unavailable", error: result.stderr.trim() || (error as Error).message });
     }
   }
-  return { readAt: new Date().toISOString(), nodes, sources };
+  return { readAt: new Date().toISOString(), nodes, sources, localHostId };
 }
 
 export function enrichRosterMember(member: RosterMember, inventory: RosterInventory) {
@@ -71,6 +76,11 @@ export function enrichRosterMember(member: RosterMember, inventory: RosterInvent
     modelObservation: observation,
     sessionStatus,
     agentActivity: { state: text(activity?.state) ?? "unknown", reason: text(activity?.reason), sampledAt: text(activity?.sampledAt) },
+    // A hosted member's last call to this host's MCP server, for a roster row on this host only: another host's member,
+    // or one whose host can't be told, is unknown (null), never this host's record for a same-named seat. Its last ring
+    // is in rig_team.
+    ...(member.hosted ? { lastCallAt: inventory.localHostId && member.host === inventory.localHostId
+      ? readPresence(mcpPresenceFilePath())[member.seat]?.lastCallAt ?? null : null } : {}),
   } };
 }
 
@@ -112,7 +122,7 @@ export function rosterCommand(deps: Deps = {}): Command {
         else {
           const members = (verb === "show" ? (result.roster as Row).members : result.matches) as Array<ReturnType<typeof enrichRosterMember> & { roster?: { id: string } }>;
           if (verb === "show") { const r = result.roster as Roster; console.log(`${r.name} — ${r.purpose}\nCurator: ${r.curator.seat} (${r.curator.host})`); }
-          for (const m of members) console.log(`${m.seat} (${m.host})${m.roster ? ` [${m.roster.id}]` : ""}\n  ${m.engagement.join(", ")}: ${m.capabilities.join(", ")}\n  When: ${m.use_when}\n  Why: ${m.why}${m.caveat ? `\n  Caveat: ${m.caveat}` : ""}\n  ${m.live.status}: runtime ${m.live.runtime ?? "unknown"}; configured model ${m.live.configuredModel ?? "unknown"}; last observed model ${formatModelObservation(m.live.modelObservation)}\n  Activity: ${m.live.agentActivity.state}; sampled ${m.live.agentActivity.sampledAt ?? "unknown"}\n  ${m.live.reason}`);
+          for (const m of members) console.log(`${m.seat} (${m.host})${m.roster ? ` [${m.roster.id}]` : ""}\n  ${m.engagement.join(", ")}: ${m.capabilities.join(", ")}\n  When: ${m.use_when}\n  Why: ${m.why}${m.caveat ? `\n  Caveat: ${m.caveat}` : ""}\n  ${m.live.status}: runtime ${m.live.runtime ?? "unknown"}; configured model ${m.live.configuredModel ?? "unknown"}; last observed model ${formatModelObservation(m.live.modelObservation)}\n  Activity: ${m.live.agentActivity.state}; sampled ${m.live.agentActivity.sampledAt ?? "unknown"}${m.hosted ? `\n  Last call: ${m.live.lastCallAt ?? "unknown"}` : ""}\n  ${m.live.reason}`);
           if (!members.length) console.log("No matching members.");
           const obs = result.observations as { sources: Row[] };
           for (const source of obs.sources) if (source.status !== "ok") console.error(`Observation gap (${source.scope}): ${source.warning ?? source.error ?? source.status}`);
