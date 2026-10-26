@@ -478,6 +478,12 @@ PID, refusing a verified Codex running beneath a shell or launcher. Recording
 both PIDs lets that wrapper pass without accepting a changed pane root or
 changing the identity schema.
 
+For dual-PID verdicts, the selected thread must also be the thread resolved for
+`observedPid`. All candidate threads still participate in the ambiguity check;
+another process's resolvable thread cannot stand in for a missing or
+unresolvable verified native process. This reuses the same process observation
+and thread lookups, without an additional census.
+
 The existing thread lookup still requires a Codex descendant with one
 resolvable thread, a thread-table record path and a matching rollout header.
 The route rechecks occupant generation, pane binding and root PID after the
@@ -485,8 +491,9 @@ thread lookup. These are bounded observations, not an atomic process snapshot.
 An unresolved identity still returns 409; `rig walk` reports consumption as
 unverified instead of claiming it read the record. Route regressions in
 `packages/daemon/test/walk-consumption-primitives.test.ts` cover shell and
-launcher wrappers, legacy verdicts, root changes and changes during thread
-resolution with synthetic process observations and actual SQLite/JSONL
+launcher wrappers, legacy verdicts, root changes, replaced or unresolved native
+processes, and changes during thread resolution with synthetic process
+observations and actual SQLite/JSONL
 fixtures; they do not exercise a live Codex conversation.
 
 ## 5. Chat flow

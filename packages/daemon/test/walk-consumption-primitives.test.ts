@@ -473,6 +473,19 @@ describe("GET /api/sessions/:sessionName/generation-record — the consumption-b
     expect(await response.json()).toMatchObject({ error: "record_identity_unverified" });
   });
 
+  it.each(["replaced", "unresolved"])("Codex refuses another process's thread when the verified native PID is %s", async (native) => {
+    const { url } = seedCodex(threadId, 20, 10);
+    vi.mocked(ProcessCensus.prototype.list).mockResolvedValue([
+      { pid: 10, ppid: 1, command: "zsh" },
+      ...(native === "unresolved" ? [{ pid: 20, ppid: 10, command: "codex", startedAt: "verified" }] : []),
+      { pid: 30, ppid: 10, command: "codex", startedAt: "replacement" },
+    ]);
+    vi.mocked(CodexThreadIdResolver.prototype.resolve).mockImplementation(async pid => pid === 30 ? threadId : undefined);
+    const response = await app.request(url);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: "record_identity_unverified" });
+  });
+
   it.each(["pane", "binding", "occupant"])("Codex still refuses a %s change during wrapped-thread resolution", async (changed) => {
     const { url, node } = seedCodex(threadId, 20, 10);
     vi.mocked(CodexThreadIdResolver.prototype.resolve).mockImplementation(async () => {
