@@ -142,6 +142,9 @@ export function isLoopbackHost(host: string): boolean {
 
 export class McpHttpConfigError extends Error {}
 
+/** The caller whose grant this server checked, as the daemon records it beside the rows it writes (principal:v1). */
+export type McpPrincipal = { source: "file" | "cloud"; id: string; grant?: string; version?: number | string };
+
 /** OpenRig Cloud's customer grant contract. Core asks on every request with the customer's raw key and its own instance
  *  id; nothing is cached, and every answer but `active` is refused. */
 export const CLOUD_GRANT_SCHEMA = "openrig.cloud.grant/v1";
@@ -189,7 +192,7 @@ const unavailable = (log: string): Refusal => ({
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === "string" && item !== "");
 
 /** One request's caller from Cloud's answer for its key. A refusal never falls back to the token file or the env's seat. */
-async function cloudCaller(cloud: CloudGrantOptions, url: URL, key: string, instance: string): Promise<{ seat: string; access: McpAccess } | Refusal> {
+async function cloudCaller(cloud: CloudGrantOptions, url: URL, key: string, instance: string): Promise<{ seat: string; access: McpAccess; principal: McpPrincipal } | Refusal> {
   let res: Response;
   try {
     res = await fetch(url, {
@@ -224,7 +227,10 @@ async function cloudCaller(cloud: CloudGrantOptions, url: URL, key: string, inst
     : grant.expires_at !== null && grant.expires_at !== undefined && !(Date.parse(grant.expires_at) > Date.now()) ? "expired" : null;
   if (problem === "expired") return unauthenticated("This credential has expired.");
   if (problem) return unavailable(`an active answer with an unusable ${problem}`);
-  return { seat, access: { principal: principal.id, owner: false, rigs, roots, workspace: false, customer: { objects } } };
+  // The principal the daemon records beside this caller's rows. A version that isn't a finite number is left out (Cloud's
+  // v1 sends a number).
+  return { seat, access: { principal: principal.id, owner: false, rigs, roots, workspace: false, customer: { objects } },
+    principal: { source: "cloud", id: principal.id, grant: grant.id, ...(Number.isFinite(grant.version) ? { version: grant.version } : {}) } };
 }
 
 export type McpHttpOptions = {
@@ -232,8 +238,9 @@ export type McpHttpOptions = {
   host: string;
   port: number;
   tokenFile: string;
-  /** Builds the daemon client for one request; sessionName is the grant's seat (absent: the env's). */
-  clientFactory?: (daemonUrl: string, sessionName?: string) => DaemonClient;
+  /** Builds the daemon client for one request; sessionName is the grant's seat (absent: the env's), and principal the
+   *  caller whose grant was checked. */
+  clientFactory?: (daemonUrl: string, sessionName?: string, principal?: McpPrincipal) => DaemonClient;
   /** Grants come from OpenRig Cloud instead of the token file, which is then never read. */
   cloudGrants?: CloudGrantOptions;
 };
@@ -264,7 +271,8 @@ export async function startMcpHttpServer(opts: McpHttpOptions): Promise<{ url: s
   if (!loopback && !configured) {
     throw new McpHttpConfigError(`Serving on ${opts.host} needs authentication: add a grant with rig mcp token add, then start again. With no grants, the server stays on loopback.`);
   }
-  const makeClient = opts.clientFactory ?? ((url: string, sessionName?: string) => new DaemonClient(url, sessionName === undefined ? undefined : { sessionName }));
+  const makeClient = opts.clientFactory ?? ((url: string, sessionName?: string, principal?: McpPrincipal) =>
+    new DaemonClient(url, sessionName === undefined ? undefined : { sessionName, ...(principal ? { principal } : {}) }));
   let boundPort = opts.port;
   // Once auth has been configured here, a missing token file is a broken configuration, not a return to local-owner
   // mode: that takes a restart with no file. A beyond-loopback listener always starts with auth.
@@ -290,7 +298,7 @@ export async function startMcpHttpServer(opts: McpHttpOptions): Promise<{ url: s
   const NO_BEARER = "This server needs a bearer credential: Authorization: Bearer <token>.";
 
   /** The caller of one request on a Cloud-granted server: its key's grant, checked with Cloud, for a seat on this instance. */
-  const cloudRequestCaller = async (req: http.IncomingMessage): Promise<{ seat: string; access: McpAccess } | Refusal> => {
+  const cloudRequestCaller = async (req: http.IncomingMessage): Promise<{ seat: string; access: McpAccess; principal: McpPrincipal } | Refusal> => {
     const key = bearer(req);
     if (!key) return unauthenticated(NO_BEARER);
     if (!CLOUD_KEY.test(key)) return unauthenticated(NOT_VALID_HERE);
@@ -317,11 +325,12 @@ export async function startMcpHttpServer(opts: McpHttpOptions): Promise<{ url: s
     }
     let access: McpAccess | undefined;
     let seat: string | undefined;
+    let principal: McpPrincipal | undefined;
     let authenticated = false;
     if (cloud) {
       const caller = await cloudRequestCaller(req);
       if (!("seat" in caller)) { refuse(res, caller); return; }
-      ({ access, seat } = caller);
+      ({ access, seat, principal } = caller);
       authenticated = true;
     } else {
       let grants: McpGrant[] | null;
@@ -344,6 +353,8 @@ export async function startMcpHttpServer(opts: McpHttpOptions): Promise<{ url: s
         }
         access = { principal: grant.name, owner: grant.owner === true, rigs: grant.rigs ?? [], roots: grant.roots ?? [], workspace: grant.workspace === true };
         seat = grant.seat;
+        // A token-file grant has a name and nothing more: no grant id or version is invented for it.
+        principal = { source: "file", id: grant.name };
         authenticated = true;
       }
     }
@@ -357,7 +368,7 @@ export async function startMcpHttpServer(opts: McpHttpOptions): Promise<{ url: s
         return;
       }
     }
-    const mcp = createMcpServer(makeClient(opts.daemonUrl, seat), { seat, access });
+    const mcp = createMcpServer(makeClient(opts.daemonUrl, seat, principal), { seat, access });
     // With no auth (loopback only), refuse a Host that isn't loopback, as a page reaching localhost through DNS rebinding
     // or a forward from elsewhere would send. With auth, the credential is the check, so a tunnel's Host is fine.
     const transport = new StreamableHTTPServerTransport({
