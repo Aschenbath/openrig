@@ -347,7 +347,7 @@ function buildSliceCreateCommand(): Command {
             action: "Pick a slug containing letters or digits.",
           });
         }
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, strictOverride: true });
         const mission = findMission(missionsRoot, missionName);
         let nn = nextSliceNN(mission.absPath);
         const title = opts.title ?? titleFromSlug(slug);
@@ -802,8 +802,16 @@ function resolveMissionCreateRoot(override: string | null | undefined, advisorie
     fs.existsSync(childMissionsRoot) && fs.statSync(childMissionsRoot).isDirectory();
   const directMissionsRoot = path.basename(candidate) === "missions" && !hasChildMissionsRoot;
   const workspaceRoot = directMissionsRoot ? path.dirname(candidate) : candidate;
-  // A missing workspace is created at the named path by the mission's own mkdir, after rendering; it never falls
-  // back to the configured root. A path that can't be created reports the filesystem's own error there.
+  // A named workspace that doesn't exist is refused, not created: a mistyped path would otherwise start a new tree
+  // there. The configured root is never used in its place (#70).
+  if (!fs.existsSync(workspaceRoot) || !fs.statSync(workspaceRoot).isDirectory()) {
+    const source = override ? "--workspace" : "OPENRIG_WORK_ROOT";
+    throw new ScopeCliError({
+      fact: `The workspace named by ${source} is not an existing directory: ${workspaceRoot}.`,
+      consequence: "Mission not created; the configured workspace was NOT used as a fallback.",
+      action: `Point ${source} at an existing workspace, or create ${workspaceRoot} first.`,
+    });
+  }
 
   // A named workspace uses its project.yaml missions.root, as work positions do; a named missions folder is used as is.
   const missionsRoot = directMissionsRoot ? candidate : readProjectMissionsRoot(workspaceRoot, advisories);
