@@ -92,9 +92,17 @@ describe("SSH tiles follow the viewing instance's effective server mode", () => 
       expect(result.ok).toBe(true);
       expect(result.code).toBeUndefined();
       const command = herdr.lastView!.opened[0]!.paneCommand;
-      expect(command).toBe(mode === "isolated"
-        ? "ssh -t 'fixture' 'env OPENRIG_HOST_SELECTED=local rig terminal attach --read-only -- '\"'\"'worker@edge'\"'\"''"
-        : "ssh -t 'fixture' 'tmux attach -r -t '\"'\"'worker@edge'\"'\"''");
+      if (mode === "isolated") {
+        expect(command).toBe("ssh -t 'fixture' 'env OPENRIG_HOST_SELECTED=local rig terminal attach --read-only -- '\"'\"'worker@edge'\"'\"''");
+      } else {
+        // Main's inherited SSH tiles use remote tmux with identity-pinned replacement handling, not remote rig.
+        expect(command).toMatch(/^ssh -t 'fixture' /);
+        expect(command).toContain("OPENRIG_NODE_ID");
+        expect(command).toContain("attach -r -t");
+        expect(command).toContain("No replacement for $target; reopen the view with rig terminal open.");
+        expect(command).not.toContain("rig terminal attach");
+        expect(herdr.lastView!.opened[0]!.recoveryCommand).toBe("ssh -t 'fixture' 'tmux attach -r -t '\"'\"'worker@edge'\"'\"''");
+      }
       expect(command).not.toContain("/local/only/socket");
     } finally {
       setDaemonTmuxServer(previousArgs, previousSelection);
