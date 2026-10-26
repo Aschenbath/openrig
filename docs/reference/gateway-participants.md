@@ -57,6 +57,31 @@ go to:
 `rig gateway default` shows the current default; `rig gateway default --clear` clears the choice. Choosing a default
 never changes `workspace.operator_seat_name`, which keeps its own meaning.
 
+## In the TUI: whose queue, and who acts
+
+The person at the terminal is the **primary user**: the default person, or, with several people and none chosen, the
+person at the terminal unnamed. Whatever the TUI shows, its acts are theirs.
+- **Opening:** with a chosen default, the TUI opens on that person's Feed. With none chosen, including a one-person
+  install that never chose one, it opens on the topology, as before.
+- **Whose queue:** `whose <person>` shows one person's asks, `whose all` everyone's, and `whose default` the default
+  person's. The Feed's first line says whose queue it shows and who acts.
+- **Acting on someone else's ask** (answer, approve or resolve from the TUI) records both: the primary user as the actor,
+  and the person asked in the audit notes and the transition. The asking seat reads, for example, "Answered by
+  mike@external, the primary user at the terminal, on sarah@external's ask". With several people and none chosen, the
+  actor is `human@host`.
+- **Viewing Sarah isn't acting as Sarah.** Only Sarah, from her own channel, answers as Sarah. Without the primary
+  user's authority, one registered person can't answer, approve, deny or resolve what was asked of another; that's
+  refused (`answer_not_recorded`) and nothing changes.
+- With no one registered, the TUI and its acts are as before, except on a shared channel's ask: the act is recorded as
+  `human@host`, the person at the terminal, never as the channel.
+- **A shared channel never acts.** Its messages are correspondence, so nothing it says answers, approves, denies or
+  resolves an ask, and a customer's earlier message in an ask's thread is never taken as its answer. A request without
+  the primary user's authority that acts as a channel is refused (`answer_not_recorded`) and nothing changes.
+- **Where the authority applies:** only on a request that carries no seat identity header, which is how the TUI calls
+  the daemon. Seats and the CLI send that header, so their acts stay theirs. This is the existing trusted-network
+  distinction, not an authentication check: a request that leaves the header out is taken as the terminal's, as any
+  such request already is.
+
 ## Shared-channel conversations
 
 A registered shared channel lets people who aren't registered, such as a customer, talk to a seat, without registering
@@ -111,6 +136,10 @@ the thread.
 For a one-person install, nothing to do: it keeps working as before, that person stays the default, pending rows keep
 their addresses, and no new file is written until you use one of the commands above.
 
+A TUI older than the daemon still works: it sends the person asked as the actor, which is still their own act. On a
+shared channel's ask that actor would be the channel, so an older TUI's answer, approve, deny or resolve there is refused
+(`answer_not_recorded`) and nothing changes. Use a current TUI, or let the asking seat close it.
+
 **If several people are already registered** (earlier versions listed hand-added people with an advisory), choose a
 default with `rig gateway default <id>` after upgrading. Until you do, escalations report
 `undeliverable:no-default-person` instead of reaching whoever's id sorted first, and the notice digest waits.
@@ -124,6 +153,8 @@ Older versions don't read `participants.yaml`, and the person files carry nothin
   an answer row (it still can't close the ask);
 - **there's no default:** escalations and the notice digest go to the first person by id, Mission Control's my-queue
   has no default person, and pairing needs `--human`;
+- **the TUI** opens on the topology and records a terminal answer as the person asked, as before. Rows already
+  answered by the primary user keep their notes;
 - **shared channels are unknown:** their customers' messages are refused again, as from any unregistered sender, and
   rows addressed to a channel become undeliverable on the older version;
 - **organizations, groups and policy aren't shown.**

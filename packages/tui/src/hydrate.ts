@@ -371,7 +371,7 @@ function agentSpecTruth(raw?: string): { runtime?: string; skills: string[] } {
  * avoids re-reading every spec every refresh; the key rolls when the library
  * entry's updatedAt changes. Owned by the caller (instance-scoped, no module state). */
 export type SpecReviewCache = Map<string, SpecLibraryReviewRead>;
-export type HydrateViewContext = Pick<ViewState, "project" | "section" | "viewTab" | "drill" | "file" | "externalUrl" | "terminalView" | "attentionOpen" | "pendingDrill">;
+export type HydrateViewContext = Pick<ViewState, "project" | "section" | "viewTab" | "drill" | "file" | "externalUrl" | "terminalView" | "attentionOpen" | "attentionView" | "pendingDrill">;
 
 export async function hydrateSnapshot(
   client: DaemonClient,
@@ -404,8 +404,8 @@ export async function hydrateSnapshot(
 
   if (viewContext?.section === "needs") {
     const [attention, updates, roots] = await Promise.all([
-      safe<NonNullable<FleetSnapshot["attentionRead"]>>("Feed", () => client.humanAttention(viewContext.attentionOpen)),
-      safe<DeliveredHumanUpdates>("delivered updates", () => client.humanUpdates()),
+      safe<NonNullable<FleetSnapshot["attentionRead"]>>("Feed", () => client.humanAttention(viewContext.attentionOpen, viewContext.attentionView ?? "default")),
+      safe<DeliveredHumanUpdates>("delivered updates", () => client.humanUpdates(viewContext.attentionView ?? "default")),
       safe<Awaited<ReturnType<DaemonClient["fileRoots"]>>>("file-roots", () => client.fileRoots()),
     ]);
     const attentionRead = composeHumanUpdates(attention, updates, viewContext.attentionOpen);
