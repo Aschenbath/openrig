@@ -376,6 +376,10 @@ export interface QueueCreateInput {
    *  to that thread. It never steers this row's own posts: delivery reads replyTo on updates
    *  only. An item that does not exist is dropped, never a reason to lose the message. */
   inboundReplyTo?: string | null;
+  /** A message that arrived from a person through the gateway (Slack inbound). Its words are already in Slack, so the
+   *  row's create, when it's addressed to a person, is recorded for Steering and the TUI and isn't echoed back as an ask.
+   *  Only the create reads it: a later park of the row is classified on its own update. */
+  gatewayInbound?: boolean;
   /** #193 — 1–4 structured questions; accepted only with humanIntent "decision". */
   humanQuestions?: HumanQuestion[] | null;
   summary?: string | null;
@@ -1138,6 +1142,7 @@ export class QueueRepository {
     explicitKind?: QueueUpdateInput["ownerNotificationKind"];
     humanIntent?: "decision" | "update" | null;
     humanAlert?: boolean;
+    gatewayInbound?: boolean;
   }): { kind: string; level: OwnerNotificationLevel } | null {
     if (input.explicitKind === "human-decision-resolved") {
       return { kind: input.explicitKind, level: "NOTICE" };
@@ -1153,6 +1158,9 @@ export class QueueRepository {
 
     const destinationHuman = resolveRegisteredHumanAddress(input.destinationSession, people);
     if (input.action === "create" && destinationHuman !== null) {
+      // A person's Slack message routed to a person is already in Slack: as it arrived, it's on Steering and the TUI and
+      // isn't echoed back. A later park of it on a person is a new ask, classified (and posted) on that update.
+      if (input.gatewayInbound) return { kind: "human-required", level: "RECORD" };
       // The person's Slack subscription decides: `every-ask` (the default) posts every ask (ALERT); `urgent-only` posts only
       // one marked --alert, and a plain ask lands on Steering and the TUI (RECORD: below the posting dial, so no post is owed).
       const person = people.find((entity) => entity.address === destinationHuman);
@@ -2029,6 +2037,7 @@ export class QueueRepository {
       action: "create",
       humanIntent: input.humanIntent,
       humanAlert: input.humanAlert,
+      gatewayInbound: input.gatewayInbound,
       destinationSession: input.destinationSession,
       nextState: "pending",
     });
