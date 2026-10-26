@@ -3089,7 +3089,7 @@ export class SessionTransport {
         // no-op here (the option is kept for back-compat). needs_input (positive picker) remains the
         // ONLY hard refuse; unknown/stale/missing already proceed-with-advisory above.
         sendAdvisory = [sendAdvisory, "target pane appears mid-task; sent anyway (busy is advisory, not a block)."].filter(Boolean).join(" ");
-        if (runtime === "codex") sendAdvisory += " This message joins its running turn and may redirect it; for separate work, use --wait-for-idle <seconds>.";
+        if (runtime === "codex") sendAdvisory += " This message joins its running turn and may redirect it. For separate work, create a queue row (rig queue create --destination <seat>): a saved row keeps the work apart from the short wake typed into the seat. To watch the result, --wait-for-idle <seconds> sends only once the seat is idle, and sends nothing if it isn't when the wait ends.";
         // fall through to the send below.
       }
       // idle (or running/unknown — now advisory-and-proceed) → proceed to send.
