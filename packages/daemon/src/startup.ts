@@ -577,8 +577,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // A confirmed prompt clearing recovers its refused queue wakes immediately, using the same
   // hook/pane resolution as status. No new captures, timer or delivery admission path.
   const retryPromptWakes = (sessionName: string) => {
-    const state = hookOrPaneActivity(agentActivityStore.getLatestForNode({ sessionName }),
-      seatStructuralActivityService.getStructuralActivity(sessionName))?.activity.state;
+    const runtime = sessionRegistry.findResumeContextByName(sessionName)?.runtime;
+    const state = hookOrPaneActivity(agentActivityStore.getLatestForNode({ sessionName,
+      order: runtime === "claude-code" ? "source" : "arrival" }),
+      seatStructuralActivityService.getStructuralActivity(sessionName), false, runtime)?.activity.state;
     void queueRepoInstance.retryPromptWakesOnClear(sessionName, state)
       .catch(error => console.warn(`Prompt-clear wake recovery: ${error instanceof Error ? error.name : typeof error}`));
   };

@@ -1284,7 +1284,8 @@ export function attachTerminalActivityAndWork(
     const work = countAssignedWorkForEntry(entry, assignedByDest);
     const arbitratedNeedsInput = arbitratedNeedsInputSignal(arb);
     const hook = entry.canonicalSessionName
-      ? deps.agentActivity?.getLatestForNode({ sessionName: entry.canonicalSessionName, now }) ?? null : null;
+      ? deps.agentActivity?.getLatestForNode({ sessionName: entry.canonicalSessionName, now,
+        order: entry.runtime === "claude-code" ? "source" : "arrival" }) ?? null : null;
     return {
       ...entry,
       terminalActive,
@@ -1604,6 +1605,7 @@ export async function attachAgentActivity(
     const hookActivity = deps.activityStore?.getLatestForNode({
       sessionName: entry.canonicalSessionName,
       now: sampledAt,
+      order: entry.runtime === "claude-code" ? "source" : "arrival",
     });
     // Reuse the existing cached capture. Only a complete supported idle frame, bound to this
     // target and started in a later second than the last write, distinguishes idle redraw from resumed work.

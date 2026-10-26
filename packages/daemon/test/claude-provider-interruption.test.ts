@@ -69,8 +69,8 @@ describe("Claude provider interruptions (#99)", () => {
     vi.useRealTimers();
   });
 
-  function report(payload: Record<string, unknown>, env = identity) {
-    const relayed = relay.buildOpenRigPayload(payload, env, () => new Date());
+  function report(payload: Record<string, unknown>, env = identity, occurredAt = new Date().toISOString()) {
+    const relayed = relay.buildOpenRigPayload(payload, env, () => new Date(occurredAt));
     const result = store.recordHookEvent(relayed as unknown as Parameters<AgentActivityStore["recordHookEvent"]>[0]);
     expect(result.ok).toBe(true);
     return relayed;
@@ -83,7 +83,11 @@ describe("Claude provider interruptions (#99)", () => {
     vi.setSystemTime(Date.parse(T0) - input.hookAge);
     reportLimit();
     vi.setSystemTime(T0);
-    let clock = new Date(Date.parse(T0) - input.paneAge);
+    return displayActivity(input);
+  }
+
+  async function displayActivity(input: { paneAge?: number; permission?: boolean; motion?: boolean } = {}) {
+    let clock = new Date(Date.parse(T0) - (input.paneAge ?? 0));
     const capturePaneContent = vi.fn(async () => input.permission ? "Do you want to proceed?" : "output\n❯ ");
     const structuralActivity = new SeatStructuralActivityService({ capturePaneContent }, () => clock);
     expect((await structuralActivity.pollSeat(SESSION, null, "claude-code"))?.state)
@@ -177,6 +181,26 @@ describe("Claude provider interruptions (#99)", () => {
     expect(await events()).toEqual([]);
   });
 
+  it.each(["provider", "display"])("ignores an old limit arriving after a newer turn (%s)", async consumer => {
+    report({ hook_event_name: "UserPromptSubmit" }, identity, "2025-01-01T11:59:59.000Z");
+    report({ hook_event_name: "StopFailure", error: "rate_limit" }, identity, "2025-01-01T11:59:58.000Z");
+    if (consumer === "provider") {
+      expect(await events()).toEqual([]);
+    } else {
+      expect(await displayActivity()).toMatchObject({ state: "running", rawEvent: "UserPromptSubmit", stale: false });
+    }
+  });
+
+  it.each(["provider", "display"])("keeps a new limit when an older Stop arrives later (%s)", async consumer => {
+    report({ hook_event_name: "StopFailure", error: "rate_limit" }, identity, "2025-01-01T11:59:59.000Z");
+    report({ hook_event_name: "Stop" }, identity, "2025-01-01T11:59:58.000Z");
+    if (consumer === "provider") {
+      expect(await events()).toEqual([expect.objectContaining({ provider: "claude", seatSession: SESSION, asOf: "2025-01-01T11:59:59.000Z" })]);
+    } else {
+      expect(await displayActivity()).toMatchObject({ state: "unknown", reason: "usage_limit", rawEvent: "StopFailure", stale: false });
+    }
+  });
+
   it.each([false, true])("keeps a fresh limit over cached idle without asking for human input (motion: %s)", async motion => {
     expect(await displayLimit({ hookAge: 1000, paneAge: 0, motion })).toMatchObject({
       state: "unknown", reason: "usage_limit", evidenceSource: "runtime_hook",
@@ -226,19 +250,47 @@ describe("Claude provider interruptions (#99)", () => {
       .toEqual([{ poolKey: "claude:local", provider: "claude", seatSessions: [SESSION], expiresAt: "2025-01-01T12:05:00.000Z", source: "config-fallback" }]);
   });
 
-  it("does not hide conflicting statusline windows behind a typed failure", async () => {
+  it.each([false, true])("holds another Claude seat's queue only while its windows support one shared account (conflict: %s)", async conflict => {
     const peer = "dev-peer@limit-fixture";
     db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime, pod_id) VALUES ('node-peer', 'rig-limit', 'dev.peer', 'claude-code', 'pod-limit')").run();
     db.prepare("INSERT INTO sessions (id, node_id, session_name, status, startup_status) VALUES ('session-peer', 'node-peer', ?, 'running', 'ready')").run(peer);
     db.prepare("INSERT INTO bindings (id, node_id, tmux_session) VALUES ('binding-peer', 'node-peer', ?)").run(peer);
     claudeSignals = [SESSION, peer].map((seatSession, index) => ({
       provider: "claude", seatSession, sourceClass: "provider_statusline", authority: "account_cross_device",
-      window: "five_hour", usedPercent: 40, resetsAt: `2025-01-01T1${index + 3}:00:00.000Z`, asOf: T0,
+      window: "five_hour", usedPercent: 40, resetsAt: `2025-01-01T1${conflict ? index + 3 : 3}:00:00.000Z`, asOf: T0,
       staleAfter: "2025-01-01T12:05:00.000Z", automationUse: "allow_switch_decision",
     }));
     reportLimit();
-    expect((await service.getReadModel()).hostUsage?.find(row => row.provider === "claude"))
-      .toMatchObject({ state: "explicit_unknown", anomalies: [expect.objectContaining({ kind: "conflicting_seat_windows" })] });
+    const usage = (await service.getReadModel()).hostUsage?.find(row => row.provider === "claude");
+    expect(usage).toMatchObject(conflict
+      ? { state: "explicit_unknown", anomalies: [expect.objectContaining({ kind: "conflicting_seat_windows" })] }
+      : { state: "limited", anomalies: [] });
+
+    queue.attachWatchdogJobsRepository(new WatchdogJobsRepository(db, () => new Date()));
+    queue.attachOutbox(new OutboxHandler(db));
+    const batons = [];
+    for (const destination of [SESSION, peer]) {
+      const source = await queue.create({ sourceSession: "sender@limit-fixture", destinationSession: "relay@limit-fixture", body: "work", nudge: false });
+      const { created } = await queue.handoff({ qitemId: source.qitemId, fromSession: "relay@limit-fixture", toSession: destination, nudge: false });
+      db.prepare("UPDATE queue_items SET last_nudge_attempt = ?, last_nudge_result = 'failed:delivery' WHERE qitem_id = ?")
+        .run("2025-01-01T11:50:00.000Z", created.qitemId);
+      batons.push(created);
+    }
+    const attemptWake = vi.fn(async () => "typed");
+    const result = await runWakeLadderTick({ db, queueRepo: queue, attemptWake, resolveOrchestrator: () => null,
+      retryIntervalSeconds: 300, usageLimitJitterSeconds: 0, getProviderReadModel: () => service.getReadModel(), log: () => {} });
+    expect(result.actions).toContainEqual({ qitemId: batons[0]!.qitemId, action: "park-usage-limit" });
+    expect(queue.getById(batons[0]!.qitemId)?.state).toBe("blocked");
+    if (conflict) {
+      expect(result.actions).toContainEqual({ qitemId: batons[1]!.qitemId, action: "retry", target: peer });
+      expect(queue.getById(batons[1]!.qitemId)?.state).toBe("pending");
+      expect(attemptWake).toHaveBeenCalledTimes(1);
+      expect(attemptWake).toHaveBeenCalledWith(batons[1]!.qitemId, peer);
+    } else {
+      expect(result.actions).toContainEqual({ qitemId: batons[1]!.qitemId, action: "park-usage-limit" });
+      expect(queue.getById(batons[1]!.qitemId)?.blockedOn).toBe(queue.getById(batons[0]!.qitemId)?.blockedOn);
+      expect(attemptWake).not.toHaveBeenCalled();
+    }
   });
 
   it("parks pending work on the existing bounded timer when the hook has no reset, then releases it once", async () => {

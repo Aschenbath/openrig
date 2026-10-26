@@ -5,6 +5,7 @@
 // `allow_switch_decision` (BR-2).
 
 import { signalEligibleForAutomation } from "./provider-policy.js";
+import { rollupHostUsage } from "./host-usage-rollup.js";
 import type { ProviderBinding, ProviderKind, ProviderSignal } from "./provider-types.js";
 
 /** One provider-native usage window from the Codex app-server `account/rateLimits/read`. */
@@ -251,7 +252,8 @@ export interface UsageLimitPool {
 /**
  * Derive the provider/account pools whose fresh structured evidence says they are
  * exhausted. Claude statusline has no account ref, so its shipped one-account-per-host
- * invariant is one local pool. Codex uses the existing account binding. Nothing unknown,
+ * invariant is one local pool, unless seat windows contradict that shared account. Explicit
+ * config homes remain separate pools. Codex uses the existing account binding. Nothing unknown,
  * stale, advisory, unbound, or already expired can create a park.
  */
 export function deriveUsageLimitPools(input: {
@@ -275,9 +277,29 @@ export function deriveUsageLimitPools(input: {
       (signal.sourceClass === "provider_event" && signal.authority === "reactive_error"),
   );
 
-  const claudePoolKey = (seatSession: string | undefined) => {
+  const sharedClaudePoolKey = (seatSession: string | undefined) => {
     const home = seatSession ? input.claudeHomeOf?.(seatSession) : undefined;
     return home ? `claude:home:${home}` : "claude:local";
+  };
+  // Reuse the rollup's conflict verdict within each proposed shared home. A different
+  // home's reset schedule cannot disprove sharing among seats in this home.
+  const claudeSignalsByPool = new Map<string, ProviderSignal[]>();
+  for (const signal of input.signals) {
+    if (signal.provider !== "claude") continue;
+    const key = sharedClaudePoolKey(signal.seatSession);
+    const lane = claudeSignalsByPool.get(key) ?? [];
+    lane.push(signal);
+    claudeSignalsByPool.set(key, lane);
+  }
+  const conflictingClaudePools = new Set([...claudeSignalsByPool].filter(([, signals]) =>
+    rollupHostUsage({ signals, codexProfilesPresent: false, now: input.now.toISOString() })
+      .some(row => row.anomalies.some(anomaly => anomaly.kind === "conflicting_seat_windows")),
+  ).map(([key]) => key));
+  const claudePoolKey = (seatSession: string | undefined) => {
+    const sharedKey = sharedClaudePoolKey(seatSession);
+    if (!conflictingClaudePools.has(sharedKey)) return sharedKey;
+    // The failure still proves this seat is limited; it cannot hold an unrelated login.
+    return seatSession ? `claude:seat:${seatSession}` : null;
   };
   const pools = new Map<string, { provider: ProviderKind; signals: ProviderSignal[] }>();
   for (const signal of exhausted) {

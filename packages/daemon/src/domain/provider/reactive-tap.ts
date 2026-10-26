@@ -12,7 +12,7 @@ interface ReactiveSeat {
 }
 
 interface ReactiveActivityReader {
-  getLatestForNode(input: { sessionName: string; now: Date }): AgentActivity | null;
+  getLatestForNode(input: { sessionName: string; now: Date; order?: "arrival" | "source" }): AgentActivity | null;
 }
 
 export interface ReactiveTapDeps {
@@ -92,7 +92,7 @@ export function collectReactiveEventSignals(deps: ReactiveTapDeps): ReactiveTapR
 
   for (const seat of deps.seats) {
     if (seat.runtime === "claude-code") {
-      const event = deps.activity.getLatestForNode({ sessionName: seat.seatSession, now: new Date(nowMs) });
+      const event = deps.activity.getLatestForNode({ sessionName: seat.seatSession, now: new Date(nowMs), order: "source" });
       if (!event || event.runtime !== seat.runtime || !isClaudeRateLimitHook(event.runtime, event.rawEvent, event.rawSubtype)) continue;
       if (event.generationProvenance !== "resolved" || event.reason === "generation_mismatch"
         || isVerificationReason(event.reason) || event.stale) continue;
