@@ -104,7 +104,17 @@ credentials are supplied.
 | `typecheck` | ubuntu | `npm run lint` |
 | `repo-checks` | ubuntu | `npm run test:repo` |
 | `package-tests` | macOS, matrix `daemon`, `cli`, `tui`, `ui` (fail-fast off) | Installs tmux, runs `npm ci` and `npm run build`. Then runs `npm run test -w packages/<pkg>` under `env -i` with a scratch `HOME`/`TMPDIR`/`TMUX_TMPDIR` and a `sandbox-exec` profile that blocks outbound network except localhost and the job's own socket directory. `scripts/ci-macos-process-probe.mjs` runs first. |
+| `linux-seat-environment` | ubuntu | Builds all packages, then runs `seat-env-parent-session.integration.test.ts` with real CLI, daemon, tmux and stub seats. A network namespace has loopback only; tests run as the unprivileged runner user under `env -i` with scratch `HOME`/`TMPDIR`/`TMUX_TMPDIR`. Runs on pull requests and manual dispatch, like `package-tests`. |
 | `installed-scenario` | ubuntu | `bash scripts/run-pr-scenarios.sh` (eight container runs, described below). Uploads `dist/pr-scenarios/` as `installed-scenario-evidence`, including on failure. |
+
+The Linux seat-environment job covers a gap in the macOS matrix: the integration test
+reads `/proc/<pid>/environ`, so macOS skips it. It checks both a new tmux server and an
+existing server carrying a parent's session identity. It verifies the scoped environment,
+the runtime directory and disabled session-bus default, and tmux's terminal identity in
+the launched panes; the existing owner session stays unchanged. This adds one focused
+Linux job to the existing suite. Stub seats prove the environment passed to the pane;
+native Claude image paste and Shift+Enter handling still need separate verification
+(see [#2041](https://github.com/mvschwarz/openrig/issues/2041)).
 
 A second workflow, `.github/workflows/portability-report.yml` (job `portability-report`),
 lists lines your PR adds that contain machine-specific values: credentials, home or temp
