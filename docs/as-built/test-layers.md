@@ -88,6 +88,11 @@ are not yet runnable checks.
   credentials, and outbound network blocked except to localhost (see below). A test that reads
   your real home directory, a running daemon, the network or a credential can pass on your
   machine and fail in CI.
+- **Mixed fixture clocks.** `compaction-command-submission.test.ts` uses one clock for the
+  enforcer, the transport's injected `now` and sleeps, and its `Date.now` idle deadline. Previously,
+  real-time transport waits could exhaust the fixture's 20 ms budget during a scheduler pause
+  even though the modeled seat was idle. Restore the `Date.now` spy after each test; keep real
+  deadline behavior covered by the transport tests. This changes the fixture, not production timeouts.
 - **Docs location.** `check-docs-guard` fails if a tracked file under `docs/` sits outside
   `docs/as-built/`, `docs/reference/` or `docs/releases/`. `docs/DESIGN.md` is the one allowed
   exception.
