@@ -293,15 +293,19 @@ resume launches (`codex-runtime-adapter.ts:378`, `codex-resume.ts:103`).
   gates keep their specific results. The handover waits within its existing
   readiness budget before sending the context packet.
 
-  The fresh path requires Claude's framed input or its version header with a
-  prompt. A shell's bare `❯` line, including the echoed launch command, does not
-  qualify even when the matching Claude process is already running. Other
-  launch paths keep their existing screen predicates.
+  The fresh path requires the last `❯` prompt to sit inside Claude's complete
+  input frame: its top rule directly above the prompt and a bottom rule below.
+  A shell's echoed launch command cannot borrow an earlier header or input
+  frame, even when the matching Claude process is already running. A header
+  and prompt alone, or a partially drawn frame, remain pending. This may delay
+  readiness until the full frame is visible; other launch paths keep their
+  existing screen predicates.
 
   Previously, unavailable observations and ambiguous headerless prompts could
   retain the old ready result. `claude-fresh-in-place-scope.test.ts` now checks
-  missing observations, unknown or changing process identity, recovery and normal
-  prompt controls. `claude-handover-readiness.test.ts` exercises the real handover
+  missing observations, unknown or changing process identity, retained UI above
+  direct and script launch commands, partial frames, recovery and normal prompt
+  controls. `claude-handover-readiness.test.ts` exercises the real handover
   service with migrated SQLite, modeled pane/process observations and one synthetic
   clock. Readiness and the later packet-submission receipt remain separate checks;
   these tests do not run a live Claude account.

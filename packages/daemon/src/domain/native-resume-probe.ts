@@ -315,10 +315,12 @@ function hasClaudeComposerPrompt(paneContent: string): boolean {
   return /(^|\n)\s*❯/.test(paneContent);
 }
 
-/** A fresh launch must have drawn Claude's input, not just left a shell's ❯ prompt visible. */
+/** A fresh launch needs the last prompt inside Claude's complete input frame. Earlier
+ * headers or frames can belong to the predecessor above the shell's launch command. */
 export function hasClaudeDrawnInput(paneContent: string): boolean {
-  return hasClaudeComposerPrompt(paneContent)
-    && (paneContent.includes("Claude Code v") || hasClaudeInputFrame(paneContent.split(/\r?\n/)));
+  const rows = paneContent.split(/\r?\n/);
+  const prompt = rows.map(row => /^\s*❯/.test(row)).lastIndexOf(true);
+  return prompt > 0 && hasClaudeInputFrame(rows.slice(prompt - 1));
 }
 
 function looksLikeClaudeBypassConsentPrompt(paneContent: string): boolean {

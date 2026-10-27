@@ -506,7 +506,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       // before pinning that process as the ready launch.
       if (!hasClaudeDrawnInput(paneContent)) return {
         status: "inconclusive" as const, code: "awaiting_runtime",
-        detail: "Waiting for the fresh Claude launch to draw its input frame or header and prompt.",
+        detail: "Waiting for the fresh Claude launch to draw its current input frame.",
       };
       probe = {
         status: "inconclusive", code: "awaiting_runtime",

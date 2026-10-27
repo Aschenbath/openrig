@@ -7,7 +7,7 @@ import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import { CLAUDE_BYPASS_CONSENT } from "./fixtures/claude-bypass-consent.js";
 
 const token = "22222222-2222-4222-8222-222222222222";
-const history = "Claude Code v2.1.303\n❯ predecessor finished turn\n  ⏵⏵ accept edits on (shift+tab to cycle)";
+const history = "Claude Code v2.1.303\n─────────\n❯ predecessor finished turn\n─────────\n  ⏵⏵ accept edits on (shift+tab to cycle)";
 const binding: NodeBinding = { id: "binding", nodeId: "node", tmuxSession: "seat", tmuxPane: "%9",
   tmuxWindow: null, cmuxWorkspace: null, cmuxSurface: null, updatedAt: "", cwd: "/fixture", launchGeneration: 7 };
 function fixture() {
@@ -97,6 +97,37 @@ describe("fresh in-place readiness requires current launch evidence", () => {
       expect(await f.adapter.checkReady(binding)).toEqual({ ready: true });
     },
   );
+
+  it.each([
+    ["retained header", "Claude Code v2.1.303"],
+    ["retained input frame", "─────────\n❯ predecessor finished turn\n─────────"],
+    ["retained header and frame", history],
+  ].flatMap(([name, retained]) => [
+    { name: `${name}, direct launch`, screen: `${retained}\n❯ claude --permission-mode acceptEdits --session-id ${token} --name seat` },
+    { name: `${name}, script launch`, screen: `${retained}\n❯ /bin/sh fixture-launch.txt` },
+  ]))("does not combine $name with a shell prompt", async ({ screen }) => {
+    const f = fixture();
+    f.getPaneCommand.mockResolvedValue("claude");
+    f.capturePaneScreen.mockResolvedValue(screen);
+    f.listProcesses.mockReturnValue(ownProcess());
+    await launch(f.adapter);
+    expect(await f.adapter.checkReady(binding)).toMatchObject({ ready: false, code: "awaiting_runtime" });
+    f.capturePaneScreen.mockResolvedValue(`${screen}\n───────── seat ─\n❯ \n─────────`);
+    expect(await f.adapter.checkReady(binding)).toEqual({ ready: true });
+  });
+
+  it("waits for the full input frame after Claude draws a header and prompt", async () => {
+    const f = fixture();
+    f.getPaneCommand.mockResolvedValue("claude");
+    f.listProcesses.mockReturnValue(ownProcess());
+    await launch(f.adapter);
+    f.capturePaneScreen.mockResolvedValue("Claude Code v2.1.303\n❯ ");
+    expect(await f.adapter.checkReady(binding)).toMatchObject({ ready: false, code: "awaiting_runtime" });
+    f.capturePaneScreen.mockResolvedValue("Claude Code v2.1.303\n─────────\n❯ ");
+    expect(await f.adapter.checkReady(binding)).toMatchObject({ ready: false, code: "awaiting_runtime" });
+    f.capturePaneScreen.mockResolvedValue("Claude Code v2.1.303\n─────────\n❯ Try \"explain this codebase\"\n─────────");
+    expect(await f.adapter.checkReady(binding)).toEqual({ ready: true });
+  });
 
   it.each([history,
     "Restored conversation\n─────────\n❯ \n─────────\n  ⏵⏵ auto mode on (shift+tab to cycle)",
