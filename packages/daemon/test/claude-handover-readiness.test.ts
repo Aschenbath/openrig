@@ -87,6 +87,7 @@ describe("Claude fresh in-place handover readiness", () => {
 
   afterEach(() => {
     db.close();
+    vi.useRealTimers();
   });
 
   function tmux(): TmuxAdapter {
@@ -138,6 +139,9 @@ describe("Claude fresh in-place handover readiness", () => {
     ...["shell", "script"].flatMap(process => ["prompt", "command"].flatMap(frame =>
       ["readable", "unreadable"].map(listing => `classic-chevron-${process}-${frame}-${listing}`))),
   ])("1544 %s", async mode => {
+    const startedAtMs = Date.parse("2026-10-19T21:30:00Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(startedAtMs);
     const { node } = seedSeat({ runtime: "claude-code" });
     let elapsed = 0, requested = false, packetPasted = false, packetText = "", packetEnterCount = 0;
     const chevron = mode.startsWith("classic-chevron-");
@@ -149,7 +153,7 @@ describe("Claude fresh in-place handover readiness", () => {
     const bypass = mode === "working-headerless-bypass-unavailable";
     if (auto || bypass) new NativePermissionStore(db).write(node.id, { runtime: "claude-code", mode: auto ? "auto" : "bypassPermissions" }, "fixture", "headerless qualification");
     const nativeAt = mode === "new-runtime-already-ready" || mode === "working-wrapper-screen-unavailable" || mode === "complete-staged-packet" || headerless ? 0 : 500;
-    const unavailable = mode.endsWith("screen-unavailable");
+    const unavailable = mode === "stale-wrapper-screen-unavailable" || mode === "working-wrapper-screen-unavailable";
     const identicalFrame = "Claude Code v2.1.303\n❯ \n  ⏵⏵ accept edits on (shift+tab to cycle)";
     const autoFrame = "Restored conversation\n─────────\n❯ \n─────────\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
     const headerlessFrame = auto ? autoFrame : autoFrame.replace("auto mode on", bypass ? "bypass permissions on" : "accept edits on");
@@ -214,7 +218,9 @@ describe("Claude fresh in-place handover readiness", () => {
       sendShellCommand: async (session: string, text: string) => sendText(session, text) } as unknown as TmuxAdapter;
     const fsError = () => { throw new Error("unexpected filesystem access"); };
     const listProcesses = vi.fn(() => {
-      if (unavailable || unreadable || mode.endsWith("-unavailable")) {
+      // A transient process-read failure can recover once the new runtime starts.
+      // The wrapper/headerless cases below keep their observations unavailable.
+      if (unavailable || (unreadable && elapsed < nativeAt) || (headerless && mode.endsWith("-unavailable"))) {
         trace.push({ kind: "process-read", elapsed, available: false });
         throw new Error("fixture ps unavailable");
       }
@@ -231,7 +237,12 @@ describe("Claude fresh in-place handover readiness", () => {
         trace.push({ kind: "process-read", elapsed, available: true, rows });
         return rows;
       }
-      if (mode !== "working-headerless-auto-proof") return [];
+      if (mode !== "working-headerless-auto-proof") return [
+        { pid: 100, ppid: 1, pgid: 100, tpgid: requested && elapsed >= nativeAt ? 102 : 100,
+          command: "-zsh", executableName: "zsh", startedAt },
+        ...(requested && elapsed >= nativeAt ? [{ pid: 102, ppid: 100, pgid: 102, tpgid: 102,
+          command: `claude --session-id ${successorToken}`, executableName: "claude", startedAt }] : []),
+      ];
       return [
         { pid: 100, ppid: 1, pgid: 100, tpgid: 101, command: "-bash", executableName: "bash", startedAt },
         { pid: 101, ppid: 100, pgid: 101, tpgid: 101, command: "/bin/sh fixture-launch.txt", executableName: "sh", startedAt },
@@ -270,12 +281,20 @@ describe("Claude fresh in-place handover readiness", () => {
       contextUsageStore: { readSidecar } as never, resumeTokenCapturer: { captureCodexThreadId } as never,
       occupantInvalidator: { invalidateRetiringOccupant }, activityOracle: { declareOccupantSwap },
       predecessorRecapResolver: resolvePredecessorRecap as never, readinessTimeoutMs: 5000,
-      sleep: async ms => { elapsed += ms; trace.push({ kind: "sleep", ms, elapsed }); },
+      sleep: async ms => { elapsed += ms; vi.setSystemTime(startedAtMs + elapsed); trace.push({ kind: "sleep", ms, elapsed }); },
     });
     const result = await handover.handover({ seatRef: "dev-impl@seat-rig", source: "fresh", reason: "bounded scrollback reproduction" });
     const sessions = db.prepare("SELECT session_name,status,resume_token,startup_status FROM sessions ORDER BY id").all();
     observations.push({ mode, result, trace, reads, listProcessesCalls: listProcesses.mock.calls.length,
       sessions, respawn: respawnPane.mock.calls });
+    if (unavailable || (headerless && mode.endsWith("-unavailable"))) {
+      expect(result.ok).toBe(false);
+      expect(packetPasted).toBe(false);
+      expect(reads.length).toBeGreaterThan(0);
+      expect(reads.every((read: any) => read.result.ready === false)).toBe(true);
+      expect(capturePaneScreen).toHaveBeenCalledWith("%9");
+      return;
+    }
     if (unverifiablePacketMode || sameSizedDifferentPasteMode || stagedPacketMode) {
       expect(result.ok).toBe(true);
       expect(result).toMatchObject({ result: {
@@ -293,7 +312,12 @@ describe("Claude fresh in-place handover readiness", () => {
         expect(trace.some((x: any) => String((x as any).returnedPane).includes("[Pasted text #2 +"))).toBe(true);
       }
       if (stagedPacketMode) {
-        expect((result as any).result.restorePacket.reason).toBe("the input box could not be observed");
+        expect((reads[0] as any).result.ready).toBe(false);
+        const packet = trace.find((x: any) => x.kind === "packet-paste") as any;
+        expect(packet.elapsed).toBeGreaterThanOrEqual(nativeAt);
+        expect(packet.successorRuntimeStarted).toBe(true);
+        // Readiness does not prove this collapsed marker belongs to our packet.
+        expect((result as any).result.restorePacket.reason).toBe("the input box did not clearly show the prompt as submitted");
       }
       return;
     }
@@ -301,11 +325,11 @@ describe("Claude fresh in-place handover readiness", () => {
     expect(reads.length).toBeGreaterThan(0);
     const first = reads[0] as any;
     if (chevron) {
-      expect(first.result.ready).toBe(unreadable);
+      expect(first.result.ready).toBe(false);
       expect(first.successorRuntimeStarted).toBe(false);
       const packet = trace.find((x: any) => x.kind === "packet-paste") as any;
-      expect(packet.elapsed).toBe(unreadable ? 0 : 1000);
-      expect(packet.successorRuntimeStarted).toBe(!unreadable);
+      expect(packet.elapsed).toBe(1000);
+      expect(packet.successorRuntimeStarted).toBe(true);
       expect(trace).toContainEqual({ kind: "current-frame", target: "%9", elapsed: 0, returnedPane: shellPrompt });
       expect(trace.some((x: any) => x.kind === "process-read" && x.available === !unreadable)).toBe(true);
     } else if (mode === "classic-predecessor-history") {
@@ -321,11 +345,6 @@ describe("Claude fresh in-place handover readiness", () => {
       if (!auto && !bypass) expect(launched.text).toMatch(/--permission-mode acceptEdits(?: |$)/);
       expect(first.result.ready).toBe(true);
       expect(first.successorRuntimeStarted).toBe(true);
-      expect(capturePaneScreen).toHaveBeenCalledWith("%9");
-    } else if (unavailable) {
-      // O1 deliberately preserves admission for this indistinguishable stale/working pair.
-      expect(first.result.ready).toBe(true);
-      expect(first.successorRuntimeStarted).toBe(mode === "working-wrapper-screen-unavailable");
       expect(capturePaneScreen).toHaveBeenCalledWith("%9");
     } else if (mode === "new-runtime-already-ready" || completeStagedPacketMode) expect(first.result.ready).toBe(true);
     else {

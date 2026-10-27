@@ -424,7 +424,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     const paneCommand = await this.tmux.getPaneCommand(binding.tmuxSession);
     const paneContent = (await this.tmux.capturePaneContent(binding.tmuxSession, 40)) ?? "";
     const historyProbe = await this.assessManagedProbe(binding, paneCommand, paneContent, options);
-    const probe = await this.assessFreshInPlaceProbe(binding, paneCommand, historyProbe);
+    const probe = await this.assessFreshInPlaceProbe(binding, historyProbe);
 
     // A script-launched Claude reads as `sh` until the script hands over the foreground, so the label alone
     // is not a return to a shell. Say so only for a proven idle shell (the rule Codex's checkReady uses).
@@ -453,11 +453,10 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
 
   // -- Private helpers --
 
-  /** A fresh in-place launch keeps the retiree's scrollback. Qualify a history-based ready result
-   * with the current frame, only for the exact launch that requested it. Unavailable observations
-   * retain the old admission (including its ambiguity); visible gates and conflicting identity do not. */
+  /** A fresh in-place launch keeps the retiree's scrollback. Its readiness requires a current
+   * prompt and stable process proof for that exact launch. Missing observations stay inconclusive. */
   private async assessFreshInPlaceProbe(
-    binding: NodeBinding, paneCommand: string | null,
+    binding: NodeBinding,
     historyProbe: ReturnType<typeof assessNativeResumeProbe>,
   ) {
     const launch = this.autoLaunches.get(binding.nodeId);
@@ -468,8 +467,8 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
 
     let screen: string | null = null;
     try { screen = await this.tmux.capturePaneScreen(binding.tmuxPane); } catch { /* unavailable */ }
-    // Missing process evidence is unknown, not a conflicting recipient. Reuse the launch observer's
-    // positive conflict distinction without requiring process proof for ordinary ready frames.
+    // Missing process evidence is unknown, not a conflicting recipient. Keep that distinction
+    // while requiring positive launch evidence before admitting the current prompt below.
     let occupant: "own" | "another" | "unknown" | "absent" = "unknown";
     try { occupant = await this.paneOccupant(binding, false, { positiveConflictOnly: true }); } catch { /* unavailable */ }
     if (this.autoLaunches.get(binding.nodeId) !== launch) return {
@@ -479,31 +478,39 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       status: "inconclusive" as const, code: "claude_launch_identity_conflict",
       detail: "A different runtime identity occupies the fresh launch's pane.",
     };
-    if (!screen?.trim()) return historyProbe;
-    const current = await this.assessManagedProbe(binding, paneCommand, screen);
+    if (!screen?.trim()) return {
+      status: "inconclusive" as const, code: "awaiting_runtime",
+      detail: "The fresh launch's current Claude prompt could not be observed.",
+    };
+    // A process label alone cannot establish an interactive prompt. This probe uses the current
+    // frame and the same exact, stable launch proof as managed headerless readiness.
+    const current = await this.assessManagedProbe(binding, null, screen, { requireCurrentLaunch: true });
     if (this.autoLaunches.get(binding.nodeId) !== launch) return {
       status: "inconclusive" as const, code: "awaiting_runtime", detail: "The fresh launch changed during readiness observation.",
     };
-    // A shell prompt can also start with ❯. Keep the headerless fallback only when process
-    // evidence cannot rule Claude out; a readable shell/script-only pane uses the current result.
-    const withIdentity = assessNativeResumeProbe({ runtime: "claude-code", paneCommand, paneContent: screen,
-      claudeAutoIdentityVerified: true, claudeResumeIdentityVerified: true });
-    return withIdentity.status === "resumed" && occupant !== "absent" ? historyProbe : current;
+    return current;
   }
 
-  private async assessManagedProbe(binding: NodeBinding, paneCommand: string | null, paneContent: string, options?: ReadinessOptions) {
+  private async assessManagedProbe(binding: NodeBinding, paneCommand: string | null, paneContent: string, options?: ReadinessOptions & { requireCurrentLaunch?: boolean }) {
     const input = { runtime: "claude-code", paneCommand, paneContent };
-    const probe = assessNativeResumeProbe(input);
+    let probe = assessNativeResumeProbe(input);
     // Headerless managed launches (including bypass mode) use the same readiness
     // precedence as resume. This candidate result is returned only after the
     // exact launch identity below is proved; screen text alone is insufficient.
     const verifiedProbe = assessNativeResumeProbe({ ...input,
       claudeAutoIdentityVerified: true, claudeResumeIdentityVerified: true });
-    if (probe.status === "resumed" || verifiedProbe.status !== "resumed") return probe;
+    if ((!options?.requireCurrentLaunch && probe.status === "resumed") || verifiedProbe.status !== "resumed") return probe;
+    if (options?.requireCurrentLaunch) probe = {
+      status: "inconclusive", code: "awaiting_runtime",
+      detail: "Waiting to confirm the new Claude process in this pane.",
+    };
     const launch = this.autoLaunches.get(binding.nodeId);
     // No launch record (this daemon did not launch the seat): the caller's real binding and the seat's recorded
     // conversation are the proof's inputs. A record for another launch keeps today's result below.
-    if (!launch) return await this.proveWithoutLaunch(binding, options) ? { ...verifiedProbe, provedWithoutLaunch: true } : probe;
+    if (!launch) {
+      if (options?.requireCurrentLaunch) return probe;
+      return await this.proveWithoutLaunch(binding, options) ? { ...verifiedProbe, provedWithoutLaunch: true } : probe;
+    }
     if (!binding.tmuxPane || !binding.tmuxSession
       || launch.binding.id !== binding.id || launch.binding.tmuxPane !== binding.tmuxPane
       || launch.binding.tmuxSession !== binding.tmuxSession
