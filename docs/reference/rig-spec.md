@@ -647,7 +647,9 @@ launch leaves the choice unchanged. Restarting from saved context keeps it.
 Only `none` is accepted, and the field is invalid on other runtimes. If the
 seat switches to another runtime, the Claude choice stays dormant and applies
 again if it switches back. A currently running Claude process is unaffected.
-Export describes the current runtime and omits a dormant Claude choice. If
+Export describes the current runtime and omits a dormant Claude choice. YAML
+exports name each affected agent in a `# Not carried:` comment, which `rig export`
+also prints after writing the file; JSON exports keep their existing shape. If
 you rebuild from that export and switch back to Claude, restore `claude_mcp: none`
 in the Claude declaration. Re-check this setting after downgrading
 OpenRig too: older versions can ignore it.
@@ -655,6 +657,14 @@ OpenRig too: older versions can ignore it.
 Shutdown resume probes and the displayed native recovery commands (including
 the conversation picker) also carry the saved MCP choice. If shutdown cannot
 read that choice, it skips the probe and retains the token; shutdown proceeds.
+
+This opt-out is incompatible with an active enterprise `managed-mcp.json`:
+[Claude rejects strict overrides of that managed server set](https://code.claude.com/docs/en/managed-mcp#servers-passed-with---mcp-config-or---strict-mcp-config).
+OpenRig keeps the requested opt-out flags, so startup and resume remain subject
+to that native refusal; it does not fall back to loading servers. Use a host
+without that managed configuration, or omit the opt-out to use the managed set.
+Shutdown skips the probe when it can read and parse a managed configuration,
+reports the conflict, and keeps the token unverified instead of marking it unusable.
 
 ### Claude Advisor (`runtime: claude-code`)
 

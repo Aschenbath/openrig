@@ -46,6 +46,14 @@ export class RigSpecExporter {
     }).map((node) => node.logicalId).sort();
   }
 
+  /** Name dormant Claude MCP choices omitted from declarations for another runtime. */
+  claudeMcpNotCarried(rigId: string): string[] {
+    const rig = this.rigRepo.getRig(rigId);
+    return (rig?.nodes ?? [])
+      .filter((node) => node.runtime !== "claude-code" && node.claudeMcp === "none")
+      .map((node) => node.logicalId).sort();
+  }
+
   exportRig(rigId: string): LegacyRigSpec | RigSpec {
     const rig = this.rigRepo.getRig(rigId);
     if (!rig) {

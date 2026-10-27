@@ -73,6 +73,9 @@ updates the seat choice after launch eligibility and startup-source resolution;
 an already-bound seat or a failed tmux launch keeps its prior value. Export
 describes the current runtime; a dormant choice on another runtime is omitted
 and must be restored in the Claude declaration when rebuilding from that export.
+The YAML export route names those agents in the existing `# Not carried:` report;
+the JSON export is unchanged. `rigspec-routes.test.ts` covers both pod-aware and
+legacy exports, omission controls and successful JSON export.
 
 The shared `StartupOrchestrator` reads the current seat record, so both an authored start
 and saved-context restore pass the choice to Claude. Legacy resume and handover
@@ -81,6 +84,12 @@ the target is Claude. `claude-mcp.ts` builds the strict empty-server arguments
 for the adapters, shutdown resume probes and displayed recovery commands,
 including the conversation picker. Shutdown skips a probe with an unreadable
 saved choice and keeps the resume token without adding a shutdown refusal.
+For an opted-out seat, it also checks Claude's documented system path for
+`managed-mcp.json`: a readable JSON object skips the incompatible probe and
+records `inconclusive`, with a diagnostic and the token retained. The lifecycle
+test simulates that file read, including malformed-file and omitted-setting
+controls; it does not run an enterprise-managed Claude instance. Other launch
+paths retain the strict flags and Claude's native policy refusal.
 The native lineage selectors recognize these exact
 arguments without treating JSON contents as session options. Invalid stored
 values refuse launch. With no choice, the adapters add no MCP arguments.
