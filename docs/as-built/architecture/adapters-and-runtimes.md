@@ -281,6 +281,34 @@ resume launches (`codex-runtime-adapter.ts:378`, `codex-resume.ts:103`).
   `no_conversation_found` (`:429–434`) and with `recovery:
   "attention_required"` plus pane evidence on an `attention_required` probe
   (`:444–450`) — the adapter never relaunches on its own.
+- **Fresh in-place handover readiness.** `assessFreshInPlaceProbe` qualifies an
+  otherwise ready history probe only for the matching fresh launch, binding and
+  launch generation. The current pane must show a prompt, and `assessManagedProbe`
+  must confirm the new launch's exact session token in the same foreground process
+  across two observations, with the pane and launch still current. It reuses the
+  existing managed identity proof, including its process fingerprint. A process
+  label alone, old scrollback, an unavailable screen, an unreadable process list
+  or an unidentified Claude process cannot admit the handover. Those cases stay
+  `awaiting_runtime`; a positive identity conflict and visible approval or login
+  gates keep their specific results. The handover waits within its existing
+  readiness budget before sending the context packet.
+
+  The fresh path requires the last `❯` prompt to sit inside Claude's complete
+  input frame: its top rule directly above the prompt and a bottom rule below.
+  A shell's echoed launch command cannot borrow an earlier header or input
+  frame, even when the matching Claude process is already running. A header
+  and prompt alone, or a partially drawn frame, remain pending. This may delay
+  readiness until the full frame is visible; other launch paths keep their
+  existing screen predicates.
+
+  Previously, unavailable observations and ambiguous headerless prompts could
+  retain the old ready result. `claude-fresh-in-place-scope.test.ts` now checks
+  missing observations, unknown or changing process identity, retained UI above
+  direct and script launch commands, partial frames, recovery and normal prompt
+  controls. `claude-handover-readiness.test.ts` exercises the real handover
+  service with migrated SQLite, modeled pane/process observations and one synthetic
+  clock. Readiness and the later packet-submission receipt remain separate checks;
+  these tests do not run a live Claude account.
 
 ### CodexRuntimeAdapter (`codex-runtime-adapter.ts:65`)
 
