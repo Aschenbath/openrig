@@ -176,6 +176,7 @@ interface AttentionAggregateRead {
 }
 /** The host registry (`rig host list`): each registered host with a quick reachability probe. */
 interface HostsRead {
+  ownName?: unknown;
   hosts?: Array<{ id?: unknown; status?: unknown }>;
 }
 interface StreamItemRead {
@@ -663,6 +664,7 @@ export async function hydrateSnapshot(
   const localHost: HostNode = {
     id: "local",
     name: instanceHealth?.selfHostId?.trim() || "local",
+    displayName: typeof hostsRead?.ownName === "string" ? hostsRead.ownName.trim() || undefined : undefined,
     reachable: true,
     rigs: rigs.sort(byRigName),
   };

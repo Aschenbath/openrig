@@ -51,6 +51,12 @@ through ONE path. Safe-core grammar: `:<section>` (any of the eight, e.g.
 `spec-of <agent>` · `running <spec>`. Keys: arrows + Enter navigate the
 explorer, `F` toggles the footer, `q` quits.
 
+Topology shows this daemon's configured host name beside its identity, for
+example `Mac mini 2 (mac)` after `rig host rename "Mac mini 2"`. Host commands
+continue to use the identity (`host mac`); changing the name preserves the
+current selection and reads, even when it matches a registered remote host.
+When the name is absent or matches the identity, the identity appears once.
+
 In Scopes, select a mission or use `mission <name>`; with a mission selected, `M`
 collapses its mini-requirements and `N` shows its narrative. Its workflow rows open the
 current work, owner, recorded waiting reason, wake mechanism, next action and

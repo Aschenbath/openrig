@@ -30,6 +30,7 @@ import { buildLedgerExplorer } from "./crash-cart/ledger-explorer.js";
 import type { CrashCartModel } from "./crash-cart/crash-cart-model.js";
 import type { DaemonState, DaemonUnverifiedEvidence } from "./crash-cart/contract.js";
 import { runtimeMarkSegs } from "./topology/runtime-marks.js";
+import { hostLabel } from "./topology/host-label.js";
 import { barCells, flashActive, reducedMotion, spinnerFrame } from "./motion.js";
 import { explorerWidth, MOTION_FRAME_MS } from "./visual-layout.js";
 import type { ColorMode, Token } from "./theme.js";
@@ -441,7 +442,7 @@ function agentDetailLines(
       {
         title: "SEAT",
         fields: [
-          { label: "host", value: found.host.name },
+          { label: "host", value: hostLabel(found.host) },
           { label: "rig", value: rig.name },
           { label: "pod", value: pod.name },
         ],
@@ -714,7 +715,7 @@ function instanceContentLines(
   contentWidth: number,
   motion: MotionCtx,
 ): ContentLine[] {
-  const lines = tabsLine(state, `instance ${host.name}`);
+  const lines = tabsLine(state, `instance ${hostLabel(host)}`);
   const scope = { kind: "instance", local: host === snap.hosts[0] } as const;
   if (state.viewTab === "health") return [...lines, { text: "" }, ...healthListLines(snap, scope, contentWidth)];
   if (state.viewTab === "recent") {
@@ -727,7 +728,7 @@ function instanceContentLines(
   if (state.viewTab === "overview") {
     return [
       ...lines,
-      ...detailPage({ text: `instance ${host.name}` }, [
+      ...detailPage({ text: `instance ${hostLabel(host)}` }, [
         {
           title: "instance",
           fields: [
@@ -905,7 +906,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
     const host = (hostName ? snap.hosts.find((candidate) => candidate.name === hostName) : snap.hosts[0]);
     if (leaf?.kind === "host" && host) return instanceContentLines(state, snap, host, contentWidth, motion);
     if (!leaf && host?.rigs.length) return wrapDetailLines([
-      { text: `TOPOLOGY · ${host.name}` }, { text: "Choose a rig to read its seats and work." },
+      { text: `TOPOLOGY · ${hostLabel(host)}` }, { text: "Choose a rig to read its seats and work." },
       { text: `${host.rigs.length} rig${host.rigs.length === 1 ? "" : "s"} · select one in Explorer` },
       { text: "Bright ▦ live agents · gray ▦ none · ? unknown" },
     ], contentWidth);
@@ -1008,7 +1009,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
           {
             title: "rig",
             fields: [
-              { label: "host", value: host.name },
+              { label: "host", value: hostLabel(host) },
               { label: "shape", value: `${rig.pods.length} pods · ${all.length} agents` },
               ...(rig.lifecycleState ? [{ label: "state", value: rig.lifecycleState }] : []),
             ],

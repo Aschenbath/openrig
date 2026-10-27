@@ -16,7 +16,7 @@ const REMOTE_RIGS = [{ id: "r-vps-kernel", name: "kernel", lifecycleState: "runn
 const LOCAL_CHANGE: RecentTransitionSnap = { transitionId: 41, qitemId: "qitem-local", ts: "2026-10-25T19:00:00.000Z",
   actorSession: "local-seat@kernel", change: "created", rig: "kernel", targetKind: "qitem", target: "qitem-local" };
 
-interface Fake { calls: string[]; hosts?: unknown[]; hostsStatus?: number; remoteStatus?: number; aggregateHosts?: unknown[] }
+interface Fake { calls: string[]; ownName?: unknown; hosts?: unknown[]; hostsStatus?: number; remoteStatus?: number; aggregateHosts?: unknown[] }
 
 function daemon(fake: Fake): DaemonClient {
   return new DaemonClient({ baseUrl: "http://fixture", fetchImpl: (async (input) => {
@@ -24,7 +24,7 @@ function daemon(fake: Fake): DaemonClient {
     if (u.pathname === "/healthz") return Response.json({ selfHostId: "mac" });
     if (u.pathname === "/api/hosts") return fake.hostsStatus
       ? Response.json({ error: "invalid_registry" }, { status: fake.hostsStatus })
-      : Response.json({ ownName: "mac", selected: "local", hosts: fake.hosts ?? [VPS] });
+      : Response.json({ ownName: Object.hasOwn(fake, "ownName") ? fake.ownName : "mac", selected: "local", hosts: fake.hosts ?? [VPS] });
     if (u.pathname === "/api/rigs/summary") {
       const host = u.searchParams.get("host");
       if (!host) return Response.json(LOCAL_RIGS);
@@ -52,13 +52,59 @@ async function page(fake: Fake, ...steps: Step[]) {
   const view = createViewState({ instanceId: "remote-hosts", getSnapshot: () => snap });
   const client = daemon(fake);
   const rigName = () => view.get().drill.find((part) => part.kind === "rig")?.name ?? null;
-  snap = await hydrateSnapshot(client, undefined, null, null, rigName(), view.get());
+  const refresh = async () => snap = await hydrateSnapshot(client, undefined, null, null, rigName(), view.get());
+  await refresh();
   for (const step of steps) {
     view.dispatch(typeof step === "string" ? parseCommand(step) : step);
-    snap = await hydrateSnapshot(client, undefined, null, null, rigName(), view.get());
+    await refresh();
   }
-  return { snap, view, text: renderScreen(view.get(), snap, { cols: 160, rows: 50, colorMode: "none" }).lines.join("\n") };
+  return { snap, view, refresh, text: renderScreen(view.get(), snap, { cols: 160, rows: 50, colorMode: "none" }).lines.join("\n") };
 }
+
+describe("the local host's configured display name (#2049)", () => {
+  it.each([undefined, null, 7, "  ", "mac"])("keeps one stable identity when the served name is %s", async (ownName) => {
+    const { snap, view, text } = await page({ calls: [], ownName }, "host mac");
+    expect(text).toContain("⊕ mac");
+    expect(text).toContain("instance mac");
+    expect(text).not.toContain("mac (mac)");
+    expect(snap.hosts[0]?.name).toBe("mac");
+    expect(view.get().drill).toEqual([{ kind: "host", name: "mac" }]);
+  });
+
+  it("shows its name on the tree and host pages while commands keep its identity", async () => {
+    for (const tab of ["table", "overview", "graph", "health", "recent"]) {
+      const fake: Fake = { calls: [], ownName: "Mac mini 2" };
+      const { snap, view, text } = await page(fake, "host mac", `tab ${tab}`);
+      expect(text).toContain("⊕ Mac mini 2 (mac)");
+      expect(text).toContain("instance Mac mini 2 (mac)");
+      expect(view.get().drill).toEqual([{ kind: "host", name: "mac" }]);
+      expect(snap.hosts.map((host) => [host.id, host.name])).toEqual([["local", "mac"], ["vps", "vps"]]);
+      expect(fake.calls.some((call) => call.includes("host="))).toBe(false);
+    }
+  });
+
+  it("keeps selection and local reads when a rename matches a registered remote host", async () => {
+    const fake: Fake = { calls: [], ownName: "Desk Mac" };
+    const { snap, view, refresh } = await page(fake, "host mac", "tab recent");
+    const screen = (current: FleetSnapshot) => renderScreen(view.get(), current, { cols: 160, rows: 50, colorMode: "none" });
+    const before = screen(snap);
+    expect(before.lines.join("\n")).toContain("⊕ Desk Mac (mac)");
+    const keys = before.explorerRows.map((row) => row.key);
+    fake.ownName = "vps";
+    fake.calls.length = 0;
+    const renamed = screen(await refresh());
+    expect(renamed.lines.join("\n")).toContain("⊕ vps (mac)");
+    expect(renamed.lines.join("\n")).toContain("qitem-local");
+    expect(renamed.explorerRows.map((row) => row.key)).toEqual(keys);
+    expect(view.get().drill).toEqual([{ kind: "host", name: "mac" }]);
+    expect(fake.calls.some((call) => call.startsWith("/api/queue/recent-transitions?scope=instance"))).toBe(true);
+    expect(fake.calls.some((call) => call.includes("host=vps"))).toBe(false);
+    view.dispatch(parseCommand("host vps"));
+    const remote = screen(await refresh());
+    expect(fake.calls).toContain("/api/rigs/summary?host=vps");
+    expect(remote.lines.join("\n")).not.toContain("qitem-local");
+  });
+});
 
 describe("a registered remote host in the topology tree (#2049)", () => {
   it("is listed on the Table tab with no feed subscription and no attention-aggregate read", async () => {
