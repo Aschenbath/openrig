@@ -501,6 +501,13 @@ describe("capture --host (http branch)", () => {
     expect(captured.stdoutLines).toContain("pane content here");
   });
 
+  it("http host: a non-positive --lines posts the documented default of 20, not 0", async () => {
+    const h = mockClient(() => ({ status: 200, data: { content: "pane content here" } }));
+    const cmd = captureCommand(httpDeps(h));
+    await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "--lines=0"], { from: "user" });
+    expect(h.calls[0]!.body).toEqual({ lines: 20, session: "dev-impl@my-rig", inputBox: true });
+  });
+
   it("anonymous (URL-only) http host: capture POSTs with NO Authorization header; still succeeds", async () => {
     const h = mockClient(() => ({ status: 200, data: { content: "pane content here" } }));
     const cmd = captureCommand(httpDeps(h));
