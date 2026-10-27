@@ -1,3 +1,4 @@
+import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 // OPR.0.4.6.02 C3 — the terminal-provider-ride daemon routes.
 //
 // ONE canonical, NON-rig-scoped composer for EVERY view kind (arch R1 / guard
@@ -49,7 +50,7 @@ function readOpenBody(raw: unknown): { provider?: string; session?: string; view
 }
 
 /** The canonical, non-rig-scoped terminal route family. Mounted at `/api/terminal`. */
-export function terminalRoutes(): Hono {
+export function terminalRoutes(opts?: { bearerToken?: string | null }): Hono {
   const app = new Hono();
 
   app.post("/open", async (c) => {
@@ -65,6 +66,22 @@ export function terminalRoutes(): Hono {
     if ("error" in body) return c.json({ code: "invalid_terminal_session", error: body.error }, 400);
     const result = await svc.openView({ ...body, view: body.view ?? "" });
     return c.json(result, statusForOpen(result.ok, result.code));
+  });
+
+  app.post("/viewer/ensure", authBearerTokenMiddleware({ expectedToken: opts?.bearerToken ?? null }), async c => {
+    const svc = getService(c);
+    if (!svc) return c.json({ ok: false, code: "terminal_service_unavailable" }, 503);
+    const raw = await c.req.json().catch(() => null) as Record<string, unknown> | null;
+    if (!raw || typeof raw !== "object") return c.json({ ok: false, code: "body_invalid" }, 400);
+    const parsed = readOpenBody(raw);
+    const member = raw.member as { hostId?: unknown; nodeId?: unknown } | undefined;
+    if ("error" in parsed || !member || typeof member.hostId !== "string" || !member.hostId.trim()
+      || typeof member.nodeId !== "string" || !member.nodeId.trim() || typeof raw.expectedPlan !== "string" || !raw.expectedPlan) {
+      return c.json({ ok: false, code: "body_invalid", error: "Expected view, member:{hostId,nodeId}, and expectedPlan from the current preview." }, 400);
+    }
+    const result = await svc.ensureViewer({ ...parsed, view: parsed.view ?? "", expectedPlan: raw.expectedPlan,
+      member: { hostId: member.hostId, nodeId: member.nodeId } });
+    return c.json(result, result.ok ? 200 : result.code === "preview_changed" ? 409 : result.code === "view_not_found" ? 404 : 200);
   });
 
   app.get("/views", async (c) => {

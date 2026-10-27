@@ -35,7 +35,7 @@ describe("#707 local tiles run the tmux the daemon resolves", () => {
 
         const resolved = composeView("v", [local("seat'a", readOnly)], { resolveHost: () => null, localTmux: tmux });
         execFileSync("/bin/sh", ["-c", resolved.opened[0]!.paneCommand], { env });
-        expect(readFileSync(argsFile, "utf8").trimEnd().split("\n")).toEqual(["attach", ...(readOnly ? ["-r"] : []), "-t", "session-id"]);
+        expect(readFileSync(argsFile, "utf8").trimEnd().split("\n")).toEqual(["attach", ...(readOnly ? ["-r"] : ["-f", "ignore-size"]), "-t", "session-id"]);
         expect(resolved.opened[0]!.readOnly).toBe(readOnly);
       }
     } finally {
@@ -91,11 +91,11 @@ function service(resolveLocalTmux?: TerminalServiceDeps["resolveLocalTmux"]): { 
 
 describe("#707 the service passes only an absolute resolved tmux to the composer", () => {
   const cases: Array<[string, TerminalServiceDeps["resolveLocalTmux"] | undefined, string]> = [
-    ["an absolute path", () => "/usr/local/bin/tmux", "'/usr/local/bin/tmux' attach -t 'a@r'"],
-    ["a bare name", () => "tmux", "tmux attach -t 'a@r'"],
-    ["nothing found", async () => null, "tmux attach -t 'a@r'"],
-    ["a failed probe", () => { throw new Error("probe failed"); }, "tmux attach -t 'a@r'"],
-    ["no resolver", undefined, "tmux attach -t 'a@r'"],
+    ["an absolute path", () => "/usr/local/bin/tmux", "'/usr/local/bin/tmux' attach -f ignore-size -t 'a@r'"],
+    ["a bare name", () => "tmux", "tmux attach -f ignore-size -t 'a@r'"],
+    ["nothing found", async () => null, "tmux attach -f ignore-size -t 'a@r'"],
+    ["a failed probe", () => { throw new Error("probe failed"); }, "tmux attach -f ignore-size -t 'a@r'"],
+    ["no resolver", undefined, "tmux attach -f ignore-size -t 'a@r'"],
   ];
   it.each(cases)("%s", async (_name, resolver, expected) => {
     const { svc, herdr } = service(resolver);
@@ -130,7 +130,7 @@ function herdrOpening(paneList: (params: Record<string, unknown>) => HerdrResult
   };
   return { adapter: new HerdrAdapter({ transportFactory: () => transport, newLaunchToken: () => "tok" }), methods };
 }
-const pane = (seat: string, label = seat): ComposedPane => ({ seat, label, paneCommand: `tmux attach -t '${seat}'`, readOnly: false });
+const pane = (seat: string, label = seat): ComposedPane => ({ seat, label, paneCommand: `tmux attach -f ignore-size -t '${seat}'`, readOnly: false });
 const viewOf = (...panes: ComposedPane[]): ComposedView => ({ id: "v", opened: panes, absent: [], degraded: [], pages: [panes] });
 // Three seats lay out as a 2×2 grid with one blank filler pane (label "").
 const listed = (...labels: Array<string | undefined>): HerdrResult => ({

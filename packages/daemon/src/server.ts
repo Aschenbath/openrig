@@ -820,7 +820,7 @@ export function createApp(deps: AppDeps): Hono {
   // OPR.0.4.6.02 C3 — the canonical non-rig-scoped terminal composer + the
   // rig-scoped thin alias (composes view=rig:<rigId>, delegates to the same
   // TerminalService; arch R1 / guard b1).
-  app.route("/api/terminal", terminalRoutes());
+  app.route("/api/terminal", terminalRoutes({ bearerToken: deps.terminalBearerToken ?? null }));
   app.route("/api/rigs/:rigId/terminal", rigTerminalRoutes);
   // V0.3.1 slice 12 walk-item 1 — mission scope data layer
   // (aggregated mission metadata + slices filter; pairs with

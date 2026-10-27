@@ -180,7 +180,39 @@ its name, falling back to the qitem ID. The existing preview `view` string is
 unchanged. A following view derives membership when requested; it does not
 mean an open workspace updates itself.
 
-Preview is read-only. In this membership increment, `viewerStatus` is
-`not-provisioned`: the response does not verify a reusable provider terminal
+Preview is read-only. A member without owned viewer provenance is
+`not-provisioned`; the ensure operation below can establish a reusable provider
 mapping. An explicit open retains the provider's existing workspace behavior;
 it does not continuously reconcile the view or change an agent's lifecycle.
+
+## Ensuring an owner viewer
+
+The owner-facing HTTP operation `POST /api/terminal/viewer/ensure` accepts
+`{view:"qitem:<id>", member:{hostId,nodeId}, provider:"herdr", session,
+expectedPlan}`. Use a current preview's member key and plan. This explicit
+operation uses the daemon's existing terminal bearer and browser boundary;
+a bridge must retain its signed-in owner, Origin and expiry controls. It does
+not grant authority based on task membership or accept a caller terminal ID.
+
+On the qualified Linux Herdr 0.9.5/protocol 22 endpoint, it creates one viewer
+or reuses an owned, verified `{workspaceId,paneId,terminalId,readOnly}` mapping.
+A repeated/concurrent request does not create another viewer. A lost create
+reply is reconciled before starting anything else; a lost run reply is checked
+against the actual foreground process, never blindly repeated. Unknown or
+changed terminal identity remains unconfirmed. The operation does not relayout,
+close departed viewers, take over control, focus existing panes or launch/stop
+agents. A first workspace on an otherwise empty Herdr server may become focused.
+
+Preview remains passive and names `not-provisioned`, `verified` or `unconfirmed`
+viewer status. Studio can ensure a new member, add its browser frame, and retain
+a pinned leaver labeled as no longer participating. The provider mapping is
+small presentation provenance, separate from queue membership. Herdr display
+labels are not that provenance. Other providers/platforms remain unsupported
+for ensure-viewer until qualified; ordinary open retains its existing behavior.
+
+Writable tile clients use `tmux attach -f ignore-size`; read-only clients keep
+`-r` (which also implies ignore-size). This can avoid contributing to sizing
+when other clients establish the agent window's dimensions. It is **not resize
+isolation**: opening a tile can change the agent's terminal size when it is the
+only sizing client. Observers of a Herdr terminal do not themselves resize it;
+a controlling browser can. No cross-version resize guarantee is implied.

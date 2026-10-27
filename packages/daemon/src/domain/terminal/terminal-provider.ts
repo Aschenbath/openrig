@@ -1,3 +1,4 @@
+import type { ViewerKey, ViewerResult } from "./herdr-viewer.js";
 import type { TaskMembership } from "./task-terminal-view.js";
 // OPR.0.4.6.02 C2 — the TerminalProvider abstraction (the CORE seam of the
 // terminal-provider ride).
@@ -140,4 +141,6 @@ export interface TerminalProvider {
   status(): Promise<ProviderStatus>;
   liveness(): Promise<ProviderLiveness>;
   openView(view: ComposedView): Promise<OpenViewResult>;
+  ensureViewer?(key: ViewerKey, pane: ComposedPane, stillCurrent?: () => Promise<boolean>): Promise<ViewerResult>;
+  lookupViewer?(key: ViewerKey, pane: ComposedPane): Promise<ViewerResult>;
 }

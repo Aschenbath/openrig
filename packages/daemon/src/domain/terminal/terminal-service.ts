@@ -1,3 +1,6 @@
+import { tileAttachArgv } from "./tile-attach.js";
+import { shellQuote } from "../../adapters/shell-quote.js";
+import type { ViewerKey, ViewerResult } from "./herdr-viewer.js";
 // OPR.0.4.6.02 C3 — the TerminalService orchestrator.
 //
 // ONE daemon-side composer for EVERY view kind (arch R1 / guard b1): the
@@ -227,6 +230,7 @@ export class TerminalService {
 
     const composed = await this.resolveComposed(req.view, provider.panesPerPage, req.viewportColumns);
     if ("code" in composed) return errorResult(providerName, composed.code, composed.error);
+    await this.viewerMappings(provider, composed);
     const planId = this.planId(providerName, composed, session);
     if (req.expectedPlan !== undefined && req.expectedPlan !== planId) {
       return errorResult(providerName, "preview_changed", "View membership, layout or provider session changed. Refresh the preview before Open; nothing was launched.");
@@ -284,7 +288,7 @@ export class TerminalService {
   }
 
   private planId(provider: string, composed: ComposedView, session?: string): string {
-    return createHash("sha256").update(JSON.stringify({ provider, ...(session !== undefined ? { session } : {}), composed, grids: composed.pages.map(page => buildGridRoot(page, composed.columns)) })).digest("hex");
+    return createHash("sha256").update(JSON.stringify({ provider, ...(session !== undefined ? { session } : {}), composed: { ...composed, ...(composed.task ? { task: { ...composed.task, members: composed.task.members.map(({ viewer, viewerStatus, ...member }) => member) } } : {}) }, grids: composed.pages.map(page => buildGridRoot(page, composed.columns)) })).digest("hex");
   }
 
   /** Passive: inventory, local has-session and provider probe only. Never openView. */
@@ -295,8 +299,48 @@ export class TerminalService {
     const { provider, session } = selected;
     const composed = await this.resolveComposed(req.view, provider.panesPerPage, req.viewportColumns);
     if ("code" in composed) return errorResult(providerName, composed.code, composed.error);
+    await this.viewerMappings(provider, composed);
     return { provider: providerName, ...(session !== undefined ? { session } : {}), view: req.view, composed, viewDescriptor: composed.viewDescriptor, ...(composed.task ? { task: composed.task } : {}),
       grids: composed.pages.map(page => buildGridRoot(page, composed.columns)), planId: this.planId(providerName, composed, session), status: await provider.status() };
+  }
+
+  private viewerPane(pane: import("./terminal-provider.js").ComposedPane) {
+    const original = pane.attachArgv;
+    if (!original) return pane;
+    const attachArgv = tileAttachArgv(original[5]!, original.slice(6), original[4]!, false);
+    return { ...pane, readOnly: false, attachArgv, paneCommand: attachArgv.map(shellQuote).join(" ") };
+  }
+
+  private async viewerMappings(provider: TerminalProvider, composed: ComposedView): Promise<void> {
+    if (!composed.task || !provider.lookupViewer) return;
+    for (const member of composed.task.members) {
+      const pane = composed.opened.find(p => p.seat === member.seat);
+      if (!pane || !member.key.hostId || !member.key.nodeId) continue;
+      const result = await provider.lookupViewer({ hostId: member.key.hostId, nodeId: member.key.nodeId }, this.viewerPane(pane));
+      if (result.ok) { member.viewerStatus = "verified"; member.viewer = result.viewer; }
+      else if (result.code !== "viewer_not_provisioned") member.viewerStatus = "unconfirmed";
+    }
+  }
+
+  /** Explicit owner operation: membership never grants input authority. The
+   * HTTP route supplies the existing owner bearer/browser boundary. */
+  async ensureViewer(req: OpenViewRequest & { member: ViewerKey; expectedPlan: string }): Promise<ViewerResult> {
+    if (!req.view.startsWith("qitem:")) return { ok: false, code: "view_required", error: "Ensure-viewer requires a qitem view." };
+    const selected = this.selectProvider({ ...req, provider: req.provider ?? "herdr" });
+    if ("ok" in selected) return { ok: false, code: selected.code ?? "unknown_provider", error: selected.error ?? "Provider unavailable." };
+    if (!selected.provider.ensureViewer) return { ok: false, code: "viewer_unsupported", error: "This provider has no qualified ensure-viewer operation." };
+    const composed = await this.resolveComposed(req.view, selected.provider.panesPerPage, req.viewportColumns);
+    if ("code" in composed) return { ok: false, code: composed.code, error: composed.error };
+    if (req.expectedPlan !== this.planId(selected.name, composed, selected.session)) return { ok: false, code: "preview_changed", error: "Task membership or attachment changed; refresh the preview before ensuring a viewer." };
+    if (!composed.task?.complete) return { ok: false, code: "viewer_unconfirmed", error: "Task membership is incomplete; no viewer was provisioned." };
+    const member = composed.task.members.find(m => m.key.hostId === req.member.hostId && m.key.nodeId === req.member.nodeId);
+    const pane = member?.availability === "available" && composed.opened.find(p => p.seat === member.seat);
+    if (!pane) return { ok: false, code: "viewer_unavailable", error: "This current task member has no verified local terminal attachment." };
+    return selected.provider.ensureViewer(req.member, this.viewerPane(pane), async () => {
+      const current = await this.resolveComposed(req.view, selected.provider.panesPerPage, req.viewportColumns);
+      return !("code" in current) && current.task?.complete === true
+        && this.planId(selected.name, current, selected.session) === req.expectedPlan;
+    });
   }
 
   /** List saved views + the rig names openable as derived views. */

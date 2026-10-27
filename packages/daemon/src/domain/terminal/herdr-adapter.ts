@@ -1,3 +1,4 @@
+import type { HerdrViewer, ViewerKey, ViewerResult } from "./herdr-viewer.js";
 // OPR.0.4.6.02 C2+FB4 — the herdr TerminalProvider (the proof-gated primary
 // provider). Arm's-length AGPL: it drives the installed herdr's local control
 // SOCKET through the injected `HerdrTransport` (see herdr-transport.ts) and
@@ -285,6 +286,7 @@ export function extractWorkspaceId(result: HerdrResult): string | null {
 }
 
 export interface HerdrAdapterDeps {
+  viewer?: HerdrViewer;
   transportFactory: HerdrTransportFactory;
   launch?: ProviderStatus["launch"];
   /**
@@ -445,6 +447,13 @@ export class HerdrAdapter implements TerminalProvider {
     } catch (err) {
       return { alive: false, detail: err instanceof Error ? err.message : String(err) };
     }
+  }
+
+  async ensureViewer(key: ViewerKey, pane: ComposedPane, stillCurrent?: () => Promise<boolean>): Promise<ViewerResult> {
+    return this.deps.viewer?.ensure(key, pane, stillCurrent) ?? { ok: false, code: "viewer_unsupported", error: "This Herdr endpoint has no qualified viewer allocator." };
+  }
+  async lookupViewer(key: ViewerKey, pane: ComposedPane): Promise<ViewerResult> {
+    return this.deps.viewer?.lookup(key, pane) ?? { ok: false, code: "viewer_not_provisioned", error: "No qualified viewer mapping." };
   }
 
   async openView(view: ComposedView): Promise<OpenViewResult> {
