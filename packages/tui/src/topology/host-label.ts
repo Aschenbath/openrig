@@ -1,12 +1,15 @@
 import { stripVTControlCharacters } from "node:util";
 import type { HostNode } from "../types.js";
 
-function displayName(host: HostNode): string | undefined {
+export function sanitizeHostDisplayName(value: string): string {
   // Node 22's VT stripper does not consume every OSC payload (for example a
   // window title with spaces). Remove the entire string before stripping CSI.
-  const plain = host.displayName?.replace(/(?:\x1b\]|\x9d)[\s\S]*?(?:\x07|\x1b\\|\x9c|$)/g, "");
-  const name = plain === undefined ? undefined
-    : stripVTControlCharacters(plain).replace(/[\x00-\x1f\x7f-\x9f\p{Bidi_Control}]/gu, "").trim();
+  const plain = value.replace(/(?:\x1b\]|\x9d)[\s\S]*?(?:\x07|\x1b\\|\x9c|$)/g, "");
+  return stripVTControlCharacters(plain).replace(/[\x00-\x1f\x7f-\x9f\p{Bidi_Control}]/gu, "").trim();
+}
+
+function displayName(host: HostNode): string | undefined {
+  const name = host.displayName === undefined ? undefined : sanitizeHostDisplayName(host.displayName);
   return name && name !== host.name ? name : undefined;
 }
 

@@ -59,7 +59,7 @@ full display name. Terminal control sequences and Unicode bidirectional
 formatting controls in that name are removed before rendering. Host commands
 continue to use the identity (`host mac`); changing the name preserves the
 current selection and reads, even when it matches a registered remote host.
-When the name is absent, is the default `localhost`, or matches the identity,
+When the cleaned name is absent, is the default `localhost`, or matches the identity,
 the identity appears once, as it does on an installation that has not been renamed.
 
 In Scopes, select a mission or use `mission <name>`; with a mission selected, `M`

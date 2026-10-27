@@ -127,6 +127,8 @@ describe("the local host's configured display name (#2049)", () => {
     { label: "C1 OSC", ownName: "\u009d0;Changed title\u009cDesk", shown: "Desk (mac)" },
     { label: "C0 and C1 controls", ownName: "De\u0000s\u007fk\u0085", shown: "Desk (mac)" },
     { label: "bidirectional formatting controls", ownName: "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069Desk", shown: "Desk (mac)" },
+    { label: "styled default name", ownName: "\u001b[31mlocalhost\u001b[0m", shown: "mac" },
+    { label: "default name with OSC, bidi and C0 controls", ownName: "\u001b]0;Changed title\u0007\u202elocal\u0000host", shown: "mac" },
     { label: "only controls", ownName: "\u001b[2J\u0007", shown: "mac" },
     { label: "ordinary Unicode", ownName: "研发 机房 🖥", shown: "研发 机房 🖥 (mac)" },
     { label: "Arabic and Hebrew text", ownName: "مكتب שרת", shown: "مكتب שרת (mac)" },
