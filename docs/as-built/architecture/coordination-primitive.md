@@ -190,6 +190,14 @@ finding open without itself sending another wake or creating another finding.
 A verified wake resolves a wake failure, not an unclaimed obligation: delivery
 does not prove pickup.
 
+A legacy human notice with no owner-notification history can still resolve from
+the existing item-scoped posted ledger when its recipient is confirmed human.
+This covers older pending asks and parks without inventing an episode that was
+never recorded. A registered alias needs a readable registry to establish its
+human recipient; reserved human references remain known during an outage.
+Modern notifications still require their current episode, and an unrelated
+legacy human receipt cannot resolve an agent wake.
+
 A known hold still leaves recovery with the existing mechanism: an ask on
 Steering without an alert, a wake held by the seat typing guard, or a live
 quiet-release job. Its closure note names that disposition rather than claiming

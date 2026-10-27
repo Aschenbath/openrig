@@ -408,6 +408,14 @@ function deliveryResolutionEvidence(
       && deps.queueRepo.deliveryOutcomeFor(qitemId)?.outcome === "posted") {
       return "current human notification posted";
     }
+    // Pre-OWNER notices have no episode to match. Their existing row-scoped
+    // ledger can resolve that human notice, but never an unrelated agent wake.
+    if (!notification && deps.queueRepo.deliveryOutcomeFor(qitemId)?.outcome === "posted") {
+      const recipient = row.state === "blocked" ? row.blockedOn : row.destinationSession;
+      try {
+        if (recipient && deps.queueRepo.isHumanDestination(recipient)) return "legacy human notification posted";
+      } catch { /* An unreadable registry does not establish the recipient. */ }
+    }
   }
   if (row.state === "pending" && deps.queueRepo.humanAskWithoutAlert(qitemId)) return "current human ask placed on Steering without an alert";
   const quiet = quietHoldCustody(deps.db, qitemId, now);

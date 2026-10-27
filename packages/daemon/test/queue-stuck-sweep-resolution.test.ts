@@ -186,6 +186,37 @@ describe("stuck-sweep resolution uses source evidence", () => {
       transitionNote: `slack-owner-notification-${outcome} notification_key=${key} level=ALERT ${outcome === "posted" ? "message_ts=1.2" : "detail=fixture-failure"}` });
   }
 
+  it.each([false, true].flatMap((parked) => [person.address, "other-person@r"].map((recipient) => ({ parked, recipient }))))(
+    "closes a delivered legacy human notice without owner history ($recipient; parked: $parked)", async ({ parked, recipient }) => {
+    const row = parked ? await work() : await repo.create({ sourceSession: "sender@r", destinationSession: recipient,
+      body: "Choose A or B", summary: "A or B?", evidenceRef: "rig queue show qitem-fixture", nudge: false });
+    if (parked) {
+      repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+      await repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: "blocked", blockedOn: recipient,
+        summary: "Choose A or B", evidenceRef: "rig queue show qitem-fixture" });
+    }
+    // Migration 076 adds these columns without backfilling historical notices.
+    db.prepare("UPDATE queue_transitions SET owner_notification_kind = NULL, owner_notification_level = NULL WHERE qitem_id = ?").run(row.qitemId);
+    const key = `${row.qitemId}:0`;
+    await receipt(row.qitemId, key, "transport-failed");
+    await sweep();
+    const [finding] = findings(row);
+    expect(finding?.tags).toContain(`stuck-sweep:undelivered-human-notice:${row.qitemId}`);
+    await receipt(row.qitemId, key, "posted");
+    expect(repo.transitionLog.latestOwnerNotificationForQitem(row.qitemId)).toBeNull();
+    expect(repo.deliveryOutcomeFor(row.qitemId)?.outcome).toBe("posted");
+    expect(repo.humanNotificationPostedThisEpisode(row.qitemId)).toBe(false);
+    registryAvailable = false;
+    await sweep();
+    // Reserved human references remain known; an alias needs its registry.
+    expect(repo.getById(finding!.qitemId)?.state).toBe(recipient === person.address ? "done" : "pending");
+    registryAvailable = true;
+    await sweep();
+    expect(repo.getById(finding!.qitemId)?.state).toBe("done");
+    expect(repo.transitionLog.listForQitem(finding!.qitemId).at(-1)?.transitionNote).toContain("legacy human notification posted");
+    expect(repo.getById(row.qitemId)?.state).toBe(parked ? "blocked" : "pending");
+  });
+
   it("keeps a claimed agent's separate human notification until its receipt arrives", async () => {
     const row = await work();
     repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
