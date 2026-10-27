@@ -55,10 +55,13 @@ stays the endpoint; a proxy in front forwards the metadata path unchanged.`)
       let daemonUrl: string;
       if (opts.port) {
         const daemonPort = parseInt(opts.port, 10);
-        if (isNaN(daemonPort)) {
+        if (Number.isNaN(daemonPort)) {
           console.error("Invalid port number");
           process.exitCode = 1;
           return;
+        }
+        if (daemonPort < 1 || daemonPort > 65535) {
+          console.error(`Warning: daemon port ${daemonPort} is outside [1, 65535]; MCP will start, but daemon tool calls may fail. Check --port.`);
         }
         daemonUrl = `http://127.0.0.1:${daemonPort}`;
       } else {
