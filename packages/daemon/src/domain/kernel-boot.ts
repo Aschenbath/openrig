@@ -116,7 +116,10 @@ export async function bootKernelIfNeeded(deps: KernelBootDeps): Promise<KernelBo
       return tracker;
     }
     log("info", `kernel-boot: kernel rig already managed (${managed.kind}); skipping builtin boot`);
-    tracker.setSkipped("kernel rig already managed");
+    // A stale kernel stays down on purpose; say why and how to bring it back (`rig start` prints it).
+    tracker.setSkipped(managed.kind === "stale"
+      ? "kernel rig already managed; it was already down before this daemon start, so it was not restored. Bring it back with: rig up kernel --existing"
+      : "kernel rig already managed");
     if (managed.kind === "live") tracker.observeManagedKernel();
     return tracker;
   }

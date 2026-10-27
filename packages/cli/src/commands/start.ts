@@ -288,9 +288,13 @@ status); a restore that returned without a ready kernel exits 1.
         if (kernelResult.kernelState === "skipped") {
           // The daemon also skips its boot when a kernel rig already exists (kernel-boot.ts).
           // That rig need not be running, after a reboot it is not, and this command does not restore it.
-          if (!opts.json) console.log(kernelResult.detail === "kernel rig already managed"
+          // A longer detail with the same start is the daemon's own reason, such as a kernel already down before it started.
+          const detail = kernelResult.detail ?? "";
+          if (!opts.json) console.log(detail === "kernel rig already managed"
             ? "Kernel auto-boot skipped (kernel rig already managed). If its seats are not running, for example after a reboot, bring it back with: rig up kernel --existing"
-            : "Kernel auto-boot skipped (--no-kernel or test mode), including the operator that helps you start a team. To start it later, run rig, set up or select kernel, then start its operator seat.");
+            : detail.startsWith("kernel rig already managed")
+              ? `Kernel auto-boot skipped: ${detail}`
+              : "Kernel auto-boot skipped (--no-kernel or test mode), including the operator that helps you start a team. To start it later, run rig, set up or select kernel, then start its operator seat.");
         } else {
           const terminalFailure = ["auth_blocked", "spec_missing", "bootstrap_failed", "degraded"].includes(kernelResult.kernelState ?? "");
           console.error(`${terminalFailure ? "Kernel failed to start" : "Kernel did not report ready before the deadline"}: state=${kernelResult.kernelState ?? "unknown"}, detail=${kernelResult.detail ?? "none"}`);

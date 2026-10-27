@@ -108,9 +108,10 @@ export class Reconciler {
             });
           });
           const persistedEvent = txn();
-          this.eventBus.notifySubscribers(persistedEvent);
+          // Detached once the transaction commits, even if notifying afterwards throws.
           detached++;
           detachedSessionIds.push(session.id);
+          this.eventBus.notifySubscribers(persistedEvent);
         } catch (err) {
           errors.push({
             sessionId: session.id,

@@ -133,7 +133,11 @@ describe("daemon start with an existing kernel rig", () => {
     const restore = vi.fn(async () => ({ errors: [] }));
     const tracker = await h.daemonStart(restore);
     expect(restore).not.toHaveBeenCalled();
-    expect(tracker.getStatus()).toMatchObject({ kernelState: "skipped", detail: "kernel rig already managed" });
+    // The person is told why it stayed down and how to bring it back.
+    expect(tracker.getStatus()).toMatchObject({
+      kernelState: "skipped",
+      detail: "kernel rig already managed; it was already down before this daemon start, so it was not restored. Bring it back with: rig up kernel --existing",
+    });
     expect(classifyManagedKernel(h.rigRepo, h.sessionRegistry, await h.reconcile())).toEqual({ kind: "stale" });
     expect(h.bootstrap.bootstrap).not.toHaveBeenCalled();
     expect(h.statuses()).toEqual(["detached", "detached"]);
