@@ -84,6 +84,20 @@ describe("fresh in-place readiness requires current launch evidence", () => {
     expect(await f.adapter.checkReady(binding)).toMatchObject({ ready: false, code: "awaiting_runtime" });
   });
 
+  it.each(["❯ ", `❯ claude --permission-mode acceptEdits --session-id ${token} --name seat`])(
+    "waits for Claude to draw its input when the launch process is stable but the shell still shows %s", async screen => {
+      const f = fixture();
+      f.getPaneCommand.mockResolvedValue("claude");
+      f.capturePaneScreen.mockResolvedValue(screen);
+      f.listProcesses.mockReturnValue(ownProcess());
+      await launch(f.adapter);
+      expect(await f.adapter.checkReady(binding)).toMatchObject({ ready: false, code: "awaiting_runtime" });
+      expect(f.listProcesses).toHaveBeenCalled();
+      f.capturePaneScreen.mockResolvedValue("───────── seat ─\n❯ \n─────────\n  ⏵⏵ accept edits on (shift+tab to cycle)");
+      expect(await f.adapter.checkReady(binding)).toEqual({ ready: true });
+    },
+  );
+
   it.each([history,
     "Restored conversation\n─────────\n❯ \n─────────\n  ⏵⏵ auto mode on (shift+tab to cycle)",
     "Restored conversation\n─────────\n❯ \n─────────\n  ⏵⏵ accept edits on (shift+tab to cycle)",

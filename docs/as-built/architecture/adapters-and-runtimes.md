@@ -293,6 +293,11 @@ resume launches (`codex-runtime-adapter.ts:378`, `codex-resume.ts:103`).
   gates keep their specific results. The handover waits within its existing
   readiness budget before sending the context packet.
 
+  The fresh path requires Claude's framed input or its version header with a
+  prompt. A shell's bare `❯` line, including the echoed launch command, does not
+  qualify even when the matching Claude process is already running. Other
+  launch paths keep their existing screen predicates.
+
   Previously, unavailable observations and ambiguous headerless prompts could
   retain the old ready result. `claude-fresh-in-place-scope.test.ts` now checks
   missing observations, unknown or changing process identity, recovery and normal

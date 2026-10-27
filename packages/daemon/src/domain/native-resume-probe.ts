@@ -315,6 +315,12 @@ function hasClaudeComposerPrompt(paneContent: string): boolean {
   return /(^|\n)\s*❯/.test(paneContent);
 }
 
+/** A fresh launch must have drawn Claude's input, not just left a shell's ❯ prompt visible. */
+export function hasClaudeDrawnInput(paneContent: string): boolean {
+  return hasClaudeComposerPrompt(paneContent)
+    && (paneContent.includes("Claude Code v") || hasClaudeInputFrame(paneContent.split(/\r?\n/)));
+}
+
 function looksLikeClaudeBypassConsentPrompt(paneContent: string): boolean {
   // Plain capture of Claude's current consent menu. Labels in prose or a menu
   // followed by a new composer are not evidence of an active dialog.

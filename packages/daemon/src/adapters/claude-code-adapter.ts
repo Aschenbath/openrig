@@ -14,7 +14,7 @@ import type {
 } from "../domain/runtime-adapter.js";
 import { resolveConcreteHint } from "../domain/runtime-adapter.js";
 import type { ProjectionPlan, ProjectionEntry } from "../domain/projection-planner.js";
-import { assessNativeResumeProbe } from "../domain/native-resume-probe.js";
+import { assessNativeResumeProbe, hasClaudeDrawnInput } from "../domain/native-resume-probe.js";
 import { resumeProbeEvidence } from "../domain/native-resume-probe-evidence.js";
 import { resolveReadinessTimeoutMs } from "../domain/readiness-timeout.js";
 import { subtreeNamesClaudeExecutable, claudeCommandSessionToken, listNativeProcesses, observeClaudeDelivery, observeClaudePaneProcess, observeClaudePaneRuntime, observeCodexPaneProcess, verifyClaudePaneProcess, verifyCodexPaneProcess, verifyPaneIdleShell, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
@@ -500,10 +500,19 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     const verifiedProbe = assessNativeResumeProbe({ ...input,
       claudeAutoIdentityVerified: true, claudeResumeIdentityVerified: true });
     if ((!options?.requireCurrentLaunch && probe.status === "resumed") || verifiedProbe.status !== "resumed") return probe;
-    if (options?.requireCurrentLaunch) probe = {
-      status: "inconclusive", code: "awaiting_runtime",
-      detail: "Waiting to confirm the new Claude process in this pane.",
-    };
+    if (options?.requireCurrentLaunch) {
+      // The shell may use the same ❯ glyph while its new Claude process is still
+      // starting. Preserve gate results above, and require Claude's drawn input
+      // before pinning that process as the ready launch.
+      if (!hasClaudeDrawnInput(paneContent)) return {
+        status: "inconclusive" as const, code: "awaiting_runtime",
+        detail: "Waiting for the fresh Claude launch to draw its input frame or header and prompt.",
+      };
+      probe = {
+        status: "inconclusive", code: "awaiting_runtime",
+        detail: "Waiting to confirm the new Claude process in this pane.",
+      };
+    }
     const launch = this.autoLaunches.get(binding.nodeId);
     // No launch record (this daemon did not launch the seat): the caller's real binding and the seat's recorded
     // conversation are the proof's inputs. A record for another launch keeps today's result below.

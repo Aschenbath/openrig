@@ -245,8 +245,9 @@ interactive"), and the post-launch files aren't sent. A Codex fork that the rig 
 with its startup context kept for `rig seat continue` (see below). A seat handover's fork has its own readiness check.
 
 **Fresh Claude handovers.** `rig handover --source fresh` keeps the previous agent's scrollback. Before sending the
-handover context, OpenRig waits for a current prompt and confirms that the process in the pane belongs to the new
-launch. If the current screen or process cannot be read, or the process identity is unconfirmed, the handover keeps
+handover context, OpenRig waits for Claude's framed input or its header with a prompt, and confirms that the process
+in the pane belongs to the new launch. A shell's `❯` prompt or echoed launch command is not enough, even if Claude
+is already running. If the current screen or process cannot be read, or the process identity is unconfirmed, the handover keeps
 waiting within the readiness window and fails if that window expires. Old screen text or the `claude` process label
 alone cannot complete this check. A healthy agent can therefore remain unconfirmed while those observations are
 unavailable; inspect its pane before deciding how to recover.
