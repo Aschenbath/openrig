@@ -1,3 +1,4 @@
+import { resolveEscalationOwner, ESCALATION_HOP_TAG, hasConsumedEscalationHop } from "./escalation-owner.js";
 import type { ArbitratedSeatState } from "./activity-taxonomy.js";
 import { seatRuntimeHomeBySession } from "./seat-runtime-home.js";
 import { quietHoldCustody } from "./quiet-hold-custody.js";
@@ -63,7 +64,6 @@ import {
   LADDER_ATTEMPT_PREFIX,
   LADDER_RUNG_PREFIX,
   LADDER_EXHAUSTED_PREFIX,
-  defaultResolveOrchestrator,
   resolveOperatorSeat,
   resolveSessionNodeId,
 } from "./queue-stuck-sweep.js";
@@ -473,13 +473,15 @@ function suspensionReason(db: Database.Database, destination: string, graceSecon
 /** Read the existing ladder's next eligible action; never create an intent,
  * reserve a retry, consume provider state or change its policy. The scheduler
  * still makes the final live-state decision at delivery time. */
-export function readWakeLadderBackstop(db: Database.Database, qitemId: string): WaitingView["nextBackstop"] | null {
+export function readWakeLadderBackstop(db: Database.Database, qitemId: string, acceptsDestination?: (destination: string) => boolean): WaitingView["nextBackstop"] | null {
   const row = db.prepare(`SELECT qitem_id AS qitemId, state, source_session AS sourceSession,
     destination_session AS destinationSession, claimed_at AS claimedAt, handed_off_from AS handedOffFrom,
     last_heartbeat AS lastHeartbeat, last_nudge_result AS lastNudgeResult,
-    last_nudge_attempt AS lastNudgeAttempt, ts_created AS tsCreated FROM queue_items WHERE qitem_id = ?`)
-    .get(qitemId) as Pick<QueueItem, "qitemId" | "state" | "sourceSession" | "destinationSession" | "claimedAt" | "handedOffFrom" | "lastHeartbeat" | "lastNudgeResult" | "lastNudgeAttempt" | "tsCreated"> | undefined;
+    last_nudge_attempt AS lastNudgeAttempt, ts_created AS tsCreated, tags AS tagsJson FROM queue_items WHERE qitem_id = ?`)
+    .get(qitemId) as Pick<QueueItem, "qitemId" | "state" | "sourceSession" | "destinationSession" | "claimedAt" | "handedOffFrom" | "lastHeartbeat" | "lastNudgeResult" | "lastNudgeAttempt" | "tsCreated"> & { tagsJson: string | null } | undefined;
   if (!row || !["pending", "in-progress"].includes(row.state)) return null;
+  const escalationOwner = () => hasConsumedEscalationHop(db, qitemId)
+    ? null : resolveEscalationOwner(db, row.destinationSession, acceptsDestination).owner;
   const recovery = findWakeRecovery(db, qitemId);
   const disposition = recovery ? db.prepare("SELECT destination_session, tags FROM queue_items WHERE qitem_id = ?")
     .get(recovery.qitemId) as { destination_session: string; tags: string | null } : null;
@@ -498,7 +500,7 @@ export function readWakeLadderBackstop(db: Database.Database, qitemId: string): 
   if (!eligible || !mode || ((mode === "unconfirmed" || mode === "held") && hasPickupEvidence(db, row))) return recovery ? recoveryBackstop() : null;
   const ladder = readLadder(db, qitemId);
   if (ladder.exhausted) return recovery ? recoveryBackstop() : {
-    owner: defaultResolveOrchestrator(db, row.destinationSession) ?? row.destinationSession,
+    owner: escalationOwner() ?? row.destinationSession,
     mechanism: "queue-wake-ladder:exhausted; queue-stuck-sweep:undelivered", dueAt: null, intervalSeconds: null,
     note: "No further ladder retry. Inspect the retained exhaustion and delivery evidence; the stuck sweep is the safety net.",
   };
@@ -522,7 +524,7 @@ export function readWakeLadderBackstop(db: Database.Database, qitemId: string): 
   }
   const suspension = readSuspension(db, row.destinationSession, resolveWakeSwapGraceSeconds(), now);
   if (suspension) due = Math.max(due, Date.parse(suspension.until));
-  const orch = defaultResolveOrchestrator(db, row.destinationSession);
+  const orch = disposition?.destination_session ?? escalationOwner();
   const operator = ladder.orchRung || orch === null || orch === row.destinationSession;
   return {
     owner: retry ? row.destinationSession : operator ? resolveOperatorSeat() ?? row.sourceSession : orch!,
@@ -631,7 +633,9 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
     const windowMin = deps.unconfirmedWindowMinutes ?? resolveWakeUnconfirmedWindowMinutes();
     const graceS = deps.swapGraceSeconds ?? resolveWakeSwapGraceSeconds();
     const resolveOrch =
-      deps.resolveOrchestrator ?? ((session: string) => defaultResolveOrchestrator(deps.db, session));
+      deps.resolveOrchestrator ?? ((session: string) => {
+        return resolveEscalationOwner(deps.db, session, target => deps.queueRepo.acceptsDestination(target)).owner;
+      });
     const attemptWake =
       deps.attemptWake ??
       (async (qitemId: string, target: string): Promise<string> => {
@@ -834,6 +838,19 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
           : mode === "held"
             ? `held by ${row.destinationSession}'s typing guard for ${minutesSince(row.tsCreated, now)} min: nothing was typed, and it isn't retried`
             : `unconfirmed delivery with no pickup evidence over ${minutesSince(row.tsCreated, now)} min`;
+      if (hasConsumedEscalationHop(deps.db, row.qitemId)) {
+        if (!due || suspended) continue;
+        const consumedReason = `${reason}; escalates_to one-hop delivery already used; existing fallback retained`;
+        // Keep this recovery visible without sharing the ordinary destination aggregate or forwarding another hop.
+        await ensureEscalationRow(deps, row.destinationSession, resolveOperatorSeat() ?? row.sourceSession,
+          [{ row, reason: consumedReason }], consumedReason, `consumed-hop:${row.qitemId}`, [ESCALATION_HOP_TAG]);
+        if (!view.orchRung) appendMarker(deps.queueRepo, row, `${LADDER_RUNG_PREFIX} orchestrator self-skip reason=${consumedReason}`);
+        if (await operatorRung(deps, row, consumedReason, actions, view)) {
+          appendExhausted(deps.queueRepo, row, "consumed escalation hop reached operator fallback");
+          exhaustedThisTick += 1;
+        }
+        continue;
+      }
       const dest = row.destinationSession;
       if (!escalating.has(dest)) escalating.set(dest, []);
       escalating.get(dest)!.push({ row, view, mode, reason, due, suspended });
@@ -842,7 +859,11 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
     // F3 — per-destination aggregation: ONE escalation carrying the row list, refreshed
     // not duplicated (the S02 idempotency shape), and rung markers on every member baton.
     for (const [dest, members] of escalating) {
-      const orch = resolveOrch(dest);
+      const orch = openEscalationOwner(deps.db, escalationDedupTag(dest)) ?? resolveOrch(dest);
+      const route = !deps.resolveOrchestrator
+        ? resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)) : null;
+      const routeReason = route && route.outcome !== "none" && route.outcome !== "parent" ? route.reason : "";
+      for (const member of members) if (routeReason) member.reason += `; ${routeReason}`;
 
       // F3 — the aggregate refresh is detection-gated (the S02 idempotency shape): a
       // live escalation group refreshes its one open row every pass, no wake attached.
@@ -875,14 +896,16 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
           }
         } else {
           const escRow = await ensureEscalationRow(deps, dest, orch, members, reason);
-          const outcome = await attemptWake(escRow.qitemId, orch);
+          // An already-open recovery retains its owner, including a claim made before topology changed.
+          const recoveryOwner = deps.queueRepo.getById(escRow.qitemId)?.destinationSession ?? orch;
+          const outcome = await attemptWake(escRow.qitemId, recoveryOwner);
           for (const m of needsOrchRung) {
             appendMarker(
               deps.queueRepo,
               m.row,
-              `${LADDER_RUNG_PREFIX} orchestrator -> ${orch} outcome=${outcome} reason=${m.reason}`,
+              `${LADDER_RUNG_PREFIX} orchestrator -> ${recoveryOwner} outcome=${outcome} reason=${m.reason}`,
             );
-            actions.push({ qitemId: m.row.qitemId, action: "escalate-orchestrator", target: orch });
+            actions.push({ qitemId: m.row.qitemId, action: "escalate-orchestrator", target: recoveryOwner });
             if (!outcome.startsWith("failed:")) {
               // Delivered (or durable-unconfirmed — the aggregate row itself is now the
               // orchestrator's durable obligation; S02 nets it if it sits unclaimed).
@@ -1039,6 +1062,17 @@ function postedPromptAlert(db: Database.Database, except: string): string | null
   return row?.qitem_id ?? null;
 }
 
+/** Keep both ordinary and consumed-recovery choice alerts behind the same durable gate. */
+function waitsOnPostedPromptAlert(deps: WakeLadderDeps, row: QueueItem, choiceOnly: boolean): boolean {
+  const posted = choiceOnly && deps.deliveryEngine ? postedPromptAlert(deps.db, row.qitemId) : null;
+  if (!posted) return false;
+  const waiting = `${LADDER_RUNG_PREFIX} operator waiting on ${posted}`;
+  if (!deps.queueRepo.listTransitions(row.qitemId).some(t => t.transitionNote?.startsWith(waiting))) {
+    appendMarker(deps.queueRepo, row, `${waiting} reason=one person alert at a time for seats blocked at a prompt`);
+  }
+  return true;
+}
+
 /** Positive refusals enter the existing rungs without ever retrying the blocked
  * seat. One aggregate carries the episode's obligations and notification key;
  * original work remains owned by its current recipient. */
@@ -1051,7 +1085,7 @@ async function advancePromptRefusals(
   attemptWake: (qitemId: string, target: string) => Promise<string>,
   actions: WakeLadderAction[],
 ): Promise<void> {
-  const groups = new Map<string, { keys: string[]; rows: Map<string, QueueItem>; jobs: Map<string, string>; refusedAt: string; choiceSince?: string; choice?: boolean; other?: boolean; latestChoice?: boolean }>();
+  const groups = new Map<string, { keys: string[]; rowKeys: Map<string, Set<string>>; jobKeys: Set<string>; rows: Map<string, QueueItem>; jobs: Map<string, string>; refusedAt: string; choiceSince?: string; choice?: boolean; other?: boolean; latestChoice?: boolean }>();
   const readAt = (dest: string, refusedAt: string): "blocked" | "clear" | "unknown" => {
     try { return deps.readPromptState?.(dest, refusedAt) ?? "unknown"; } catch { return "unknown"; }
   };
@@ -1094,14 +1128,13 @@ async function advancePromptRefusals(
     if (readLadder(deps.db, qitem_id).exhausted) continue;
     for (const episode of openPromptRefusals(deps.queueRepo.listTransitions(qitem_id))) {
       if (!episode.key.startsWith(`${primary.destinationSession}|`)) continue;
-      // A closed disposition for this exact episode is final, even while the
-      // original work remains open. Only a new refusal key can start again.
-      if (closedEpisode(`${PROMPT_EPISODE_TAG}${episode.key}`)) continue;
+      // Ordinary work shares an episode; consumed recoveries retain independent dispositions.
       const rows = episode.ids.map(id => readCandidate(id, primary.destinationSession)).filter((row): row is QueueItem =>
-        Boolean(row && row.destinationSession === primary.destinationSession && ["pending", "in-progress", "blocked"].includes(row.state)));
+        Boolean(row && row.destinationSession === primary.destinationSession && ["pending", "in-progress", "blocked"].includes(row.state)
+          && !closedEpisode(`${PROMPT_EPISODE_TAG}${episode.key}${hasConsumedEscalationHop(deps.db, row.qitemId) ? `|consumed:${row.qitemId}` : ""}`)));
       if (!rows.length) continue;
       let group = groups.get(primary.destinationSession);
-      if (!group) { group = { keys: [], rows: new Map(), jobs: new Map(), refusedAt: episode.refusedAt }; groups.set(primary.destinationSession, group); }
+      if (!group) { group = { keys: [], rowKeys: new Map(), jobKeys: new Set(), rows: new Map(), jobs: new Map(), refusedAt: episode.refusedAt }; groups.set(primary.destinationSession, group); }
       if (Date.parse(episode.refusedAt) > Date.parse(group.refusedAt)) group.refusedAt = episode.refusedAt;
       // The transport refused at a choice prompt, such as a usage-limit dialog, that no permission hook announces.
       const choice = episode.note.includes("(selection_prompt)");
@@ -1113,8 +1146,13 @@ async function advancePromptRefusals(
         if (readAt(primary.destinationSession, episode.refusedAt) !== "clear"
           && (!group.choiceSince || Date.parse(episode.refusedAt) < Date.parse(group.choiceSince))) group.choiceSince = episode.refusedAt;
       }
-      group.keys.push(`${PROMPT_EPISODE_TAG}${episode.key}`);
-      for (const row of rows) group.rows.set(row.qitemId, row);
+      for (const row of rows) {
+        const key = `${PROMPT_EPISODE_TAG}${episode.key}${hasConsumedEscalationHop(deps.db, row.qitemId) ? `|consumed:${row.qitemId}` : ""}`;
+        if (!group.keys.includes(key)) group.keys.push(key);
+        if (!group.rowKeys.has(row.qitemId)) group.rowKeys.set(row.qitemId, new Set());
+        group.rowKeys.get(row.qitemId)!.add(key);
+        group.rows.set(row.qitemId, row);
+      }
     }
   }
 
@@ -1134,12 +1172,35 @@ async function advancePromptRefusals(
     const tag = `${PROMPT_EPISODE_TAG}${job.key}`;
     if (closedEpisode(tag)) continue;
     let group = groups.get(job.dest);
-    if (!group) { group = { keys: [], rows: new Map(), jobs: new Map(), refusedAt: job.refusedAt }; groups.set(job.dest, group); }
+    if (!group) { group = { keys: [], rowKeys: new Map(), jobKeys: new Set(), rows: new Map(), jobs: new Map(), refusedAt: job.refusedAt }; groups.set(job.dest, group); }
     if (Date.parse(job.refusedAt) > Date.parse(group.refusedAt)) group.refusedAt = job.refusedAt;
     if (job.refusedAt === group.refusedAt) group.latestChoice = job.choice;
     group.keys.push(tag);
+    group.jobKeys.add(tag);
     group.jobs.set(job.jobId, job.registeredBy);
     if (job.choice) group.choice = true; else group.other = true;
+  }
+
+  // A recovery returned to the blocked seat inherits only its source row's episodes.
+  // Reconstruct this membership before retirement, even when the recovery has no refusal of its own.
+  for (const [dest, group] of groups) {
+    for (const row of [...group.rows.values()]) {
+      if (hasConsumedEscalationHop(deps.db, row.qitemId)) continue;
+      // The newer ordinary alert must not hide the underlying returned recovery on the next tick.
+      const recovery = findQueueRecovery(deps.db, row.qitemId, PROMPT_ALERT_TAG);
+      if (!recovery || !["pending", "in-progress", "blocked"].includes(recovery.state)) continue;
+      const held = readCandidate(recovery.qitemId, dest);
+      if (!held || held.destinationSession !== dest || held.tags?.includes(PROMPT_ALERT_TAG)) continue;
+      const suffix = hasConsumedEscalationHop(deps.db, held.qitemId) ? `|consumed:${held.qitemId}` : "";
+      for (const sourceKey of group.rowKeys.get(row.qitemId) ?? []) {
+        const key = `${sourceKey}${suffix}`;
+        if (closedEpisode(key)) continue;
+        if (!group.keys.includes(key)) group.keys.push(key);
+        if (!group.rowKeys.has(held.qitemId)) group.rowKeys.set(held.qitemId, new Set());
+        group.rowKeys.get(held.qitemId)!.add(key);
+        group.rows.set(held.qitemId, held);
+      }
+    }
   }
 
   const promptState = (dest: string): "blocked" | "clear" | "unknown" => {
@@ -1158,8 +1219,10 @@ async function advancePromptRefusals(
   for (const { qitem_id } of aggregates) {
     const aggregate = deps.queueRepo.getById(qitem_id);
     if (!aggregate || !Array.isArray(aggregate.tags)) continue;
-    const destinationTag = aggregate.tags.find(t => typeof t === "string" && t.startsWith("prompt-destination:"));
-    const dest = destinationTag?.slice("prompt-destination:".length);
+    const destinationTag = aggregate.tags.find(t => typeof t === "string"
+      && (t.startsWith("prompt-destination:") || t.startsWith("consumed-prompt-destination:")));
+    const dest = destinationTag?.slice(destinationTag.startsWith("consumed-")
+      ? "consumed-prompt-destination:".length : "prompt-destination:".length);
     if (!dest) continue;
     // Incomplete membership is not evidence that an episode ended.
     if (unreadableDestinations.has(dest)) continue;
@@ -1190,34 +1253,80 @@ async function advancePromptRefusals(
     // Recovery owned elsewhere already has a route. A fallback finding sent
     // into this same blocked seat does not: include it in the aggregate while
     // retaining its original body/custody, rather than treating it as delivery.
-    const selfRecoveries = new Map<string, QueueItem>();
     const ownedElsewhere = members.some(({ row }) => {
+      if (hasConsumedEscalationHop(deps.db, row.qitemId)) return false;
       const recovery = findQueueRecovery(deps.db, row.qitemId);
       if (!recovery || !["pending", "in-progress", "blocked"].includes(recovery.state)) return false;
       const held = deps.queueRepo.getById(recovery.qitemId);
       if (!held) return false;
       if (held.tags?.includes(PROMPT_ALERT_TAG)) return false;
-      if (held.destinationSession !== dest) return true;
-      selfRecoveries.set(held.qitemId, held);
-      return false;
+      return held.destinationSession !== dest;
     });
     if (ownedElsewhere) continue;
-    for (const row of selfRecoveries.values()) {
-      if (!group.rows.has(row.qitemId)) members.push({ row, reason: "recovery fallback also targets the prompt-blocked seat" });
+    // A consumed recovery owns its own operator continuation. It must not change
+    // the route or one-hop marker of unrelated work/watchdogs at the same prompt.
+    for (let i = members.length - 1; i >= 0; i--) {
+      const member = members[i]!;
+      if (!hasConsumedEscalationHop(deps.db, member.row.qitemId)) continue;
+      const recovery = findQueueRecovery(deps.db, member.row.qitemId);
+      const heldRecovery = recovery ? deps.queueRepo.getById(recovery.qitemId) : null;
+      if (recovery && ["pending", "in-progress", "blocked"].includes(recovery.state)
+        && heldRecovery?.destinationSession !== dest
+        && !heldRecovery?.tags?.includes(`consumed-hop:${member.row.qitemId}`)) {
+        members.splice(i, 1);
+        continue;
+      }
+      const view = readLadder(deps.db, member.row.qitemId, 0);
+      if (!view.exhausted && (view.lastMarkerTs === null || now.getTime() - view.lastMarkerTs >= intervalS * 1000)) {
+        const reason = "interactive prompt blocks recovery; escalates_to one-hop delivery already used; existing fallback retained";
+        const choiceOnly = Boolean(group.choice && !group.other);
+        const promptTags = choiceOnly ? [PROMPT_ALERT_TAG, PROMPT_CHOICE_TAG, `consumed-prompt-destination:${dest}`,
+          ...(group.rowKeys.get(member.row.qitemId) ?? [])] : [];
+        const continuation = await ensureEscalationRow(deps, dest, resolveOperatorSeat() ?? member.row.sourceSession,
+          [{ row: member.row, reason }], reason, `consumed-hop:${member.row.qitemId}`, [ESCALATION_HOP_TAG, ...promptTags]);
+        if (!view.orchRung) appendMarker(deps.queueRepo, member.row, `${LADDER_RUNG_PREFIX} orchestrator self-skip reason=${reason}`);
+        // A choice alert's tags and dispatch marker must live on the same durable row the shared gate reads.
+        const operatorRow = choiceOnly ? deps.queueRepo.getById(continuation.qitemId)! : member.row;
+        if (choiceOnly) {
+          const missing = promptTags.filter(tag => !operatorRow.tags?.includes(tag));
+          if (missing.length) deps.db.prepare("UPDATE queue_items SET tags=? WHERE qitem_id=?")
+            .run(JSON.stringify([...(operatorRow.tags ?? []), ...missing]), operatorRow.qitemId);
+        }
+        if (waitsOnPostedPromptAlert(deps, operatorRow, choiceOnly)) {
+          members.splice(i, 1);
+          continue;
+        }
+        const operatorView = choiceOnly ? readLadder(deps.db, operatorRow.qitemId, 0) : view;
+        if (choiceOnly && operatorView.exhausted) {
+          members.splice(i, 1);
+          continue;
+        }
+        if (await operatorRung(deps, operatorRow, reason, actions, operatorView, choiceOnly)) {
+          // Choice custody stays on the alert until it closes; exhausting its source now would retire the alert next tick.
+          if (!choiceOnly) appendExhausted(deps.queueRepo, member.row, "consumed escalation hop reached operator fallback");
+          if (choiceOnly) appendExhausted(deps.queueRepo, operatorRow, "operator rung resolved");
+        }
+      }
+      members.splice(i, 1);
     }
-    const orch = resolveOrch(dest);
+    if (!members.length && !group.jobs.size) continue;
+    const orch = openEscalationOwner(deps.db, `prompt-destination:${dest}`) ?? resolveOrch(dest);
     const toOperator = orch === null || orch === dest;
-    const reason = "interactive prompt blocks outstanding work; no input was sent";
+    const route = !deps.resolveOrchestrator
+      ? resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)) : null;
+    const reason = "interactive prompt blocks outstanding work; no input was sent"
+      + (route && route.outcome !== "none" && route.outcome !== "parent" ? `; ${route.reason}` : "");
     // Every refusal at a choice prompt: the alert follows queue.wake_human_rung and holds for other choice alerts. Any other
     // prompt keeps the permission-prompt route.
     const choiceOnly = Boolean(group.choice && !group.other);
     const kindTags = choiceOnly ? [PROMPT_CHOICE_TAG] : [];
+    const keys = group.keys.filter(key => group.jobKeys.has(key) || members.some(m => group.rowKeys.get(m.row.qitemId)?.has(key)));
     const aggregate = await ensureEscalationRow(deps, dest,
       toOperator ? resolveOperatorSeat() ?? members[0]?.row.sourceSession ?? [...group.jobs.values()][0]! : orch!, members, reason,
-      `prompt-destination:${dest}`, [PROMPT_ALERT_TAG, ...kindTags, ...group.keys], group.jobs);
+      `prompt-destination:${dest}`, [PROMPT_ALERT_TAG, ...kindTags, ...keys], group.jobs);
     const row = deps.queueRepo.getById(aggregate.qitemId);
     if (!row) continue;
-    const addedKeys = group.keys.filter(key => !row.tags?.includes(key));
+    const addedKeys = keys.filter(key => !row.tags?.includes(key));
     // A reminder's run keeps its key while its latest refusal changes kind, so the kind is recomputed on its own too.
     const kindChanged = choiceOnly !== Boolean(row.tags?.includes(PROMPT_CHOICE_TAG));
     if (addedKeys.length || kindChanged) {
@@ -1249,9 +1358,10 @@ async function advancePromptRefusals(
       fresh && fresh.destinationSession === dest && ["pending", "in-progress", "blocked"].includes(fresh.state)))) continue;
     if (!view.orchRung) {
       if (!toOperator) {
-        const outcome = await attemptWake(row.qitemId, orch!);
-        appendMarker(deps.queueRepo, row, `${LADDER_RUNG_PREFIX} orchestrator -> ${orch} outcome=${outcome} reason=${reason}`);
-        actions.push({ qitemId: row.qitemId, action: "escalate-orchestrator", target: orch! });
+        const recoveryOwner = row.destinationSession;
+        const outcome = await attemptWake(row.qitemId, recoveryOwner);
+        appendMarker(deps.queueRepo, row, `${LADDER_RUNG_PREFIX} orchestrator -> ${recoveryOwner} outcome=${outcome} reason=${reason}`);
+        actions.push({ qitemId: row.qitemId, action: "escalate-orchestrator", target: recoveryOwner });
         if (!outcome.startsWith("failed:")) appendExhausted(deps.queueRepo, row, `escalated to orchestrator (${outcome})`);
         continue;
       }
@@ -1260,14 +1370,7 @@ async function advancePromptRefusals(
     // One choice-prompt alert to a person at a time on this machine: a prompt many seats hit together, such as a shared usage
     // limit, posts once. Each other choice alert stays open, names the alert it waits on, and posts after that one retires.
     // A permission prompt, which only a person can approve, never waits behind it.
-    const posted = choiceOnly && deps.deliveryEngine ? postedPromptAlert(deps.db, row.qitemId) : null;
-    if (posted) {
-      const waiting = `${LADDER_RUNG_PREFIX} operator waiting on ${posted}`;
-      if (!deps.queueRepo.listTransitions(row.qitemId).some(t => t.transitionNote?.startsWith(waiting))) {
-        appendMarker(deps.queueRepo, row, `${waiting} reason=one person alert at a time for seats blocked at a prompt`);
-      }
-      continue;
-    }
+    if (waitsOnPostedPromptAlert(deps, row, choiceOnly)) continue;
     if (await operatorRung(deps, row, reason, actions, view, choiceOnly)) {
       const floor = deps.queueRepo.listTransitions(row.qitemId).at(-1)?.transitionNote?.includes("human rung explicit-only");
       appendExhausted(deps.queueRepo, row, floor ? PROMPT_FLOOR_EXHAUSTED : "operator rung resolved");
@@ -1387,6 +1490,13 @@ async function refreshEscalationRowIfExists(
   })();
 }
 
+/** Existing recovery custody takes precedence over a newly resolved topology fallback. */
+function openEscalationOwner(db: Database.Database, dedupTag: string): string | null {
+  return (db.prepare(`SELECT destination_session FROM queue_items WHERE state IN ('pending','in-progress','blocked')
+    AND json_valid(tags) AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?) LIMIT 1`)
+    .get(dedupTag) as { destination_session: string } | undefined)?.destination_session ?? null;
+}
+
 async function ensureEscalationRow(
   deps: WakeLadderDeps,
   dest: string,
@@ -1416,12 +1526,16 @@ async function ensureEscalationRow(
     members.map((m) => `- ${m.row.qitemId}: ${m.row.summary ?? "outstanding work"} (${m.reason})`).join("\n") +
     (jobs.size ? `\nwatchdog reminders refused at its prompt (${jobs.size}):\n${[...jobs.keys()].map(id => `- ${id}`).join("\n")}` : "") +
     `\nThe rows above still carry their obligations exactly-once; this escalation is the wake, not the content.`;
+  const route = !deps.resolveOrchestrator
+    ? resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)) : null;
+  const oneHop = route?.outcome === "routed" && route.owner === orch;
   const created = await deps.queueRepo.create({
     sourceSession: members[0]?.row.sourceSession ?? [...jobs.values()][0]!,
     destinationSession: orch,
     body,
     summary: `Wake escalation: ${members.length} baton(s)${jobs.size ? ` and ${jobs.size} watchdog reminder(s)` : ""} stuck at ${dest} — ${reason}`,
-    tags: [WAKE_ESCALATION_TAG, dedupTag, ...extraTags, ...members.map(m => recoveryTag(m.row.qitemId))],
+    tags: [WAKE_ESCALATION_TAG, dedupTag,
+      ...(oneHop ? [ESCALATION_HOP_TAG] : []), ...extraTags, ...members.map(m => recoveryTag(m.row.qitemId))],
     nudge: false, // delivery is the ladder's own rung attempt, recorded with its outcome
   });
   return { qitemId: created.qitemId };

@@ -1,3 +1,4 @@
+import { isEscalationTargetRef } from "./escalation-target-ref.js";
 import nodePath from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { effortPrecedence, readSeatEffort } from "./seat-effort.js";
@@ -137,7 +138,7 @@ export class RigInstantiator {
           this.rigRepo.addEdge(
             rig.id,
             nodeIdMap[specEdge.from]!,
-            nodeIdMap[specEdge.to]!,
+            nodeIdMap[specEdge.to] ?? specEdge.to,
             specEdge.kind
           );
         }
@@ -816,7 +817,7 @@ export class PodRigInstantiator {
         for (const pod of rigSpec.pods) {
           for (const edge of pod.edges) {
             const fromId = logicalIdToNodeId.get(`${pod.id}.${edge.from}`);
-            const toId = logicalIdToNodeId.get(`${pod.id}.${edge.to}`);
+            const toId = logicalIdToNodeId.get(`${pod.id}.${edge.to}`) ?? (edge.kind === "escalates_to" && isEscalationTargetRef(edge.to) ? edge.to : undefined);
             if (!fromId || !toId) {
               throw { code: "materialize_conflict", message: `Pod-local edge references missing node: ${pod.id}.${edge.from} -> ${pod.id}.${edge.to}` };
             }
@@ -826,7 +827,7 @@ export class PodRigInstantiator {
 
         for (const edge of rigSpec.edges) {
           const fromId = logicalIdToNodeId.get(edge.from);
-          const toId = logicalIdToNodeId.get(edge.to);
+          const toId = logicalIdToNodeId.get(edge.to) ?? (edge.kind === "escalates_to" && isEscalationTargetRef(edge.to) ? edge.to : undefined);
           if (!fromId || !toId) {
             throw { code: "materialize_conflict", message: `Cross-pod edge references missing node: ${edge.from} -> ${edge.to}` };
           }
@@ -1220,8 +1221,8 @@ export class PodRigInstantiator {
     const resolvedEdges: Array<{ from: string; to: string; kind: string }> = [];
     for (const edge of declaredEdges) {
       const from = `${podNamespace}.${edge.from}`;
-      const to = `${podNamespace}.${edge.to}`;
-      if (!knownLogicalIds.has(from) || !knownLogicalIds.has(to)) {
+      const to = edge.kind === "escalates_to" && isEscalationTargetRef(edge.to) ? edge.to : `${podNamespace}.${edge.to}`;
+      if (!knownLogicalIds.has(from) || (!knownLogicalIds.has(to) && !(edge.kind === "escalates_to" && isEscalationTargetRef(to)))) {
         const missing = !knownLogicalIds.has(from) ? from : to;
         return { ok: false, code: "edge_unresolved", message: `Pod-local edge references "${missing}", which is neither the new member "${qualifiedId}" nor an existing seat in rig "${rig.rig.name}". Use member ids within pod "${podNamespace}".` };
       }
@@ -1753,7 +1754,7 @@ export class PodRigInstantiator {
     for (const pod of rigSpec.pods) {
       for (const edge of pod.edges) {
         const fromId = nodeIdMap[`${pod.id}.${edge.from}`];
-        const toId = nodeIdMap[`${pod.id}.${edge.to}`];
+        const toId = nodeIdMap[`${pod.id}.${edge.to}`] ?? (edge.kind === "escalates_to" && isEscalationTargetRef(edge.to) ? edge.to : undefined);
         if (fromId && toId) {
           try {
             this.deps.rigRepo.addEdge(rigId, fromId, toId, edge.kind);
@@ -1765,7 +1766,7 @@ export class PodRigInstantiator {
     // Create cross-pod edges
     for (const edge of rigSpec.edges) {
       const fromId = nodeIdMap[edge.from];
-      const toId = nodeIdMap[edge.to];
+      const toId = nodeIdMap[edge.to] ?? (edge.kind === "escalates_to" && isEscalationTargetRef(edge.to) ? edge.to : undefined);
       if (fromId && toId) {
         try {
           this.deps.rigRepo.addEdge(rigId, fromId, toId, edge.kind);

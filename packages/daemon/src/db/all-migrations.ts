@@ -1,3 +1,4 @@
+import { escalationTargetRefsSchema } from "./migrations/126_escalation_target_refs.js";
 import { claudeTokenReadingsSchema } from "./migrations/134_claude_token_readings.js";
 // The canonical ordered migration list. SINGLE SOURCE: the daemon boot path
 // (startup.ts) and any test/tool that needs a schema-faithful DB both migrate from THIS array,
@@ -265,6 +266,7 @@ export const ALL_MIGRATIONS: Migration[] = [
   queueDelegatedDecisionSchema,
   contextUsageWatchdogUnitsSchema,
   nodeAdvisorSchema,
+  escalationTargetRefsSchema,
   operationCorrelationSchema,
   terminalPolicySchema,
   streamDispositionsSchema,
