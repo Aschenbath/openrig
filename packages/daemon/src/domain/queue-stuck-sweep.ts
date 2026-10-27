@@ -412,8 +412,14 @@ function deliveryResolutionEvidence(
     // ledger can resolve that human notice, but never an unrelated agent wake.
     if (!notification && deps.queueRepo.deliveryOutcomeFor(qitemId)?.outcome === "posted") {
       const recipient = row.state === "blocked" ? row.blockedOn : row.destinationSession;
+      // Legacy receipts carry no recipient key. A destination reroute needs a
+      // new episode, even if an old receipt arrives later. A park's recipient
+      // stays blockedOn when only its asking agent is rerouted.
+      const recipientRetained = row.state === "blocked" || !deps.db.prepare(
+        "SELECT 1 FROM queue_transitions WHERE qitem_id = ? AND transition_note LIKE 'fallback-routed:%' LIMIT 1",
+      ).get(qitemId);
       try {
-        if (recipient && deps.queueRepo.isHumanDestination(recipient)) return "legacy human notification posted";
+        if (recipientRetained && recipient && deps.queueRepo.isHumanDestination(recipient)) return "legacy human notification posted";
       } catch { /* An unreadable registry does not establish the recipient. */ }
     }
   }

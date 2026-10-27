@@ -275,4 +275,42 @@ describe("stuck-sweep resolution uses source evidence", () => {
     await sweep();
     expect(repo.getById(finding.qitemId)?.state).toBe("pending");
   });
+
+  it.each([false, true])("does not rebind a legacy receipt after changing the human recipient (late receipt: %s)", async (lateReceipt) => {
+    const { row, finding, key } = await humanNotice();
+    db.prepare("UPDATE queue_transitions SET owner_notification_kind = NULL, owner_notification_level = NULL WHERE qitem_id = ?").run(row.qitemId);
+    if (!lateReceipt) await receipt(row.qitemId, key, "posted");
+    repo.routeToFallback(row.qitemId, otherPerson.address, "ask the other person instead");
+    if (lateReceipt) await receipt(row.qitemId, key, "posted");
+    expect(repo.transitionLog.latestOwnerNotificationForQitem(row.qitemId)).toBeNull();
+    expect(repo.deliveryOutcomeFor(row.qitemId)?.outcome).toBe("posted");
+    await sweep();
+    expect(repo.getById(finding.qitemId)?.state).toBe("pending");
+    // A new episode gives the new recipient its own receipt, unlike the legacy note.
+    await repo.update({ qitemId: row.qitemId, actorSession: "sender@r", state: "blocked", blockedOn: otherPerson.address,
+      summary: "The other person's decision", evidenceRef: "rig queue show qitem-fixture" });
+    const nextKey = `${row.qitemId}:${repo.transitionLog.latestOwnerNotificationForQitem(row.qitemId)!.transitionId}`;
+    expect(nextKey).not.toBe(key);
+    await receipt(row.qitemId, nextKey, "posted");
+    await sweep();
+    expect(repo.getById(finding.qitemId)?.state).toBe("done");
+  });
+
+  it("keeps the legacy park's human recipient when only the asking agent is rerouted", async () => {
+    const row = await work();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    await repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: "blocked", blockedOn: person.address,
+      summary: "Choose A or B", evidenceRef: "rig queue show qitem-fixture" });
+    db.prepare("UPDATE queue_transitions SET owner_notification_kind = NULL, owner_notification_level = NULL WHERE qitem_id = ?").run(row.qitemId);
+    const key = `${row.qitemId}:0`;
+    await receipt(row.qitemId, key, "transport-failed");
+    await sweep();
+    const [finding] = findings(row);
+    expect(finding?.tags).toContain(`stuck-sweep:undelivered-human-notice:${row.qitemId}`);
+    repo.routeToFallback(row.qitemId, "other-worker@r", "another agent will follow up");
+    await receipt(row.qitemId, key, "posted");
+    await sweep();
+    expect(repo.getById(finding!.qitemId)?.state).toBe("done");
+    expect(repo.getById(row.qitemId)).toMatchObject({ state: "blocked", blockedOn: person.address, destinationSession: "other-worker@r" });
+  });
 });
