@@ -24,7 +24,7 @@ function daemon(fake: Fake): DaemonClient {
     if (u.pathname === "/healthz") return Response.json({ selfHostId: "mac" });
     if (u.pathname === "/api/hosts") return fake.hostsStatus
       ? Response.json({ error: "invalid_registry" }, { status: fake.hostsStatus })
-      : Response.json({ ownName: Object.hasOwn(fake, "ownName") ? fake.ownName : "mac", selected: "local", hosts: fake.hosts ?? [VPS] });
+      : Response.json({ ownName: Object.hasOwn(fake, "ownName") ? fake.ownName : "localhost", selected: "local", hosts: fake.hosts ?? [VPS] });
     if (u.pathname === "/api/rigs/summary") {
       const host = u.searchParams.get("host");
       if (!host) return Response.json(LOCAL_RIGS);
@@ -62,7 +62,7 @@ async function page(fake: Fake, ...steps: Step[]) {
 }
 
 describe("the local host's configured display name (#2049)", () => {
-  it.each([undefined, null, 7, "  ", "mac"])("keeps one stable identity when the served name is %s", async (ownName) => {
+  it.each([undefined, null, 7, "  ", "mac", "localhost", " localhost "])("keeps one stable identity when the served name is %s", async (ownName) => {
     const { snap, view, text } = await page({ calls: [], ownName }, "host mac");
     expect(text).toContain("⊕ mac");
     expect(text).toContain("instance mac");
@@ -126,12 +126,14 @@ describe("the local host's configured display name (#2049)", () => {
     { label: "OSC string terminator", ownName: "\u001b]0;Changed title\u001b\\Desk", shown: "Desk (mac)" },
     { label: "C1 OSC", ownName: "\u009d0;Changed title\u009cDesk", shown: "Desk (mac)" },
     { label: "C0 and C1 controls", ownName: "De\u0000s\u007fk\u0085", shown: "Desk (mac)" },
+    { label: "bidirectional formatting controls", ownName: "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069Desk", shown: "Desk (mac)" },
     { label: "only controls", ownName: "\u001b[2J\u0007", shown: "mac" },
     { label: "ordinary Unicode", ownName: "研发 机房 🖥", shown: "研发 机房 🖥 (mac)" },
+    { label: "Arabic and Hebrew text", ownName: "مكتب שרת", shown: "مكتب שרת (mac)" },
   ])("renders $label as plain display text", async ({ ownName, shown }) => {
     const { text, view } = await page({ calls: [], ownName }, "host mac");
     expect(text).toContain(`instance ${shown}`);
-    expect(text).not.toMatch(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/);
+    expect(text).not.toMatch(/[\x00-\x09\x0b-\x1f\x7f-\x9f\p{Bidi_Control}]/u);
     expect(view.get().drill).toEqual([{ kind: "host", name: "mac" }]);
   });
 });

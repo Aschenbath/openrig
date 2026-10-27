@@ -6,7 +6,7 @@ function displayName(host: HostNode): string | undefined {
   // window title with spaces). Remove the entire string before stripping CSI.
   const plain = host.displayName?.replace(/(?:\x1b\]|\x9d)[\s\S]*?(?:\x07|\x1b\\|\x9c|$)/g, "");
   const name = plain === undefined ? undefined
-    : stripVTControlCharacters(plain).replace(/[\x00-\x1f\x7f-\x9f]/g, "").trim();
+    : stripVTControlCharacters(plain).replace(/[\x00-\x1f\x7f-\x9f\p{Bidi_Control}]/gu, "").trim();
   return name && name !== host.name ? name : undefined;
 }
 

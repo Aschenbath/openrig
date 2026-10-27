@@ -661,10 +661,11 @@ export async function hydrateSnapshot(
     }
   }
   const aggHosts = agg?.hosts ?? [];
+  const ownName = typeof hostsRead?.ownName === "string" ? hostsRead.ownName.trim() : undefined;
   const localHost: HostNode = {
     id: "local",
     name: instanceHealth?.selfHostId?.trim() || "local",
-    displayName: typeof hostsRead?.ownName === "string" ? hostsRead.ownName.trim() || undefined : undefined,
+    displayName: ownName && ownName !== "localhost" ? ownName : undefined,
     reachable: true,
     rigs: rigs.sort(byRigName),
   };
