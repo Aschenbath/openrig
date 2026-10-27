@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -27,6 +28,7 @@ import { SnapshotCapture } from "../src/domain/snapshot-capture.js";
 import { SnapshotRepository } from "../src/domain/snapshot-repository.js";
 import { CheckpointStore } from "../src/domain/checkpoint-store.js";
 import { RestoreOrchestrator } from "../src/domain/restore-orchestrator.js";
+import { ResumeMetadataRefresher } from "../src/domain/resume-metadata-refresher.js";
 import type { NativeProcessRow } from "../src/domain/native-process-lineage.js";
 import type { LegacyRigSpec } from "../src/domain/types.js";
 
@@ -99,6 +101,41 @@ function setup() {
 }
 
 describe("per-agent Claude MCP selection (#1478)", () => {
+  it.each(["none", undefined, "unreadable"] as const)("the shutdown fallback probe keeps the saved MCP choice and resume token: %s", async selection => {
+    const f = setup(), start = await f.inst.materialize(JSON.stringify(f.raw), f.root);
+    if (!start.ok) throw Error(JSON.stringify(start));
+    const node = f.rigRepo.getRig(start.result.rigId)!.nodes.find(node => node.logicalId === "dev.owner")!;
+    f.rigRepo.setNodeClaudeMcp(node.id, selection === "none" ? "none" : null);
+    if (selection === "unreadable") {
+      f.db.pragma("ignore_check_constraints = ON");
+      f.db.prepare("UPDATE nodes SET claude_mcp = 'corrupt' WHERE id = ?").run(node.id);
+    }
+    const session = f.sessionRegistry.registerSession(node.id, "dev-owner@mcp-rig");
+    f.sessionRegistry.updateResumeToken(session.id, "claude_id", "mcp-history", "operator");
+    const refresher = new ResumeMetadataRefresher({
+      sessionRegistry: f.sessionRegistry, tmuxAdapter: f.tmux, sleep: async () => {},
+      listClaudeProcesses: async () => [], homeDir: f.root,
+    });
+    await refresher.refresh([{
+      nodeId: node.id, sessionId: session.id, sessionName: session.sessionName,
+      runtime: "claude-code", resumeType: "claude_id", resumeToken: "mcp-history", cwd: f.root,
+    }]);
+    const probes = f.commands.filter(entry => entry.command.includes("--resume"));
+    expect(f.sessionRegistry.getSessionsForRig(start.result.rigId)[0]?.resumeToken).toBe("mcp-history");
+    if (selection === "unreadable") {
+      expect(probes).toEqual([]);
+      expect(f.tmux.createSession).not.toHaveBeenCalled();
+      return;
+    }
+    expect(probes).toHaveLength(1);
+    const argv = execFileSync("/bin/sh", ["-c", `claude() { printf '%s\\n' "$@"; }; ${probes[0]!.command}`], { encoding: "utf8" }).trim().split("\n");
+    expect(argv).toContain("mcp-history");
+    expect(argv.filter(arg => arg === "--strict-mcp-config")).toHaveLength(selection === "none" ? 1 : 0);
+    expect(argv.filter(arg => arg === "--mcp-config")).toHaveLength(selection === "none" ? 1 : 0);
+    if (selection === "none") expect(argv[argv.indexOf("--mcp-config") + 1]).toBe('{"mcpServers":{}}');
+    expect(f.tmux.killSession).toHaveBeenCalledWith(probes[0]!.session);
+  });
+
   it.each(["claude_mcp", "claudeMcp"])("the expansion HTTP route preserves %s through validation, persistence and launch", async key => {
     const f = setup();
     const { app, rigRepo } = createTestApp(f.db, { podInstantiatorFsOps: f.fsOps });

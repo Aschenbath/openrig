@@ -647,10 +647,14 @@ launch leaves the choice unchanged. Restarting from saved context keeps it.
 Only `none` is accepted, and the field is invalid on other runtimes. If the
 seat switches to another runtime, the Claude choice stays dormant and applies
 again if it switches back. A currently running Claude process is unaffected.
-The spec cannot represent this dormant choice on another runtime: YAML and
-JSON export return a conflict naming the affected seats. Switch those seats
-back to Claude before exporting; this extra step avoids losing their opt-out
-on export and import. Rigs without dormant opt-outs export as usual.
+Export describes the current runtime and omits a dormant Claude choice. If
+you rebuild from that export and switch back to Claude, restore `claude_mcp: none`
+in the Claude declaration. Re-check this setting after downgrading
+OpenRig too: older versions can ignore it.
+
+Shutdown resume probes and the displayed native recovery commands (including
+the conversation picker) also carry the saved MCP choice. If shutdown cannot
+read that choice, it skips the probe and retains the token; shutdown proceeds.
 
 ### Claude Advisor (`runtime: claude-code`)
 

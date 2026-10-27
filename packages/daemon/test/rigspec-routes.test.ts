@@ -81,38 +81,6 @@ describe("Rigspec export routes", () => {
     expect(body.nodes).toHaveLength(1);
   });
 
-  it.each([
-    ["legacy", "spec"], ["legacy", "spec.json"],
-    ["pod", "spec"], ["pod", "spec.json"],
-  ])("%s %s export names a dormant Claude MCP choice and succeeds after switching back", async (format, endpoint) => {
-    const rig = rigRepo.createRig("mcp-export");
-    const pod = format === "pod" ? new PodRepository(db).createPod(rig.id, "dev", "Dev") : undefined;
-    const logicalId = pod ? "dev.worker" : "worker";
-    const node = rigRepo.addNode(rig.id, logicalId, {
-      runtime: "claude-code", claudeMcp: "none", podId: pod?.id,
-      agentRef: "local:agents/worker", profile: "default", cwd: "/workspace/app",
-    });
-    // The runtime switch keeps the Claude selection on the seat while Codex is active.
-    db.prepare("UPDATE nodes SET runtime = 'codex' WHERE id = ?").run(node.id);
-    const refused = await app.request(`/api/rigs/${rig.id}/${endpoint}`);
-    expect(refused.status).toBe(409);
-    expect(await refused.json()).toMatchObject({
-      code: "dormant_claude_mcp", seats: [logicalId],
-      error: expect.stringMatching(/claude_mcp: none.*[Ss]witch.*Claude/),
-    });
-    expect(rigRepo.getRig(rig.id)!.nodes[0]!.claudeMcp).toBe("none");
-    db.prepare("UPDATE nodes SET runtime = 'claude-code' WHERE id = ?").run(node.id);
-    const exported = await app.request(`/api/rigs/${rig.id}/${endpoint}`);
-    expect(exported.status).toBe(200);
-    const spec = endpoint === "spec.json" ? await exported.json() : PodRigSpecCodec.parse(await exported.text());
-    const member = pod ? spec.pods[0].members[0] : spec.nodes[0];
-    expect(member[endpoint === "spec.json" ? "claudeMcp" : "claude_mcp"]).toBe("none");
-    // Ordinary non-Claude seats, without a dormant choice, remain exportable.
-    rigRepo.setNodeClaudeMcp(node.id, null);
-    db.prepare("UPDATE nodes SET runtime = 'codex' WHERE id = ?").run(node.id);
-    expect((await app.request(`/api/rigs/${rig.id}/${endpoint}`)).status).toBe(200);
-  });
-
   it("GET /api/rigs/:rigId/spec preserves a persisted pod-aware workspace", async () => {
     const rig = rigRepo.createRig("workspace-rig");
     const pod = new PodRepository(db).createPod(rig.id, "dev", "Dev");

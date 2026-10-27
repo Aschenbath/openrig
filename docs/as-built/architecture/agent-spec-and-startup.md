@@ -71,13 +71,17 @@ expansion HTTP route preserves both `claude_mcp` and `claudeMcp`, including
 invalid values for the canonical validator to reject. An authored relaunch
 updates the seat choice after launch eligibility and startup-source resolution;
 an already-bound seat or a failed tmux launch keeps its prior value. Export
-refuses a non-Claude seat with a dormant opt-out because the spec cannot
-represent it; the YAML and JSON routes name the seats in a 409 response.
+describes the current runtime; a dormant choice on another runtime is omitted
+and must be restored in the Claude declaration when rebuilding from that export.
+
 The shared `StartupOrchestrator` reads the current seat record, so both an authored start
 and saved-context restore pass the choice to Claude. Legacy resume and handover
 successors read it separately; a runtime-switch successor reads it only when
 the target is Claude. `claude-mcp.ts` builds the strict empty-server arguments
-for both Claude adapters. The native lineage selectors recognize these exact
+for the adapters, shutdown resume probes and displayed recovery commands,
+including the conversation picker. Shutdown skips a probe with an unreadable
+saved choice and keeps the resume token without adding a shutdown refusal.
+The native lineage selectors recognize these exact
 arguments without treating JSON contents as session options. Invalid stored
 values refuse launch. With no choice, the adapters add no MCP arguments.
 

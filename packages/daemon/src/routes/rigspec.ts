@@ -10,7 +10,7 @@ import { RigSpecCodec } from "../domain/rigspec-codec.js";
 import { LegacyRigSpecSchema } from "../domain/rigspec-schema.js";
 import { RigSpecSchema } from "../domain/rigspec-schema.js";
 import { rigPreflight } from "../domain/rigspec-preflight.js";
-import { DormantClaudeMcpExportError, RigNotFoundError } from "../domain/errors.js";
+import { RigNotFoundError } from "../domain/errors.js";
 import { runtimeVersionProbeCwd } from "../adapters/preflight-exec.js";
 import { execRuntimeProbe } from "../adapters/runtime-probe-exec.js";
 import { RigSpecParseError, validateRigSpecImport } from "../domain/spec-validation-service.js";
@@ -57,9 +57,6 @@ export function handleExportYaml(c: Context): Response {
     if (err instanceof RigNotFoundError) {
       return c.json({ error: err.message }, 404);
     }
-    if (err instanceof DormantClaudeMcpExportError) {
-      return c.json({ error: err.message, code: "dormant_claude_mcp", seats: err.seats }, 409);
-    }
     return c.json({ error: "Export failed" }, 500);
   }
 }
@@ -75,9 +72,6 @@ export function handleExportJson(c: Context): Response {
   } catch (err) {
     if (err instanceof RigNotFoundError) {
       return c.json({ error: err.message }, 404);
-    }
-    if (err instanceof DormantClaudeMcpExportError) {
-      return c.json({ error: err.message, code: "dormant_claude_mcp", seats: err.seats }, 409);
     }
     return c.json({ error: "Export failed" }, 500);
   }
