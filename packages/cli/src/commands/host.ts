@@ -23,6 +23,7 @@ import { runCrossHostCommand, type CrossHostResult } from "../cross-host-executo
 import { recordHostObservation, loadHostBindings, describeBindingConflict, defaultHostBindingsPath, type HostObservationOutcome } from "../host-bindings.js";
 import { DaemonClient } from "../client.js";
 import { readOwnHostName, readSelectedHost } from "../host-selection.js";
+import { parseFeedHostSubscriptionKey } from "../config-store.js";
 
 // ---------------------------------------------------------------------------
 // rig host pair — the approval wait is BOUNDED.
@@ -481,6 +482,21 @@ function authPointer(h: HostEntry): string {
   return h.bearer_env ? `env:${h.bearer_env}` : h.bearer_file ? `file:${h.bearer_file}` : "—";
 }
 
+function printHostNextSteps(host: HostEntry): void {
+  console.log(`Verify it: rig host doctor ${host.id}`);
+  if (host.transport !== "http") {
+    console.log("Remote FEED requires an HTTP host entry. Pair its daemon URL with: rig host pair <url>");
+    return;
+  }
+  const key = `feed.subscriptions.${host.id}.enabled`;
+  if (!parseFeedHostSubscriptionKey(key)) {
+    console.log(`For remote FEED, register this host with a different id: '${host.id}' is reserved by feed settings.`);
+    return;
+  }
+  console.log("Remote FEED is off by default. To include this host's attention items, run locally:");
+  console.log(`  rig config set ${key} true`);
+}
+
 export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
   const cmd = new Command("host").description("Manage the multi-host registry (~/.openrig/hosts.yaml)");
 
@@ -516,7 +532,7 @@ export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
         return;
       }
       console.log(`Added host '${res.entry.id}' (${res.entry.transport}) to ${res.path}`);
-      console.log(`Verify it: rig host doctor ${res.entry.id}`);
+      printHostNextSteps(res.entry);
     });
 
   cmd
@@ -786,7 +802,7 @@ export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
         return;
       }
       console.log(`Paired. Host '${id}' registered (${targetBase}, bearer_file ${tokenPath}).`);
-      console.log(`Verify it: rig host doctor ${id}`);
+      printHostNextSteps(added.entry);
     });
 
   cmd

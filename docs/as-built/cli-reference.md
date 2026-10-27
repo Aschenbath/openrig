@@ -354,6 +354,23 @@ the sections that were not read are `null`.
 | `rig host list` | `ls` | `--json` |
 | `rig host doctor <id>` | — | `--posture <profile>`<br>`--public-addr <ip>`<br>`--json` |
 
+Registration makes a host visible in topology; remote FEED attention remains opt-in.
+The human-readable success output of `host add` and `host pair` now includes the FEED
+next step alongside the existing `host doctor` suggestion. For an HTTP entry named
+`laptop`, run this on the local instance to include its attention items:
+
+```sh
+rig config set feed.subscriptions.laptop.enabled true
+```
+
+The key uses the registry id, including any dots, and defaults to `false`. Registration
+does not change that setting. SSH entries instead explain that FEED needs an HTTP entry;
+ids reserved by feed settings (such as `progress`) get a different-id suggestion rather
+than an invalid command. `--json` keeps its single JSON result without these hints.
+The host CLI tests execute the advertised command against an isolated config and cover
+registration, reserved names and JSON output; pairing responses are simulated, so they
+do not establish connectivity to a live peer.
+
 ### ps
 
 | Invocation | Aliases | Declared options |
