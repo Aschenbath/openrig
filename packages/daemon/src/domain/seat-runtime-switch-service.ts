@@ -16,6 +16,7 @@ import { SeatLifecycleService } from "./seat-lifecycle-service.js";
 import { SuccessorSessionLauncher } from "./successor-session-launcher.js";
 import { buildRestorePacket, type PredecessorRecapResolver } from "./seat-handover-service.js";
 import { NativePermissionStore } from "./native-permission-store.js";
+import { readSeatClaudeMcp, type ClaudeMcp } from "./claude-mcp.js";
 import { clearCodexMemberPermissions } from "./codex-member-permissions.js";
 import { validateNativePermissionSelection, type NativePermissionSelection } from "./native-permission-selection.js";
 import { AppliedLaunchObservationStore } from "./applied-launch-observation-store.js";
@@ -298,7 +299,9 @@ export class SeatRuntimeSwitchService {
       guidance: guidance ?? `${ctx.seatRef} is unchanged on ${node.runtime}. Correct the cause and try again.` });
     // Refuse unreadable target settings before an active switch can hold sends to the current occupant.
     let override: ReturnType<NativePermissionStore["launchOverride"]>;
+    let claudeMcp: ClaudeMcp | undefined;
     try {
+      claudeMcp = target === "claude-code" ? readSeatClaudeMcp(db, node.id) : undefined;
       override = new NativePermissionStore(db).launchOverride(node.id, target, {
         selection: ctx.selection, codexProfile: materials.settings.codexConfigProfile.value,
       });
@@ -346,6 +349,7 @@ export class SeatRuntimeSwitchService {
       stagingSession: row.staging_session, canonicalSession: sessionName, occupantGeneration: successorGeneration,
       node: { id: node.id, runtime: target, cwd: node.cwd, model: materials.settings.model.value, effort: materials.settings.effort.value,
         advisor: materials.settings.advisor.value, codexConfigProfile: materials.settings.codexConfigProfile.value,
+        claudeMcp,
         claudePermissions: override.claudePermissions, kernelAuthority: override.kernelAuthority, teamPermissionDefault: override.teamPermissionDefault,
         ...(override.codexPermissions ? { codexPermissions: override.codexPermissions } : {}),
         nonInterruptive: rigRepo.getRigNonInterruptive(node.rigId), launchPosture, ...(permissionMode ? { permissionMode } : {}),

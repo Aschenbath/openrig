@@ -95,6 +95,7 @@ export class RigSpecExporter {
       if (node.model) specNode.model = node.model;
       if (node.effort) specNode.effort = node.effort;
       if (node.advisor) specNode.advisor = node.advisor;
+      if (node.runtime === "claude-code" && node.claudeMcp) specNode.claudeMcp = node.claudeMcp;
       const rules = node.runtime === "claude-code" ? readClaudePermissionRules(this.db, node.id) : undefined;
       if (rules !== undefined) specNode.claudePermissions = rules;
       const envelope = node.runtime === "codex" ? readCodexMemberPermissions(this.db, node.id) : undefined;
@@ -181,6 +182,7 @@ export class RigSpecExporter {
         if (node.model) member.model = node.model;
         if (node.effort) member.effort = node.effort;
         if (node.advisor) member.advisor = node.advisor;
+        if (node.runtime === "claude-code" && node.claudeMcp) member.claudeMcp = node.claudeMcp;
         // OPR.0.4.6.FAC1: a declared seat role exports with the pod
         // member (round-trip fidelity — export→import keeps the role).
         if (node.role) member.role = node.role;

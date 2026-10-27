@@ -36,6 +36,8 @@ export interface Node {
   effort?: string | null;
   /** Session-scoped Claude Advisor model; never written to shared Claude settings. */
   advisor?: string | null;
+  /** Claude MCP loading for this seat; null/absent preserves the provider default. */
+  claudeMcp?: import("./claude-mcp.js").ClaudeMcp | null;
   /** OPR.0.7.0.7: the seat's explicit effort choice (rig seat set-effort); null = none. */
   effortChoice?: string | null;
   codexConfigProfile?: string | null;
@@ -1080,6 +1082,7 @@ export interface LegacyRigSpecNode {
   effort?: string;
   advisor?: string;
   claudePermissions?: import("./claude-permission-rules.js").ClaudePermissionRules;
+  claudeMcp?: import("./claude-mcp.js").ClaudeMcp;
   codexPermissions?: import("./codex-member-permissions.js").CodexMemberPermissions;
   cwd?: string;
   surfaceHint?: string;
@@ -1201,6 +1204,7 @@ export interface RigSpecPodMember {
    *  custom path). Absent = the floor. Overrides the rig-level ref. */
   permissionPolicy?: string;
   claudePermissions?: import("./claude-permission-rules.js").ClaudePermissionRules;
+  claudeMcp?: import("./claude-mcp.js").ClaudeMcp;
   /** A Codex member's own permission envelope; the seat's live record afterwards. */
   codexPermissions?: import("./codex-member-permissions.js").CodexMemberPermissions;
   /** OPR.0.7.0.9 — Claude members only: their own agent file, appended system prompt file and plugin folders,
@@ -1489,6 +1493,7 @@ export interface ExpansionPodFragment {
     model?: string;
     codexConfigProfile?: string;
     claudePermissions?: unknown;
+    claudeMcp?: unknown;
     codexPermissions?: unknown;
     /** OPR.0.4.8.3 Seam B: per-seat permission_policy REF — threaded through the
      *  expansion ingress exactly like role (never silently dropped). Typed UNKNOWN
