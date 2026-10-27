@@ -1059,12 +1059,7 @@ describe("S02 standing stuck sweep — both halves, routed findings, quiet-but-o
       actorSession: "sender@r",
       transitionNote: `${mod.LADDER_ATTEMPT_PREFIX} 1 failed:tmux session not found`,
     });
-    await repo.update({
-      qitemId: row.qitemId,
-      actorSession: "daemon@kernel",
-      transitionNote: `slack-owner-notification-posted notification_key=${row.qitemId}:0 level=ALERT message_ts=1.2`,
-    });
-    expect(repo.deliveryOutcomeFor(row.qitemId)?.outcome).toBe("posted");
+    repo.recordNudgeAttempt(row.qitemId, "verified");
     await runSweep();
     const after = await findingsFor(row.qitemId);
     expect(after).toHaveLength(1);
