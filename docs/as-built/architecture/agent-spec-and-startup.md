@@ -66,8 +66,14 @@ resolve → project → deliver pre-launch files → persist replay context → 
 ## 2. Execution and projection types
 
 The member's optional `claude_mcp: none` is normalized as `claudeMcp` and
-persisted independently in `nodes.claude_mcp` (migration 141). The shared
-`StartupOrchestrator` reads the current seat record, so both an authored start
+persisted independently in `nodes.claude_mcp` (migration 141). The
+expansion HTTP route preserves both `claude_mcp` and `claudeMcp`, including
+invalid values for the canonical validator to reject. An authored relaunch
+updates the seat choice after launch eligibility and startup-source resolution;
+an already-bound seat or a failed tmux launch keeps its prior value. Export
+refuses a non-Claude seat with a dormant opt-out because the spec cannot
+represent it; the YAML and JSON routes name the seats in a 409 response.
+The shared `StartupOrchestrator` reads the current seat record, so both an authored start
 and saved-context restore pass the choice to Claude. Legacy resume and handover
 successors read it separately; a runtime-switch successor reads it only when
 the target is Claude. `claude-mcp.ts` builds the strict empty-server arguments

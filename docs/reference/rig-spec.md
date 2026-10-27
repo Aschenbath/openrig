@@ -642,10 +642,15 @@ preserve it. The same field is supported on legacy `nodes` declarations.
 Other agents in the same directory keep their own choices; OpenRig does not
 rewrite shared MCP configuration files. Omit the field for Claude's normal
 loading. A later launch from an authored spec without the field clears the
-seat's saved opt-out; restarting from saved context keeps the saved choice.
+seat's saved opt-out once the launch is accepted for startup; a rejected
+launch leaves the choice unchanged. Restarting from saved context keeps it.
 Only `none` is accepted, and the field is invalid on other runtimes. If the
 seat switches to another runtime, the Claude choice stays dormant and applies
 again if it switches back. A currently running Claude process is unaffected.
+The spec cannot represent this dormant choice on another runtime: YAML and
+JSON export return a conflict naming the affected seats. Switch those seats
+back to Claude before exporting; this extra step avoids losing their opt-out
+on export and import. Rigs without dormant opt-outs export as usual.
 
 ### Claude Advisor (`runtime: claude-code`)
 

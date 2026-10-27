@@ -2382,8 +2382,6 @@ export class PodRigInstantiator {
     }
 
     this.updateNodeResolvedConfig(input.nodeId, configResult.config);
-    // A new authored launch applies this member's selection. Restore instead reads the saved seat record.
-    if (input.member.runtime === "claude-code") this.deps.rigRepo.setNodeClaudeMcp(input.nodeId, input.member.claudeMcp ?? null);
 
     // OPR.0.4.8.3 Seam B: resolve the seat's permission-policy attachment once for this
     // launch (member > rig precedence; declaring dir = the rig root, where the declaring
@@ -2733,6 +2731,10 @@ export class PodRigInstantiator {
     const finalResolvedStartupFiles = starterArtifacts
       ? [...starterArtifacts, ...dedupedResolvedFiles]
       : dedupedResolvedFiles;
+
+    // Apply the authored selection only after accepting the launch and resolving its startup sources.
+    // An already-bound seat, failed tmux launch or unresolved source must keep the previous choice.
+    if (input.member.runtime === "claude-code") this.deps.rigRepo.setNodeClaudeMcp(input.nodeId, input.member.claudeMcp ?? null);
 
     const startupResult = await this.deps.startupOrchestrator.startNode({
       rigId: input.rigId,

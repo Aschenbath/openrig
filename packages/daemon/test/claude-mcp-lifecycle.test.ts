@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createFullTestDb } from "./helpers/test-app.js";
+import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import { mockShellCommand } from "./helpers/shell-command-mock.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { migrate } from "../src/db/migrate.js";
@@ -99,6 +99,47 @@ function setup() {
 }
 
 describe("per-agent Claude MCP selection (#1478)", () => {
+  it.each(["claude_mcp", "claudeMcp"])("the expansion HTTP route preserves %s through validation, persistence and launch", async key => {
+    const f = setup();
+    const { app, rigRepo } = createTestApp(f.db, { podInstantiatorFsOps: f.fsOps });
+    const rig = rigRepo.createRig("expanded-mcp"), pod = f.raw.pods[0]!;
+    const member = pod.members[0]! as Record<string, unknown>;
+    delete member.claude_mcp;
+    member[key] = "none";
+    const response = await app.request(`/api/rigs/${rig.id}/expand`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pod, rigRoot: f.root }),
+    });
+    const result = await response.json();
+    expect(response.status, JSON.stringify(result)).toBe(201);
+    expect(result.nodes.map((node: { status: string }) => node.status)).toEqual(["launched", "launched"]);
+    const nodes = rigRepo.getRig(rig.id)!.nodes;
+    expect(nodes.find(node => node.logicalId === "dev.owner")?.claudeMcp).toBe("none");
+    expect(nodes.find(node => node.logicalId === "dev.reviewer")?.claudeMcp).toBeNull();
+  });
+
+  it.each([
+    ["claude_mcp", null, "claude-code"], ["claudeMcp", null, "claude-code"],
+    ["claude_mcp", "all", "claude-code"], ["claudeMcp", false, "claude-code"],
+    ["claude_mcp", "none", "codex"], ["claudeMcp", "none", "codex"],
+  ])("the expansion HTTP route rejects %s=%j on %s without creating members", async (key, value, runtime) => {
+    const f = setup();
+    const { app, rigRepo, tmuxAdapter } = createTestApp(f.db, { podInstantiatorFsOps: f.fsOps });
+    const rig = rigRepo.createRig("invalid-expansion"), pod = f.raw.pods[0]!;
+    const member = pod.members[0]! as Record<string, unknown>;
+    delete member.claude_mcp;
+    member[key as string] = value;
+    member.runtime = runtime;
+    const response = await app.request(`/api/rigs/${rig.id}/expand`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pod, rigRoot: f.root }),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain("claude_mcp");
+    expect(rigRepo.getRig(rig.id)!.nodes).toEqual([]);
+    expect(tmuxAdapter.createSession).not.toHaveBeenCalled();
+  });
+
   it.each(["bootstrap", "materialize"])("%s keeps same-cwd agents independent through export, snapshot and saved-context resume", async mode => {
     const f = setup(), yaml = JSON.stringify(f.raw);
     const start = mode === "bootstrap" ? await f.inst.instantiate(yaml, f.root) : await f.inst.materialize(yaml, f.root);
@@ -151,6 +192,32 @@ describe("per-agent Claude MCP selection (#1478)", () => {
     const command = f.commands.find(c => c.command.includes("--resume 'legacy-history'"))!.command;
     expect(command).toContain("--strict-mcp-config");
     expect(command).toContain('{"mcpServers":{}}');
+  });
+
+  it.each([
+    ["already bound", "none"], ["already bound", undefined],
+    ["tmux failure", "none"], ["tmux failure", undefined],
+  ] as const)("a launch rejected by %s preserves the saved choice: %s", async (failure, selection) => {
+    const f = setup();
+    f.raw.pods[0]!.members[0]!.claude_mcp = selection;
+    const start = await f.inst.instantiate(JSON.stringify(f.raw), f.root);
+    if (!start.ok) throw Error(JSON.stringify(start));
+    const rigId = start.result.rigId;
+    f.raw.pods[0]!.members[0]!.claude_mcp = selection === "none" ? undefined : "none";
+    if (failure === "tmux failure") {
+      f.live.clear();
+      for (const session of f.sessionRegistry.getSessionsForRig(rigId)) {
+        f.sessionRegistry.markDetached(session.id); f.sessionRegistry.clearBinding(session.nodeId);
+      }
+      vi.spyOn(f.tmux, "createSession").mockResolvedValue({ ok: false, code: "unknown", message: "fixture tmux failure" });
+    }
+    f.commands.length = 0;
+    const result = await f.inst.launchMaterialized(JSON.stringify(f.raw), f.root, rigId);
+    expect(result).toMatchObject({ ok: true, result: { nodes: expect.arrayContaining([
+      expect.objectContaining({ logicalId: "dev.owner", status: "failed", error: expect.stringContaining(failure) }),
+    ]) } });
+    expect(f.commands).toEqual([]);
+    expect(f.rigRepo.getRig(rigId)!.nodes.find(node => node.logicalId === "dev.owner")?.claudeMcp).toBe(selection ?? null);
   });
 
   it("clears the saved selection when a later authored launch omits it", async () => {

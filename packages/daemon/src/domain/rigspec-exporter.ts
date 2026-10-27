@@ -7,7 +7,7 @@ import type {
   LegacyRigSpec, LegacyRigSpecNode, LegacyRigSpecEdge,
   RigSpec, RigSpecPod, RigSpecPodMember, RigSpecPodEdge, RigSpecCrossPodEdge,
 } from "./types.js";
-import { RigNotFoundError } from "./errors.js";
+import { DormantClaudeMcpExportError, RigNotFoundError } from "./errors.js";
 import { seatLaunchAdditionsForNode } from "./seat-launch-additions.js";
 
 interface RigSpecExporterDeps {
@@ -51,6 +51,13 @@ export class RigSpecExporter {
     if (!rig) {
       throw new RigNotFoundError(rigId);
     }
+
+    // The spec only accepts claude_mcp on Claude declarations. Exporting a switched seat
+    // would otherwise erase its saved choice when the rig is imported and switched back.
+    const dormantMcpSeats = rig.nodes
+      .filter((node) => node.runtime !== "claude-code" && node.claudeMcp === "none")
+      .map((node) => node.logicalId).sort();
+    if (dormantMcpSeats.length > 0) throw new DormantClaudeMcpExportError(dormantMcpSeats);
 
     // Detect pod-aware: any node has a non-null podId, or pods exist explicitly.
     const isPodAware = rig.nodes.some((n) => n.podId != null) || (this.podRepo?.getPodsForRig(rigId).length ?? 0) > 0;
