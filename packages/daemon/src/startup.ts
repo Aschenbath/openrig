@@ -2030,6 +2030,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     const { createRexCliTransport } = await import("./domain/terminal/rex-transport.js");
     const { CmuxLayoutService } = await import("./domain/cmux-layout-service.js");
     const { TerminalViewsStore } = await import("./domain/terminal/terminal-views-store.js");
+    const { readTaskTerminalView, resolveLocalTaskSeat } = await import("./domain/terminal/task-terminal-view.js");
+    const { getSelfHostId } = await import("./domain/hosts/fanout-contract.js");
     const { getNodeInventory, getNodeInventoryForRigs } = await import("./domain/node-inventory.js");
     const { loadHostRegistry, resolveHost: resolveHostInRegistry } = await import(
       "./domain/hosts/hosts-registry-reader.js"
@@ -2111,6 +2113,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         }
         return rows;
       },
+      resolveTaskView: (qitemId) => readTaskTerminalView(db, qitemId, (address) =>
+        resolveLocalTaskSeat(db, address, getSelfHostId(), sessionRegistry.resolveAddress(address)?.nodeId)),
       listRigNames: () => rigRepo.listRigs().map((r) => r.name),
       resolveHost: (id) => {
         const res = loadHostRegistry();

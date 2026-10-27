@@ -30,6 +30,7 @@
 // not found), so the route JSON and the CLI JSON carry ONE contract for every
 // outcome.
 
+import type { TaskTerminalView, TaskMembership } from "./task-terminal-view.js";
 import { composeView, type ViewMemberInput } from "./view-composer.js";
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
@@ -50,6 +51,7 @@ import type {
   ProviderLiveness,
   ProviderStatus,
   TerminalProvider,
+  ViewDescriptor,
 } from "./terminal-provider.js";
 
 /** The provider name set (herdr = proof-gated primary; cmux = best-effort; rex = by name or from a Rex caller). */
@@ -63,7 +65,7 @@ export interface OpenViewRequest {
   provider?: string;
   /** An explicit provider session; omission retains the daemon's configured endpoint. */
   session?: string;
-  /** The view argument: a rig name | `mission:<id>` | `slice:<id>` | a saved-view id. */
+  /** A rig, mission:<id>, slice:<id>, qitem:<id> local episode, or saved view. */
   view: string;
   /** Preview fingerprint. A changed membership/layout must be previewed again. */
   expectedPlan?: string;
@@ -80,6 +82,8 @@ export interface TerminalPreview {
   /** The same pure grid roots consumed by the Herder adapter. */
   grids: ReturnType<typeof buildGridRoot>[];
   status: ProviderStatus;
+  task?: TaskMembership;
+  viewDescriptor?: ViewDescriptor;
 }
 
 /** The `rig terminal views` payload: saved views + the live rig names you can open. */
@@ -119,6 +123,8 @@ export interface TerminalServiceDeps {
   listPodSeats(rigArg: string, podNamespace: string): Promise<LiveSeatRow[] | null> | LiveSeatRow[] | null;
   /** Live seats for a derived scope (`mission:<id>` | `slice:<id>`); null when the scope is unknown/invalid. */
   listScopeSeats(scope: string): Promise<LiveSeatRow[] | null> | LiveSeatRow[] | null;
+  /** Exact local queue episode; unavailable owners must remain in task.members. */
+  resolveTaskView?(qitemId: string): Promise<TaskTerminalView | null> | TaskTerminalView | null;
   /** Known rig names (for the `views` listing). */
   listRigNames(): Promise<string[]> | string[];
   /** Read-only host resolution for the composer (registry unavailable → null for every id). */
@@ -157,7 +163,7 @@ function savedMemberToInput(m: SavedViewMember): ViewMemberInput {
 /** The default kernel view's space name in a terminal multiplexer such as Herdr. */
 export const KERNEL_SPACE_LABEL = "openrig kernel";
 
-type ResolvedView = { id: string; members: ViewMemberInput[]; kernelLayout?: string; columns?: number; panesPerPage?: number } | { code: string; error: string };
+type ResolvedView = { id: string; members: ViewMemberInput[]; kernelLayout?: string; columns?: number; panesPerPage?: number; task?: TaskMembership } | { code: string; error: string };
 type ComposedTerminalView = ComposedView & { kernelLayout?: string };
 
 export class TerminalService {
@@ -225,7 +231,7 @@ export class TerminalService {
     if (req.expectedPlan !== undefined && req.expectedPlan !== planId) {
       return errorResult(providerName, "preview_changed", "View membership, layout or provider session changed. Refresh the preview before Open; nothing was launched.");
     }
-    const notes = composed.kernelLayout ? [`Default kernel view: ${composed.kernelLayout}.`] : [];
+    const notes = composed.task ? [...composed.task.issues] : composed.kernelLayout ? [`Default kernel view: ${composed.kernelLayout}.`] : [];
     if (fellBack) notes.push(`Herdr isn't available here (not installed or not answering), so this view uses ${providerName}.`);
     if (composed.kernelLayout && composed.opened.length === 0) {
       return {
@@ -243,7 +249,7 @@ export class TerminalService {
     if (!composed.kernelLayout && composed.opened.some(pane => !pane.readOnly)) {
       notes.push("The shared dashboard is the overview; the team's lead pane is where you can talk about the work. Check the opened seats and any absent or degraded seats above. Can you see the team? A created workspace or a capture alone does not confirm what is visible on your screen.");
     }
-    return { ...result, ...(session !== undefined ? { session } : {}), ...(notes.length ? { notes: [...notes, ...(result.notes ?? [])] } : {}) };
+    return { ...result, viewDescriptor: composed.viewDescriptor, ...(composed.task ? { task: composed.task } : {}), ...(session !== undefined ? { session } : {}), ...(notes.length ? { notes: [...notes, ...(result.notes ?? [])] } : {}) };
   }
 
   private async resolveComposed(viewArg: string, panesPerPage?: number, viewportColumns?: number): Promise<ComposedTerminalView | { code: string; error: string }> {
@@ -252,6 +258,21 @@ export class TerminalService {
     const resolved = await this.resolveView(view);
     if ("code" in resolved) return resolved;
     const composed = composeView(resolved.id, await this.refineLiveness(resolved.members), { resolveHost: (id) => this.deps.resolveHost(id), panesPerPage: resolved.panesPerPage ?? panesPerPage, localTmux: await this.resolveLocalTmux(), localTmuxServer: daemonTmuxServerArgs() });
+    const saved = view.startsWith("saved:") ? this.deps.viewsStore.get(view.slice(6))
+      : !/^(qitem|mission|slice|pod|rig):/.test(view) ? this.deps.viewsStore.get(view) : null;
+    composed.viewDescriptor = { kind: saved && saved.id === resolved.id ? "fixed" : "following",
+      name: resolved.task?.name ?? (saved?.id === resolved.id ? saved.name : resolved.id) };
+    if (resolved.task) {
+      for (const member of resolved.task.members) {
+        const missing = composed.absent.find(item => item.seat === member.seat);
+        if (missing && member.availability === "available") {
+          member.availability = "missing"; member.reason = missing.reason;
+        } else if (member.availability !== "available") {
+          composed.absent.push({ seat: member.seat, host: member.key.hostId, reason: member.reason ?? member.availability });
+        }
+      }
+      return { ...composed, task: resolved.task };
+    }
     if (resolved.kernelLayout && Number.isSafeInteger(viewportColumns) && viewportColumns! >= 120) {
       // The default's members are operator, dashboard, advisor. Keep the advisor separate
       // even when one of the other roles is unavailable; chunking two at a time would not.
@@ -274,7 +295,7 @@ export class TerminalService {
     const { provider, session } = selected;
     const composed = await this.resolveComposed(req.view, provider.panesPerPage, req.viewportColumns);
     if ("code" in composed) return errorResult(providerName, composed.code, composed.error);
-    return { provider: providerName, ...(session !== undefined ? { session } : {}), view: req.view, composed,
+    return { provider: providerName, ...(session !== undefined ? { session } : {}), view: req.view, composed, viewDescriptor: composed.viewDescriptor, ...(composed.task ? { task: composed.task } : {}),
       grids: composed.pages.map(page => buildGridRoot(page, composed.columns)), planId: this.planId(providerName, composed, session), status: await provider.status() };
   }
 
@@ -335,6 +356,11 @@ export class TerminalService {
 
   /** Resolve a view argument into composer-ready members (precedence in the file header). */
   private async resolveView(view: string): Promise<ResolvedView> {
+    if (view.startsWith("qitem:")) {
+      const task = await this.deps.resolveTaskView?.(view.slice(6));
+      return task ? { id: view, members: task.members, task: task.task }
+        : { code: "view_not_found", error: `unknown local queue episode '${view.slice(6)}'` };
+    }
     if (view.startsWith("saved:")) {
       const saved = this.deps.viewsStore.get(view.slice(6));
       if (saved) return { id: saved.id, members: saved.members.map(savedMemberToInput) };

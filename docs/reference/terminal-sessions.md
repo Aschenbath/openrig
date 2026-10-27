@@ -139,3 +139,48 @@ session keeps the normal HTTP 200 provider result with `ok: false`, its selected
 `session`, an error code and direct-attach guidance.
 The `kernel_seats_unavailable` result also keeps the selected session, so the CLI
 reports that known failure instead of replacing it with an unconfirmed-session error.
+
+## Task terminal views
+
+`rig terminal open qitem:<id> --provider herdr --json` opens a derived, read-only
+view of the current owners of a local queue episode. The episode includes the
+requested row and explicitly linked descendants; only pending, in-progress and
+blocked obligations contribute owners. It does not include historical senders,
+closed predecessors, parent episodes or siblings. Membership is not input
+permission.
+
+The existing daemon endpoints accept the same view:
+
+```text
+GET /api/terminal/preview?view=qitem:<id>&provider=herdr
+POST /api/terminal/open {"view":"qitem:<id>","provider":"herdr","expectedPlan":"<preview planId>"}
+```
+
+Preview and open include `task: {qitemId, name, complete, issues, members}`. Each member
+names its structured `{hostId, nodeId}` key (null when unresolved), seat,
+contributing `obligations`, `availability` and `viewerStatus`. Stopped, missing,
+external and unresolved remote owners remain visible. Remote queues are not
+crawled and no remote tmux socket is guessed. A bounded or damaged lineage is
+explicitly incomplete; it is never silently presented as the whole team.
+
+The local lineage read has work limits: 50,000 scanned rows (plus one overflow
+sentinel), 8 MiB of encoded lineage, 100,000 links, and 16 KiB per chain record.
+It reads one snapshot from the requested task forward, then probes earlier active
+obligations using the queue's existing state index and follows references by exact
+ID, including closed intermediaries. A child may arrive before its referenced root.
+All these reads share the work limits; unrelated older closed history is not scanned.
+Only the requested episode is expanded, up to 256 rows. Caller-supplied task IDs
+are supported.
+Hitting a work limit preserves known members and reports incomplete membership;
+it does not claim that an owner outside the scanned history is absent.
+
+Preview and open also include `viewDescriptor: {kind, name}`: `following` for
+derived views and `fixed` for a saved layout. A task uses its row summary as
+its name, falling back to the qitem ID. The existing preview `view` string is
+unchanged. A following view derives membership when requested; it does not
+mean an open workspace updates itself.
+
+Preview is read-only. In this membership increment, `viewerStatus` is
+`not-provisioned`: the response does not verify a reusable provider terminal
+mapping. An explicit open retains the provider's existing workspace behavior;
+it does not continuously reconcile the view or change an agent's lifecycle.

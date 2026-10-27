@@ -141,6 +141,7 @@ describe("TerminalService — view resolution + one-shape result", () => {
     const res = await svc.openView({ view: "rig:rig-id-1" });
     expect(res.ok).toBe(true);
     expect(herdr.lastView?.id).toBe("rig:rig-id-1");
+    expect(res.viewDescriptor).toEqual({ kind: "following", name: "rig:rig-id-1" });
     expect(res.opened.length).toBe(2);
   });
 
@@ -186,6 +187,7 @@ describe("TerminalService — view resolution + one-shape result", () => {
     const svc = new TerminalService(deps);
     const res = await svc.openView({ view: "watchtower" });
     expect(res.ok).toBe(true);
+    expect(res.viewDescriptor).toEqual({ kind: "fixed", name: savedView.name });
     const byReadOnly = Object.fromEntries((herdr.lastView?.opened ?? []).map((p) => [p.seat, p.readOnly]));
     expect(byReadOnly["lead@acme-ops"]).toBe(true);
     expect(byReadOnly["builder@acme-ops"]).toBe(false);
