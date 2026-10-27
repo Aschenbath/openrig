@@ -75,7 +75,7 @@ describe("the local host's configured display name (#2049)", () => {
     for (const tab of ["table", "overview", "graph", "health", "recent"]) {
       const fake: Fake = { calls: [], ownName: "Mac mini 2" };
       const { snap, view, text } = await page(fake, "host mac", `tab ${tab}`);
-      expect(text).toContain("⊕ Mac mini 2 (mac)");
+      expect(text).toContain("⊕ mac · Mac mini 2");
       expect(text).toContain("instance Mac mini 2 (mac)");
       expect(view.get().drill).toEqual([{ kind: "host", name: "mac" }]);
       expect(snap.hosts.map((host) => [host.id, host.name])).toEqual([["local", "mac"], ["vps", "vps"]]);
@@ -88,12 +88,12 @@ describe("the local host's configured display name (#2049)", () => {
     const { snap, view, refresh } = await page(fake, "host mac", "tab recent");
     const screen = (current: FleetSnapshot) => renderScreen(view.get(), current, { cols: 160, rows: 50, colorMode: "none" });
     const before = screen(snap);
-    expect(before.lines.join("\n")).toContain("⊕ Desk Mac (mac)");
+    expect(before.lines.join("\n")).toContain("⊕ mac · Desk Mac");
     const keys = before.explorerRows.map((row) => row.key);
     fake.ownName = "vps";
     fake.calls.length = 0;
     const renamed = screen(await refresh());
-    expect(renamed.lines.join("\n")).toContain("⊕ vps (mac)");
+    expect(renamed.lines.join("\n")).toContain("⊕ mac · vps");
     expect(renamed.lines.join("\n")).toContain("qitem-local");
     expect(renamed.explorerRows.map((row) => row.key)).toEqual(keys);
     expect(view.get().drill).toEqual([{ kind: "host", name: "mac" }]);
@@ -103,6 +103,36 @@ describe("the local host's configured display name (#2049)", () => {
     const remote = screen(await refresh());
     expect(fake.calls).toContain("/api/rigs/summary?host=vps");
     expect(remote.lines.join("\n")).not.toContain("qitem-local");
+  });
+
+  it.each([80, 160].flatMap(cols => [true, false].map(reachable => ({ cols, reachable }))))(
+    "keeps the local identity and reachability visible at $cols columns (reachable=$reachable)", async ({ cols, reachable }) => {
+      const otherHost = { ...VPS, id: "fleet-machine-with-a-very-long-identifier" };
+      const { snap, view } = await page({ calls: [], ownName: otherHost.id, hosts: [otherHost] });
+      snap.hosts[0]!.reachable = reachable;
+      const screen = renderScreen(view.get(), snap, { cols, rows: 50, colorMode: "none" });
+      const local = screen.explorerRows.find(row => row.key === "host:mac")!;
+      const visible = screen.lines[local.y - 1]!.slice(0, screen.explorerWidth);
+      expect(visible).toContain("⊕ mac");
+      if (!reachable) expect(visible).toContain("(unreachable)");
+      view.dispatch(local.action!);
+      expect(view.get().drill).toEqual([{ kind: "host", name: "mac" }]);
+    },
+  );
+
+  it.each([
+    { label: "ANSI styling and erase", ownName: "\u001b[31mDesk\u001b[0m\u001b[2J", shown: "Desk (mac)" },
+    { label: "OSC window title", ownName: "\u001b]0;Changed title\u0007Desk", shown: "Desk (mac)" },
+    { label: "OSC string terminator", ownName: "\u001b]0;Changed title\u001b\\Desk", shown: "Desk (mac)" },
+    { label: "C1 OSC", ownName: "\u009d0;Changed title\u009cDesk", shown: "Desk (mac)" },
+    { label: "C0 and C1 controls", ownName: "De\u0000s\u007fk\u0085", shown: "Desk (mac)" },
+    { label: "only controls", ownName: "\u001b[2J\u0007", shown: "mac" },
+    { label: "ordinary Unicode", ownName: "研发 机房 🖥", shown: "研发 机房 🖥 (mac)" },
+  ])("renders $label as plain display text", async ({ ownName, shown }) => {
+    const { text, view } = await page({ calls: [], ownName }, "host mac");
+    expect(text).toContain(`instance ${shown}`);
+    expect(text).not.toMatch(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/);
+    expect(view.get().drill).toEqual([{ kind: "host", name: "mac" }]);
   });
 });
 
