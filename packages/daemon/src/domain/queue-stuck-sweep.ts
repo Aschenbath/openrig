@@ -578,6 +578,10 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     for (const row of deps.queueRepo.findUndelivered()) {
       if (isFindingRow(row)) continue;
       const humanNotice = row.deliveryOutcome === "never-posted" || row.deliveryOutcome === "transport-failed";
+      // A claim supersedes a retained failed wake, including on a row returned to
+      // pending. Its pickup finding must not be replaced by that historical failure;
+      // a separate human notification still needs its own delivery evidence.
+      if (!humanNotice && row.claimedAt) continue;
       const notification = humanNotice ? deps.queueRepo.transitionLog.latestOwnerNotificationForQitem(row.qitemId) : null;
       const resolutionNotice = notification?.ownerNotificationKind === "human-decision-resolved";
       // Match the notification source in slack/queue-access.ts, not the agent wake's escalator.

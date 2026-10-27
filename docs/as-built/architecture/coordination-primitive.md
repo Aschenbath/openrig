@@ -196,7 +196,9 @@ quiet-release job. Its closure note names that disposition rather than claiming
 delivery or pickup. An unreadable quiet hold is not positive closure evidence.
 Claimed work in either `pending` or `in-progress` uses the same pickup derivation;
 returning a row to `pending` while retaining its claim no longer hides a later
-stall or closes its existing stalled-claim finding.
+stall or closes its existing stalled-claim finding. A retained failed wake cannot
+override that pickup evidence. The agent's claim still does not establish delivery
+of a separate notification to a person.
 
 That automatic closure records `stuck-sweep@system` as the actor in both the
 transition and the `queue.updated` audit event, with the source evidence in the

@@ -106,10 +106,15 @@ describe("stuck-sweep resolution uses source evidence", () => {
     expect(repo.getById(finding.qitemId)?.state).toBe("pending");
   });
 
-  it.each(["verified", "wake-accepted:webhook fixture answered 202", "claim", "done", "canceled"])("closes a failed-wake finding once the source has %s evidence", async (evidence) => {
+  it.each(["verified", "wake-accepted:webhook fixture answered 202", "claim", "claim-returned-to-pending", "done", "canceled"])("closes a failed-wake finding once the source has %s evidence", async (evidence) => {
     const { row, finding } = await failedWake();
     if (evidence === "verified" || evidence.startsWith("wake-accepted:")) repo.recordNudgeAttempt(row.qitemId, evidence);
-    else if (evidence === "claim") repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    else if (evidence === "claim" || evidence === "claim-returned-to-pending") {
+      repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+      if (evidence === "claim-returned-to-pending") {
+        await repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: "pending", transitionNote: "returned to pending" });
+      }
+    }
     else await repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: evidence as "done" | "canceled",
       ...(evidence === "done" ? { closureReason: "no-follow-on" as const } : {}), transitionNote: "work resolved" });
     expect((await sweep()).findings).toContainEqual(expect.objectContaining({ findingQitemId: finding.qitemId, action: "closed" }));
@@ -145,8 +150,9 @@ describe("stuck-sweep resolution uses source evidence", () => {
     expect(repo.getById(finding!.qitemId)?.state).toBe("done");
   });
 
-  it.each([false, true])("detects a stalled claim retained on a pending row (existing finding: %s)", async (existing) => {
+  it.each([[false, false], [true, false], [false, true], [true, true]])("detects a stalled claim retained on a pending row (existing finding: %s; retained failed wake: %s)", async (existing, failed) => {
     const row = await work();
+    if (failed) repo.recordNudgeAttempt(row.qitemId, "failed:transport unavailable");
     repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
     advance(5);
     if (existing) await sweep();
@@ -179,6 +185,27 @@ describe("stuck-sweep resolution uses source evidence", () => {
     return repo.update({ qitemId, actorSession: "daemon@kernel",
       transitionNote: `slack-owner-notification-${outcome} notification_key=${key} level=ALERT ${outcome === "posted" ? "message_ts=1.2" : "detail=fixture-failure"}` });
   }
+
+  it("keeps a claimed agent's separate human notification until its receipt arrives", async () => {
+    const row = await work();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    await repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: "blocked", blockedOn: person.address,
+      summary: "Choose A or B", evidenceRef: "rig queue show qitem-fixture" });
+    const key = `${row.qitemId}:${repo.transitionLog.latestOwnerNotificationForQitem(row.qitemId)!.transitionId}`;
+    await receipt(row.qitemId, key, "transport-failed");
+    expect(repo.getById(row.qitemId)?.claimedAt).toEqual(expect.any(String));
+    await sweep();
+    const [finding] = findings(row);
+    expect(finding).toMatchObject({ state: "pending", destinationSession: "worker@r",
+      tags: expect.arrayContaining([`stuck-sweep:undelivered-human-notice:${row.qitemId}`]) });
+    registryAvailable = false;
+    await sweep();
+    expect(repo.getById(finding!.qitemId)?.state).toBe("pending");
+    registryAvailable = true;
+    await receipt(row.qitemId, key, "posted");
+    await sweep();
+    expect(repo.getById(finding!.qitemId)?.state).toBe("done");
+  });
 
   it("keeps a human-delivery finding during a registry outage, then closes it on the current receipt", async () => {
     const { row, finding, key } = await humanNotice();
