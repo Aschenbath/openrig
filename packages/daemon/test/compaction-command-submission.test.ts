@@ -500,14 +500,14 @@ it('a post-paste metadata failure (the binding read throws) reads written: 1 wri
   f.onText((text) => { if (text.startsWith('/compact')) f.metaThrows(true); });
   const real = f.transport.send.bind(f.transport);
   const results: any[] = [];
-  vi.spyOn(f.transport, 'send').mockImplementation(async (s: string, text: string, opts?: any) => { const r = await real(s, text, opts); if (text.startsWith('/compact')) results.push(r); return r; });
+  const sendSpy = vi.spyOn(f.transport, 'send').mockImplementation(async (s: string, text: string, opts?: any) => { const r = await real(s, text, opts); if (text.startsWith('/compact')) results.push(r); return r; });
   await f.e.maybeAutoCompact(input);
   expect(results[0]).toMatchObject({sent: true, inputPhase: 'written'});
   expect(results[0].error).toContain('Enter was not sent'); // the throw came before the Enter key reached the adapter
   expect(f.e.getPreparationState(seat)).toMatchObject({status: 'stopped', compact: 'uncertain'});
   expect(compactWrites(f)).toBe(1);
   expect(entersAfterCompact(f)).toBe(0);
-  vi.restoreAllMocks();
+  sendSpy.mockRestore();
   await noSecondWrite(f);
   expect(compactWrites(f)).toBe(1);
 });
@@ -520,13 +520,13 @@ it('Enter uncertainty (sendKeys itself throws): written, the submission outcome 
   f.onKeys(() => { if (pasted) throw new Error('send-keys: lost reply'); });
   const real = f.transport.send.bind(f.transport);
   const results: any[] = [];
-  vi.spyOn(f.transport, 'send').mockImplementation(async (s: string, text: string, opts?: any) => { const r = await real(s, text, opts); if (text.startsWith('/compact')) results.push(r); return r; });
+  const sendSpy = vi.spyOn(f.transport, 'send').mockImplementation(async (s: string, text: string, opts?: any) => { const r = await real(s, text, opts); if (text.startsWith('/compact')) results.push(r); return r; });
   await f.e.maybeAutoCompact(input);
   expect(results[0]).toMatchObject({sent: true, inputPhase: 'written'});
   expect(results[0].error).toContain('the submission (Enter) outcome is unconfirmed');
   expect(results[0].error).not.toContain('Enter was not sent');
   expect(f.e.getPreparationState(seat)).toMatchObject({status: 'stopped', compact: 'uncertain'});
-  vi.restoreAllMocks();
+  sendSpy.mockRestore();
   await noSecondWrite(f);
   expect(compactWrites(f)).toBe(1);
 });
@@ -534,9 +534,9 @@ it('Enter uncertainty (sendKeys itself throws): written, the submission outcome 
 async function compactResult(f: ReturnType<typeof fixture>) {
   const real = f.transport.send.bind(f.transport);
   const results: any[] = [];
-  vi.spyOn(f.transport, 'send').mockImplementation(async (s: string, text: string, opts?: any) => { const r = await real(s, text, opts); if (text.startsWith('/compact')) results.push(r); return r; });
+  const sendSpy = vi.spyOn(f.transport, 'send').mockImplementation(async (s: string, text: string, opts?: any) => { const r = await real(s, text, opts); if (text.startsWith('/compact')) results.push(r); return r; });
   await f.e.maybeAutoCompact(input);
-  vi.restoreAllMocks();
+  sendSpy.mockRestore();
   return results[0];
 }
 
