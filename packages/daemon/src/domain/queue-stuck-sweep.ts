@@ -376,6 +376,81 @@ function isFindingRow(item: QueueItem): boolean {
   return (item.tags ?? []).includes(STUCK_SWEEP_FINDING_TAG);
 }
 
+/** Without OWNER history a receipt has no recipient/episode key. A simple
+ * legacy park is still identifiable, but a later state write or an earlier
+ * notice/reroute makes that binding unknown. Even a same-state append may be
+ * a re-park whose recipient could not be classified during a registry outage. */
+function legacyHumanRecipientRetained(deps: StuckSweepDeps, row: QueueItem): boolean {
+  const history = deps.queueRepo.transitionLog.listForQitem(row.qitemId);
+  const isReceipt = (note: string | null) => note?.startsWith("slack-owner-notification-posted ")
+    || note?.startsWith("slack-owner-notification-transport-failed ");
+  const isReroute = (note: string | null) => note?.startsWith("fallback-routed:");
+  if (row.state !== "blocked") {
+    return !history.some((transition) => transition.state === "blocked" || isReroute(transition.transitionNote));
+  }
+  const firstPark = history.findIndex((transition) => transition.state === "blocked");
+  if (firstPark < 0 || history.slice(0, firstPark).some((transition) =>
+    isReceipt(transition.transitionNote) || isReroute(transition.transitionNote))) return false;
+  // Receipts and asking-agent reroutes preserve blockedOn. Other appends do
+  // not record whether it changed, so they cannot prove the original park.
+  return history.slice(firstPark + 1).every((transition) => transition.state === "blocked"
+    && (isReceipt(transition.transitionNote) || isReroute(transition.transitionNote)));
+}
+
+/** Falling out of a reporting query is not proof of delivery or pickup. Read the
+ * source's receipts and dispositions before closing an existing finding; an
+ * unavailable source or an unconfirmed send supplies no resolution evidence. */
+function deliveryResolutionEvidence(
+  deps: StuckSweepDeps,
+  kind: "undelivered-wake" | "undelivered-human-notice" | "unclaimed-obligation",
+  qitemId: string,
+  now: Date,
+): string | null {
+  const row = deps.queueRepo.getById(qitemId);
+  if (!row) return null;
+  if (["done", "failed", "denied", "canceled", "handed-off"].includes(row.state)) {
+    return `source closed (${row.state})`;
+  }
+  // An agent's claim/park resolves its failed wake or unclaimed work, not the
+  // separate notification owed to a person while that agent is waiting on them.
+  if (kind !== "undelivered-human-notice") {
+    if (row.claimedAt) return `source claimed at ${row.claimedAt}`;
+    if (row.state === "blocked") return "source parked";
+    if (kind === "undelivered-wake") {
+      if (row.lastNudgeResult === "verified") return "source wake verified";
+      if (row.lastNudgeResult?.startsWith("wake-accepted:")) return "source wake accepted by its hosted trigger";
+    }
+  }
+  if (deps.queueRepo.humanNotificationPostedThisEpisode(qitemId)) return "current human ask posted";
+  if (kind === "undelivered-human-notice") {
+    const notification = deps.queueRepo.transitionLog.latestOwnerNotificationForQitem(qitemId);
+    // Park and resolution notices have their own current ledger; a row-scoped
+    // legacy receipt cannot establish delivery of an unrelated agent wake/ask.
+    if (notification && (row.state === "blocked" || notification.ownerNotificationKind === "human-decision-resolved")
+      && deps.queueRepo.deliveryOutcomeFor(qitemId)?.outcome === "posted") {
+      return "current human notification posted";
+    }
+    // Pre-OWNER notices have no episode to match. Their existing row-scoped
+    // ledger can resolve that human notice, but never an unrelated agent wake.
+    if (!notification && deps.queueRepo.deliveryOutcomeFor(qitemId)?.outcome === "posted") {
+      const recipient = row.state === "blocked" ? row.blockedOn : row.destinationSession;
+      const recipientRetained = legacyHumanRecipientRetained(deps, row);
+      try {
+        if (recipientRetained && recipient && deps.queueRepo.isHumanDestination(recipient)) return "legacy human notification posted";
+      } catch { /* An unreadable registry does not establish the recipient. */ }
+    }
+  }
+  if (row.state === "pending" && deps.queueRepo.humanAskWithoutAlert(qitemId)) return "current human ask placed on Steering without an alert";
+  const quiet = quietHoldCustody(deps.db, qitemId, now);
+  if (quiet && !quiet.unreadable && (quiet.state === "held" || quiet.state === "released")) {
+    return `source held by quiet-release job for window ${quiet.windowId}`;
+  }
+  if (kind !== "undelivered-human-notice" && row.lastNudgeResult === "retained:typing_guard") {
+    return "source wake held by the seat typing guard";
+  }
+  return null;
+}
+
 function latestIso(...values: Array<string | null | undefined>): string {
   let latest: { iso: string; time: number } | undefined;
   for (const iso of values) {
@@ -456,7 +531,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     /** The dedup tags of the candidates the LADDER suppressed in this pass, and only those:
      *  a row the ladder alone would have stopped. A finding for such a row stays open,
      *  because the marker only ever stopped the re-report — it never resolved anything.
-     *  Every other finding resolves as soon as the sweep no longer detects its condition. */
+     *  Other delivery/pickup findings still need source evidence before closure. */
     const suppressedTags = new Set<string>();
     const ageMinutes = deps.unclaimedAgeMinutes ?? resolveStuckSweepUnclaimedAgeMinutes();
     const routeNotes = new Map<string, string>();
@@ -497,7 +572,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     // S04 seam — a claimed row with no later motion past the pickup threshold. The
     // pickup module remains the ONE derivation rule; this loop only enumerates and routes.
     const claimedRows = deps.db
-      .prepare("SELECT qitem_id FROM queue_items WHERE state = 'in-progress' AND claimed_at IS NOT NULL")
+      .prepare("SELECT qitem_id FROM queue_items WHERE state IN ('pending', 'in-progress') AND claimed_at IS NOT NULL")
       .all() as Array<{ qitem_id: string }>;
     for (const { qitem_id } of claimedRows) {
       const row = deps.queueRepo.getById(qitem_id);
@@ -545,6 +620,10 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     for (const row of deps.queueRepo.findUndelivered()) {
       if (isFindingRow(row)) continue;
       const humanNotice = row.deliveryOutcome === "never-posted" || row.deliveryOutcome === "transport-failed";
+      // A claim supersedes a retained failed wake, including on a row returned to
+      // pending. Its pickup finding must not be replaced by that historical failure;
+      // a separate human notification still needs its own delivery evidence.
+      if (!humanNotice && row.claimedAt) continue;
       const notification = humanNotice ? deps.queueRepo.transitionLog.latestOwnerNotificationForQitem(row.qitemId) : null;
       const resolutionNotice = notification?.ownerNotificationKind === "human-decision-resolved";
       // Match the notification source in slack/queue-access.ts, not the agent wake's escalator.
@@ -880,19 +959,23 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       const dedupTag = tags.find((t) => t.startsWith("stuck-sweep:"));
       if (!dedupTag || liveDedupTags.has(dedupTag)) continue;
       const [, kind, stuckId] = dedupTag.match(/^stuck-sweep:([a-z-]+):(.+)$/) ?? [];
-      // Suppression is not resolution (#1419), and only the ladder's own suppression counts:
-      // a finding whose row the ladder stopped in THIS pass stays open, because the marker
-      // only ever stopped the re-report. Every other finding resolves as soon as the sweep
-      // no longer detects its condition — a resumed claim, a verified custody disposition, a
-      // notice that has since posted, or a row the ladder never owned.
+      // A retry marker only suppresses reporting. Other reporting filters (a new
+      // unconfirmed send, a fresh post window, or a larger unclaimed age) do not
+      // prove resolution either: delivery/pickup findings need source evidence.
       if (suppressedTags.has(dedupTag)) continue;
+      let resolution = "no longer detected";
+      if (stuckId && (kind === "undelivered-wake" || kind === "undelivered-human-notice" || kind === "unclaimed-obligation")) {
+        const evidence = deliveryResolutionEvidence(deps, kind, stuckId, now);
+        if (!evidence) continue;
+        resolution = evidence;
+      }
       await deps.queueRepo.update({
         qitemId: f.qitem_id,
         // The sweep performed this transition; ownership stays on the existing row.
         actorSession: "stuck-sweep@system",
         state: "done",
         closureReason: "no-follow-on",
-        transitionNote: `stuck-sweep resolved: ${kind ?? "finding"} on ${stuckId ?? "row"} no longer detected`,
+        transitionNote: `stuck-sweep resolved: ${kind ?? "finding"} on ${stuckId ?? "row"} ${resolution}`,
       });
       if (kind && stuckId) {
         findings.push({
