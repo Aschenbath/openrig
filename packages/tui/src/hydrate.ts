@@ -22,6 +22,7 @@ import { DaemonClient } from "./daemon-client.js";
 import { parse as parseYaml } from "yaml";
 import type { AgentRow, FleetSnapshot, HealthCoverage, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, SeatActivitySummary, SeatEffortRead, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
 import { isHumanSeatSession } from "./pulse/pulse-model.js";
+import { sanitizeHostDisplayName } from "./topology/host-label.js";
 
 // Narrow read-shapes: just the served fields this module consumes (names match
 // the daemon's serialized output — see the Phase-2 endpoint-shape survey).
@@ -176,6 +177,7 @@ interface AttentionAggregateRead {
 }
 /** The host registry (`rig host list`): each registered host with a quick reachability probe. */
 interface HostsRead {
+  ownName?: unknown;
   hosts?: Array<{ id?: unknown; status?: unknown }>;
 }
 interface StreamItemRead {
@@ -660,9 +662,11 @@ export async function hydrateSnapshot(
     }
   }
   const aggHosts = agg?.hosts ?? [];
+  const ownName = typeof hostsRead?.ownName === "string" ? sanitizeHostDisplayName(hostsRead.ownName) : undefined;
   const localHost: HostNode = {
     id: "local",
     name: instanceHealth?.selfHostId?.trim() || "local",
+    displayName: ownName && ownName !== "localhost" ? ownName : undefined,
     reachable: true,
     rigs: rigs.sort(byRigName),
   };
