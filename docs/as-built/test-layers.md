@@ -105,7 +105,7 @@ credentials are supplied.
 | `repo-checks` | ubuntu | `npm run test:repo` |
 | `package-tests` | macOS, matrix `daemon`, `cli`, `tui`, `ui` (fail-fast off) | Installs tmux, runs `npm ci` and `npm run build`. Then runs `npm run test -w packages/<pkg>` under `env -i` with a scratch `HOME`/`TMPDIR`/`TMUX_TMPDIR` and a `sandbox-exec` profile that blocks outbound network except localhost and the job's own socket directory. `scripts/ci-macos-process-probe.mjs` runs first. |
 | `linux-seat-environment` | ubuntu | Builds all packages, then runs `seat-env-parent-session.integration.test.ts` with real CLI, daemon, tmux and stub seats. A network namespace has loopback only; tests run as the unprivileged runner user under `env -i` with scratch `HOME`/`TMPDIR`/`TMUX_TMPDIR`. Runs on pull requests and manual dispatch, like `package-tests`. |
-| `installed-scenario` | ubuntu | `bash scripts/run-pr-scenarios.sh` (eight container runs, described below). Uploads `dist/pr-scenarios/` as `installed-scenario-evidence`, including on failure. |
+| `installed-scenario` | ubuntu | `bash scripts/run-pr-scenarios.sh` (fifteen container runs, described below). Uploads `dist/pr-scenarios/` as `installed-scenario-evidence`, including on failure. |
 
 The Linux seat-environment job covers a gap in the macOS matrix: the integration test
 reads `/proc/<pid>/environ`, so macOS skips it. It checks both a new tmux server and an
@@ -185,10 +185,12 @@ node --import tsx packages/daemon/scripts/run-scenarios.mjs packages/daemon/test
 
 In CI the `installed-scenario` job runs `scripts/run-pr-scenarios.sh` with no arguments:
 both baton cases (`fixture` = `scenario-02-baton.yaml`, `library` = `queue-baton-survives-restart.yaml`),
-each run three times as healthy, then lost-baton, then healthy. Then the two stub-script
-cases (`transcript` = `transcript-reads-addressed-seat.yaml`, `capture` =
-`capture-returns-addressed-seat.yaml`) run once each, healthy only. That is eight fresh
-containers.
+each run three times as healthy, then lost-baton, then healthy (six containers); the
+`refocus-parked` effect case runs healthy, seeded, then healthy (three containers); and the
+six passing-only cases (`transcript` = `transcript-reads-addressed-seat.yaml`, `capture` =
+`capture-returns-addressed-seat.yaml`, `daemon-restart`, `refocus-active`,
+`refocus-parked-off`, `prompt-state`) run once each, healthy only (six containers). That is
+fifteen fresh containers.
 
 To run a case before you push, point `DOCKER_HOST` at a Docker engine you control over SSH:
 
@@ -198,10 +200,13 @@ DOCKER_HOST=ssh://<your-host> bash scripts/run-pr-scenarios.sh \
   --remote --case library --mode healthy --out dist/scenario-check
 ```
 
-- Options: `--case fixture|library|transcript|capture` (default: all four), `--mode
-  healthy|lost-baton` (default: healthy, lost-baton, healthy) and `--out <dir>` (default
-  `dist/pr-scenarios`). `--mode` applies to `fixture` and `library`; `transcript` and `capture`
-  always run once, healthy. `--mode lost-baton` leaves them out of a full run, and
+- Options: `--case fixture|library|transcript|capture|daemon-restart|refocus-parked|
+  refocus-active|refocus-parked-off|prompt-state` (default: all nine), `--mode
+  healthy|lost-baton|seeded` (default: healthy, lost-baton, healthy) and `--out <dir>` (default
+  `dist/pr-scenarios`). `--mode` applies to the baton cases (`fixture` and `library`) and to
+  the `refocus-parked` effect case; the six passing-only cases (`transcript`, `capture`,
+  `daemon-restart`, `refocus-active`, `refocus-parked-off`, `prompt-state`) always run once
+  each, healthy. `--mode lost-baton` leaves them out of a full run, and
   `--case transcript|capture --mode lost-baton` is refused with exit 2. Use a fresh `--out`
   directory for each run you want to keep.
 - `--remote` accepts only `ssh://` values for `DOCKER_HOST`, and it refuses if
