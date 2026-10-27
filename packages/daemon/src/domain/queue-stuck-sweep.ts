@@ -375,6 +375,27 @@ function isFindingRow(item: QueueItem): boolean {
   return (item.tags ?? []).includes(STUCK_SWEEP_FINDING_TAG);
 }
 
+/** Without OWNER history a receipt has no recipient/episode key. A simple
+ * legacy park is still identifiable, but a later state write or an earlier
+ * notice/reroute makes that binding unknown. Even a same-state append may be
+ * a re-park whose recipient could not be classified during a registry outage. */
+function legacyHumanRecipientRetained(deps: StuckSweepDeps, row: QueueItem): boolean {
+  const history = deps.queueRepo.transitionLog.listForQitem(row.qitemId);
+  const isReceipt = (note: string | null) => note?.startsWith("slack-owner-notification-posted ")
+    || note?.startsWith("slack-owner-notification-transport-failed ");
+  const isReroute = (note: string | null) => note?.startsWith("fallback-routed:");
+  if (row.state !== "blocked") {
+    return !history.some((transition) => transition.state === "blocked" || isReroute(transition.transitionNote));
+  }
+  const firstPark = history.findIndex((transition) => transition.state === "blocked");
+  if (firstPark < 0 || history.slice(0, firstPark).some((transition) =>
+    isReceipt(transition.transitionNote) || isReroute(transition.transitionNote))) return false;
+  // Receipts and asking-agent reroutes preserve blockedOn. Other appends do
+  // not record whether it changed, so they cannot prove the original park.
+  return history.slice(firstPark + 1).every((transition) => transition.state === "blocked"
+    && (isReceipt(transition.transitionNote) || isReroute(transition.transitionNote)));
+}
+
 /** Falling out of a reporting query is not proof of delivery or pickup. Read the
  * source's receipts and dispositions before closing an existing finding; an
  * unavailable source or an unconfirmed send supplies no resolution evidence. */
@@ -412,12 +433,7 @@ function deliveryResolutionEvidence(
     // ledger can resolve that human notice, but never an unrelated agent wake.
     if (!notification && deps.queueRepo.deliveryOutcomeFor(qitemId)?.outcome === "posted") {
       const recipient = row.state === "blocked" ? row.blockedOn : row.destinationSession;
-      // Legacy receipts carry no recipient key. A destination reroute needs a
-      // new episode, even if an old receipt arrives later. A park's recipient
-      // stays blockedOn when only its asking agent is rerouted.
-      const recipientRetained = row.state === "blocked" || !deps.db.prepare(
-        "SELECT 1 FROM queue_transitions WHERE qitem_id = ? AND transition_note LIKE 'fallback-routed:%' LIMIT 1",
-      ).get(qitemId);
+      const recipientRetained = legacyHumanRecipientRetained(deps, row);
       try {
         if (recipientRetained && recipient && deps.queueRepo.isHumanDestination(recipient)) return "legacy human notification posted";
       } catch { /* An unreadable registry does not establish the recipient. */ }

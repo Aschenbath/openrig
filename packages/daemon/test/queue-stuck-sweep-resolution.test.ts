@@ -296,6 +296,40 @@ describe("stuck-sweep resolution uses source evidence", () => {
     expect(repo.getById(finding.qitemId)?.state).toBe("done");
   });
 
+  it.each([false, true].flatMap((parked) => [false, true].map((lateReceipt) => ({ parked, lateReceipt }))))(
+    "does not use a former recipient's legacy receipt after a park during a registry outage (already parked: $parked; late receipt: $lateReceipt)",
+    async ({ parked, lateReceipt }) => {
+      const row = parked ? await work() : (await humanNotice()).row;
+      if (parked) {
+        repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+        await repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: "blocked", blockedOn: person.address,
+          summary: "Choose A or B", evidenceRef: "rig queue show qitem-fixture" });
+      }
+      db.prepare("UPDATE queue_transitions SET owner_notification_kind = NULL, owner_notification_level = NULL WHERE qitem_id = ?").run(row.qitemId);
+      const key = `${row.qitemId}:0`;
+      await receipt(row.qitemId, key, "transport-failed");
+      await sweep();
+      const [finding] = findings(row);
+      expect(finding?.tags).toContain(`stuck-sweep:undelivered-human-notice:${row.qitemId}`);
+      if (!lateReceipt) await receipt(row.qitemId, key, "posted");
+      if (!parked) repo.routeToFallback(row.qitemId, otherPerson.address, "ask the other person instead");
+      registryAvailable = false;
+      await repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: "blocked", blockedOn: otherPerson.address });
+      expect(repo.transitionLog.latestOwnerNotificationForQitem(row.qitemId)).toBeNull();
+      if (lateReceipt) await receipt(row.qitemId, key, "posted");
+      registryAvailable = true;
+      expect(repo.deliveryOutcomeFor(row.qitemId)?.outcome).toBe("posted");
+      await sweep();
+      expect(repo.getById(finding!.qitemId)?.state).toBe("pending");
+      await repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: "pending" });
+      await repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: "blocked", blockedOn: otherPerson.address });
+      const current = repo.transitionLog.latestOwnerNotificationForQitem(row.qitemId)!;
+      await receipt(row.qitemId, `${row.qitemId}:${current.transitionId}`, "posted");
+      await sweep();
+      expect(repo.getById(finding!.qitemId)?.state).toBe("done");
+    },
+  );
+
   it("keeps the legacy park's human recipient when only the asking agent is rerouted", async () => {
     const row = await work();
     repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });

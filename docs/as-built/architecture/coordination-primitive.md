@@ -196,8 +196,13 @@ This covers older pending asks and parks without inventing an episode that was
 never recorded. A registered alias needs a readable registry to establish its
 human recipient; reserved human references remain known during an outage.
 Legacy receipts carry no recipient key, so a destination reroute requires a new
-matching notification episode. Rerouting the asking agent of a parked item
-keeps that park's human recipient (`blockedOn`).
+matching notification episode. A legacy park is accepted only when no earlier
+notice or reroute predates it, and later history contains only receipts or
+asking-agent reroutes within that park. A re-park, an exit from the park or an
+ambiguous append cannot establish the same recipient without owner history;
+the finding waits for a new matching episode or other source resolution.
+Rerouting only the asking agent within an otherwise unchanged park preserves
+its human recipient (`blockedOn`).
 Modern notifications still require their current episode, and an unrelated
 legacy human receipt cannot resolve an agent wake.
 
