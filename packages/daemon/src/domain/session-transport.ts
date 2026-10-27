@@ -66,6 +66,10 @@ const SEND_READINESS_FRESHNESS_MS = 15_000;
 // unconfirmed, and Enter is still sent once.
 const INPUT_BOX_READ_DEADLINE_MS = 500;
 
+// A Claude seat whose recorded pane is no longer in its tmux session. The usual cause is a seat resumed by hand in its
+// session (after a reboot, say), and `rig reconcile-session` binds the live pane, so the refusal names it.
+const STALE_BOUND_PANE = "The session does not have the expected bound pane";
+
 // Mid-work detection patterns (cheap heuristics)
 const MID_WORK_PATTERNS = [
   /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/, // spinner chars
@@ -2687,7 +2691,8 @@ export class SessionTransport {
       if (bindingChanged()) return changedRecipient();
       if (observation.state === "idle_shell" || observation.state === "conflict") {
         return { ok: false, sessionName, sent: false, reason: observation.state === "idle_shell" ? "target_runtime_not_running" : "target_runtime_conflict",
-          error: `Refused: ${observation.detail}. No text was sent.` };
+          error: `Refused: ${observation.detail}. No text was sent.${observation.detail === STALE_BOUND_PANE
+            ? ` If the seat was resumed by hand in its session, run: rig reconcile-session ${sessionName}` : ""}` };
       }
       if (observation.state === "unknown") runtimeAdvisory = `runtime: ${observation.detail}; delivery proceeds without verified native identity.`;
       return null;
@@ -3513,7 +3518,7 @@ export class SessionTransport {
         return { state: "conflict", detail: "The session has several panes but no recorded bound pane" };
       }
       if (panes.length > 0 && pane && !panes.some(candidate => candidate.id === pane)) {
-        return { state: "conflict", detail: "The session does not have the expected bound pane" };
+        return { state: "conflict", detail: STALE_BOUND_PANE };
       }
       if (!pane || panes.length === 0) return unknown;
       let panePid: number | null;
