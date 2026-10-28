@@ -208,6 +208,78 @@ describe("Claude tool-batch completion resolves its permission notification", ()
     expect(subject.latest()).toEqual(before);
   });
 
+  it.each([undefined, "child-1"])("does not revive actor %s after its completed notification arrives again", async agentId => {
+    const subject = fixture();
+    await subject.hook("UserPromptSubmit");
+    const notification = await subject.hook("Notification", { agent_id: agentId });
+    const batch = await subject.hook("PostToolBatch", { agent_id: agentId });
+    const before = subject.latest();
+    for (const occurredAt of [notification.occurredAt,
+      new Date(Date.parse(String(batch.occurredAt)) - 1).toISOString()]) {
+      await subject.hook("Notification", { agent_id: agentId }, { occurredAt });
+      expect(subject.count()).toBe(0);
+      expect(subject.latest()).toEqual(before);
+    }
+  });
+
+  it.each([undefined, "child-1"])("remembers actor %s completing before its first notification arrives", async agentId => {
+    const subject = fixture();
+    const batch = await subject.hook("PostToolBatch", { agent_id: agentId });
+    await subject.hook("Notification", { agent_id: agentId },
+      { occurredAt: new Date(Date.parse(String(batch.occurredAt)) - 1).toISOString() });
+    expect(subject.count()).toBe(0);
+    expect(subject.store.getLatestForNode({ sessionName: subject.sessionName })?.state).not.toBe("needs_input");
+    expect(subject.changed).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 1])("keeps a new notification whose timestamp is %s ms after the prior batch", async offset => {
+    const subject = fixture();
+    await subject.hook("Notification");
+    const batch = await subject.hook("PostToolBatch");
+    await subject.hook("Notification", {},
+      { occurredAt: new Date(Date.parse(String(batch.occurredAt)) + offset).toISOString() });
+    expect(subject.count()).toBe(1);
+    expect(subject.latest().state).toBe("needs_input");
+  });
+
+  it("retains the latest completion per actor even when older batches arrive later", async () => {
+    const subject = fixture();
+    await subject.hook("UserPromptSubmit");
+    const completedAt = subject.now().getTime() + 100;
+    const at = (offset: number) => new Date(completedAt + offset).toISOString();
+    await subject.hook("PostToolBatch", { agent_id: "child-1" }, { occurredAt: at(0) });
+    await subject.hook("PostToolBatch", { agent_id: "child-1" }, { occurredAt: at(-20) });
+    await subject.hook("Notification", { agent_id: "child-1" }, { occurredAt: at(-10) });
+    expect(subject.count()).toBe(0);
+    await subject.hook("Notification", {}, { occurredAt: at(-10) });
+    expect(subject.count()).toBe(1);
+    expect(subject.latest().state).toBe("needs_input");
+  });
+
+  it("keeps an unattributed legacy notification even after the main actor completed", async () => {
+    const subject = fixture();
+    const batch = await subject.hook("PostToolBatch");
+    await subject.hook("Notification", {}, { hookAgentId: undefined,
+      occurredAt: new Date(Date.parse(String(batch.occurredAt)) - 1).toISOString() });
+    expect(subject.count()).toBe(1);
+    expect(subject.latest().state).toBe("needs_input");
+  });
+
+  it.each(["forget", "swap"] as const)("discards the prior occupant's completion on %s", async action => {
+    const subject = fixture();
+    const batch = await subject.hook("PostToolBatch");
+    let generation = subject.generation;
+    if (action === "forget") subject.service.forgetSeat(subject.sessionName);
+    else {
+      generation = subject.registry.mintOccupantTenure(subject.node.id, "initial").generationUuid;
+      subject.service.declareOccupantSwap(subject.node.id, generation);
+    }
+    await subject.hook("Notification", {}, { generation,
+      occurredAt: new Date(Date.parse(String(batch.occurredAt)) - 1).toISOString() });
+    expect(subject.count()).toBe(1);
+    expect(subject.latest().state).toBe("needs_input");
+  });
+
   it.each([{ generation: null }, { generation: "retired-generation" }, { hookAgentId: undefined },
     { hookAgentId: 42 }, { occurredAt: "invalid" }, { sessionName: "old@batch-permission" }])(
     "preserves attention when batch attribution is unusable: %j", async wire => {

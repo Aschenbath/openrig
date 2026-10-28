@@ -455,7 +455,8 @@ activityRoutes.post("/hooks", async (c) => {
   // All tools in this actor's batch have resolved. An individual PostToolUse can belong to a parallel tool,
   // and a subagent's batch says nothing about the main session's permission. Only the current occupant can
   // settle a matching, older episode. Do not record an unrelated batch as an unknown hook that hides attention.
-  if (body.hookEvent === "PostToolBatch") {
+  const claudePermission = body.runtime === "claude-code" && body.hookEvent === "Notification" && body.subtype === "permission_prompt";
+  if (body.hookEvent === "PostToolBatch" || claudePermission) {
     const oracle = c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined;
     const registry = c.get("sessionRegistry" as never) as SessionRegistry | undefined;
     const sessionName = stringOrNull(body.sessionName);
@@ -471,9 +472,19 @@ activityRoutes.post("/hooks", async (c) => {
       && generation !== null && current?.generationUuid === generation
       && (hookAgentId === null || (typeof hookAgentId === "string" && hookAgentId.trim().length > 0))
       && occurredAt !== null && Number.isFinite(Date.parse(occurredAt));
-    const settled = attributable && oracle
-      ? oracle.completeClaudeToolBatch(seat!.sessionName, hookAgentId as string | null, occurredAt!) : false;
-    return c.json({ ok: true, permissionResolved: settled });
+    if (body.hookEvent === "PostToolBatch") {
+      if (attributable && oracle && !oracle.hasRungInventory(seat!.nodeId, seat!.sessionName)) {
+        // The completion may be this occupant's first hook to reach the daemon.
+        oracle.declareRungInventory({ seatNodeId: seat!.nodeId, sessionName: seat!.sessionName }, runtimeRungInventory("claude-code"));
+      }
+      const settled = attributable && oracle
+        ? oracle.completeClaudeToolBatch(seat!.sessionName, hookAgentId as string | null, occurredAt!) : false;
+      return c.json({ ok: true, permissionResolved: settled });
+    }
+    // Do not publish an already-completed request as fresh attention to the store's event consumers.
+    if (attributable && oracle?.hasLaterClaudeToolBatch(seat!.sessionName, hookAgentId as string | null, occurredAt!)) {
+      return c.json({ ok: true, permissionResolved: true });
+    }
   }
 
   const result = store.recordHookEvent({

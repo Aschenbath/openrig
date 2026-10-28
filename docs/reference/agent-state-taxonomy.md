@@ -151,6 +151,10 @@ Batch completion must come from the current occupant and have a later source tim
 the matching notification. Missing actor attribution from an older relay, equal or older
 timestamps, and another actor's completion retain attention. An unrecognized or missing screen
 does not expire attention by age. `Stop` and `UserPromptSubmit` remain the turn-boundary fallback.
+The oracle remembers each actor's latest completed batch for the current occupant, so a strictly
+earlier notification arriving late cannot restore the mark, even if the completion arrived first.
+A notification with an equal or later timestamp remains eligible; swapping or retiring the
+occupant discards its remembered completions.
 Completing a batch changes the needs-input signal without inferring that the seat is idle or
 overwriting a later elicitation. The hook contract is documented in
 [Claude's hooks reference](https://code.claude.com/docs/en/hooks#posttoolbatch).

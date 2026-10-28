@@ -212,6 +212,9 @@ export class SeatActivityService {
     const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
     if (!seat || seat.retired || seat.inventory?.runtime !== "claude-code") return false;
     const completedAt = Date.parse(observedAt);
+    if (!Number.isFinite(completedAt)) return false;
+    // A notification may arrive after its completion, including when no request was observed yet.
+    seat.claudeToolBatches.set(hookAgentId, Math.max(completedAt, seat.claudeToolBatches.get(hookAgentId) ?? -Infinity));
     let settled = false;
     for (const [id, request] of seat.permissions) {
       if (request.hookAgentId === undefined || request.hookAgentId !== hookAgentId
@@ -223,6 +226,16 @@ export class SeatActivityService {
     seat.permissionRevision++;
     this.reportPermissionObservation(seatNodeId!, seat, "lifecycle-hooks", observedAt, "permission_prompt");
     return true;
+  }
+
+  /** Whether this occupant's actor already completed a strictly later batch. Equal timestamps do not establish order. */
+  hasLaterClaudeToolBatch(sessionName: string, hookAgentId: string | null | undefined, observedAt: string): boolean {
+    if (hookAgentId === undefined) return false;
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired || seat.inventory?.runtime !== "claude-code") return false;
+    const completedAt = seat.claudeToolBatches.get(hookAgentId);
+    return completedAt !== undefined && Date.parse(observedAt) < completedAt;
   }
 
   private reportPermissionObservation(seatNodeId: string, seat: SeatLadderState, rung: EvidenceRungId,
@@ -263,6 +276,7 @@ export class SeatActivityService {
     seat.retired = true;
     seat.sources.clear();
     seat.permissions.clear();
+    seat.claudeToolBatches.clear();
     seat.permissionEvidence = null;
     seat.pendingIdle = null;
     seat.contradictionSinceMs = null;
@@ -414,6 +428,7 @@ export class SeatActivityService {
     const wasConfirmed = seat.arbitrated.needsInput.count > 0;
     if (evidence.permissionRequest) {
       const request = evidence.permissionRequest;
+      if (claude && this.hasLaterClaudeToolBatch(evidence.sessionName, request.hookAgentId, evidence.observedAt)) return;
       const previousRequest = seat.permissions.get(request.id);
       // Relay posts can arrive out of order. Keep the newer actor request so an older batch cannot settle it.
       if (claude && previousRequest && Date.parse(evidence.observedAt) < Date.parse(previousRequest.observedAt)) return;
@@ -470,6 +485,7 @@ export class SeatActivityService {
     if (!seat) return;
     seat.sources.clear();
     seat.permissions.clear();
+    seat.claudeToolBatches.clear();
     seat.permissionEvidence = null;
     seat.pendingIdle = null;
     seat.contradictionSinceMs = null;
@@ -553,6 +569,7 @@ export class SeatActivityService {
         inventory: null,
         sources: new Map(),
         permissions: new Map(),
+        claudeToolBatches: new Map(),
         permissionRevision: 0,
         permissionPolling: false,
         permissionEvidence: null,
@@ -879,6 +896,7 @@ interface PromotionRun {
 interface SeatLadderState {
   permissions: Map<string, { sinceMs: number; observedAt: string; hookAgentId?: string | null;
     confirmed: boolean; seen: boolean; nextCheckMs: number }>;
+  claudeToolBatches: Map<string | null, number>;
   permissionRevision: number;
   permissionPolling: boolean;
   permissionEvidence: ArbitratedSeatState["needsInputEvidence"];
