@@ -464,7 +464,12 @@ activityRoutes.post("/hooks", async (c) => {
     const hookAgentId = body.hookAgentId;
     const generation = stringOrNull(body.generation);
     const occurredAt = stringOrNull(body.occurredAt);
-    const current = seat && registry?.currentOccupantTenure(seat.nodeId);
+    let current: ReturnType<SessionRegistry["currentOccupantTenure"]> | undefined;
+    try {
+      current = seat ? registry?.currentOccupantTenure(seat.nodeId) : null;
+    } catch {
+      return c.json({ ok: false, code: "generation_resolver_error", error: "Occupant generation is unavailable." }, 503);
+    }
     const session = seat && store.db.prepare("SELECT status FROM sessions WHERE id = ?")
       .get(seat.sessionId) as { status: string } | undefined;
     const attributable = body.runtime === "claude-code" && seat?.runtime === "claude-code"

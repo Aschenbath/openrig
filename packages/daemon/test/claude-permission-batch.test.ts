@@ -69,7 +69,7 @@ function fixture(visible: boolean | null = false) {
     expect(response.status).toBe(200);
     return payload;
   };
-  return { db, node, registry, session, sessionName, generation, store, service, reader, changed, hook, now,
+  return { app, db, node, registry, session, sessionName, generation, store, service, reader, changed, hook, now,
     advance: (delta: number) => { nowMs += delta; },
     count: () => service.getSeatState(node.id)!.needsInput.count,
     latest: () => {
@@ -278,6 +278,30 @@ describe("Claude tool-batch completion resolves its permission notification", ()
       occurredAt: new Date(Date.parse(String(batch.occurredAt)) - 1).toISOString() });
     expect(subject.count()).toBe(1);
     expect(subject.latest().state).toBe("needs_input");
+  });
+
+  it.each(["PostToolBatch", "Notification"])("returns a named 503 for %s when the occupant ledger cannot be read", async hookEvent => {
+    const subject = fixture();
+    await subject.hook("Notification");
+    const before = subject.latest();
+    const resolver = vi.spyOn(subject.registry, "currentOccupantTenure")
+      .mockImplementation(() => { throw new Error("fixture occupant ledger unavailable"); });
+    try {
+      const response = await subject.app.request("/activity/hooks", { method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer batch-test-token" },
+        body: JSON.stringify({ runtime: "claude-code", hookEvent, subtype: "permission_prompt",
+          sessionName: subject.sessionName, nodeId: subject.node.id, generation: subject.generation,
+          hookAgentId: null, occurredAt: new Date(subject.now().getTime() + 1).toISOString() }),
+      });
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({ ok: false, code: "generation_resolver_error" });
+    } finally {
+      resolver.mockRestore();
+    }
+    expect(subject.count()).toBe(1);
+    expect(subject.latest()).toEqual(before);
+    await subject.hook(hookEvent);
+    expect(subject.count()).toBe(hookEvent === "PostToolBatch" ? 0 : 1);
   });
 
   it.each([{ generation: null }, { generation: "retired-generation" }, { hookAgentId: undefined },
