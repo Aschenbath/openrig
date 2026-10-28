@@ -574,18 +574,20 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // per running seat per tick + classifies motion STRUCTURALLY, so the `rig ps` ACTIVITY column reflects
   // real liveness for hook-less / stale-hook / turn-boundary seats WITHOUT a per-request capture storm.
   const seatStructuralActivityService = new SeatStructuralActivityService(tmuxAdapter);
-  // A confirmed prompt clearing recovers its refused queue wakes immediately, using the same
+  // Prompt clearing and positive idle recover their corresponding refused queue wakes, using the same
   // hook/pane resolution as status. No new captures, timer or delivery admission path.
-  const retryPromptWakes = (sessionName: string) => {
+  const retryQueueWakes = (sessionName: string) => {
     const runtime = sessionRegistry.findResumeContextByName(sessionName)?.runtime;
     const state = hookOrPaneActivity(agentActivityStore.getLatestForNode({ sessionName,
       order: runtime === "claude-code" ? "source" : "arrival" }),
       seatStructuralActivityService.getStructuralActivity(sessionName), false, runtime)?.activity.state;
-    void queueRepoInstance.retryPromptWakesOnClear(sessionName, state)
-      .catch(error => console.warn(`Prompt-clear wake recovery: ${error instanceof Error ? error.name : typeof error}`));
+    void Promise.all([
+      queueRepoInstance.retryPromptWakesOnClear(sessionName, state),
+      queueRepoInstance.retryBusyWakesOnIdle(sessionName, state),
+    ]).catch(error => console.warn(`Queue wake recovery: ${error instanceof Error ? error.name : typeof error}`));
   };
-  seatStructuralActivityService.attachActivityChanged(retryPromptWakes);
-  eventBus.subscribe(event => { if (event.type === "agent.activity") retryPromptWakes(event.sessionName); });
+  seatStructuralActivityService.attachActivityChanged(retryQueueWakes);
+  eventBus.subscribe(event => { if (event.type === "agent.activity") retryQueueWakes(event.sessionName); });
   // OPR.0.4.3.19 — SeatIdentityReconciler owns the liveness identity verdict
   // (the THIRD axis). Reconciles each running seat's pane PID/command against
   // the registered binding and persists the verdict so node-inventory can gate

@@ -117,6 +117,14 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
    `:311–315`) or an `unknown` one proceeds with an advisory `warning` (`:1495`,
    `:1503`). `--force` has no effect on this path, and combining it with
    `--wait-for-idle` is refused with 400 (`routes/transport.ts:66`–`73`).
+   For a queue wake, `wait_for_idle_timeout` accompanied by proof that input was
+   never reached is a failed attempt. The queue retains the native refusal code
+   and its human-readable detail. A positive idle hook or cached pane reading
+   then retries the pending, unclaimed notification through the existing delivery
+   path, preserving its outbox ID and body. This automatic retry happens at most
+   once per committed wake, including across daemon restarts; the stuck sweep
+   remains the backstop. Uncertain sends and deliberately held messages remain
+   under their existing recovery and release rules.
 4. Two-step tmux send: a unique file/buffer pasted with `paste-buffer -d -r -p`
    (`packages/daemon/src/adapters/tmux.ts:625`) → ~200ms delay
    (`session-transport.ts:1558`) → separate named `Enter` (`session-transport.ts:1573–1578`). The paste
@@ -138,8 +146,8 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
    preparation and again immediately before keys. The delivery lease records
    the pasted text and any observed collapsed-paste label; Enter requires that
    owned input. Late human input, changed recipients or stopped queue wakes refuse
-   further input or hold the message; ambiguous writes remain indeterminate. Nothing
-   is retried automatically. Unicode cell widths use the daemon's direct
+   further input or hold the message; ambiguous writes remain indeterminate. Idle-triggered
+   queue recovery does not retry this uncertain/retained class. Unicode cell widths use the daemon's direct
    `string-width` dependency. See [per-seat terminal delivery](../../reference/seat-delivery.md)
    for activation, persistence, inspection and lifecycle tradeoffs.
 5. Optional `--verify`: capture the last 30 pane lines before the paste and,

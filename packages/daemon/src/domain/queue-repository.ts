@@ -97,6 +97,9 @@ const AUTO_UNPARK_WAKE_TAG = "queue:auto-unpark:blocker";
 const WAKE_TRIGGER_OPENRIG_TAG = "queue:wake-trigger:openrig";
 /** On a wake intent whose ring a hosted member's trigger accepted: recovery doesn't ring that intent again. */
 const HOSTED_WAKE_ACCEPTED_TAG = "queue:hosted-wake-accepted";
+/** One automatic idle retry per committed busy wake, including across daemon restarts. */
+const BUSY_IDLE_RETRIED_TAG = "queue:busy-idle-retried";
+const BUSY_WAKE_FAILURE = "failed:wait_for_idle_timeout";
 
 /** Who triggered a wake, which is its source at the seat's interruption level: an agent's create or handoff nudge, or
  *  OpenRig's own scheduling on an agent's row (ladder retries, an auto-unpark, boot recovery, health re-presentation). */
@@ -132,15 +135,21 @@ export function presentedNudgeResult(wireResult: string | null, claimedAt: strin
   return wireResult;
 }
 
+/** Recognize the persisted native refusal code, plus the older exact no-input busy receipt. */
+function isBusyWakeFailure(result: string | null | undefined): boolean {
+  return result === BUSY_WAKE_FAILURE || (typeof result === "string" && (result.startsWith(`${BUSY_WAKE_FAILURE}:`)
+    || /^failed:\s*Target was still busy \([^\r\n)]+\) when the \d+ms wait ended(?: \(\d+ observations?\))?\. No text was sent\.$/.test(result)));
+}
+
 /**
  * 0.5.1-54 DR-1 (classifier fold, PM ruling) — classify a create-path
- * nudge FAILURE so the surfaced count becomes ACTIONABLE (constraint iii). Two classes:
+ * nudge FAILURE so the surfaced count becomes ACTIONABLE (constraint iii). Known classes:
  *   - "permanent-topology": the destination is not resolvable on THIS daemon (the nudge can never
  *     succeed here — a local-registry lookup reporting "not found" for a seat that lives on another
  *     daemon). Retrying is a guaranteed-permanent failure repeated on a schedule → NOT retryable;
  *     these belong to the ADDRESSING family, not to retry machinery. (The live corpus: 9/10 strands.)
- *   - "transient": a live, resolvable seat that refused THIS attempt (busy at an interactive prompt) or
- *     the attempt timed out — the only class a future bounded re-attempt (DR-2, held n=1) would touch.
+ *   - "transient": a live, resolvable seat that refused THIS attempt (busy or at an interactive prompt),
+ *     or a recorded timeout. This label alone does not authorize another send.
  *   - "unknown": a failure whose text matches NEITHER known pattern. NOT silently defaulted to transient
  *     (ship-block ruling): defaulting would assert "a live seat refused
  *     this attempt" for a string that only means "did not match the permanent pattern" — two different
@@ -148,11 +157,13 @@ export function presentedNudgeResult(wireResult: string | null, claimedAt: strin
  *     a default that collapses unknown into a known class is the exact sin, mirrored.
  * Returns null when `lastNudgeResult` is not a recorded failure (`failed:%`).
  *
- * Each class is a POSITIVE match — there is no default class. DR-2 (retry) stays HELD at n=1; this is
+ * Each class is a POSITIVE match — there is no default class. This is
  * READ-side labeling only, making the strand's nature legible (addressing-fix vs retry vs triage-the-unknown).
  */
 export function classifyNudgeFailure(lastNudgeResult: string | null | undefined): "permanent-topology" | "transient" | "unknown" | null {
   if (typeof lastNudgeResult !== "string" || !lastNudgeResult.startsWith("failed:")) return null;
+  // A recorded pre-input busy refusal is stronger evidence than incidental words in its detail.
+  if (isBusyWakeFailure(lastNudgeResult)) return "transient";
   // permanent-topology: local-registry "not found" — the destination is not resolvable on THIS daemon.
   if (/\bnot found\b/i.test(lastNudgeResult)) return "permanent-topology";
   // transient: a live seat refused this attempt (busy at a prompt) or the attempt timed out.
@@ -1120,6 +1131,10 @@ export class QueueRepository {
     // Input evidence survives receipt removal: an issued paste or uncertain Enter is never an unsent failure.
     const inputUncertain = res.sent === true || res.inputPhase === "attempted" || res.inputPhase === "written"
       || (res.sent !== false && res.inputPhase !== "not_reached" && (res.reason === "delivery_indeterminate" || res.reason === "submit_failed"));
+    // This timeout is before input. Keep issued/uncertain input above it, and every other timeout ambiguous.
+    if (!inputUncertain && res.reason === "wait_for_idle_timeout" && (res.sent === false || res.inputPhase === "not_reached")) {
+      return { classified: "failed", nudgeResult: res.error ? `${BUSY_WAKE_FAILURE}:${res.error}` : BUSY_WAKE_FAILURE };
+    }
     if (inputUncertain || isWakeTimeoutSignal(res.reason) || isWakeTimeoutSignal(res.error)) {
       return { classified: "indeterminate", nudgeResult: `indeterminate:${detail}` };
     }
@@ -1362,6 +1377,7 @@ export class QueueRepository {
     outboxId: string,
     attempted: Set<string> = new Set(), // this pass's attempt history, inherited by any release it delivers
     eligible: (entry: OutboxEntry) => boolean = () => true,
+    attemptTag?: string,
   ): Promise<"delivered" | "indeterminate" | "failed" | "skipped" | "retained"> {
     if (!this.outbox) return "skipped";
     if (!this.transport) return "skipped"; // no transport → stays pending for a later drain
@@ -1482,6 +1498,12 @@ export class QueueRepository {
       const wakeEvent = this.db.transaction(() => {
         this.recordNudgeAttempt(qitemId, nudgeResult);
         this.outbox!.finalizeDelivery(intent.outboxId, finalState);
+        // A correlated member released before this send keeps its retry until its own attempt is recorded.
+        if (attemptTag) {
+          this.db.prepare(`UPDATE outbox_entries SET tags = json_insert(COALESCE(tags, '[]'), '$[#]', ?)
+            WHERE outbox_id = ? AND NOT EXISTS (SELECT 1 FROM json_each(COALESCE(outbox_entries.tags, '[]')) WHERE value = ?)`)
+            .run(attemptTag, intent.outboxId, attemptTag);
+        }
         // The acceptance belongs to this intent, so recovery can tell this wake already rang.
         if (outcome.nudgeResult.startsWith("wake-accepted:")) {
           this.db.prepare(`UPDATE outbox_entries SET tags = json_insert(COALESCE(tags, '[]'), '$[#]', ?)
@@ -1523,7 +1545,7 @@ export class QueueRepository {
     // send, so never attempted), so nothing already sent here is regrouped, and each released member gets one attempt.
     for (const entry of released) attempted.delete(entry.outboxId);
     for (const entry of released) {
-      await this.deliverWakeIntent(entry.outboxId, attempted, eligible).catch((err) => console.error(`Queue wake delivery failed for ${entry.outboxId}:`, err));
+      await this.deliverWakeIntent(entry.outboxId, attempted, eligible, attemptTag).catch((err) => console.error(`Queue wake delivery failed for ${entry.outboxId}:`, err));
     }
     return reportedState;
   }
@@ -1635,6 +1657,30 @@ export class QueueRepository {
     if (this.outbox?.getById(outboxId) && this.getById(qitemId)?.state === "pending") return;
     // Boot recovery is OpenRig's own scheduling, whoever created the row.
     await this.maybeNudge(qitemId, destinationSession, undefined, sourceSession, undefined, "openrig");
+  }
+
+  /** One automatic retry of a durably recorded, definitely-unsent busy wake when the seat is positively idle.
+   *  The existing transport still checks readiness and admission; uncertainty and deliberate holds stay untouched. */
+  async retryBusyWakesOnIdle(sessionName: string, state: AgentActivity["state"] | undefined): Promise<void> {
+    if (state !== "idle" || !this.outbox) return;
+    const addresses = this.resolveSessionAddresses(sessionName);
+    if (!addresses.length) return;
+    const eligible = (entry: OutboxEntry): boolean => {
+      if (entry.deliveryState !== "failed" || !entry.auditPointer || entry.tags?.includes(BUSY_IDLE_RETRIED_TAG)) return false;
+      const row = this.getById(entry.auditPointer);
+      return row?.state === "pending" && addresses.includes(row.destinationSession) && isBusyWakeFailure(row.lastNudgeWireResult);
+    };
+    const rows = this.db.prepare(`SELECT e.outbox_id FROM outbox_entries e
+      JOIN queue_items q ON q.qitem_id = e.audit_pointer AND q.destination_session = e.destination_session
+      WHERE e.delivery_state = 'failed' AND q.state = 'pending'
+        AND q.destination_session IN (${addresses.map(() => "?").join(",")})
+        AND substr(e.outbox_id, 1, ?) = ?
+        AND (q.last_nudge_result = ? OR q.last_nudge_result LIKE ?
+          OR q.last_nudge_result LIKE 'failed:%Target was still busy (%No text was sent.')
+        AND NOT EXISTS (SELECT 1 FROM json_each(COALESCE(e.tags, '[]')) WHERE value = ?)`)
+      .all(...addresses, WAKE_INTENT_PREFIX.length, WAKE_INTENT_PREFIX, BUSY_WAKE_FAILURE, `${BUSY_WAKE_FAILURE}:%`, BUSY_IDLE_RETRIED_TAG) as Array<{ outbox_id: string }>;
+    const attempted = new Set<string>();
+    for (const row of rows) await this.deliverWakeIntent(row.outbox_id, attempted, eligible, BUSY_IDLE_RETRIED_TAG);
   }
 
   /** One recovery pass on a positive attention-clear transition; the existing sweep remains the backstop. */
