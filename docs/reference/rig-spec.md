@@ -663,8 +663,6 @@ This opt-out is incompatible with an active enterprise `managed-mcp.json`:
 OpenRig keeps the requested opt-out flags, so startup and resume remain subject
 to that native refusal; it does not fall back to loading servers. Use a host
 without that managed configuration, or omit the opt-out to use the managed set.
-Shutdown skips the probe when it can read and parse a managed configuration,
-reports the conflict, and keeps the token unverified instead of marking it unusable.
 
 ### Claude Advisor (`runtime: claude-code`)
 

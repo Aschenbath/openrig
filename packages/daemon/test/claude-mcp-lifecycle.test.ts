@@ -136,39 +136,6 @@ describe("per-agent Claude MCP selection (#1478)", () => {
     expect(f.tmux.killSession).toHaveBeenCalledWith(probes[0]!.session);
   });
 
-  it.each([
-    ["none", '{"mcpServers":{}}', false],
-    ["none", "{invalid-json", true],
-    [undefined, '{"mcpServers":{}}', true],
-  ] as const)("managed MCP shutdown probe: choice %s, policy %s", async (selection, policy, shouldProbe) => {
-    const f = setup(), start = await f.inst.materialize(JSON.stringify(f.raw), f.root);
-    if (!start.ok) throw Error(JSON.stringify(start));
-    const node = f.rigRepo.getRig(start.result.rigId)!.nodes.find(node => node.logicalId === "dev.owner")!;
-    f.rigRepo.setNodeClaudeMcp(node.id, selection ?? null);
-    const session = f.sessionRegistry.registerSession(node.id, "dev-owner@mcp-rig");
-    f.sessionRegistry.updateResumeToken(session.id, "claude_id", "mcp-history", "operator");
-    const readFile = fs.readFileSync;
-    vi.spyOn(fs, "readFileSync").mockImplementation((...args) => {
-      if (String(args[0]).endsWith("managed-mcp.json")) return policy;
-      return readFile(...args);
-    });
-    const markProbe = vi.spyOn(f.sessionRegistry, "markResumeProbeResult");
-    const log = vi.fn();
-    const refresher = new ResumeMetadataRefresher({
-      sessionRegistry: f.sessionRegistry, tmuxAdapter: f.tmux, sleep: async () => {},
-      listClaudeProcesses: async () => [], homeDir: f.root, log,
-    });
-    await refresher.refresh([{
-      nodeId: node.id, sessionId: session.id, sessionName: session.sessionName,
-      runtime: "claude-code", resumeType: "claude_id", resumeToken: "mcp-history", cwd: f.root,
-    }]);
-    expect(f.tmux.createSession).toHaveBeenCalledTimes(shouldProbe ? 1 : 0);
-    expect(f.commands.filter(entry => entry.command.includes("--resume"))).toHaveLength(shouldProbe ? 1 : 0);
-    expect(markProbe).toHaveBeenCalledWith(session.id, shouldProbe ? "resumable" : "inconclusive");
-    expect(f.sessionRegistry.getSessionsForRig(start.result.rigId)[0]?.resumeToken).toBe("mcp-history");
-    if (!shouldProbe) expect(log).toHaveBeenCalledWith(expect.stringContaining("managed-mcp.json"));
-  });
-
   it.each(["claude_mcp", "claudeMcp"])("the expansion HTTP route preserves %s through validation, persistence and launch", async key => {
     const f = setup();
     const { app, rigRepo } = createTestApp(f.db, { podInstantiatorFsOps: f.fsOps });

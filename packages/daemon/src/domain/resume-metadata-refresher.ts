@@ -393,21 +393,6 @@ export class ResumeMetadataRefresher {
     configDir?: string,
     claudeMcp?: ClaudeMcp,
   ): Promise<"resumable" | "not_resumable" | "inconclusive"> {
-    if (claudeMcp === "none") {
-      // Claude rejects strict MCP overrides when an enterprise config is readable and parseable.
-      // That host policy says nothing about the stored conversation's resumability.
-      const managedPath = process.platform === "darwin" ? "/Library/Application Support/ClaudeCode/managed-mcp.json"
-        : process.platform === "win32" ? "C:\\Program Files\\ClaudeCode\\managed-mcp.json"
-        : process.platform === "linux" ? "/etc/claude-code/managed-mcp.json" : null;
-      let managedConfig: unknown;
-      try {
-        if (managedPath) managedConfig = JSON.parse(fs.readFileSync(managedPath, "utf8"));
-      } catch { /* Unreadable or malformed files do not establish an active managed configuration. */ }
-      if (managedConfig !== null && typeof managedConfig === "object" && !Array.isArray(managedConfig)) {
-        this.log("[resume-metadata] skipped Claude probe: claude_mcp: none conflicts with managed-mcp.json; token remains unverified");
-        return "inconclusive";
-      }
-    }
     const resume = buildNativeResumeCommand("claude-code", resumeToken, sessionName, undefined, undefined, claudeMcp);
     if (!resume) {
       return "not_resumable";
