@@ -54,6 +54,7 @@ it.each(["create", "handoff"] as const)("retries an unsent busy %s wake once on 
   await f.observe("idle");
   expect(f.send).toHaveBeenCalledTimes(2);
   expect(f.send.mock.calls[1][1]).toContain(original.body);
+  expect(f.send.mock.calls[1][1]).toBe(f.send.mock.calls[0][1]);
   expect(f.wake(id).outboxId).toBe(original.outboxId);
   expect(f.wake(id).deliveryState).toBe("delivered");
   expect(f.queue().getById(id)?.state).toBe("pending");

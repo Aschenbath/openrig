@@ -1449,7 +1449,9 @@ export class QueueRepository {
     }
     const qitemId = intent.auditPointer ?? outboxId;
     // Preserve the original envelope/source generation; add context without rewriting its stored bytes.
-    const recoveryNotice = recovering ? "Recovered queue notification: delivery may repeat after an earlier unconfirmed attempt.\n" : "";
+    // Every member admitted by the busy-idle pass has positive evidence that its earlier send never reached input.
+    const recoveryNotice = recovering && attemptTag !== BUSY_IDLE_RETRIED_TAG
+      ? "Recovered queue notification: delivery may repeat after an earlier unconfirmed attempt.\n" : "";
     // The group was formed on the first member's outcome, so its own source and urgency reach that same outcome at the
     // send; the other members' bodies keep their own frozen urgent lines.
     const trigger: WakeTrigger = group[0]!.tags?.includes(WAKE_TRIGGER_OPENRIG_TAG) ? "openrig" : "agent";
