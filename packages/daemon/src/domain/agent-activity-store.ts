@@ -8,6 +8,7 @@ export const AGENT_ACTIVITY_FRESHNESS_MS = 5 * 60 * 1000;
 
 export interface HookActivityInput {
   turnId?: string | null;
+  hookAgentId?: string | null;
 
   runtime: string | null;
   sessionName?: string | null;
@@ -120,6 +121,7 @@ export class AgentActivityStore {
       generation,
     });
     activity.turnId = input.turnId ?? null;
+    if (input.hookAgentId !== undefined) activity.hookAgentId = input.hookAgentId;
     if (input.sourceSequence) activity.sourceSequence = input.sourceSequence;
     if (input.livenessSeconds) activity.livenessSeconds = input.livenessSeconds;
 

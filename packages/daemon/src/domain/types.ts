@@ -574,6 +574,8 @@ export type AgentActivityEvidenceSource =
 
 export interface AgentActivity {
   turnId?: string | null;
+  /** Native Claude hook actor: null is the main session; absent means an older or unrecognized relay. */
+  hookAgentId?: string | null;
 
   state: AgentActivityState;
   reason: string;

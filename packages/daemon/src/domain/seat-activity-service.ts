@@ -188,7 +188,9 @@ export class SeatActivityService {
       let updated = false;
       for (const [id, request] of snapshot) {
         if (seat.permissions.get(id) !== request) continue;
-        request.seen ||= visible === true;
+        // A screen does not identify which Claude actor owns a dialog. With overlapping actors, only a
+        // scoped batch or turn boundary can settle their unseen notifications.
+        request.seen ||= visible === true && (!claude || seat.permissions.size === 1);
         request.confirmed = visible !== false || (claude && !request.seen);
         request.nextCheckMs = this.now().getTime()
           + (visible === false && this.now().getTime() - request.sinceMs >= 10_000 ? 5_000 : DEFAULT_POLL_INTERVAL_MS);
@@ -196,23 +198,60 @@ export class SeatActivityService {
         updated = true;
       }
       if (!updated) return;
-      seat.permissionObservedAt = this.now().toISOString();
-      const count = [...seat.permissions.values()].filter(request => request.confirmed).length;
-      if (claude && count === 0) {
-        for (const source of seat.sources.values()) {
-          if (source.latest.permissionRequest) source.latest = { ...source.latest, needsInput: undefined };
-        }
-      }
-      const sourceId = `${runtime}:permission-prompt`;
-      this.reportEvidence({
-        seatNodeId: seatNodeId!, sessionName, rung: "needs-input-chrome", sourceId,
-        seq: (seat.sources.get(sourceId)?.latest.seq ?? 0) + 1,
-        observedAt: seat.permissionObservedAt,
-        needsInput: { count, reason: count ? (!claude && visible === null ? "permission_request_unverified" : "permission_prompt") : null },
-      });
+      this.reportPermissionObservation(seatNodeId!, seat, "needs-input-chrome", this.now().toISOString(),
+        !claude && visible === null ? "permission_request_unverified" : "permission_prompt");
     } finally {
       seat.permissionPolling = false;
     }
+  }
+
+  /** A native Claude PostToolBatch resolves only this actor's earlier permission notifications. The route checks
+   *  the emitting occupant first. Missing actor attribution and unordered timestamps retain the pane/turn fallback. */
+  completeClaudeToolBatch(sessionName: string, hookAgentId: string | null, observedAt: string): boolean {
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired || seat.inventory?.runtime !== "claude-code") return false;
+    const completedAt = Date.parse(observedAt);
+    if (!Number.isFinite(completedAt)) return false;
+    // A notification may arrive after its completion, including when no request was observed yet.
+    seat.claudeToolBatches.set(hookAgentId, Math.max(completedAt, seat.claudeToolBatches.get(hookAgentId) ?? -Infinity));
+    let settled = false;
+    for (const [id, request] of seat.permissions) {
+      if (request.hookAgentId === undefined || request.hookAgentId !== hookAgentId
+          || !(Date.parse(request.observedAt) < completedAt)) continue;
+      seat.permissions.delete(id);
+      settled = true;
+    }
+    if (!settled) return false;
+    seat.permissionRevision++;
+    this.reportPermissionObservation(seatNodeId!, seat, "lifecycle-hooks", observedAt, "permission_prompt");
+    return true;
+  }
+
+  /** Whether this occupant's actor already completed a strictly later batch. Equal timestamps do not establish order. */
+  hasLaterClaudeToolBatch(sessionName: string, hookAgentId: string | null | undefined, observedAt: string): boolean {
+    if (hookAgentId === undefined) return false;
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired || seat.inventory?.runtime !== "claude-code") return false;
+    const completedAt = seat.claudeToolBatches.get(hookAgentId);
+    return completedAt !== undefined && Date.parse(observedAt) < completedAt;
+  }
+
+  private reportPermissionObservation(seatNodeId: string, seat: SeatLadderState, rung: EvidenceRungId,
+    observedAt: string, reason: string): void {
+    const runtime = seat.inventory?.runtime ?? "codex";
+    seat.permissionEvidence = { rung, observedAt };
+    const count = [...seat.permissions.values()].filter(request => request.confirmed).length;
+    if (runtime === "claude-code" && count === 0) {
+      for (const source of seat.sources.values()) {
+        if (source.latest.permissionRequest) source.latest = { ...source.latest, needsInput: undefined };
+      }
+    }
+    const sourceId = `${runtime}:permission-prompt`;
+    this.reportEvidence({ seatNodeId, sessionName: seat.sessionName, rung, sourceId,
+      seq: (seat.sources.get(sourceId)?.latest.seq ?? 0) + 1, observedAt,
+      needsInput: { count, reason: count ? reason : null } });
   }
 
   /**
@@ -237,7 +276,8 @@ export class SeatActivityService {
     seat.retired = true;
     seat.sources.clear();
     seat.permissions.clear();
-    seat.permissionObservedAt = null;
+    seat.claudeToolBatches.clear();
+    seat.permissionEvidence = null;
     seat.pendingIdle = null;
     seat.contradictionSinceMs = null;
     seat.promotion.clear();
@@ -387,16 +427,21 @@ export class SeatActivityService {
     const claude = runtime === "claude-code";
     const wasConfirmed = seat.arbitrated.needsInput.count > 0;
     if (evidence.permissionRequest) {
-      seat.permissionRevision++;
       const request = evidence.permissionRequest;
+      if (claude && this.hasLaterClaudeToolBatch(evidence.sessionName, request.hookAgentId, evidence.observedAt)) return;
+      const previousRequest = seat.permissions.get(request.id);
+      // Relay posts can arrive out of order. Keep the newer actor request so an older batch cannot settle it.
+      if (claude && previousRequest && Date.parse(evidence.observedAt) < Date.parse(previousRequest.observedAt)) return;
+      seat.permissionRevision++;
       if (claude || !seat.permissions.has(request.id)) {
-        seat.permissions.set(request.id, { sinceMs: this.now().getTime(), confirmed: claude, seen: false, nextCheckMs: 0 });
+        seat.permissions.set(request.id, { sinceMs: this.now().getTime(), observedAt: evidence.observedAt,
+          hookAgentId: request.hookAgentId, confirmed: claude, seen: false, nextCheckMs: 0 });
       }
     } else if ((evidence.rung === "lifecycle-hooks" && (evidence.activity === "idle-at-prompt" || evidence.permissionResolved
         || (claude && evidence.needsInput?.count && evidence.needsInput.reason !== "permission_prompt")))
         || (claude && seat.permissions.size === 0 && evidence.needsInput?.count && evidence.needsInput.reason !== "permission_prompt")) {
       seat.permissions.clear();
-      seat.permissionObservedAt = null;
+      seat.permissionEvidence = null;
       seat.sources.delete(`${runtime}:permission-prompt`);
     }
     seat.sources.set(evidence.sourceId, {
@@ -423,7 +468,7 @@ export class SeatActivityService {
     const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
     if (!seat || seat.retired) return;
     seat.permissions.clear();
-    seat.permissionObservedAt = null;
+    seat.permissionEvidence = null;
     seat.sources.delete(`${seat.inventory?.runtime ?? "codex"}:permission-prompt`);
     for (const source of seat.sources.values()) {
       if (source.latest.needsInput?.count) source.latest = { ...source.latest, needsInput: undefined };
@@ -440,7 +485,8 @@ export class SeatActivityService {
     if (!seat) return;
     seat.sources.clear();
     seat.permissions.clear();
-    seat.permissionObservedAt = null;
+    seat.claudeToolBatches.clear();
+    seat.permissionEvidence = null;
     seat.pendingIdle = null;
     seat.contradictionSinceMs = null;
     seat.promotion.clear();
@@ -523,9 +569,10 @@ export class SeatActivityService {
         inventory: null,
         sources: new Map(),
         permissions: new Map(),
+        claudeToolBatches: new Map(),
         permissionRevision: 0,
         permissionPolling: false,
-        permissionObservedAt: null,
+        permissionEvidence: null,
         trust: new Map(),
         promotion: new Map(),
         contradictionSinceMs: null,
@@ -760,7 +807,7 @@ export class SeatActivityService {
     }
 
     // Codex permission hooks need probe confirmation after grace; Claude hooks latch
-    // attention until a seen prompt disappears. Unavailable capture fails safe.
+    // attention until a seen prompt disappears or the same actor's tool batch completes. Unavailable capture fails safe.
     // Other prompts retain their existing rung arbitration.
     const chrome = this.latestByRung(seat, "needs-input-chrome");
     const hooksEv = this.latestByRung(seat, "lifecycle-hooks");
@@ -775,14 +822,14 @@ export class SeatActivityService {
             : null;
     const confirmedCount = [...seat.permissions.values()].filter(p => p.confirmed).length;
     const permissionTracked = (seat.inventory?.runtime === "codex" || seat.inventory?.runtime === "claude-code")
-      && (seat.permissions.size > 0 || seat.permissionObservedAt !== null);
+      && (seat.permissions.size > 0 || seat.permissionEvidence !== null);
     const needsInput: NeedsInputShape = permissionTracked
       ? { count: confirmedCount, reason: confirmedCount ? chrome?.needsInput?.reason ?? "permission_prompt" : null }
       : decider?.needsInput ?? { count: 0, reason: null };
     if (permissionTracked && Boolean(confirmedCount) !== Boolean(seat.arbitrated.needsInput.count)) {
       this.permissionPromptChanged?.(seat.sessionName, Boolean(confirmedCount), seat.inventory!.runtime);
     }
-    const needsInputEvidence = permissionTracked ? (seat.permissionObservedAt ? { rung: "needs-input-chrome" as const, observedAt: seat.permissionObservedAt } : null) : decider ? { rung: decider.rung, observedAt: decider.observedAt } : null;
+    const needsInputEvidence = permissionTracked ? seat.permissionEvidence : decider ? { rung: decider.rung, observedAt: decider.observedAt } : null;
 
     // Which rung answers is part of the answer: default zero → observed zero changes what
     // consumers may conclude, so it advances seq and pushes like a count change.
@@ -847,10 +894,12 @@ interface PromotionRun {
 }
 
 interface SeatLadderState {
-  permissions: Map<string, { sinceMs: number; confirmed: boolean; seen: boolean; nextCheckMs: number }>;
+  permissions: Map<string, { sinceMs: number; observedAt: string; hookAgentId?: string | null;
+    confirmed: boolean; seen: boolean; nextCheckMs: number }>;
+  claudeToolBatches: Map<string | null, number>;
   permissionRevision: number;
   permissionPolling: boolean;
-  permissionObservedAt: string | null;
+  permissionEvidence: ArbitratedSeatState["needsInputEvidence"];
   sessionName: string;
   retired: boolean;
   inventory: AdapterRungInventory | null;
