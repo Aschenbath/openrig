@@ -52,7 +52,11 @@ export function evidenceFromHookActivity(input: {
   }
   if (input.runtime === "claude-code" && input.activity.rawEvent === "Notification"
       && input.activity.reason === "permission_prompt") {
-    return { ...base, permissionRequest: { id: "claude-permission-prompt" }, needsInput: { count: 1, reason: "permission_prompt" } };
+    const hookAgentId = input.activity.hookAgentId;
+    return { ...base, permissionRequest: {
+      id: hookAgentId ? `claude-permission-prompt:${hookAgentId}` : "claude-permission-prompt",
+      ...(hookAgentId !== undefined ? { hookAgentId } : {}),
+    }, needsInput: { count: 1, reason: "permission_prompt" } };
   }
   // A runner's exit report clears what its last turn said: the seat is no longer at a prompt or mid-turn.
   if (input.activity.rawEvent === "Stop" && isRunnerExit(input.activity.rawSubtype, input.runtime)) {
@@ -448,6 +452,30 @@ activityRoutes.post("/hooks", async (c) => {
     return c.json({ ok: true, oriented: "verified", nodeId: result.nodeId, challengeId: result.challengeId });
   }
 
+  // All tools in this actor's batch have resolved. An individual PostToolUse can belong to a parallel tool,
+  // and a subagent's batch says nothing about the main session's permission. Only the current occupant can
+  // settle a matching, older episode. Do not record an unrelated batch as an unknown hook that hides attention.
+  if (body.hookEvent === "PostToolBatch") {
+    const oracle = c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined;
+    const registry = c.get("sessionRegistry" as never) as SessionRegistry | undefined;
+    const sessionName = stringOrNull(body.sessionName);
+    const seat = store.resolveSession({ sessionName, nodeId: stringOrNull(body.nodeId) });
+    const hookAgentId = body.hookAgentId;
+    const generation = stringOrNull(body.generation);
+    const occurredAt = stringOrNull(body.occurredAt);
+    const current = seat && registry?.currentOccupantTenure(seat.nodeId);
+    const session = seat && store.db.prepare("SELECT status FROM sessions WHERE id = ?")
+      .get(seat.sessionId) as { status: string } | undefined;
+    const attributable = body.runtime === "claude-code" && seat?.runtime === "claude-code"
+      && (!sessionName || sessionName === seat.sessionName) && session?.status === "running"
+      && generation !== null && current?.generationUuid === generation
+      && (hookAgentId === null || (typeof hookAgentId === "string" && hookAgentId.trim().length > 0))
+      && occurredAt !== null && Number.isFinite(Date.parse(occurredAt));
+    const settled = attributable && oracle
+      ? oracle.completeClaudeToolBatch(seat!.sessionName, hookAgentId as string | null, occurredAt!) : false;
+    return c.json({ ok: true, permissionResolved: settled });
+  }
+
   const result = store.recordHookEvent({
     runtime: stringOrNull(body.runtime),
     sessionName: stringOrNull(body.sessionName),
@@ -460,6 +488,8 @@ activityRoutes.post("/hooks", async (c) => {
     // (sound per-path absence; never false-fresh).
     generation: stringOrNull(body.generation),
     turnId: stringOrNull(body.turnId),
+    ...(body.hookAgentId === null || (typeof body.hookAgentId === "string" && body.hookAgentId.trim().length > 0)
+      ? { hookAgentId: body.hookAgentId } : {}),
     sourceSequence: typeof body.sequence === "number" && Number.isSafeInteger(body.sequence) && body.sequence > 0 ? body.sequence : null,
     livenessSeconds: typeof body.livenessSeconds === "number" && Number.isSafeInteger(body.livenessSeconds)
       && body.livenessSeconds > 0 && body.livenessSeconds <= 3600 ? body.livenessSeconds : null,
