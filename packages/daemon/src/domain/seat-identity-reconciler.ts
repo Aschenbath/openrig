@@ -235,6 +235,7 @@ export class SeatIdentityReconciler {
       return Promise.all(nativeSeats.map((seat) => (seat.runtime === "codex" ? observeCodexPaneProcess
         : seat.resume_token !== null && seat.resume_token !== undefined ? observeClaudePaneProcess : observeClaudePaneRuntime)({
         target: seat.tmux_pane!, tmux, expectedToken: seat.resume_token, rotation: claudeResumeRotation(seat),
+        ...(seat.runtime === "codex" ? { requireArgv: true } : {}),
         listProcesses: () => snapshot ??= this.listProcesses(),
       })));
     };

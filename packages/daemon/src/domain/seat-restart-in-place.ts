@@ -10,7 +10,7 @@ import type { SessionRegistry } from "./session-registry.js";
 import type { HarnessLaunchResult, NodeBinding } from "./runtime-adapter.js";
 import type { PersistedEvent, RigEvent } from "./types.js";
 import {
-  codexCommandResumeToken, listNativeProcesses, processArgv, verifyCodexPaneProcess,
+  codexProcessArgv, codexProcessResumeToken, listNativeProcesses, processArgv, verifyCodexPaneProcess,
   type NativeProcessLister, type NativeProcessRow,
 } from "./native-process-lineage.js";
 import { CodexThreadIdResolver, resolveCodexDbPaths, type CodexThreadEvidence } from "./codex-thread-id.js";
@@ -405,6 +405,8 @@ export class CodexInPlaceRestart {
       return { ok: false, code: "resume_binding_unverified", message: "No single Codex process in the seat's pane could be tied to the stored conversation (a running Codex that names another conversation is refused too). Nothing was stopped." };
     }
     const { process, panePid, rows } = codex;
+    const runningArgv = codexProcessArgv(process);
+    if (!runningArgv) return { ok: false, code: "settings_unverified", message: "The running Codex's exact arguments could not be read, so its launch settings are unverified. Nothing was stopped." };
     const startedAt = process.startedAt ?? null;
     const facts = await this.io.readProcess(process.pid);
     if (!facts) return { ok: false, code: "settings_unverified", message: "The running Codex's working directory and Codex home could not be read (this observer reads /proc on Linux). Nothing was stopped." };
@@ -412,7 +414,7 @@ export class CodexInPlaceRestart {
     if (!codexHome) return { ok: false, code: "settings_unverified", message: "The running Codex's home could not be determined (no CODEX_HOME or HOME). Nothing was stopped." };
 
     // The conversation the PROCESS is on: argv for a resumed Codex, its own native logs for a fresh one.
-    const argvToken = codexCommandResumeToken(process.command);
+    const argvToken = codexProcessResumeToken(process);
     let conversationProof: "argv" | "native_logs";
     if (argvToken === token) conversationProof = "argv";
     else if (argvToken === undefined && startedAt && (await this.io.readThreadId(process.pid, startedAt, codexHome)) === token) conversationProof = "native_logs";
@@ -468,8 +470,7 @@ export class CodexInPlaceRestart {
     const relaunchBinding: NodeBinding = { ...binding, cwd };
     // The probed and prepared launch choices come from the running Codex, so the relaunch keeps them and no
     // Codex process is started to decide them again.
-    // The exact argv when /proc gives it: a --add-dir with a space (a cwd's .git) must not be cut at the space.
-    const runningArgv = facts.argv?.length ? facts.argv : processArgv(process.command);
+    // Keep the launch settings tied to the same OS argv used for the selected process's identity.
     const running = runningLaunch(runningArgv);
     const relaunch = await this.deps.codex.buildResumeCommand(relaunchBinding, { name: sessionName, resumeToken: token, running });
     if (!relaunch.ok) return { ok: false, code: "relaunch_unavailable", message: `The resume command could not be built: ${relaunch.error}. Nothing was stopped.` };
@@ -568,7 +569,7 @@ export class CodexInPlaceRestart {
     const panePid = await this.deps.tmux.getPanePid(pane);
     if (!panePid) return null;
     const observation = await verifyCodexPaneProcess({ target: pane, tmux: { getPanePid: async () => panePid },
-      listProcesses: () => rows, ...(token ? { expectedToken: token } : {}) });
+      listProcesses: () => rows, requireArgv: true, ...(token ? { expectedToken: token } : {}) });
     return observation && observation.panePid === panePid ? { process: observation.process, panePid, rows } : null;
   }
 

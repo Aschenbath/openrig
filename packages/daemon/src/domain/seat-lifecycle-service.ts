@@ -39,7 +39,7 @@ import {
   type EffortResolution, type NativeEffortObservation,
 } from "./seat-effort.js";
 import {
-  claudeCommandSessionToken, codexCommandResumeToken, observeClaudePaneRuntime, observeCodexPaneProcess, processArgv,
+  claudeCommandSessionToken, codexProcessArgv, codexProcessResumeToken, observeClaudePaneRuntime, observeCodexPaneProcess, processArgv,
 } from "./native-process-lineage.js";
 import { defaultInPlaceRestartIo } from "./seat-restart-in-place.js";
 import nodePath from "node:path";
@@ -615,19 +615,26 @@ export class SeatLifecycleService {
       ({ emitted, observed } = await this.piEffort(seat.nodeId, session.session_name, saved));
     } else {
       const observe = runtime === "claude-code" ? observeClaudePaneRuntime : observeCodexPaneProcess;
-      const process = (await observe({ target, tmux: this.tmuxAdapter, ...(this.listProcesses ? { listProcesses: this.listProcesses } : {}) }))?.process;
+      const process = (await observe({ target, tmux: this.tmuxAdapter, ...(runtime === "codex" ? { requireArgv: true } : {}),
+        ...(this.listProcesses ? { listProcesses: this.listProcesses } : {}) }))?.process;
       if (!process) {
         emitted = { state: "unknown", detail: `No single ${runtime === "claude-code" ? "Claude" : "Codex"} process could be read in the seat's pane.` };
         observed = { state: "not_verified", detail: "The running process could not be read, so no turn can be tied to its launch." };
       } else {
-        const flag = emittedEffortFromArgv(runtime, processArgv(process.command));
-        const value = flag.flag === "present" ? flag.value : null;
-        emitted = { state: "observed", value, pid: process.pid, startedAt: process.startedAt ?? null, matchesSaved: value === saved.effective };
-        // Native effort is attributed only from the transcript of the conversation this process is on.
-        const joined = await this.joinedTranscript(runtime, session, process);
-        const native = "detail" in joined ? { state: "not_verified" as const, detail: joined.detail }
-          : readNativeEffort(runtime, joined.path, process.startedAt ?? null);
-        observed = native.state === "observed" ? { ...native, matchesEmitted: native.value === value } : native;
+        const argv = runtime === "codex" ? codexProcessArgv(process) : processArgv(process.command);
+        if (!argv) {
+          emitted = { state: "unknown", detail: "The running Codex's exact arguments could not be read, so its launch effort is unknown." };
+          observed = { state: "not_verified", detail: "The running Codex's exact arguments could not be read, so no native turn can be tied to its launch." };
+        } else {
+          const flag = emittedEffortFromArgv(runtime, argv);
+          const value = flag.flag === "present" ? flag.value : null;
+          emitted = { state: "observed", value, pid: process.pid, startedAt: process.startedAt ?? null, matchesSaved: value === saved.effective };
+          // Native effort is attributed only from the transcript of the conversation this process is on.
+          const joined = await this.joinedTranscript(runtime, session, process);
+          const native = "detail" in joined ? { state: "not_verified" as const, detail: joined.detail }
+            : readNativeEffort(runtime, joined.path, process.startedAt ?? null);
+          observed = native.state === "observed" ? { ...native, matchesEmitted: native.value === value } : native;
+        }
       }
     }
     return { ok: true, seat, runtime, requested, saved, emitted, observed, precedence, summary: effortSummary(saved, emitted, observed, runtime) };
@@ -696,7 +703,7 @@ export class SeatLifecycleService {
   /** The transcript of the conversation the observed process is on, or why that join can't be made.
    *  The recorded conversation (Codex: the session's resume token; Claude: the status sidecar's session)
    *  must be the one the process itself names, by argv or, for a Codex that names none, by its own logs. */
-  private async joinedTranscript(runtime: "claude-code" | "codex", session: LatestSessionRow, process: { pid: number; command: string; startedAt?: string }):
+  private async joinedTranscript(runtime: "claude-code" | "codex", session: LatestSessionRow, process: { pid: number; command: string; argv?: string[] | null; startedAt?: string }):
     Promise<{ path: string | null } | { detail: string }> {
     if (!this.transcripts) return { detail: "The native transcript for this session isn't known to OpenRig." };
     const mismatch = "The process in the pane isn't on the conversation recorded for this seat (or its conversation couldn't be read), so no native turn can be attributed to it.";
@@ -704,7 +711,7 @@ export class SeatLifecycleService {
       if (runtime === "codex") {
         const recorded = this.sessionResumeToken(session.id);
         if (!recorded) return { detail: "No Codex conversation is recorded for this session yet." };
-        let own = codexCommandResumeToken(process.command) ?? undefined;
+        let own = codexProcessResumeToken(process) ?? undefined;
         if (own === undefined && process.startedAt) {
           const io = { ...defaultInPlaceRestartIo(), ...this.inPlaceRestartIo };
           const facts = await io.readProcess(process.pid);

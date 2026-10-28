@@ -237,7 +237,7 @@ describe("Codex runtime adapter", () => {
       });
       const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), listProcesses: () => [
         { pid: 900, ppid: 1, command: paneCommand === "bash" ? "/bin/bash" : "node launcher", pgid: 900, tpgid: 901, executableName: paneCommand, startedAt: "Sat Jan  1 12:00:00 2000" },
-        { pid: 901, ppid: 900, command: "codex", pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:01 2000" },
+        { pid: 901, ppid: 900, command: "codex", argv: ["codex"], pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:01 2000" },
       ] });
       expect(await adapter.checkReady(makeBinding()), fixture).toMatchObject({ ready: false, code: "login_required" });
       expect(tmux.capturePaneContent).toHaveBeenCalledTimes(2);
@@ -271,7 +271,7 @@ describe("Codex runtime adapter", () => {
       fsOps: mockFs(),
       listProcesses: () => [
         { pid: 900, ppid: 1, command: "/bin/zsh", pgid: 900, tpgid: 901, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
-        { pid: 901, ppid: 900, command: "codex --model anthropic/claude-3.5-sonnet", pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:01 2000" },
+        { pid: 901, ppid: 900, command: "codex --model anthropic/claude-3.5-sonnet", argv: ["codex", "--model", "anthropic/claude-3.5-sonnet"], pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:01 2000" },
       ],
     });
 
@@ -295,7 +295,7 @@ describe("Codex runtime adapter", () => {
       fsOps: mockFs(),
       listProcesses: () => [
         { pid: 900, ppid: 1, command: "/bin/zsh", pgid: 900, tpgid: 901, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
-        { pid: 901, ppid: 900, command: "codex --model anthropic/claude-3.5-sonnet", pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:01 2000" },
+        { pid: 901, ppid: 900, command: "codex --model anthropic/claude-3.5-sonnet", argv: ["codex", "--model", "anthropic/claude-3.5-sonnet"], pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:01 2000" },
       ],
     });
 
@@ -337,7 +337,7 @@ describe("Codex runtime adapter", () => {
       fsOps: mockFs(),
       listProcesses: () => [
         { pid: 900, ppid: 1, command: "/bin/bash", pgid: 900, tpgid: 901, executableName: "bash", startedAt: "Sat Jan  1 12:00:00 2000" },
-        { pid: 901, ppid: 900, command: "codex", pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
+        { pid: 901, ppid: 900, command: "codex", argv: ["codex"], pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
       ],
     });
 
@@ -1082,7 +1082,7 @@ describe("Codex runtime adapter", () => {
       fsOps: mockFs(),
       listProcesses: () => [
         { pid: 900, ppid: 1, command: "-zsh", pgid: 900, tpgid: 901, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
-        { pid: 901, ppid: 900, command: "codex", pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
+        { pid: 901, ppid: 900, command: "codex", argv: ["codex"], pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
       ],
       readThreadIdByPid: (pid) => pid === 901 ? "019d45bc-117d-78a3-a4ad-6fb186e5a86d" : undefined,
       sleep: async () => {},
@@ -1119,7 +1119,7 @@ describe("Codex runtime adapter", () => {
       fsOps: mockFs(),
       listProcesses: () => [
         { pid: 900, ppid: 1, command: "-zsh", pgid: 900, tpgid: 901, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
-        { pid: 901, ppid: 900, command: "codex", pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
+        { pid: 901, ppid: 900, command: "codex", argv: ["codex"], pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
       ],
       readThreadIdByPid: () => "019d45bc-117d-78a3-a4ad-6fb186e5a86d",
       sleep: async () => {},
@@ -1173,7 +1173,7 @@ describe("Codex runtime adapter", () => {
       fsOps: mockFs(),
       listProcesses: () => [
         { pid: 900, ppid: 1, command: "-zsh", pgid: 900, tpgid: 901, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
-        { pid: 901, ppid: 900, command: "codex", pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
+        { pid: 901, ppid: 900, command: "codex", argv: ["codex"], pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
       ],
       readThreadIdByPid: (pid) => pid === 901 ? "019d45bc-117d-78a3-a4ad-6fb186e5a86d" : undefined,
       sleep: async () => {},
@@ -1256,7 +1256,7 @@ describe("Codex runtime adapter", () => {
   it("a skip key sent to an update prompt that stays on screen is reported as sent, with the choice-bearing update screen", async () => {
     const tmux = screens(() => SKIPPABLE);
     const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {},
-      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex" }] });
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex", argv: ["codex"] }] });
     const result = await adapter.verifyResumeInPane("impl", "tok");
     expect(tmux.sendKeys).toHaveBeenCalledTimes(1);
     expect(tmux.sendKeys).toHaveBeenCalledWith("impl", ["3"]);
@@ -1268,7 +1268,7 @@ describe("Codex runtime adapter", () => {
   // Round 3: the newest observation wins in the order it was taken, including the helper's current-screen recheck, and
   // a screen OpenRig acted on afterwards is reported as the screen before that input.
   const RESUMED = "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything";
-  const CODEX_ROW = [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex" }];
+  const CODEX_ROW = [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex", argv: ["codex"] }];
   /** How many screen captures a run on an unchanging, unskippable update screen makes. */
   async function updatingCaptures(): Promise<number> {
     const counter = screens(() => UPDATING);
@@ -1643,7 +1643,7 @@ describe("Codex runtime adapter", () => {
         .mockResolvedValue("OpenAI Codex (v0.120.0)\n› Ask Codex to do anything"),
     });
     const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {},
-      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex resume sess-456" }],
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex resume sess-456", argv: ["codex", "resume", "sess-456"] }],
       readResumeEvidence: () => ({ threadId: "sess-456" }),
     });
 

@@ -966,7 +966,8 @@ describe("Claude Code runtime adapter", () => {
 
     describe("a different occupant keeps main's result (timed out, no token): only unknown observations get attention", () => {
       const timedOut = { ok: false, probe: probeEvidence, error: "Claude resume failed: timed out waiting for Claude to become active" };
-      const codex = { pid: 13, ppid: 11, pgid: 11, tpgid: 11, executableName: "codex", startedAt, command: "codex resume some-codex-session" };
+      const codex = { pid: 13, ppid: 11, pgid: 11, tpgid: 11, executableName: "codex", startedAt,
+        command: "codex resume some-codex-session", argv: ["codex", "resume", "some-codex-session"] };
       const otherClaude = { ...claude, command: "claude --permission-mode acceptEdits --resume some-other-session --name other" };
       const booting = [{ ...pane, tpgid: 11 }, launchScript];
 

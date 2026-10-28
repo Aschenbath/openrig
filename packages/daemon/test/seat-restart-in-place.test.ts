@@ -42,6 +42,7 @@ type Shape = "shell_backed" | "direct_native";
 interface WorldOptions {
   shape?: Shape;
   runningArgs?: string;
+  runningArgv?: string[];
   savedModel?: string | null;
   /** nodes.effort (authored) and nodes.effort_choice (rig seat set-effort). */
   savedEffort?: { authored?: string; choice?: string };
@@ -87,8 +88,9 @@ afterEach(() => { for (const db of dbs.splice(0)) db.close(); });
 function shellRow(pid: number, tpgid: number): NativeProcessRow {
   return { pid, ppid: 1, pgid: pid, tpgid, executableName: "bash", command: "-bash", startedAt: LSTART };
 }
-function codexRow(pid: number, ppid: number, args: string, startedAt = LSTART, pgid = pid): NativeProcessRow {
-  return { pid, ppid, pgid, tpgid: pgid, executableName: "codex", command: `/usr/local/bin/codex ${args}`, startedAt };
+function codexRow(pid: number, ppid: number, args: string, startedAt = LSTART, pgid = pid, argv?: string[]): NativeProcessRow {
+  return { pid, ppid, pgid, tpgid: pgid, executableName: "codex", command: `/usr/local/bin/codex ${args}`,
+    argv: argv ?? ["/usr/local/bin/codex", ...args.split(" ")], startedAt };
 }
 function facts(over: Partial<ProcessFacts> = {}): ProcessFacts {
   return { cwd: "/work", exe: "/usr/local/bin/codex", env: { CODEX_HOME: HOME }, ...over };
@@ -114,9 +116,9 @@ function world(options: WorldOptions = {}) {
   let rows: NativeProcessRow[] = shape === "shell_backed"
     ? options.between
       ? [shellRow(100, 150), { pid: 150, ppid: 100, pgid: 150, tpgid: 150, executableName: options.betweenName ?? options.between.split(" ")[0]!.split("/").pop()!, command: options.between, startedAt: LSTART },
-        codexRow(200, 150, runningArgs, LSTART, 150)]
-      : [shellRow(100, 200), codexRow(200, 100, runningArgs)]
-    : [codexRow(100, 1, runningArgs, LSTART, 100)];
+        codexRow(200, 150, runningArgs, LSTART, 150, options.runningArgv)]
+      : [shellRow(100, 200), codexRow(200, 100, runningArgs, LSTART, 200, options.runningArgv)]
+    : [codexRow(100, 1, runningArgs, LSTART, 100, options.runningArgv)];
   let paneCommand = "codex";
   let dead = false;
   let paneGone = false;
@@ -133,8 +135,8 @@ function world(options: WorldOptions = {}) {
 
   const relaunch = (startedAt = LATER) => {
     const replacement = shape === "shell_backed"
-      ? codexRow(300, 100, runningArgs, startedAt)
-      : codexRow(300, 1, runningArgs, startedAt, 300);
+      ? codexRow(300, 100, runningArgs, startedAt, 300, options.runningArgv)
+      : codexRow(300, 1, runningArgs, startedAt, 300, options.runningArgv);
     rows = shape === "shell_backed" ? [shellRow(100, 300), replacement] : [replacement];
     relaunched = true;
     paneCommand = "codex";
@@ -283,6 +285,28 @@ describe("rig seat restart --keep-conversation: gates before any signal", () => 
       codexHome: HOME,
     });
     expect(JSON.stringify(plan)).not.toContain("--token=x"); // argv of children is never reported
+    expect(w.calls).toEqual([]);
+    expect(w.events()).toEqual([]);
+  });
+
+  it.each([null, undefined, [], ["codex", "resume", TOKEN, "bad\0argument"], ["node", "resume", TOKEN]])(
+    "refuses plan and execution before provider input or stop when exact Codex argv is unusable: %j", async argv => {
+      const w = world({ threadId: TOKEN });
+      w.setRows([shellRow(100, 200), { ...codexRow(200, 100, `-m gpt-5.5 -s workspace-write resume ${TOKEN}`, LSTART, 200), argv }]);
+      expect(await w.service.restartInPlace({ seatRef: SEAT, plan: true })).toMatchObject({ ok: false, code: "resume_binding_unverified" });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "new account" })).toMatchObject({ ok: false, code: "resume_binding_unverified" });
+      expect(w.builds).toEqual([]);
+      expect(w.calls).toEqual([]);
+      expect(w.events()).toEqual([]);
+    });
+
+  it("refuses a readable Codex child below an opaque launcher before changing the seat", async () => {
+    const w = world({ threadId: TOKEN });
+    w.setRows([shellRow(100, 200), { ...codexRow(150, 100, "-m configured-model", LSTART, 200), argv: null },
+      codexRow(200, 150, `-m gpt-5.5 -s workspace-write resume ${TOKEN}`, LSTART, 200)]);
+    expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "new account" }))
+      .toMatchObject({ ok: false, code: "resume_binding_unverified" });
+    expect(w.builds).toEqual([]);
     expect(w.calls).toEqual([]);
     expect(w.events()).toEqual([]);
   });
@@ -529,7 +553,7 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
     const tmux = { getPaneCommand: async () => "codex", capturePaneScreen: async () => prompt, capturePaneContent: async () => prompt,
       getPanePid: async () => 901, sendKeys: async (_: string, k: string[]) => { keys.push(k); return { ok: true }; } } as unknown as TmuxAdapter;
     const adapter = new CodexRuntimeAdapter({ tmux, fsOps: {} as never, sleep: async () => {},
-      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex" }] });
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex", argv: ["codex"] }] });
     const launch = await adapter.verifyResumeInPane("impl", "tok");
     expect(keys).toEqual([["3"]]);
     const w = world({ launch });
@@ -545,7 +569,7 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
       capturePaneContent: async () => "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything",
       getPaneCommand: () => new Promise<string>((resolve) => setTimeout(() => resolve("codex"), 120)) } as unknown as TmuxAdapter;
     const adapter = new CodexRuntimeAdapter({ tmux, fsOps: {} as never, sleep: async () => {}, resumeProofWindowMs: 40,
-      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex resume tok" }],
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex resume tok", argv: ["codex", "resume", "tok"] }],
       readResumeEvidence: () => ({ threadId: "tok" }) });
     const launch = await adapter.verifyResumeInPane("impl", "tok");
     expect(launch).toMatchObject({ ok: false, recovery: "attention_required", resumeUnproven: true });
@@ -559,7 +583,7 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
     const ready = "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything";
     const tmux = { getPanePid: async () => 901, getPaneCommand: async () => "codex", capturePaneScreen: async () => ready, capturePaneContent: async () => ready } as unknown as TmuxAdapter;
     const adapter = new CodexRuntimeAdapter({ tmux, fsOps: {} as never, sleep: async () => {},
-      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex resume tok" }],
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex resume tok", argv: ["codex", "resume", "tok"] }],
       readResumeEvidence: () => ({ threadId: "another-thread" }) });
     const launch = await adapter.verifyResumeInPane("impl", "tok");
     expect(launch).toMatchObject({ ok: false, recovery: "attention_required", resumeMismatch: { opened: "another-thread" } });
@@ -579,7 +603,7 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
     ["disproved: the records name another conversation", "codex resume tok", () => ({ threadId: "another-thread" })],
   ] as const)("through the adapter, %s: the in-place result says the pane restarted and to check it", async (_case, command, evidence) => {
     const adapter = new CodexRuntimeAdapter({ tmux: readyTmux(), fsOps: {} as never, sleep: async () => {}, resumeProofWindowMs: 40,
-      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command }],
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command, argv: command.split(" ") }],
       readResumeEvidence: evidence });
     const launch = await adapter.verifyResumeInPane("impl", "tok");
     // What every other caller shows is unchanged: the adapter's own result still says nothing was restarted.
@@ -595,7 +619,7 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
   const SKIPPABLE = ["✨ Update available! 0.120.0 -> 0.121.0", "› 1. Update now (runs `npm install -g @openai/codex`)", "  2. Skip", "  3. Skip until next version", "Press enter to continue"].join("\n");
   const RESUMED = "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything";
   const BOOTING = "Loading conversation...";
-  const CODEX_ROW = [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex" }];
+  const CODEX_ROW = [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex", argv: ["codex"] }];
   function scriptedAdapter(screen: (n: number, keysSent: number) => string, sendResult: TmuxResult = { ok: true }) {
     let n = 0; let keysSent = 0;
     const tmux = { getPaneCommand: async () => "codex", getPanePid: async () => 901,
@@ -873,9 +897,17 @@ describe("#1196 round 1: launch choices come from the running Codex (LOW-1); ver
   it("an --add-dir holding a space survives whole: the relaunch reads the exact argv, not ps's whitespace split", async () => {
     // ps shows this Codex's argv joined by spaces, so its cwd's .git ("/home/u/my repo/.git") reads as "/home/u/my" + "repo/.git".
     const argv = ["/usr/local/bin/codex", "-m", "gpt-5.5", "-s", "workspace-write", "resume", TOKEN, "--add-dir", "/home/u/my repo/.git"];
-    const w = world({ runningArgs: argv.slice(1).join(" "), facts: { 200: facts({ argv }) } });
+    const w = world({ runningArgs: argv.slice(1).join(" "), runningArgv: argv, facts: { 200: facts({ argv }) } });
     await w.service.restartInPlace({ seatRef: SEAT, plan: true });
     expect(w.builds).toEqual([{ running: { networkOverride: false, daemonOptOut: false, addDirs: ["/home/u/my repo/.git"] } }]);
+  });
+
+  it("does not plan a restart when the saved token occurs only inside an argv option value", async () => {
+    const argv = ["/usr/local/bin/codex", "resume", "--add-dir", `/tmp/${TOKEN}`, "019a0000-0000-7000-8000-000000000002"];
+    const w = world({ runningArgs: argv.slice(1).join(" "), runningArgv: argv });
+    expect(await w.service.restartInPlace({ seatRef: SEAT, plan: true }))
+      .toMatchObject({ ok: false, code: "resume_binding_unverified" });
+    expect(w.calls).toEqual([]);
   });
 
   it("a /proc cmdline read keeps every argv word exactly: spaces and empty words included", () => {
@@ -1238,8 +1270,8 @@ describe("post-relaunch identity observation window", () => {
 
   it.each(["wrong token", "missing token", "conflicting native", "wrong OS executable"])("never promotes stable invalid evidence: %s", async kind => {
     const rows = replacement("shell_backed");
-    if (kind === "wrong token") rows[3] = { ...rows[3]!, command: "/usr/local/bin/codex resume other-thread" };
-    if (kind === "missing token") rows[3] = { ...rows[3]!, command: "/usr/local/bin/codex" };
+    if (kind === "wrong token") rows[3] = { ...rows[3]!, command: "/usr/local/bin/codex resume other-thread", argv: ["/usr/local/bin/codex", "resume", "other-thread"] };
+    if (kind === "missing token") rows[3] = { ...rows[3]!, command: "/usr/local/bin/codex", argv: ["/usr/local/bin/codex"] };
     if (kind === "conflicting native") rows.push(codexRow(401, 351, `resume ${TOKEN}`, LATER, 350));
     if (kind === "wrong OS executable") rows[3] = { ...rows[3]!, executableName: "node" };
     const w = world({ replacementRows: () => rows });
@@ -1258,7 +1290,7 @@ describe("post-relaunch identity observation window", () => {
 
   it("allows an earlier token mismatch to resolve only into a later fully valid pair", async () => {
     const good = replacement("shell_backed");
-    const bad = good.map(row => row.pid === 400 ? { ...row, command: "/usr/local/bin/codex resume other-thread" } : row);
+    const bad = good.map(row => row.pid === 400 ? { ...row, command: "/usr/local/bin/codex resume other-thread", argv: ["/usr/local/bin/codex", "resume", "other-thread"] } : row);
     const w = world({ replacementRows: read => read <= 2 ? bad : good });
     expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "later valid proof" }))
       .toMatchObject({ outcome: "restarted_account_unverified" });

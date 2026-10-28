@@ -632,7 +632,8 @@ describe("RestoreOrchestrator", () => {
     const processes = context === "claude-code" ? managedClaudeRows("00000000-0000-4000-8000-000000000086") : [
       { pid: 1234, ppid: 1, pgid: 1234, tpgid: 1235, executableName: "bash", command: "-bash", startedAt },
       { pid: 1235, ppid: 1234, pgid: 1235, tpgid: 1235, executableName: "sh", command: "/bin/sh /tmp/openrig-tmux-send.txt", startedAt },
-      { pid: 1236, ppid: 1235, pgid: 1235, tpgid: 1235, executableName: "codex", command: "/opt/native/codex resume 00000000-0000-4000-8000-000000000086", startedAt },
+      { pid: 1236, ppid: 1235, pgid: 1235, tpgid: 1235, executableName: "codex", command: "/opt/native/codex resume 00000000-0000-4000-8000-000000000086",
+        argv: ["/opt/native/codex", "resume", "00000000-0000-4000-8000-000000000086"], startedAt },
     ];
     /** Build a ready adapter with a valid native resume identity for the saved-runtime fixture. */
     const adapterFor = (runtime: "claude-code" | "codex"): RuntimeAdapter => ({
@@ -1537,7 +1538,8 @@ describe("RestoreOrchestrator", () => {
       { pid: 3001, ppid: 3000, pgid: 3001, tpgid: 3002, executableName: "zsh", command: "-zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
       { pid: 3002, ppid: 3001, pgid: 3002, tpgid: 3002, executableName: "bash", command: "/bin/sh /tmp/openrig-tmux-send.txt", startedAt: "Sat Jan  1 12:00:00 2000" },
       { pid: 3003, ppid: 3002, pgid: 3002, tpgid: 3002, executableName: "node", command: `node /opt/bin/codex -s workspace-write -m fixture-model resume --add-dir /tmp/state ${token}`, startedAt: "Sat Jan  1 12:00:00 2000" },
-      { pid: 3004, ppid: 3003, pgid: 3002, tpgid: 3002, executableName: "codex", command: `/opt/native/codex -s workspace-write -m fixture-model resume --add-dir /tmp/state ${token}`, startedAt: "Sat Jan  1 12:00:00 2000" },
+      { pid: 3004, ppid: 3003, pgid: 3002, tpgid: 3002, executableName: "codex", command: `/opt/native/codex -s workspace-write -m fixture-model resume --add-dir /tmp/state ${token}`,
+        argv: ["/opt/native/codex", "-s", "workspace-write", "-m", "fixture-model", "resume", "--add-dir", "/tmp/state", token], startedAt: "Sat Jan  1 12:00:00 2000" },
     ];
     const tmux = { ...mockTmux(), getPanePid: vi.fn(async () => 3001), getPaneCommand: vi.fn(async () => "bash") } as unknown as TmuxAdapter;
     const listProcesses = async () => {
@@ -1578,7 +1580,9 @@ describe("RestoreOrchestrator", () => {
       codex: mockCodexResume({ ok: true }),
       listProcesses: async () => [
         { pid: 1234, ppid: 1, command: "-zsh", pgid: 1234, tpgid: 54776, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
-        { pid: 54776, ppid: 1234, command: codexCommand, pgid: 54776, tpgid: 54776, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
+        { pid: 54776, ppid: 1234, command: codexCommand,
+          argv: ["/opt/openrig/vendor/bin/codex", "--model", "gpt-5.6", "resume", "--add-dir", "/tmp/openrig-state", resumeToken],
+          pgid: 54776, tpgid: 54776, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
       ],
     }).restore(snap.id);
 
@@ -1604,13 +1608,15 @@ describe("RestoreOrchestrator", () => {
     });
     const tmux = { ...mockTmux(), getPaneCommand: vi.fn(async () => "node") } as unknown as TmuxAdapter;
     // The observer reads ps argv after the shell has removed launch quoting.
-    const codexCommand = ["codex", "-p", "resume", "resume", "--add-dir", "/tmp/openrig-state", resumeToken].join(" ");
+    const codexArgv = ["codex", "-p", "resume", "resume", "--add-dir", "/tmp/openrig-state", resumeToken];
+    const codexCommand = codexArgv.join(" ");
     const result = await createOrchestrator({
       tmux,
       codex: mockCodexResume({ ok: true }),
       listProcesses: async () => [
         { pid: 1234, ppid: 1, command: "-zsh", pgid: 1234, tpgid: 54776, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
-        { pid: 54776, ppid: 1234, command: codexCommand, pgid: 54776, tpgid: 54776, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
+        { pid: 54776, ppid: 1234, command: codexCommand, argv: codexArgv,
+          pgid: 54776, tpgid: 54776, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
       ],
     }).restore(snap.id);
 
@@ -1635,13 +1641,15 @@ describe("RestoreOrchestrator", () => {
       resumeToken,
     });
     const tmux = { ...mockTmux(), getPaneCommand: vi.fn(async () => "node") } as unknown as TmuxAdapter;
-    const codexCommand = ["codex", "-p", "resume", "resume", "--add-dir", "/tmp/openrig-state", "different-thread", "resume", resumeToken].join(" ");
+    const codexArgv = ["codex", "-p", "resume", "resume", "--add-dir", "/tmp/openrig-state", "different-thread", "resume", resumeToken];
+    const codexCommand = codexArgv.join(" ");
     const result = await createOrchestrator({
       tmux,
       codex: mockCodexResume({ ok: true }),
       listProcesses: async () => [
         { pid: 1234, ppid: 1, command: "-zsh", pgid: 1234, tpgid: 54776, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
-        { pid: 54776, ppid: 1234, command: codexCommand, pgid: 54776, tpgid: 54776, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
+        { pid: 54776, ppid: 1234, command: codexCommand, argv: codexArgv,
+          pgid: 54776, tpgid: 54776, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
       ],
     }).restore(snap.id);
 
@@ -2171,10 +2179,11 @@ describe("RestoreOrchestrator", () => {
       { pid: 3001, ppid: 1, pgid: 3001, tpgid: 3002, executableName: "zsh", command: "-zsh", startedAt },
       { pid: 3002, ppid: 3001, pgid: 3002, tpgid: 3002, executableName: "bash", command: "/bin/sh /tmp/openrig-tmux-send.txt", startedAt },
       { pid: 3003, ppid: 3002, pgid: 3002, tpgid: 3002, executableName: "node", command: `node /opt/bin/codex resume ${token}`, startedAt },
-      { pid: 3004, ppid: 3003, pgid: 3002, tpgid: 3002, executableName: "codex", command: `/opt/native/codex -s workspace-write -m fixture-model resume --add-dir /tmp/state ${token}`, startedAt },
+      { pid: 3004, ppid: 3003, pgid: 3002, tpgid: 3002, executableName: "codex", command: `/opt/native/codex -s workspace-write -m fixture-model resume --add-dir /tmp/state ${token}`,
+        argv: ["/opt/native/codex", "-s", "workspace-write", "-m", "fixture-model", "resume", "--add-dir", "/tmp/state", token], startedAt },
     ];
-    if (mode === "wrong token") rows[3]!.command = "/opt/native/codex resume other";
-    if (mode === "wrong runtime") rows[3]!.command = "/opt/native/claude --resume " + token;
+    if (mode === "wrong token") { rows[3]!.command = "/opt/native/codex resume other"; rows[3]!.argv = ["/opt/native/codex", "resume", "other"]; }
+    if (mode === "wrong runtime") { rows[3]!.command = "/opt/native/claude --resume " + token; rows[3]!.argv = ["/opt/native/claude", "--resume", token]; }
     if (mode === "wrong executable") rows[3]!.executableName = "printf";
     if (mode === "background native") rows[3]!.pgid = 999;
     if (mode === "missing ancestry") rows[3]!.ppid = 999;
@@ -2257,6 +2266,7 @@ describe("RestoreOrchestrator", () => {
         return [
           { pid: 4001, ppid: 1, pgid: 4001, tpgid: 4002, executableName: "zsh", command: "-zsh", startedAt },
           { pid: 4002, ppid: 4001, pgid: 4002, tpgid: 4002, executableName: "codex", command: `/opt/native/codex resume ${token}`,
+            argv: ["/opt/native/codex", "resume", token],
             startedAt: replaced ? "Sat Jan  1 12:00:05 2000" : startedAt },
         ];
       };
@@ -2510,7 +2520,8 @@ describe("RestoreOrchestrator", () => {
 
     const rows = managedClaudeRows(occupant === "other-claude" ? "some-other-session" : token);
     if (occupant === "script") rows.pop();
-    if (occupant === "codex") rows[2] = { ...rows[2]!, executableName: "codex", command: "codex resume some-codex-session" };
+    if (occupant === "codex") rows[2] = { ...rows[2]!, executableName: "codex", command: "codex resume some-codex-session",
+      argv: ["codex", "resume", "some-codex-session"] };
     let launched = false;
     const tmux = {
       ...mockTmux(),
@@ -4362,7 +4373,8 @@ describe("RestoreOrchestrator", () => {
       const oldEvent = db.prepare("SELECT payload FROM events WHERE type = 'restore.completed'").get();
       const listProcesses = async () => [
         { pid: 1234, ppid: 1, pgid: 1234, tpgid: 1235, command: "bash", executableName: "bash", startedAt: "Sat Jan  1 12:00:00 2000" },
-        { pid: 1235, ppid: 1234, pgid: 1235, tpgid: 1235, command: "codex resume tok-abc-123", executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
+        { pid: 1235, ppid: 1234, pgid: 1235, tpgid: 1235, command: "codex resume tok-abc-123",
+          argv: ["codex", "resume", "tok-abc-123"], executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
       ];
       const result = await createOrchestrator({ tmux, listProcesses }).reconcileNodeRuntimeTruth(seeded.rig.id, seeded.nodeId);
       expect(result.ok).toBe(usable);
@@ -4383,7 +4395,8 @@ describe("RestoreOrchestrator", () => {
       const seeded = seedFailedAttempt({ runtime: "codex", restoreOutcome: "attention_required", withResumeToken: true });
       const listProcesses = async () => [
         { pid: 1234, ppid: 1, pgid: 1234, tpgid: 1235, command: "zsh", executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
-        { pid: 1235, ppid: 1234, pgid: 1235, tpgid: 1235, command: "codex resume tok-abc-123", executableName: "codex", startedAt: "Sat Jan  1 12:00:01 2000" },
+        { pid: 1235, ppid: 1234, pgid: 1235, tpgid: 1235, command: "codex resume tok-abc-123",
+          argv: ["codex", "resume", "tok-abc-123"], executableName: "codex", startedAt: "Sat Jan  1 12:00:01 2000" },
       ];
 
       const result = await createOrchestrator({ tmux, listProcesses }).reconcileNodeRuntimeTruth(seeded.rig.id, seeded.nodeId);
