@@ -498,6 +498,40 @@ describe("S02 standing stuck sweep — both halves, routed findings, quiet-but-o
     return row;
   }
 
+  // A bound terminal seat (a shell or a TUI, not an agent): the queue wake types nothing into it and nothing there can
+  // claim work, so its finding goes where an unroutable address's does, never to the seat itself.
+  it("work for a terminal seat is told to the person, not the seat, and says why", async () => {
+    seedLeadSeat();
+    db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime, cwd) VALUES ('node-log', 'rig-r', 'logger', 'terminal', '/tmp')").run();
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status, created_at) VALUES ('sess-log', 'node-log', 'logger@r', 'running', '2026-07-02 12:00:00')").run();
+    db.prepare("INSERT INTO bindings (id, node_id, attachment_type, tmux_session, tmux_pane) VALUES ('bind-log', 'node-log', 'tmux', 'logger@r', '%2')").run();
+    expect(repo.classifyDestinationOf("logger@r").class).toBe("pane-bound");
+    const row = await repo.create({ sourceSession: "lead@r", destinationSession: "logger@r", body: "work" });
+    setNudgeResult(row.qitemId, "failed:terminal-seat: 'logger@r' is a terminal seat (runtime: terminal), not an agent, so no wake was typed into it", new Date());
+    await runSweep({ resolveOperatorSeat: () => "person@external", resolveRecoveryAgentSeat: () => "operator-admin@kernel" });
+    const findings = await findingsFor(row.qitemId);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.destinationSession).toBe("person@external");
+    expect(findings[0]!.body).toContain("logger@r is a terminal seat; nothing there can claim this work, and no wake is typed into it. Route the work to an agent seat. This finding goes to person@external");
+  });
+
+  // The creator is a terminal seat too, so it can't take the finding either; with no person or operator agent, it stays.
+  it("work for a terminal seat with no person, agent creator or operator agent keeps its finding, and says why", async () => {
+    seedLeadSeat();
+    for (const [id, name, pane] of [["log", "logger", "%2"], ["mon", "monitor", "%3"]]) {
+      db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime, cwd) VALUES (?, 'rig-r', ?, 'terminal', '/tmp')").run(`node-${id}`, name);
+      db.prepare("INSERT INTO sessions (id, node_id, session_name, status, created_at) VALUES (?, ?, ?, 'running', '2026-07-02 12:00:00')").run(`sess-${id}`, `node-${id}`, `${name}@r`);
+      db.prepare("INSERT INTO bindings (id, node_id, attachment_type, tmux_session, tmux_pane) VALUES (?, ?, 'tmux', ?, ?)").run(`bind-${id}`, `node-${id}`, `${name}@r`, pane);
+    }
+    const row = await repo.create({ sourceSession: "monitor@r", destinationSession: "logger@r", body: "work" });
+    setNudgeResult(row.qitemId, "failed:terminal-seat: 'logger@r' is a terminal seat (runtime: terminal), not an agent, so no wake was typed into it", new Date());
+    await runSweep({ resolveOperatorSeat: () => null, resolveRecoveryAgentSeat: () => null });
+    const findings = await findingsFor(row.qitemId);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.destinationSession).toBe("logger@r");
+    expect(findings[0]!.body).toContain("logger@r is a terminal seat; nothing there can claim this work, and no wake is typed into it. Route the work to an agent seat. No person, creator or operator agent that can be reached is available, so this finding stays addressed to it");
+  });
+
   it("work for an address with no wake route (a hosted member) is told to the person, and says why", async () => {
     const row = await mkUnroutableRow();
     await runSweep({ resolveOperatorSeat: () => "person@external", resolveRecoveryAgentSeat: () => "operator-admin@kernel" });
