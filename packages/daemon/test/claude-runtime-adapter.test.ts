@@ -76,6 +76,13 @@ describe("launchHarness — per-agent --model reaches the claude launch (51-07 A
     return (calls[calls.length - 1]?.[1] as string) ?? "";
   };
 
+  it("uses the retained executable for a same-conversation continuation", async () => {
+    const tmux = mockTmux();
+    await adapterWith(tmux).launchHarness({ ...makeBinding(), claudeExecutable: "/native tools/claude" }, { name: "seat", resumeToken: "original" });
+    expect(lastCmd(tmux)).toContain("exec '/native tools/claude'");
+    expect(lastCmd(tmux)).toContain("--resume 'original'");
+  });
+
   it("FRESH launch emits --model when the binding declares one", async () => {
     const tmux = mockTmux();
     await adapterWith(tmux).launchHarness(withModel(MODEL), { name: "seat" });

@@ -9,6 +9,8 @@ import type { ClaudeResumeRotation } from "./native-process-lineage.js";
 
 export interface NodeBinding extends Binding {
   cwd: string;
+  /** In-place Claude continuation only: executable observed before the old process exits. */
+  claudeExecutable?: string;
   model?: string;
   effort?: string;
   /** Claude-only, session-scoped Advisor model. */

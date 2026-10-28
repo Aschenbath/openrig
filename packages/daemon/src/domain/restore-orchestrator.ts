@@ -6,8 +6,8 @@ import { assessSnapshotCurrentOccupants, stoppedSnapshotReason } from "./rehydra
 import { nonInterruptiveNotice, nonInterruptiveSummary } from "../adapters/non-interruptive.js";
 import { planModelAliasNotice } from "../adapters/yolo-mode.js";
 import { effortPrecedence, readSeatEffort } from "./seat-effort.js";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { ensureSeatSkillPlugin, hasSeatSkillRecords, rehydrateSeatSkills, seatSkillPaths, seatSkillPathsForNode, seatCatalogKeptNote, seatSkillReplay, writeSeatSkillCatalog, type SeatSkillRehydration, writeSeatSkillRouter, seatRouterKeptNote } from "./seat-skill-storage.js";
 import type Database from "better-sqlite3";
 import { NativePermissionStore } from "./native-permission-store.js";
@@ -29,7 +29,8 @@ import type { OmpResumeAdapter } from "../adapters/omp-resume.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import { assessNativeResumeProbe } from "./native-resume-probe.js";
 import { resumeProbeEvidence, type NativeResumeProbeEvidence } from "./native-resume-probe-evidence.js";
-import { observeClaudeDelivery, observeClaudeResumeLaunch, verifyClaudePaneProcess, verifyPaneIdleShell, type ClaudeLaunchedProcess } from "./native-process-lineage.js";
+import { observeClaudeDelivery, observeClaudeResumeLaunch, processArgv, verifyClaudePaneProcess, verifyClaudePaneRuntime, verifyPaneIdleShell, type ClaudeLaunchedProcess } from "./native-process-lineage.js";
+import { readNativeExecutablePaths } from "./native-process-executable.js";
 import { reanchorBuiltinStartupFile, reanchorShippedProjectionEntry } from "./builtin-startup-files.js";
 import { applySeatSkillsLineRule, seatGuidance, restoreMissingGuidance, missingGuidanceBlocks } from "./restore-guidance.js";
 import { readFootprintAnswer } from "./footprint-choice.js";
@@ -1200,6 +1201,8 @@ export class RestoreOrchestrator {
     if (opts?.keepPane && (!keptPane || !priorState.binding?.tmuxSession)) {
       return { nodeId, logicalId: node.logicalId, status: "failed", error: `${node.logicalId} has no bound tmux pane to keep, so nothing was stopped.` };
     }
+    // Read before takeover ends the process. An unavailable witness keeps normal launch resolution unchanged.
+    const claudeExecutable = keptPane && node.runtime === "claude-code" ? await this.claudeContinuationExecutable(keptPane) : undefined;
 
     // Clear stale state so NodeLauncher doesn't see already_bound. A kept pane keeps its binding through the takeover: the
     // delivery guard resolves the pane through it.
@@ -1346,9 +1349,24 @@ export class RestoreOrchestrator {
       warnings?.push(...launchResult.warnings);
     }
 
-    const restored = await this.postLaunchRestore(entry, rigId, data, launchResult.sessionName, launchResult, opts, warnings, priorState, seatRehydration, resumeSession);
+    const restored = await this.postLaunchRestore(entry, rigId, data, launchResult.sessionName, launchResult,
+      { ...opts, ...(claudeExecutable ? { claudeExecutable } : {}) }, warnings, priorState, seatRehydration, resumeSession);
     const checked = this.checkRestoredGuidance(restored, entry.node, rigId, data, warnings);
     return selectedHistory ? { ...checked, sourceSessionId: selectedHistory.historySessionId, resultSessionId: launchResult.session.id } : checked;
+  }
+
+  private async claudeContinuationExecutable(pane: string): Promise<string | undefined> {
+    const native = await verifyClaudePaneRuntime({ target: pane, tmux: this.tmuxAdapter,
+      ...(this.listProcesses ? { listProcesses: this.listProcesses } : {}) });
+    if (!native) return undefined;
+    const argv0 = processArgv(native.process.command)[0];
+    const executable = argv0 && isAbsolute(argv0) ? argv0 : native.process.executablePath
+      ?? (await readNativeExecutablePaths([native.process.pid])).get(native.process.pid);
+    try {
+      if (!executable || !isAbsolute(executable)) return undefined;
+      accessSync(executable, constants.X_OK);
+      return statSync(executable).isFile() ? realpathSync(executable) : undefined;
+    } catch { return undefined; }
   }
 
   /** A seat that came back running should also have its role, culture and SOP guidance. If its
@@ -1447,7 +1465,7 @@ export class RestoreOrchestrator {
     data: SnapshotData,
     sessionName: string,
     launchResult?: { ok: true; sessionName: string; session: import("./types.js").Session; binding: import("./types.js").Binding },
-    opts?: { adapters?: Record<string, import("./runtime-adapter.js").RuntimeAdapter>; fsOps?: { exists(path: string): boolean }; freshLogicalIds?: string[]; selectedHistory?: SelectedRestoreHistory },
+    opts?: { adapters?: Record<string, import("./runtime-adapter.js").RuntimeAdapter>; fsOps?: { exists(path: string): boolean }; freshLogicalIds?: string[]; selectedHistory?: SelectedRestoreHistory; claudeExecutable?: string },
     warnings?: string[],
     priorState?: { binding: import("./types.js").Binding | null; sessions: { id: string; status: string }[] },
     seatRehydration?: SeatSkillRehydration,
@@ -1598,7 +1616,7 @@ export class RestoreOrchestrator {
         }
         if (selected && !selected.beforeNative(launchedSessionId, launchResult?.binding.id)) return { nodeId: node.id, logicalId: node.logicalId, status: "attention_required", error: "The selected seat, settings or history changed after shell creation; native resume was not dispatched." };
         const resumeOutcome = await this.attemptResume(node.id, sessionName, resumeType, resumeToken, node.cwd ?? "/", this.liveCodexProfile(rigId, node, selected?.nodeId), node.model, this.resolveRestorePosture(node.id, rigId), effortForRestore(), warnings, node.advisor,
-          selected ? () => selected.beforeNative(launchedSessionId, launchResult?.binding.id) : undefined);
+          selected ? () => selected.beforeNative(launchedSessionId, launchResult?.binding.id) : undefined, opts?.claudeExecutable);
         if (resumeOutcome.kind === "resumed") {
           baseStatus = "resumed";
           if (launchedSessionId && this.claudeResume.canResume(resumeType, resumeToken)) {
@@ -1819,6 +1837,7 @@ export class RestoreOrchestrator {
 
           const binding = {
             ...launchResult.binding,
+            ...(opts?.claudeExecutable ? { claudeExecutable: opts.claudeExecutable } : {}),
             cwd: node.cwd ?? ".",
             codexConfigProfile: this.liveCodexProfile(rigId, node, selected?.nodeId) ?? undefined,
             // OPR.0.4.8.3 Seam B: the pod-aware restore path binds the restored posture too
@@ -2168,6 +2187,7 @@ export class RestoreOrchestrator {
     warnings?: string[],
     advisor?: string | null,
     beforeNative?: () => boolean,
+    claudeExecutable?: string,
   ): Promise<
     | { kind: "resumed"; launchedProcess?: ClaudeLaunchedProcess }
     | { kind: "retry_fresh" }
@@ -2207,10 +2227,11 @@ export class RestoreOrchestrator {
       const tail: unknown[] = claudePermissions !== undefined
         ? [...claudeTail, ...Array(5 - claudeTail.length).fill(undefined), launch.additions, claudePermissions]
         : launch.additions ? [...claudeTail, ...Array(5 - claudeTail.length).fill(undefined), launch.additions] : claudeTail;
-      const guardedTail = beforeNative ? [...tail, ...Array(Math.max(0, 7 - tail.length)).fill(undefined), beforeNative] : tail;
+      const guardedTail = beforeNative || claudeExecutable ? [...tail, ...Array(Math.max(0, 7 - tail.length)).fill(undefined), beforeNative,
+        ...(claudeExecutable ? [claudeExecutable] : [])] : tail;
       if (beforeNative && !beforeNative()) return { kind: "attention_required", message: "The selected seat, settings or history changed during native preparation; resume was not dispatched." };
       const result = await this.claudeResume.resume(sessionName, resumeType, resumeToken, cwd, resolvedPosture, model, permissionMode, nodeId,
-        ...(guardedTail as [...typeof launchTail, advisor?: string, launchAdditions?: SeatLaunchAdditions, claudePermissions?: import("./claude-permission-rules.js").ClaudePermissionRules, beforeNativeDispatch?: () => boolean]));
+        ...(guardedTail as [...typeof launchTail, advisor?: string, launchAdditions?: SeatLaunchAdditions, claudePermissions?: import("./claude-permission-rules.js").ClaudePermissionRules, beforeNativeDispatch?: () => boolean, executable?: string]));
       if (result.ok) {
         // OPR.0.7.0.9: the resumed conversation's own start, as on the pod-aware path.
         const promptNote = launch.additions?.appendSystemPromptFile && nodeId && resumeToken ? systemPromptPendingNoteForNode(this.db, nodeId, resumeToken) : undefined;

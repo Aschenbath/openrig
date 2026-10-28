@@ -79,6 +79,7 @@ export class ClaudeResumeAdapter {
     launchAdditions?: SeatLaunchAdditions,
     claudePermissions?: ClaudePermissionRules,
     beforeNativeDispatch?: () => boolean,
+    executable?: string,
   ): Promise<ResumeResult> {
     if (!this.canResume(resumeType, resumeToken)) {
       return { ok: false, code: "no_resume", message: "Claude resume not available" };
@@ -97,7 +98,8 @@ export class ClaudeResumeAdapter {
     if (selectedPermissionMode !== undefined) {
       try {
         if (!nodeId || !this.options.claudeManagedLaunch) await unresolvedClaudePermissionModes();
-        managed = await this.options.claudeManagedLaunch!.prepare({ nodeId: nodeId!, cwd, session: tmuxSessionName }, selectedPermissionMode);
+        managed = await this.options.claudeManagedLaunch!.prepare({ nodeId: nodeId!, cwd, session: tmuxSessionName,
+          ...(executable ? { executable } : {}) }, selectedPermissionMode);
       } catch (error) { return { ok: false, code: "permission_selection_refused", message: (error as Error).message }; }
     }
     // A seat's own subscription token, as on a fresh launch (claude-code-adapter.ts).
@@ -112,7 +114,7 @@ export class ClaudeResumeAdapter {
     });
     const permissionMode = posture + launchArgs.map(arg => ` ${shellQuote(arg)}`).join("");
     const cmd = managed ? managed.command(["--permission-mode", selectedPermissionMode!, ...launchArgs, ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []), ...(advisor ? ["--advisor", advisor] : []), ...additionArgs, "--resume", resumeToken!], claudeResumeLaunchEnv(resumeToken!))
-      : `${claudeResumeLaunchPrefix(resumeToken!)}${claudeClassicRendererEnvPrefix(process.env)}claude ${permissionMode}${modelArg}${effortArg}${advisorArg}${additionArg} --resume ${shellQuote(resumeToken!)}`;
+      : `${claudeResumeLaunchPrefix(resumeToken!)}${claudeClassicRendererEnvPrefix(process.env)}${executable ? `exec ${shellQuote(executable)}` : "claude"} ${permissionMode}${modelArg}${effortArg}${advisorArg}${additionArg} --resume ${shellQuote(resumeToken!)}`;
 
     const assertSelected = beforeNativeDispatch ? () => { if (!beforeNativeDispatch()) throw new Error("Selected history changed before Claude resume input"); } : undefined;
     const beforeManagedInput = beforeNativeDispatch ? () => { assertSelected?.(); managed?.assertCurrent?.(); } : managed?.assertCurrent;

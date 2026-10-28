@@ -1194,7 +1194,7 @@ export class TmuxAdapter {
       beforeWrite();
       const result = await this.respawnPaneUnchecked(pane, command, opts);
       const guard = this.deliveryGuard;
-      const target = guard?.maybeTarget(pane);
+      const target = guard?.maybeTarget(paneTarget);
       if (result.ok && target && guard!.ownsLifecycle(target.nodeId)) guard!.noteFreshLifecyclePane(target.nodeId, pane);
       return result;
     }, false, "respawn");

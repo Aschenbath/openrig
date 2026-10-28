@@ -33,6 +33,15 @@ function mockTmux(overrides?: {
 }
 
 describe("ClaudeResumeAdapter", () => {
+  it("the legacy continuation uses the retained executable and original conversation", async () => {
+    const tmux = mockTmux();
+    const adapter = new ClaudeResumeAdapter(tmux, { maxWaitMs: 1, sleep: async () => {} });
+    await adapter.resume("seat@rig", "claude_id", "original", "/repo", undefined, undefined, undefined, "node",
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "/native tools/claude");
+    expect(tmux.sendText).toHaveBeenCalledWith("seat@rig", expect.stringContaining("exec '/native tools/claude'"));
+    expect(tmux.sendText).toHaveBeenCalledWith("seat@rig", expect.stringContaining("--resume 'original'"));
+  });
+
   describe("canResume", () => {
     it("claude_name + token -> true", () => {
       const adapter = new ClaudeResumeAdapter(mockTmux());
