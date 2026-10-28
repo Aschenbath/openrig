@@ -205,26 +205,19 @@ export function makeQueuePorts(
   opts: { loadHumanRegistry?: () => LoadResult; sharedChannels?: () => ReadonlyArray<{ address: string }> } = {},
 ): InboundQueuePort & OutboundQueuePort & { listOpenAsks(filter: AlertFilterOpts): Promise<OpenAskEpisode[]> } {
   /** Each active row's current owner-notification episode, projected to its person or shared channel. Posted episodes
-   *  are skipped unless asked for (the alert sweep never wants them). Null when nobody is registered. */
+   *  are skipped unless asked for (the alert sweep never wants them). Null when nobody is registered.
+   *
+   *  Eligibility lives in the query now: an active row must carry an owner notification, and — for the alert sweep —
+   *  it must still be unposted to Slack. Only eligible rows reach the per-row lookup, so a pathological backlog of
+   *  active rows without any notification costs a single read instead of one latest-transition and one receipt lookup
+   *  per row. There is no row cap: an eligible item older than any window still comes back in both views. */
   const currentEpisodes = (includePosted: boolean): Array<{ item: QueueItem; posted: boolean }> | null => {
     // Nobody registered yet isn't a broken registry: rows to a registered shared channel still post (0.7.3).
     const people = registeredPeople((opts.loadHumanRegistry ?? (() => loadHumanRegistry()))());
     if (!people) return null;
     const channels = (opts.sharedChannels ?? (() => sharedChannelAddresses()))();
-    // Avoid building waiting/recovery views for rows with no unposted owner notification.
-    // Keep list(activeOnly)'s selection, ordering and cap; this remains an O(N) ID scan.
-    const ids = queueRepo.db.prepare(
-      `SELECT qitem_id FROM queue_items
-       WHERE state IN ('pending', 'in-progress', 'blocked')
-       ORDER BY CASE WHEN state IN ('pending', 'in-progress', 'blocked') THEN 0 ELSE 1 END, ts_created DESC
-       LIMIT ?`,
-    ).all(1000000) as Array<{ qitem_id: string }>;
-    return ids.flatMap(({ qitem_id: qitemId }) => {
-      const transition = queueRepo.transitionLog.latestOwnerNotificationForQitem(qitemId);
-      if (!transition) return [];
-      const notificationKey = `${qitemId}:${transition.transitionId}`;
-      const posted = queueRepo.transitionLog.hasOwnerNotificationReceipt(qitemId, notificationKey);
-      if (posted && !includePosted) return [];
+    const episodes = queueRepo.transitionLog.activeOwnerNotificationEpisodes(includePosted);
+    return episodes.flatMap(({ qitemId, transition, posted }) => {
       const row = queueRepo.getById(qitemId);
       if (!row) return [];
       const item = project(row, transition, people, channels);
