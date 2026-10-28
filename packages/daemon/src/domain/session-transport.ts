@@ -398,10 +398,14 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
         || !alignedRule(lines[start - 1] ?? "") || !alignedRule(lines[claudeEnd] ?? "")) continue;
       end = claudeEnd;
     } else {
-      for (let i = start + 1; i < lines.length; i++) {
-        if (lines[i]!.trim()) continue;
-        const tail = lines.slice(i + 1).filter(line => line.trim());
-        if (lines[i + 1]?.trim() && tail.length === 1 && codexFooter(tail[0]!.trim())) { end = i; break; }
+      end = codexFooterSeparator(lines);
+      if (end < 0) {
+        // Keep the older one-row status/context footer shapes.
+        for (let i = start + 1; i < lines.length; i++) {
+          if (lines[i]!.trim()) continue;
+          const tail = lines.slice(i + 1).filter(line => line.trim());
+          if (lines[i + 1]?.trim() && tail.length === 1 && codexFooter(tail[0]!.trim())) { end = i; break; }
+        }
       }
     }
     if (end <= y || x < prefix) continue;
@@ -1255,21 +1259,27 @@ const CODEX_HINT_ROW = /(?:^|\s)\? for shortcuts(?:\s|$)|⚠ \d+ warnings? · f2
 // Codex shows a long paste as this label until it is submitted. Matched on the normalized body.
 const CODEX_COLLAPSED_PASTE = /^\[PastedContent\d+chars\]$/;
 
-/** The current Codex input box: its normalized text ("" when empty), its rows as drawn (the prompt glyph removed)
- *  and where its prompt row is, or null when the layout is not the recognized one (another footer, a selector, no
- *  blank separator, an older TUI). */
-function codexInputBox(pane: string): { text: string; rows: string[]; lines: string[]; inputAt: number } | null {
-  const lines = pane.split("\n");
+/** The supported status/path + optional hint footer ends at the visible bottom.
+ * Share only its boundary: capture's placeholder heuristic is not close authority. */
+function codexFooterSeparator(lines: string[]): number {
   let last = lines.length - 1;
   while (last >= 0 && !lines[last]!.trim()) last--;
   let footerStart = last;
   while (footerStart > 0 && lines[footerStart - 1]!.trim()) footerStart--;
   const footer = lines.slice(footerStart, last + 1);
   if (last < 0 || footer.length > 2 || !CODEX_STATUS_LINE.test(footer[0]!)
-    || !footer.slice(1).every((row) => CODEX_HINT_ROW.test(row))) return null;
-  // promptAnswerStaged also ends a Codex input at a blank row.
+    || !footer.slice(1).every((row) => CODEX_HINT_ROW.test(row))) return -1;
   const separator = footerStart - 1;
-  if (separator < 1 || lines[separator]!.trim()) return null;
+  return separator >= 1 && !lines[separator]!.trim() ? separator : -1;
+}
+
+/** The current Codex input box: its normalized text ("" when empty), its rows as drawn (the prompt glyph removed)
+ *  and where its prompt row is, or null when the layout is not the recognized one (another footer, a selector, no
+ *  blank separator, an older TUI). */
+function codexInputBox(pane: string): { text: string; rows: string[]; lines: string[]; inputAt: number } | null {
+  const lines = pane.split("\n");
+  const separator = codexFooterSeparator(lines);
+  if (separator < 0) return null;
   const promptClass = composerPromptClassForRuntime("codex");
   const inputAt = findComposerInputLineIndex(lines.slice(0, separator), promptClass);
   if (inputAt < 0 || composerNumberedChoicePattern(promptClass).test(lines[inputAt]!.trimStart())) return null;

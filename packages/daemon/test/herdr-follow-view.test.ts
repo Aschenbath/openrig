@@ -6,6 +6,9 @@ import { HerdrFollowView } from "../src/domain/terminal/herdr-follow-view.js";
 import { composeView } from "../src/domain/terminal/view-composer.js";
 import type { ComposedView } from "../src/domain/terminal/terminal-provider.js";
 import type { ViewerPane } from "../src/domain/terminal/herdr-viewer.js";
+import { inspectComposerInput } from "../src/domain/session-transport.js";
+import type { ComposerSnapshot } from "../src/domain/composer-prompts.js";
+import { codexTwoRowComposer } from "./fixtures/codex-two-row-composer.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -22,6 +25,7 @@ function fixture() {
   const panes = new Map<string, ViewerPane & { argv: string[] }>();
   const calls: string[][] = [], rpc: Array<{ method: string; params: unknown }> = [];
   const inputs = new Map<string, "empty" | "text" | "unknown">();
+  const frames = new Map<string, ComposerSnapshot | null>();
   let transform = (view: ComposedView) => view;
   let lateFocus: { seat: string; reads: number } | undefined;
   let clock = 100, lostCreate = false, lostClose = false, readsFailed = false;
@@ -72,6 +76,7 @@ function fixture() {
       if (lateFocus?.seat === target.seat && ++lateFocus.reads === 2) {
         for (const selected of panes.values()) selected.focused = selected.argv.at(-1) === `$${target.seat}`;
       }
+      if (frames.has(target.seat)) return inspectComposerInput(frames.get(target.seat) ?? null, "codex").state;
       return inputs.get(target.seat) ?? "empty";
     },
     inspect: async argv => ({ sessionId: `$${argv[4]}`, nodeId: argv[4]! }),
@@ -83,7 +88,7 @@ function fixture() {
     } } });
   const provider = create();
   const follow = (seats = ["a", "b", "c"], controls = {}, complete = true) => provider.follow("qitem:task", transform(task(seats, complete)), { enabled: true, ...controls }, async () => true);
-  return { follow, create, panes, calls, rpc, inputs, advance: (ms: number) => { clock += ms; },
+  return { follow, create, panes, calls, rpc, inputs, frames, advance: (ms: number) => { clock += ms; },
     loseCreate: () => { lostCreate = true; }, loseClose: () => { lostClose = true; }, failReads: () => { readsFailed = true; },
     changeTarget: () => { transform = view => ({ ...view, opened: view.opened.map(target => target.seat === "a"
       ? { ...target, paneCommand: `${target.paneCommand} --changed`, attachArgv: [...target.attachArgv!.slice(0, 4), "replacement-a", ...target.attachArgv!.slice(5)] } : target) }); },
@@ -92,6 +97,39 @@ function fixture() {
 }
 
 describe("stable task-following workspace", () => {
+  it.each(["", "\x1b[2mAsk Codex to do anything\x1b[22m"])("closes only a departed viewer when the real reader confirms its two-footer Codex composer is empty (%s)", async body => {
+    const f = fixture(); f.frames.set("c", codexTwoRowComposer(body));
+    await f.follow();
+    const before = [...f.panes.values()].map(p => ({ id: p.pane_id, terminal: p.terminal_id, argv: [...p.argv] }));
+    await f.follow(["a", "b"]); f.advance(20000);
+    const result = await f.follow(["a", "b"]);
+    expect(result.opened).toEqual(["a", "b"]);
+    const closes = f.calls.filter(call => call[1] === "close"); expect(closes).toHaveLength(1);
+    const closed = before.find(p => p.id === closes[0]![2])!;
+    expect(closed.argv.at(-1)).toBe("$c");
+    for (const prior of before.filter(p => p.id !== closed.id)) {
+      const current = f.panes.get(prior.id)!;
+      expect({ terminal: current.terminal_id, argv: current.argv }).toEqual({ terminal: prior.terminal, argv: prior.argv });
+    }
+    expect(f.frames.get("c")).toEqual(codexTwoRowComposer(body));
+    expect(f.calls.filter(call => call[1] === "run")).toHaveLength(4); // initial canvas + three viewer clients only
+    expect(f.rpc).toHaveLength(0); // unfocused leaver: no focus transfer
+  });
+
+  it.each(["typed", "literal placeholder", "unavailable", "ambiguous"])("keeps a departed %s composer through the real reader", async kind => {
+    const f = fixture();
+    const frame = kind === "unavailable" ? null : codexTwoRowComposer(kind === "literal placeholder" ? "Ask Codex to do anything"
+      : kind === "ambiguous" ? "\n› " : "a real draft");
+    if (kind === "ambiguous" && frame) { frame.cursor.y = 7; frame.cursor.x = 4; }
+    f.frames.set("c", frame);
+    await f.follow(); await f.follow(["a", "b"]); f.advance(20000);
+    const result = await f.follow(["a", "b"]);
+    expect(result.opened).toContain("c");
+    expect(result.following!.tiles.find(tile => tile.seat === "c")!.reason).toBeTruthy();
+    expect(f.calls.filter(call => call[1] === "close")).toHaveLength(0);
+    expect(f.frames.get("c")).toEqual(frame);
+  });
+
   it("3→4→3 keeps one workspace, unchanged survivor identities, and uses no layout refresh", async () => {
     const f = fixture(); const first = await f.follow();
     expect(first).toMatchObject({ ok: true, opened: ["a", "b", "c"], workspaceId: "w1" });
