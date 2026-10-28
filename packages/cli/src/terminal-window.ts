@@ -401,9 +401,7 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
           ...(session !== undefined ? { session } : {}), ...(expectedPlan !== undefined ? { expectedPlan } : {}) },
           { timeoutMs: 45_000, headers: terminalAuthHeaders() });
         if (!answer.data.ok || !answer.data.workspaceId) return { ...answer.data, window, notes: [...(answer.data.notes ?? []), ...windowNotes] };
-        const selectedSession = session ?? endpoint.session;
-        const selectedArgs = ["-u", "TMUX", "-u", "HERDR_SESSION", "-u", "HERDR_SOCKET_PATH", herdr,
-          ...(selectedSession && selectedSession !== "default" ? ["--session", selectedSession] : [])];
+        const selectedArgs = herdrArgs;
         const selectedStatus = JSON.parse(await deps.exec("/usr/bin/env", [...selectedArgs, "status", "server", "--json"]));
         const selectedBody = selectedStatus?.result ?? selectedStatus;
         if (selectedStatus.error || selectedBody?.running !== true || selectedBody.socket !== endpoint.socketPath) {

@@ -26,13 +26,15 @@ const runFile = promisify(execFile);
 
 /** The supported CLI, never guessed socket RPC method parity. Its reported
  * endpoint must match the adapter's selected socket before any mutation. */
-export function createHerdrViewerRun(session?: string): HerdrViewerRun {
+export function createHerdrViewerRun(endpoint: { socketPath: string }, sourceEnv: NodeJS.ProcessEnv = process.env): HerdrViewerRun {
+  // Herdr's explicit --session wins over the socket override. Select by the
+  // already resolved socket alone, including paths outside the config tree.
+  const env: NodeJS.ProcessEnv = { ...sourceEnv, HERDR_SOCKET_PATH: endpoint.socketPath };
+  delete env.HERDR_SESSION;
   return async args => {
-    const binary = resolveOnPath("herdr", process.env.PATH);
+    const binary = resolveOnPath("herdr", env.PATH);
     if (!binary) throw new Error("Herdr CLI is unavailable.");
-    const env = { ...process.env };
-    delete env.HERDR_SESSION; delete env.HERDR_SOCKET_PATH;
-    const { stdout } = await runFile(binary, [...(session && session !== "default" ? ["--session", session] : []), ...args],
+    const { stdout } = await runFile(binary, args,
       { env, encoding: "utf8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 });
     return stdout;
   };
