@@ -1489,6 +1489,8 @@ export interface ExpansionPodFragment {
     profile?: string;
     cwd?: string;
     model?: string;
+    /** As written: the canonical RigSpec schema trims a text effort and ignores any other value with an advisory. */
+    effort?: unknown;
     codexConfigProfile?: string;
     claudePermissions?: unknown;
     codexPermissions?: unknown;
