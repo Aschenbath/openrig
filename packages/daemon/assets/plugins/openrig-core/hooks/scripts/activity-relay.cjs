@@ -63,15 +63,19 @@ function buildOpenRigPayload(providerPayload, env = process.env, now = () => new
 
   if ((!sessionName && !nodeId) || !runtime || !hookEvent) return null;
 
-  const subtype = firstString(
-    providerPayload.subtype,
-    providerPayload.notification_type,
-    providerPayload.notificationType,
-    providerPayload.tool_name,
-    providerPayload.toolName,
-    providerPayload.source,
-    providerPayload.matcher
-  );
+  // StopFailure has a typed error field. Never infer it from rendered error text,
+  // a tool name, or another event's subtype; those are not provider failures.
+  const subtype = runtime === "claude-code" && hookEvent === "StopFailure"
+    ? firstString(providerPayload.error)
+    : firstString(
+      providerPayload.subtype,
+      providerPayload.notification_type,
+      providerPayload.notificationType,
+      providerPayload.tool_name,
+      providerPayload.toolName,
+      providerPayload.source,
+      providerPayload.matcher
+    );
 
   return {
     sessionName,
@@ -80,6 +84,11 @@ function buildOpenRigPayload(providerPayload, env = process.env, now = () => new
     generation,
     hookEvent,
     subtype,
+    // Claude's main session omits agent_id; subagents and in-process teammates carry it.
+    // Keep that distinction for permission completion, without forwarding tool inputs/results.
+    ...(runtime === "claude-code" && (hookEvent === "Notification" || hookEvent === "PostToolBatch")
+      && (providerPayload.agent_id == null || firstString(providerPayload.agent_id))
+      ? { hookAgentId: firstString(providerPayload.agent_id) } : {}),
     turnId: firstString(providerPayload.turn_id, providerPayload.turnId),
     occurredAt: now().toISOString(),
     relayRoute: argv.includes("--from-plugin") ? "plugin" : "managed",

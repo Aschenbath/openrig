@@ -29,9 +29,10 @@ import { OutboxHandler } from "./outbox-handler.js";
 import { DraftAwareDelivery, type GuardedDeliverySummary, type QueueWakeFacts } from "./draft-aware-delivery.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
-import { claudeResumeRotation, type SessionRegistry } from "./session-registry.js";
-import type { TmuxAdapter } from "../adapters/tmux.js";
-import { tmuxResizeWindowCommand } from "../adapters/tmux-server.js";
+import { communityHarnessOf } from "./built-in-runtimes.js";
+import { claudeResumeRotation, sessionCommunityHarnessSelect, type SessionRegistry } from "./session-registry.js";
+import type { TmuxAdapter, TmuxResult } from "../adapters/tmux.js";
+import { newPinHolder, readPinSizing, recordPin, releasePin, WINDOW_SIZE_PRIOR_OPTION, withWindowPin, type PinRelease } from "../terminal/window-pin.js";
 import { latestHookPermissionPending, latestHookWaitsOnPerson, type AgentActivityStore } from "./agent-activity-store.js";
 import type { EventBus } from "./event-bus.js";
 import type { AgentActivity } from "./types.js";
@@ -64,6 +65,10 @@ const SEND_READINESS_FRESHNESS_MS = 15_000;
 // Enter, and the post-Enter process read about this much before the reply. A read that misses it leaves the send
 // unconfirmed, and Enter is still sent once.
 const INPUT_BOX_READ_DEADLINE_MS = 500;
+
+// A Claude seat whose recorded pane is no longer in its tmux session. The usual cause is a seat resumed by hand in its
+// session (after a reboot, say), and `rig reconcile-session` binds the live pane, so the refusal names it.
+const STALE_BOUND_PANE = "The session does not have the expected bound pane";
 
 // Mid-work detection patterns (cheap heuristics)
 const MID_WORK_PATTERNS = [
@@ -393,10 +398,14 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
         || !alignedRule(lines[start - 1] ?? "") || !alignedRule(lines[claudeEnd] ?? "")) continue;
       end = claudeEnd;
     } else {
-      for (let i = start + 1; i < lines.length; i++) {
-        if (lines[i]!.trim()) continue;
-        const tail = lines.slice(i + 1).filter(line => line.trim());
-        if (lines[i + 1]?.trim() && tail.length === 1 && codexFooter(tail[0]!.trim())) { end = i; break; }
+      end = codexFooterSeparator(lines);
+      if (end < 0) {
+        // Keep the older one-row status/context footer shapes.
+        for (let i = start + 1; i < lines.length; i++) {
+          if (lines[i]!.trim()) continue;
+          const tail = lines.slice(i + 1).filter(line => line.trim());
+          if (lines[i + 1]?.trim() && tail.length === 1 && codexFooter(tail[0]!.trim())) { end = i; break; }
+        }
       }
     }
     if (end <= y || x < prefix) continue;
@@ -448,7 +457,8 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
     // Claude replaces its mode hint after our paste; that noninteractive hint is not a new composer.
     const stableFooter = prompt.glyph === "❯" && (CLAUDE_MODE_FOOTER.test(footer) || isClaudePasteHint(footer)) ? "claude-composer" : footer;
     const frame = JSON.stringify([prompt.glyph, prefix, width, stableFooter]);
-    const input: ComposerInput = { state: empty ? "empty" : "text", cursor: { ...snapshot.cursor }, suggestionRows, rows: visible, columns: width - prefix, cursorAtEnd, collapsedPaste: label, frame,
+    const nativeCodex = prompt.glyph !== "❯" && codexFooterSeparator(lines) === end;
+    const input: ComposerInput = { state: empty ? "empty" : "text", cursor: { ...snapshot.cursor }, suggestionRows, rows: visible, columns: width - prefix - (nativeCodex ? 1 : 0), cursorAtEnd, collapsedPaste: label, frame,
       ...(ghost ? { ghost } : {}) };
     // A numbered body is allowed only as this operation's exact text in its
     // previously empty composer. A newly observed menu gains no such authority.
@@ -457,6 +467,13 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
       && hasExpectedStagedText(`${prompt.glyph} ${visible.join("\n")}`, owned.text, runtime)) {
       input.collapsedPaste = visible.join("\n");
       input.pasteMatchesExpected = true;
+    }
+    if (nativeCodex) {
+      // Codex 0.164 fullscreen: composer <= 2/3 of the pane (at least eight
+      // rows, capped by the pane), less padding/status/hint rows. Leave the
+      // one-column right inset out of the native printable width.
+      input.pasteViewport = { columns: input.columns,
+        rows: Math.min(height, Math.max(8, Math.floor(height * 2 / 3))) - 4 };
     }
     candidates.push(input);
   }
@@ -554,10 +571,33 @@ function draftComposerLine(lines: string[], verdict: PaneActivityClassification)
   return lines[last]!.trim();
 }
 
+const OPENCLAW_TURN_NOT_RECOVERED = "OpenClaw turn not recovered; inspect the pane before retrying";
+
+/** The pinned OpenClaw local error frame, not a quoted error in history or a recovery-state diagnosis.
+ * Multiple native branches emit the same refusal; observe it without touching native session state. */
+function currentOpenClawTurnRefusal(paneContent: string): string | null {
+  const lines = trimPaneLines(styledTextLines(paneContent).map(line => line.text).join("\n"));
+  const editorRules = lines.flatMap((line, at) => /^─{3,}$/.test(line) ? [at] : []);
+  // The pinned TUI puts its status/footer above the editor. Extra rules make that boundary ambiguous;
+  // leave those layouts unclassified rather than selecting a quoted frame inside the composer.
+  if (editorRules.length !== 2 || editorRules[1] !== lines.length - 1) return null;
+  for (let at = editorRules[0]! - 1; at >= 0; at--) {
+    if (!/^(?:local|gateway)\s+.*\|/.test(lines[at]!)) continue;
+    if (lines[at]!.replace(/\s+/g, " ") !== "local ready | error"
+      || !lines[at + 1]?.startsWith("agent main | session ")) return null;
+    const error = lines.slice(Math.max(0, at - 12), at).join(" ");
+    const match = /(?:^| )run error:\s*Session\s+"[^"]+"\s+changed while\s+starting work\.\s+Retry\.$/.exec(error);
+    return match ? truncateEvidence(match[0]) : null;
+  }
+  return null;
+}
+
 /** A community harness's screen never proves it's idle: a quiet prompt can be an approval or a pause, so its idle
  *  reading becomes unknown. Positive work and attention are kept. `communityHarness` is the seat's recorded selection
  *  (`communityHarnessOf`); without it the classification is returned as it is. */
-export function communityHarnessPaneActivity(classification: PaneActivityClassification, communityHarness: string | null | undefined): PaneActivityClassification {
+export function communityHarnessPaneActivity(classification: PaneActivityClassification, communityHarness: string | null | undefined, paneContent = ""): PaneActivityClassification {
+  const refused = communityHarness === "openclaw" ? currentOpenClawTurnRefusal(paneContent) : null;
+  if (refused) return { state: "attention", reason: OPENCLAW_TURN_NOT_RECOVERED, evidence: refused };
   return communityHarness && classification.state === "agent_idle"
     ? { state: "unknown", reason: "community_harness_no_idle_signal", evidence: classification.evidence }
     : classification;
@@ -767,6 +807,8 @@ export async function probeSessionActivity(input: {
   composerSnapshot?: () => Promise<ComposerSnapshot | null>;
   /** The seat's community harness (`communityHarnessOf`): its idle-looking screen reads unknown. */
   communityHarness?: string | null;
+  /** Ordinary sends keep existing community idle readings; an OpenClaw turn error is advisory, not a picker. */
+  communityHarnessSendProbe?: boolean;
   /** See ClassifyPaneOptions.postCompactTurnBoundary. */
   postCompactTurnBoundary?: boolean;
 }): Promise<AgentActivity> {
@@ -891,8 +933,13 @@ export async function probeSessionActivity(input: {
       currentClaudeDialogueOnly: input.currentClaudeDialogueOnly === true,
       postCompactTurnBoundary: input.postCompactTurnBoundary === true,
     };
-    let classification = communityHarnessPaneActivity(classifyPaneActivity(paneContent ?? "", { ...classifyOptions,
-      composerSnapshot: snapshot ?? undefined, runtime }), input.communityHarness);
+    const paneClassification = classifyPaneActivity(paneContent ?? "", { ...classifyOptions,
+      composerSnapshot: snapshot ?? undefined, runtime });
+    let classification = communityHarnessPaneActivity(paneClassification, input.communityHarness, paneContent ?? "");
+    if (input.communityHarnessSendProbe) {
+      if (classification.reason === "community_harness_no_idle_signal") classification = paneClassification;
+      else if (classification.reason === OPENCLAW_TURN_NOT_RECOVERED) classification = { ...classification, state: "unknown" };
+    }
     // Claude renders its prompt suggestion faint, which the plain capture loses. When a Claude pane reads
     // as a draft, one capture with styling is classified on its own. Newer attention or work there is
     // kept. A faint suggestion counts only when it's the same composer text this capture read as a draft;
@@ -1220,21 +1267,27 @@ const CODEX_HINT_ROW = /(?:^|\s)\? for shortcuts(?:\s|$)|⚠ \d+ warnings? · f2
 // Codex shows a long paste as this label until it is submitted. Matched on the normalized body.
 const CODEX_COLLAPSED_PASTE = /^\[PastedContent\d+chars\]$/;
 
-/** The current Codex input box: its normalized text ("" when empty), its rows as drawn (the prompt glyph removed)
- *  and where its prompt row is, or null when the layout is not the recognized one (another footer, a selector, no
- *  blank separator, an older TUI). */
-function codexInputBox(pane: string): { text: string; rows: string[]; lines: string[]; inputAt: number } | null {
-  const lines = pane.split("\n");
+/** The supported status/path + optional hint footer ends at the visible bottom.
+ * Share only its boundary: capture's placeholder heuristic is not close authority. */
+function codexFooterSeparator(lines: string[]): number {
   let last = lines.length - 1;
   while (last >= 0 && !lines[last]!.trim()) last--;
   let footerStart = last;
   while (footerStart > 0 && lines[footerStart - 1]!.trim()) footerStart--;
   const footer = lines.slice(footerStart, last + 1);
   if (last < 0 || footer.length > 2 || !CODEX_STATUS_LINE.test(footer[0]!)
-    || !footer.slice(1).every((row) => CODEX_HINT_ROW.test(row))) return null;
-  // promptAnswerStaged also ends a Codex input at a blank row.
+    || !footer.slice(1).every((row) => CODEX_HINT_ROW.test(row))) return -1;
   const separator = footerStart - 1;
-  if (separator < 1 || lines[separator]!.trim()) return null;
+  return separator >= 1 && !lines[separator]!.trim() ? separator : -1;
+}
+
+/** The current Codex input box: its normalized text ("" when empty), its rows as drawn (the prompt glyph removed)
+ *  and where its prompt row is, or null when the layout is not the recognized one (another footer, a selector, no
+ *  blank separator, an older TUI). */
+function codexInputBox(pane: string): { text: string; rows: string[]; lines: string[]; inputAt: number } | null {
+  const lines = pane.split("\n");
+  const separator = codexFooterSeparator(lines);
+  if (separator < 0) return null;
   const promptClass = composerPromptClassForRuntime("codex");
   const inputAt = findComposerInputLineIndex(lines.slice(0, separator), promptClass);
   if (inputAt < 0 || composerNumberedChoicePattern(promptClass).test(lines[inputAt]!.trimStart())) return null;
@@ -1667,6 +1720,8 @@ export function readInputBox(pane: string | null, runtime: "claude-code" | "code
 export interface SendOpts {
   /** Internal provenance derived by the transport route. */
   identityProvenance?: string;
+  /** Internal: with identityProvenance principal:v1, the MCP adapter's caller (the route's resolveRecordedIdentity). */
+  identityPrincipal?: string;
   /** Internal wake provenance, never accepted from the public transport route. */
   queueWake?: boolean;
   /** Internal: this send is OpenRig's own (a watchdog, a scheduler wake, a notice, the compaction enforcer). Never accepted
@@ -1884,6 +1939,9 @@ export interface CaptureResult {
   inputBox?: InputBoxAnnotation;
   /** When the caller asked: the captured screen is at a prompt in a pane smaller than 80x24, which may cut it off. */
   promptPane?: { width: number; height: number; hint: string };
+  /** When the caller asked to read at a readable size: the size it asked for and what letting the window go did, or
+   *  why the window wasn't resized. */
+  readable?: { resized: true; width: number; height: number; release: PinRelease; sizeBack?: string } | { resized: false; reason: string };
 }
 
 export interface BroadcastResult {
@@ -1924,7 +1982,7 @@ interface SessionTransportDeps {
 
 interface SessionRow { node_id: string; session_name: string; }
 interface NodeRow { rig_id: string; logical_id: string; }
-interface SessionMetaRow { runtime: string | null; attachment_type: string | null; node_id: string | null; binding_session: string | null; pane: string | null; occupant: string | null; resume_token: string | null;
+interface SessionMetaRow { community_harness: string | null; runtime: string | null; attachment_type: string | null; node_id: string | null; binding_session: string | null; pane: string | null; occupant: string | null; resume_token: string | null;
   resume_provenance: string | null; resume_rotated_from: string | null; resume_rotated_process: string | null; resume_launch_process: string | null; }
 interface ResolvedTarget { sessionName: string; rigName: string; nodeLogicalId: string; }
 interface AbsenceProbeTarget { session_id: string; node_id: string; session_name: string; tmux_pane: string | null; }
@@ -2040,6 +2098,7 @@ export class SessionTransport {
   private getSessionMeta(sessionName: string): {
     runtime: string | null; attachmentType: string | null; nodeId: string | null; pane: string | null; occupant: string | null; resumeToken: string | null;
     rotation: ClaudeResumeRotation | null;
+    communityHarness: string | null;
   } {
     sessionName = physicalSessionName(this.db, sessionName);
     // One existing statement; P2 reads the binding columns it already joins plus the
@@ -2047,6 +2106,7 @@ export class SessionTransport {
     const row = this.db.prepare(`
       SELECT
         n.runtime AS runtime,
+        ${sessionCommunityHarnessSelect(this.db)} AS community_harness,
         b.attachment_type AS attachment_type,
         n.id AS node_id,
         b.tmux_session AS binding_session,
@@ -2067,6 +2127,7 @@ export class SessionTransport {
 
     return {
       runtime: row?.runtime ?? null,
+      communityHarness: communityHarnessOf(row?.community_harness, row?.runtime),
       attachmentType: row?.attachment_type ?? null,
       nodeId: row?.node_id ?? null,
       // The row may be a historical session of a node now bound elsewhere: only a
@@ -2449,7 +2510,7 @@ export class SessionTransport {
             if (opts?.committedOutboxIds && (!prior || prior.destinationSession !== sessionName)) throw new Error("Committed wake target/ID mismatch");
             outbox.retain(prior ? { ...prior, outboxId: id, tags: prior.tags ?? undefined, auditPointer: prior.auditPointer ?? undefined } : {
               outboxId: id, senderSession: opts?.actorSession ?? "unknown", destinationSession: sessionName, body: text, auditPointer: opts?.auditPointer,
-              identityProvenance: opts?.identityProvenance, ...(opts?.urgent ? { urgency: "urgent" } : {}),
+              identityProvenance: opts?.identityProvenance, identityPrincipal: opts?.identityPrincipal, ...(opts?.urgent ? { urgency: "urgent" } : {}),
             }, target, !!opts?.committedOutboxIds);
           }
         })();
@@ -2648,7 +2709,8 @@ export class SessionTransport {
       if (bindingChanged()) return changedRecipient();
       if (observation.state === "idle_shell" || observation.state === "conflict") {
         return { ok: false, sessionName, sent: false, reason: observation.state === "idle_shell" ? "target_runtime_not_running" : "target_runtime_conflict",
-          error: `Refused: ${observation.detail}. No text was sent.` };
+          error: `Refused: ${observation.detail}. No text was sent.${observation.detail === STALE_BOUND_PANE
+            ? ` If the seat was resumed by hand in its session, run: rig reconcile-session ${sessionName}` : ""}` };
       }
       if (observation.state === "unknown") runtimeAdvisory = `runtime: ${observation.detail}; delivery proceeds without verified native identity.`;
       return null;
@@ -3076,8 +3138,12 @@ export class SessionTransport {
         // or not --dangerously-interact was passed (B1 code-review fix) — so the honest telemetry is
         // surfaced without ever blocking communication. Hooks are advisory telemetry, not authority
         // over whether agents can talk.
-        const linkDiagnosis = await this.diagnoseProducerLink(sessionName);
-        sendAdvisory = [sendAdvisory, `producer-link: ${linkDiagnosis} — activity could not be determined (${readiness.reason}); sent anyway (telemetry is advisory).`].filter(Boolean).join(" ");
+        if (readiness.reason === OPENCLAW_TURN_NOT_RECOVERED) {
+          sendAdvisory = [sendAdvisory, `OpenClaw refused its last local turn and OpenRig hasn't recovered it; this message submits a new turn. Inspect it with rig capture ${sessionName}.`].filter(Boolean).join(" ");
+        } else {
+          const linkDiagnosis = await this.diagnoseProducerLink(sessionName, sessionMeta.runtime);
+          sendAdvisory = [sendAdvisory, `producer-link: ${linkDiagnosis} — activity could not be determined (${readiness.reason}); sent anyway (telemetry is advisory).`].filter(Boolean).join(" ");
+        }
         // fall through to the send below.
       } else if (readiness.state === "running") {
         // OPR.0.4.3.28 fast-follow (advisor audit-catch, pm-ruled a founder-principle residual):
@@ -3086,7 +3152,7 @@ export class SessionTransport {
         // no-op here (the option is kept for back-compat). needs_input (positive picker) remains the
         // ONLY hard refuse; unknown/stale/missing already proceed-with-advisory above.
         sendAdvisory = [sendAdvisory, "target pane appears mid-task; sent anyway (busy is advisory, not a block)."].filter(Boolean).join(" ");
-        if (runtime === "codex") sendAdvisory += " This message joins its running turn and may redirect it; for separate work, use --wait-for-idle <seconds>.";
+        if (runtime === "codex") sendAdvisory += " This message joins its running turn and may redirect it. For separate work, create a queue row (rig queue create --destination <seat>): a saved row keeps the work apart from the short wake typed into the seat. To watch the result, --wait-for-idle <seconds> sends only once the seat is idle, and sends nothing if it isn't when the wait ends.";
         // fall through to the send below.
       }
       // idle (or running/unknown — now advisory-and-proceed) → proceed to send.
@@ -3470,7 +3536,7 @@ export class SessionTransport {
         return { state: "conflict", detail: "The session has several panes but no recorded bound pane" };
       }
       if (panes.length > 0 && pane && !panes.some(candidate => candidate.id === pane)) {
-        return { state: "conflict", detail: "The session does not have the expected bound pane" };
+        return { state: "conflict", detail: STALE_BOUND_PANE };
       }
       if (!pane || panes.length === 0) return unknown;
       let panePid: number | null;
@@ -3527,8 +3593,10 @@ export class SessionTransport {
   }, privateInput = false): Promise<AgentActivity> {
     const now = this.now();
     let binding = input.binding;
+    let communityHarness: string | null = null;
     try {
       const stored = this.getSessionMeta(input.sessionName);
+      communityHarness = stored.communityHarness;
       binding = {
         sessionName: input.sessionName,
         nodeId: binding?.nodeId ?? stored.nodeId,
@@ -3541,6 +3609,7 @@ export class SessionTransport {
     const hookActivity = this.agentActivityStore?.getLatestForNode({
       sessionName: input.sessionName,
       now,
+      order: input.runtime === "claude-code" ? "source" : "arrival",
     });
     const permissionPending = latestHookPermissionPending(hookActivity, input.runtime);
     if (hookActivity && permissionPending && this.hookFreshForSend(hookActivity, now)) {
@@ -3573,6 +3642,7 @@ export class SessionTransport {
       if (this.hookFreshForSend(hookActivity, now)) {
         if (hookActivity.state === "running" && input.runtime === "claude-code") {
           const paneVeto = await probeSessionActivity({
+            communityHarness, communityHarnessSendProbe: true,
             composerSnapshot,
             currentClaudeDialogueOnly: true,
             sessionName: input.sessionName,
@@ -3589,7 +3659,8 @@ export class SessionTransport {
       }
       // OPR.0.4.3.28 Part A — a stale-but-latest `idle` hook (older than the 15s
       // send window but still within the 5-min store window, so stale!==true) is
-      // SENDABLE. getLatestForNode returns the single newest event by seq, so a
+      // SENDABLE. getLatestForNode returns the newest event in the runtime's
+      // order (source time for Claude, arrival sequence for other runtimes), so a
       // latest hook still `idle` proves no newer activity exists (had the seat
       // started work, the latest hook would be UserPromptSubmit/PermissionRequest).
       // A stale NON-idle hook (running/needs_input >15s) still falls through to
@@ -3602,6 +3673,7 @@ export class SessionTransport {
         // vetoes (→ refuse); an unknown pane (the flaky-Codex case this trust
         // exists for) or a clean idle pane does NOT veto → trust the stale hook.
         const paneVeto = await probeSessionActivity({
+          communityHarness, communityHarnessSendProbe: true,
           composerSnapshot,
           sessionName: input.sessionName,
           runtime: input.runtime,
@@ -3619,6 +3691,7 @@ export class SessionTransport {
     }
 
     const probe = await probeSessionActivity({
+      communityHarness, communityHarnessSendProbe: true,
       composerSnapshot,
       sessionName: input.sessionName,
       runtime: input.runtime,
@@ -3678,7 +3751,7 @@ export class SessionTransport {
   // producer chain is broken + the next step, instead of an opaque
   // `no_activity_signal`. NEVER surfaces a token value — env checks are
   // presence-only, and the store carries no token.
-  private async diagnoseProducerLink(sessionName: string): Promise<string> {
+  private async diagnoseProducerLink(sessionName: string, runtime: string | null): Promise<string> {
     // Link 1 — the relay's prerequisites: the daemon URL, the activity token, and the runtime
     // (without OPENRIG_RUNTIME the relay builds no payload and posts nothing). Only the tmux SESSION
     // environment is inspected; the agent process's own environment is not read, and an env-prefixed
@@ -3753,7 +3826,11 @@ export class SessionTransport {
     if (!store) {
       return withEnv(`daemon-ingest link DOWN — the activity store is not configured on this daemon (ingest returns 503)`);
     }
-    const latest = store.getLatestForNode({ sessionName, now: this.now() });
+    const latest = store.getLatestForNode({
+      sessionName,
+      now: this.now(),
+      order: runtime === "claude-code" ? "source" : "arrival",
+    });
     if (!latest || latest.evidenceSource !== "runtime_hook") {
       return withEnv(`no activity hook is stored for this seat — which link failed is not identified: the relay may never have posted (it needs OPENRIG_RUNTIME, the relay URL and the token in the agent process), Codex hook-trust may be uncleared, or ingest may have rejected posts (401 token mismatch, 503 unconfigured)`);
     }
@@ -3831,7 +3908,8 @@ export class SessionTransport {
   /** `inputBox`: also describe a Claude Code or Codex seat's live input box (three more tmux reads), for callers that
    *  use it: the capture route asks when its request does (`rig capture`, the MCP tool). `inputBoxBudget` is the time
    *  those reads may still take, shared across a fan-out; a single capture gets its own CAPTURE_INPUT_BOX_DEADLINE_MS. */
-  async capture(sessionName: string, opts?: { lines?: number; inputBox?: boolean; inputBoxBudget?: InputBoxBudget; promptPane?: boolean }): Promise<CaptureResult> {
+  async capture(sessionName: string, opts?: { lines?: number; inputBox?: boolean; inputBoxBudget?: InputBoxBudget; promptPane?: boolean;
+    readable?: { width: number; height: number }; readableBudget?: ReadableBudget }): Promise<CaptureResult> {
     sessionName = physicalSessionName(this.db, sessionName);
     const sessionMeta = this.getSessionMeta(sessionName);
     if (sessionMeta.attachmentType === "external_cli") {
@@ -3876,24 +3954,127 @@ export class SessionTransport {
     }
 
     const lines = opts?.lines ?? 20;
-    const content = await this.tmuxAdapter.capturePaneContent(sessionName, lines);
-    if (content === null) {
-      return {
-        ok: false,
-        sessionName,
-        reason: "capture_failed",
-        error: `Could not capture pane content for '${sessionName}'.`,
-      };
+    const read = async (): Promise<CaptureResult> => {
+      const content = await this.tmuxAdapter.capturePaneContent(sessionName, lines);
+      if (content === null) {
+        return {
+          ok: false,
+          sessionName,
+          reason: "capture_failed",
+          error: `Could not capture pane content for '${sessionName}'.`,
+        };
+      }
+
+      await this.reconcileStartupReadiness(sessionName).catch(() => {});
+
+      const runtime = sessionMeta.runtime;
+      const inputBox = opts?.inputBox && (runtime === "claude-code" || runtime === "codex")
+        ? await this.captureInputBox(sessionName, runtime, opts.inputBoxBudget ?? { remainingMs: CAPTURE_INPUT_BOX_DEADLINE_MS })
+        : undefined;
+      const promptPane = opts?.promptPane ? await this.capturePromptPane(sessionName, content, runtime) : undefined;
+      return { ok: true, sessionName, content, lines, ...(inputBox ? { inputBox } : {}), ...(promptPane ? { promptPane } : {}) };
+    };
+    if (!opts?.readable) return read();
+    const { value, readable } = await this.readAtReadableSize(sessionName, opts.readable,
+      opts.readableBudget ?? { remainingMs: CAPTURE_READABLE_BUDGET_MS }, read);
+    return value.ok ? { ...value, readable } : value;
+  }
+
+  /**
+   * Run `read` with the seat's window enlarged to at least `size`, then put the window back: its size, and its own
+   * `window-size` exactly. resize-window sets that to manual, which would stop the window's clients (Herdr, attach)
+   * sizing it. The window is named by its id, and the resize is recorded as a pin (window-pin.ts) in the window's
+   * queue, so a web terminal that opens meanwhile keeps the window's own value and the window is put back only when the
+   * last live holder lets go. Read as it is, with the reason: a window already that big; one whose own `window-size`
+   * is manual for a live holder or a person (a pin whose holders are gone is taken over and given back); one whose
+   * sizing can't be read or whose record couldn't be written (it couldn't be given back); one with several panes; and
+   * any seat once `budget` (shared across a fan-out) is spent.
+   */
+  private async readAtReadableSize<T>(sessionName: string, size: { width: number; height: number }, budget: ReadableBudget,
+    read: () => Promise<T>): Promise<{ value: T; readable: NonNullable<CaptureResult["readable"]> }> {
+    const started = this.now().getTime();
+    const deadline = started + budget.remainingMs;
+    const asItIs = async (reason: string) => ({ value: await read(), readable: { resized: false as const, reason } });
+    const spent = `this capture's ${CAPTURE_READABLE_BUDGET_MS / 1000} s for readable reads ran out`;
+    const late = () => deadline - this.now().getTime() < READABLE_MIN_REMAINING_MS;
+    try {
+      // Spent: no readable setup at all (no queue wait or sizing reads), so a long fan-out still returns in time.
+      if (late()) return await asItIs(spent);
+      const window = (await this.tmuxAdapter.readWindow(sessionName, WINDOW_SIZE_PRIOR_OPTION).catch(() => null))?.id;
+      if (!window) return await asItIs("the window's sizing couldn't be read, so it couldn't be given back");
+      const pin = await withWindowPin(window, async () => {
+        const sizing = await readPinSizing(this.tmuxAdapter, window);
+        if (!sizing) return "the window's sizing couldn't be read, so it couldn't be given back";
+        if (sizing.live === "manual" && (sizing.prior === "manual" || sizing.holders.length > 0)) {
+          return "the window's size is pinned (its window-size is manual)";
+        }
+        // Still manual here: a pin whose holders are gone (a capture or a web terminal that ended without giving it back).
+        // It's taken over, and given back after this read even when the pane is already big enough.
+        const leftover = sizing.live === "manual";
+        const panes = await this.tmuxAdapter.listPanes(window).catch(() => []);
+        if (panes.length !== 1) return panes.length === 0 ? "the window's size couldn't be read" : "the window has several panes";
+        const pane = panes[0]!;
+        const bigEnough = pane.width >= size.width && pane.height >= size.height;
+        if (bigEnough && !leftover) return `the pane is already ${pane.width}x${pane.height}`;
+        if (!bigEnough && late()) return spent;
+        const holder = newPinHolder();
+        if (!(await recordPin(this.tmuxAdapter, sizing, holder))) return "its restore record couldn't be written, so it wasn't resized";
+        // The record can settle late: past the deadline, let go without resizing.
+        if (!bigEnough && late()) return { holder, pane, resized: null, spent: true };
+        const resized = bigEnough ? null
+          : await this.tmuxAdapter.resizeWindow(window, Math.max(size.width, pane.width), Math.max(size.height, pane.height));
+        return { holder, pane, resized, spent: false };
+      });
+      if (typeof pin === "string") return await asItIs(pin);
+      const { holder, pane, resized } = pin;
+      if (pin.spent) {
+        await releasePin(this.tmuxAdapter, window, holder);
+        return await asItIs(spent);
+      }
+      let readable: NonNullable<CaptureResult["readable"]> | undefined;
+      let value: T;
+      try {
+        if (!resized) {
+          readable = { resized: false, reason: `the pane is already ${pane.width}x${pane.height}` };
+          value = await read();
+        } else if (!resized.ok) {
+          readable = { resized: false, reason: `the resize failed: ${resized.message}` };
+          value = await read();
+        } else {
+          await this.settleRedraw(sessionName, deadline);
+          value = await read();
+          readable = { resized: true, width: Math.max(size.width, pane.width), height: Math.max(size.height, pane.height), release: "not-listed" };
+        }
+      } finally {
+        // As the last holder: back to its size first (that pins it again), then its own sizing, so a window with
+        // clients follows them again.
+        let sizeBack: TmuxResult | null = null;
+        const release = await releasePin(this.tmuxAdapter, window, holder, resized ? async () => {
+          sizeBack = await this.tmuxAdapter.resizeWindow(window, pane.width, pane.height);
+        } : undefined);
+        if (readable?.resized) {
+          readable.release = release;
+          const back = sizeBack as TmuxResult | null;
+          if (back && !back.ok) readable.sizeBack = `putting its size back failed: ${back.message}`;
+        }
+        else if (!resized && release === "given-back" && readable) readable.reason += "; a pin left on its window was given back";
+      }
+      return { value, readable: readable! };
+    } finally {
+      budget.remainingMs = Math.max(0, budget.remainingMs - (this.now().getTime() - started));
     }
+  }
 
-    await this.reconcileStartupReadiness(sessionName).catch(() => {});
-
-    const runtime = sessionMeta.runtime;
-    const inputBox = opts?.inputBox && (runtime === "claude-code" || runtime === "codex")
-      ? await this.captureInputBox(sessionName, runtime, opts.inputBoxBudget ?? { remainingMs: CAPTURE_INPUT_BOX_DEADLINE_MS })
-      : undefined;
-    const promptPane = opts?.promptPane ? await this.capturePromptPane(sessionName, content, runtime) : undefined;
-    return { ok: true, sessionName, content, lines, ...(inputBox ? { inputBox } : {}), ...(promptPane ? { promptPane } : {}) };
+  /** After a resize, give the seat's TUI time to redraw: two equal screens 150 ms apart, at most 12 looks, and never
+   *  past `deadline`. */
+  private async settleRedraw(sessionName: string, deadline: number): Promise<void> {
+    let last: string | null = null;
+    for (let look = 0; look < 12 && this.now().getTime() + 150 <= deadline; look++) {
+      await this.sleep(150);
+      const screen = await this.tmuxAdapter.capturePaneScreen(sessionName).catch(() => null);
+      if (screen !== null && screen === last) return;
+      last = screen;
+    }
   }
 
   /** A prompt drawn in a pane smaller than an 80x24 terminal may be cut off, so a reader can't see what the seat asks.
@@ -3905,7 +4086,7 @@ export class SessionTransport {
     const pane = panes.find(entry => entry.active) ?? panes[0];
     if (!pane || (pane.width >= 80 && pane.height >= 24)) return undefined;
     return { width: pane.width, height: pane.height,
-      hint: `pane ${pane.width}x${pane.height} is smaller than 80x24, so the prompt may be cut off; resize it (${tmuxResizeWindowCommand(sessionName, 120, 40)}) and capture again` };
+      hint: `pane ${pane.width}x${pane.height} is smaller than 80x24, so the prompt may be cut off; read it at a readable size with rig capture ${sessionName} --readable` };
   }
 
   /** The input box, or unknown when its reads don't finish within the budget's remaining time (or none is left): the
@@ -4193,6 +4374,18 @@ const INPUT_CONTINUATION_COLUMN = 2; // Claude Code and Codex indent an input's 
 // How long a capture's input-box reads may take in all before the box reports unknown: one seat's three reads, or a
 // whole fan-out's (the send path's INPUT_BOX_READ_DEADLINE_MS bounds one read each).
 export const CAPTURE_INPUT_BOX_DEADLINE_MS = 1_000;
+
+/** The time a capture's readable reads (`--readable`, `--size`) may take: the resize, the redraw and the read, for one
+ *  seat or a whole fan-out. Seats left once it's spent are read as they are, so the request returns inside the CLI's
+ *  wait (capture.ts's READABLE_REQUEST_TIMEOUT_MS). Each window is given back whatever is left. */
+export const CAPTURE_READABLE_BUDGET_MS = 8_000;
+/** Below this, a seat isn't resized: two redraw looks and the read wouldn't fit. */
+const READABLE_MIN_REMAINING_MS = 500;
+
+/** The time a capture's readable reads may still take; the capture route shares one across a fan-out. */
+export interface ReadableBudget {
+  remainingMs: number;
+}
 
 /** The time a capture's input-box reads may still take; the capture route shares one across a fan-out. */
 export interface InputBoxBudget {

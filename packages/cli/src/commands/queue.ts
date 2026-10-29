@@ -144,7 +144,7 @@ function terminalWakeOutcome(wakeResult: string | null): TerminalDeliveryResult[
 /** Only these known states mean "not delivered yet, nothing went wrong". An unknown value never gets that label. */
 function isKnownUnconfirmed(wakeResult: string | null, outcome: TerminalDeliveryResult["outcome"]): boolean {
   if (outcome === "not-requested" || wakeResult === null || wakeResult === "delivered-ack-pending") return true;
-  return wakeResult.startsWith("indeterminate:") || wakeResult.startsWith("retained:");
+  return wakeResult.startsWith("indeterminate:") || wakeResult.startsWith("retained:") || wakeResult.startsWith("wake-accepted:");
 }
 
 function terminalDeliveryResult(
@@ -165,7 +165,9 @@ function terminalDeliveryResult(
     "claimed": "Terminal receipt unconfirmed, but the seat has claimed the item (claimed).",
     "retained": `The wake is held (${wakeResult}): nothing was typed into the pane. A held create wake is not retried automatically; inspect it with rig seat held-messages ${seat}.`,
     "failed": `The wake failed (${wakeResult}).`,
-    "indeterminate": `Terminal receipt unconfirmed (${wakeResult}).`,
+    "indeterminate": wakeResult?.startsWith("wake-accepted:")
+      ? `The member's trigger accepted the ring (${wakeResult}). That isn't pickup: its claim is.`
+      : `Terminal receipt unconfirmed (${wakeResult}).`,
     "still-pending": waitedMs === null ? "No terminal receipt was recorded before the claim." : `No terminal receipt was recorded within ${waitedMs}ms.`,
     "not-requested": "No terminal wake was requested (--no-nudge).",
   };
@@ -513,13 +515,10 @@ function notThisCreate(row: Record<string, unknown>, sent: SentCreate, storedSou
   return null;
 }
 
-/** A create whose answer didn't arrive, or arrived unreadable, may still have committed. Read the row back once by the ID it
- *  was sent with, from the daemon that holds it: this one for a local row, the destination's registered daemon for a
- *  cross-host one. Only a row that is this create counts as committed; anything else leaves the outcome unknown. It never
- *  sends the create again. */
-async function readBackCreate(deps: QueueDeps, client: DaemonClient, hostId: string | undefined, qitemId: string, sent: SentCreate): Promise<{ row: Record<string, unknown> | null; note: string }> {
-  const remote = remoteHostOf(hostId);
-  const where = remote ? ` on host '${remote}'` : "";
+/** Both reconciliation and --verify read the daemon that holds the row, with its own bearer. */
+async function queueReadTarget(deps: QueueDeps, client: DaemonClient, hostId: string | undefined) {
+  let remote = remoteHostOf(hostId);
+  if (remote && await daemonSelfHostId(client) === remote) remote = undefined;
   let reader = client;
   let options: { timeoutMs: number; headers?: Record<string, string> } = { timeoutMs: CREATE_READ_BACK_TIMEOUT_MS };
   if (remote) {
@@ -527,15 +526,45 @@ async function readBackCreate(deps: QueueDeps, client: DaemonClient, hostId: str
     const match = registry.ok ? resolveHost(registry.registry, remote, loadHostBindings().bindings) : undefined;
     if (!match?.ok || match.host.transport !== "http") {
       const why = match?.ok ? "its entry in this CLI's host registry is SSH, not a daemon URL" : "it isn't in this CLI's host registry";
-      return { row: null, note: `This CLI couldn't read the row back from host '${remote}' (${why}).` };
+      return { error: `from host '${remote}' (${why})` };
     }
     const bearer = resolveRemoteBearer(match.host);
-    if (!bearer.ok) return { row: null, note: `This CLI couldn't read the row back from host '${remote}' (${bearer.error}).` };
+    if (!bearer.ok) return { error: `from host '${remote}' (${bearer.error})` };
     reader = deps.clientFactory(match.host.url);
     if (bearer.token) options = { ...options, headers: { Authorization: `Bearer ${bearer.token}` } };
   }
+  return { reader, options };
+}
+
+/** A successful forward isn't a delivery receipt. Never accept a different remote row as this create's receipt. */
+function createReceiptReader(deps: QueueDeps, client: DaemonClient, hostId: string | undefined, qitemId: string, sent: SentCreate): Pick<DaemonClient, "get"> {
+  if (!remoteHostOf(hostId)) return client;
+  let target: ReturnType<typeof queueReadTarget> | undefined;
+  let source: ReturnType<typeof storedSourceOf> | undefined;
+  return {
+    get: async <T>(path: string) => {
+      const selected = await (target ??= queueReadTarget(deps, client, hostId));
+      if ("error" in selected) throw new Error(`receipt could not be read ${selected.error}`);
+      const response = await selected.reader.get<T>(path, selected.options);
+      const row = response.data as Record<string, unknown> | undefined;
+      if (response.status === 200 && (!row || row.qitemId !== qitemId
+        || notThisCreate(row, sent, await (source ??= storedSourceOf(client, sent))) !== null)) {
+        throw new Error("receipt row does not match the created qitem");
+      }
+      return response;
+    },
+  };
+}
+
+/** A create whose answer didn't arrive, or arrived unreadable, may still have committed. Read the row back once by the ID it
+ *  was sent with, from the daemon that holds it. Only this create's row counts; it never sends the create again. */
+async function readBackCreate(deps: QueueDeps, client: DaemonClient, hostId: string | undefined, qitemId: string, sent: SentCreate): Promise<{ row: Record<string, unknown> | null; note: string }> {
+  const remote = remoteHostOf(hostId);
+  const where = remote ? ` on host '${remote}'` : "";
+  const target = await queueReadTarget(deps, client, hostId);
+  if ("error" in target) return { row: null, note: `This CLI couldn't read the row back ${target.error}.` };
   try {
-    const res = await reader.get<Record<string, unknown>>(`/api/queue/${encodeURIComponent(qitemId)}`, options);
+    const res = await target.reader.get<Record<string, unknown>>(`/api/queue/${encodeURIComponent(qitemId)}`, target.options);
     if (res.status === 200 && res.data?.qitemId === qitemId) {
       const differs = notThisCreate(res.data, sent, await storedSourceOf(client, sent));
       if (differs === "unread") {
@@ -757,6 +786,19 @@ function resolveCurrentSession(explicit: string | undefined, optionName: string)
   if (session) return session;
 
   console.error(`--${optionName} is required when OPENRIG_SESSION_NAME is not set`);
+  process.exitCode = 1;
+  return undefined;
+}
+
+/** For a verb whose actor is the seat's own identity (the X-OpenRig-Session header the CLI sets from OPENRIG_SESSION_NAME),
+ *  where the named flag is deprecated and ignored: the error names what actually sets the actor, never the flag. */
+function requireSeatSession(ignoredFlag: string): string | undefined {
+  const session = readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME");
+  if (session) return session;
+
+  console.error(`OPENRIG_SESSION_NAME is not set, so there's no seat to act as. Run this from a managed seat, or set ` +
+    `OPENRIG_SESSION_NAME to the seat's session name (for example dev-impl@my-rig). --${ignoredFlag} is ignored: the ` +
+    "actor is the seat's own identity.");
   process.exitCode = 1;
   return undefined;
 }
@@ -1064,7 +1106,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           if (opts.verify && status < 400) {
             const createdId = typeof created.qitemId === "string" ? created.qitemId : null;
             const delivery = createdId
-              ? await waitForDeliveryOutcome(client, createdId, deps.deliveryVerify, { destinationSession: hostResolved.destination, nudge: opts.nudge })
+              ? await waitForDeliveryOutcome(createReceiptReader(deps, client, hostResolved.hostId, qitemId, sent), createdId, deps.deliveryVerify, { destinationSession: hostResolved.destination, nudge: opts.nudge })
               : unreadableDeliveryResult(null, hostResolved.destination, {}, "create response did not include a qitem id; delivery cannot be correlated");
             await printWriteResult(client, opts.json ?? false, { ...created, qitemId: createdId, persisted: true, delivery }, status, receipt);
             return;
@@ -1122,7 +1164,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .action(async (qitemId: string, opts: { destination?: string; json?: boolean; full?: boolean }) => {
       // P21 I3 reconcile: the claimant is DERIVED from the seat env — --destination deprecated + ignored,
       // no body claim. Verify the env (the header source) or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "destination")) return;
+      if (!requireSeatSession("destination")) return;
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/claim`, {});
@@ -1140,7 +1182,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .action(async (qitemId: string, opts: { destination?: string; reason: string; json?: boolean; full?: boolean }) => {
       // P21 I3 reconcile: the releaser is DERIVED from the seat env — --destination deprecated + ignored,
       // no body claim. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "destination")) return;
+      if (!requireSeatSession("destination")) return;
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/unclaim`, {
@@ -1201,7 +1243,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       // P21 I3 reconcile: the actor is DERIVED from the seat env (X-OpenRig-Session, stamped by
       // DaemonClient) — --actor is deprecated + ignored, no body actorSession. Verify the env (the
       // header source) or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal). Matches `resolve`.
-      if (!resolveCurrentSession(undefined, "actor")) return;
+      if (!requireSeatSession("actor")) return;
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/update`, {
@@ -1265,7 +1307,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     }) => {
       // P21 I3 reconcile: actor DERIVED from the seat env (X-OpenRig-Session) — --actor deprecated +
       // ignored, no body actorSession. Verify the env, else the daemon returns 400 actor_required (no seat identity to record). Matches `resolve`.
-      if (!resolveCurrentSession(undefined, "actor")) return;
+      if (!requireSeatSession("actor")) return;
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/update`, {
@@ -1305,7 +1347,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       // P21: the resolver is DERIVED from the seat env (X-OpenRig-Session, stamped by DaemonClient) —
       // --actor is deprecated + ignored. The pre-check verifies the env (the header source); else the
       // daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "actor")) return;
+      if (!requireSeatSession("actor")) return;
       const deps = getDeps();
       const bearer = opts.bearer ?? process.env.OPENRIG_AUTH_BEARER_TOKEN;
       await withClient(deps, async (client) => {
@@ -1365,7 +1407,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     }) => {
       // P21 I3 reconcile: the handing-off seat is DERIVED from the seat env (X-OpenRig-Session) —
       // --from deprecated + ignored, no body fromSession. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "from")) return;
+      if (!requireSeatSession("from")) return;
       // slice-08 OPR.0.4.7.8 — body-input parity. Resolve through the shipped
       // resolveQueueBody ONLY when a body source is supplied; neither preserves
       // today's source-body default (POST body undefined). Both/invalid reject
@@ -1469,7 +1511,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     }) => {
       // P21 I3 reconcile: the handing-off seat is DERIVED from the seat env (X-OpenRig-Session) —
       // --from deprecated + ignored, no body fromSession. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "from")) return;
+      if (!requireSeatSession("from")) return;
       // slice-08 OPR.0.4.7.8 — body-input parity (same contract as handoff):
       // resolve only when a body source is supplied; neither keeps the
       // source-body default; both/invalid reject before daemon contact.
@@ -1918,7 +1960,7 @@ Examples:
       }
       // P21 I3 reconcile: the sender is DERIVED from the seat env (X-OpenRig-Session) — --sender
       // deprecated + ignored, no body senderSession. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "sender")) return;
+      if (!requireSeatSession("sender")) return;
       const deps = getDeps();
       const tags = opts.tags ? opts.tags.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
       await withClient(deps, async (client) => {

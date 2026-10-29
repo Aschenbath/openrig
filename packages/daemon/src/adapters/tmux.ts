@@ -643,7 +643,7 @@ export class TmuxAdapter {
     }
   }
 
-  async listPanes(target: string): Promise<TmuxPane[]> {
+  async listPanes(target: string, allWindows = false): Promise<TmuxPane[]> {
     // Callers name a session (optionally with a window), or an immutable tmux
     // id. Exact session matching prevents observing a prefix neighbor's pane.
     // A bare leading '=' belongs to the literal session name. Only qualified
@@ -652,8 +652,8 @@ export class TmuxAdapter {
     const exactTarget = /^[%$@]\d+$/.test(target) ? target
       : namedTarget.includes(":") ? namedTarget : `${namedTarget}:`;
     try {
-      const output = await this.run(["tmux", "list-panes", "-t", exactTarget, "-F", PANE_FORMAT],
-        `tmux list-panes -t ${shellQuote(exactTarget)} -F "${PANE_FORMAT}"`);
+      const output = await this.run(["tmux", "list-panes", ...(allWindows ? ["-s"] : []), "-t", exactTarget, "-F", PANE_FORMAT],
+        `tmux list-panes ${allWindows ? "-s " : ""}-t ${shellQuote(exactTarget)} -F "${PANE_FORMAT}"`);
       return parseLines(output, parsePaneLine);
     } catch (err) {
       if (isNoServerError(err) || isTmuxTransportAbsentError(err)) return [];
@@ -909,7 +909,7 @@ export class TmuxAdapter {
       const identity = this.freshManaged.get(target)?.nodeId ?? target;
       const checkDraft = guard?.needsInputCheck(identity);
       const policy = checkDraft || options?.beforePaste ? {
-        beforePaste: async () => { if (checkDraft) await guard!.beforeInput(identity); await options?.beforePaste?.(); },
+        beforePaste: async () => { if (checkDraft) await guard!.beforeInput(identity, false, text); await options?.beforePaste?.(); },
         afterPaste: async () => { if (checkDraft) await guard!.notePasted(identity, text); },
       } : undefined;
       return this.sendTextUnchecked(pane, text, () => { beforeWrite(); beforeInput?.(); }, options?.bracketed, policy);
@@ -1012,7 +1012,11 @@ export class TmuxAdapter {
       if (!text.ok) return text;
       const enter = await this.sendKeys(target, ["Enter"], beforeInput);
       if (!enter.ok) {
-        await this.sendKeys(target, ["C-c"]);
+        if (!beforeInput) await this.sendKeys(target, ["C-c"]);
+        else {
+          try { beforeInput(); await this.sendKeys(target, ["C-c"], beforeInput); }
+          catch { /* The target changed; do not clear another occupant's input. */ }
+        }
         return enter;
       }
       // The receiver now owns removal. Unlinking here races shell startup.
@@ -1054,6 +1058,52 @@ export class TmuxAdapter {
     try {
       await this.run(["tmux", "set-option", "-w", "-t", window, option, value],
         `tmux set-option -w -t ${shellQuote(window)} ${shellQuote(option)} ${shellQuote(value)}`);
+      return { ok: true };
+    } catch (err) {
+      return classifyWriteError(err);
+    }
+  }
+
+  /** The window's OWN value for an option, without the inherited global value: the string, null when the window
+   *  sets none, undefined when tmux could not be read. A caller that changes the option for a while restores
+   *  exactly this with restoreWindowOption. */
+  async getWindowLocalOption(target: string, option: string): Promise<string | null | undefined> {
+    const window = exactTarget(target, "window");
+    try {
+      const output = await this.run(["tmux", "show-options", "-w", "-v", "-t", window, option],
+        `tmux show-options -w -v -t ${shellQuote(window)} ${shellQuote(option)}`);
+      return output.length === 0 ? null : output.replace(/\r?\n$/, "");
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The window a session name (its current window) or `@N` names, read in one call: its immutable id (`@N`), which
+   *  later commands can target after a client switches windows, and the value of one of its user options (`@name`; ""
+   *  when unset). Null when tmux can't say, including when the session or window is gone. */
+  async readWindow(target: string, userOption: string): Promise<{ id: string; userOption: string } | null> {
+    if (!/^@[A-Za-z0-9_-]+$/.test(userOption)) return null;
+    const window = exactTarget(target, "window");
+    const format = `#{window_id}|#{${userOption}}`;
+    try {
+      const output = (await this.run(["tmux", "display-message", "-p", "-t", window, format],
+        `tmux display-message -p -t ${shellQuote(window)} ${shellQuote(format)}`)).replace(/\r?\n$/, "");
+      const bar = output.indexOf("|");
+      const id = output.slice(0, Math.max(bar, 0));
+      return /^@\d+$/.test(id) ? { id, userOption: output.slice(bar + 1) } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Put back what getWindowLocalOption read: set the value, or unset the window's own value when it had none. */
+  async restoreWindowOption(target: string, option: string, value: string | null): Promise<TmuxResult> {
+    const window = exactTarget(target, "window");
+    const argv = value === null
+      ? ["tmux", "set-option", "-w", "-u", "-t", window, option]
+      : ["tmux", "set-option", "-w", "-t", window, option, value];
+    try {
+      await this.run(argv, argv.map((part, index) => index < 2 ? part : shellQuote(part)).join(" "));
       return { ok: true };
     } catch (err) {
       return classifyWriteError(err);
@@ -1154,7 +1204,7 @@ export class TmuxAdapter {
       beforeWrite();
       const result = await this.respawnPaneUnchecked(pane, command, opts);
       const guard = this.deliveryGuard;
-      const target = guard?.maybeTarget(pane);
+      const target = guard?.maybeTarget(paneTarget);
       if (result.ok && target && guard!.ownsLifecycle(target.nodeId)) guard!.noteFreshLifecyclePane(target.nodeId, pane);
       return result;
     }, false, "respawn");
@@ -1800,20 +1850,24 @@ export class TmuxAdapter {
     }
   }
 
-  /** Every pane's pid and current command in ONE tmux call, keyed by pane id (%N): the values `getPanePid` /
-   *  `getPaneCommand` read per pane. Panes without a valid pid are left out (read those per pane). Null when tmux can't
-   *  be read at all. The command is the LAST field, so a separator inside it stays intact. */
-  async readAllPaneProcesses(): Promise<Map<string, { pid: number; command: string | null }> | null> {
+  /** Every pane's pid, explicit dead flag and current command in ONE tmux call. A retained dead pane can keep
+   *  its former PID/command: neither proves an executor is alive. A dead pane without a valid PID is retained with
+   *  null PID; other invalid rows fall back to per-pane reads. The command stays LAST to preserve separators. */
+  async readAllPaneProcesses(): Promise<Map<string, { pid: number | null; command: string | null; dead?: boolean }> | null> {
     try {
-      const format = ["#{pane_id}", "#{pane_pid}", "#{pane_current_command}"].join(TMUX_FIELD_SEPARATOR);
+      const format = ["#{pane_id}", "#{pane_pid}", "#{pane_dead}", "#{pane_current_command}"].join(TMUX_FIELD_SEPARATOR);
       const output = await this.run(["tmux", "list-panes", "-a", "-F", format], `tmux list-panes -a -F '${format}'`);
-      const out = new Map<string, { pid: number; command: string | null }>();
+      const out = new Map<string, { pid: number | null; command: string | null; dead?: boolean }>();
       for (const line of output.split("\n")) {
         const first = line.indexOf(TMUX_FIELD_SEPARATOR), second = line.indexOf(TMUX_FIELD_SEPARATOR, first + 1);
-        if (first <= 0 || second < 0) continue;
-        const id = line.slice(0, first), pid = parseInt(line.slice(first + 1, second).trim(), 10);
-        if (!Number.isFinite(pid) || pid <= 0) continue;
-        out.set(id, { pid, command: line.slice(second + 1).trim() || null });
+        const third = line.indexOf(TMUX_FIELD_SEPARATOR, second + 1);
+        if (first <= 0 || second < 0 || third < 0) continue;
+        const id = line.slice(0, first), rawPid = Number(line.slice(first + 1, second).trim());
+        const pid = Number.isInteger(rawPid) && rawPid > 0 ? rawPid : null;
+        const rawDead = line.slice(second + 1, third).trim();
+        const dead = rawDead === "1" ? true : rawDead === "0" ? false : undefined;
+        if (pid === null && dead !== true) continue;
+        out.set(id, { pid, command: line.slice(third + 1).trim() || null, ...(dead === undefined ? {} : { dead }) });
       }
       return out;
     } catch {

@@ -75,7 +75,7 @@ function getDeps(c: { get: (key: string) => unknown }) {
 
 function narrowLaunchErrorStatus(code: string | undefined): 404 | 409 | 500 {
   if (code === "rig_not_found" || code === "no_matching_nodes" || code === "snapshot_not_found" || code === "snapshot_wrong_rig" || code === "no_usable_snapshot") return 404;
-  if (code === "snapshot_unusable") return 409;
+  if (code === "snapshot_unusable" || code === "selection_changed") return 409;
   return 500;
 }
 
@@ -105,7 +105,8 @@ sessionsRoutes.get("/", (c) => {
 nodesRoutes.get("/", observeInventoryHandler, async (c) => {
   const rigId = c.req.param("rigId")!;
   const deps = getDeps(c);
-  const rig = deps.rigRepo.getRig(rigId);
+  // Only existence is needed here; the inventory below builds the response.
+  const rig = deps.rigRepo.db.prepare("SELECT 1 FROM rigs WHERE id = ?").get(rigId);
   if (!rig) return c.json({ error: `Rig "${rigId}" not found. List rigs with: rig ps` }, 404);
 
   const refresh = c.req.query("refresh") === "true";
@@ -284,7 +285,7 @@ nodesRoutes.post("/:logicalId/launch", async (c) => {
     return c.json(result, result.ok ? 201 : result.code === "failed" ? 500 : 409);
   }
 
-  if (node.podId) {
+  if (node.podId || body.snapshotId !== undefined) {
     if (body.snapshotId === undefined) {
       const instantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
       const firstStart = await instantiator?.launchFirstMaterializedNode(rigId, node.id);
@@ -753,18 +754,29 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
     }
     try {
       const pid = await tmuxAdapter?.getPanePid?.(binding.tmuxPane);
-      if (!pid || pid !== identity.evidence.observedPid) {
+      // A shell or launcher can be the pane root; legacy verdicts only recorded one PID.
+      const verifiedPanePid = identity.evidence.observedPanePid ?? identity.evidence.observedPid;
+      if (!pid || pid !== verifiedPanePid) {
         return c.json({ error: "record_identity_unverified", message: `The bound pane for '${sessionName}' no longer matches its verified occupant.` }, 409);
       }
+      let verifiedNativeThreadId: string | undefined;
       const live = await resolveLiveCodexThreadId(binding.tmuxPane, {
         getPanePid: async () => pid,
         listProcesses: () => generationCensus.list(),
-        readThreadIdByPid: (nativePid, startedAt) => startedAt
-          ? generationThreadIds.resolve(nativePid, startedAt) : undefined,
+        readThreadIdByPid: async (nativePid, startedAt) => {
+          const threadId = startedAt ? await generationThreadIds.resolve(nativePid, startedAt) : undefined;
+          if (nativePid === identity.evidence.observedPid) verifiedNativeThreadId = threadId;
+          return threadId;
+        },
       });
       if (!live.ok) return c.json({ error: "record_identity_unverified", message: live.reason }, 409);
       sessionId = live.id;
       transcriptPath = store.readCodexTranscriptPath(sessionId);
+      // Dual-PID verdicts must name the process whose thread was selected; legacy verdicts only identify the root. A different
+      // conversation under a surviving wrapper isn't a binding change, so it says what it is.
+      if (identity.evidence.observedPanePid != null && verifiedNativeThreadId !== sessionId) {
+        return c.json({ error: "record_identity_unverified", message: `The Codex conversation in the pane for '${sessionName}' isn't the one its verified process owned, so no generation record is served.` }, 409);
+      }
       if (registry.currentOccupantTenure(context!.nodeId)?.generationUuid !== occupant.generationUuid
         || registry.getBindingForNode(context!.nodeId)?.tmuxPane !== binding.tmuxPane
         || await tmuxAdapter.getPanePid?.(binding.tmuxPane) !== pid) {

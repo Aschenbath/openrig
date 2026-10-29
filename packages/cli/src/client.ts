@@ -3,7 +3,7 @@ import { assessLocalDaemonOwner, ForeignLocalDaemonError, type LocalDaemonOwner 
 export { ForeignLocalDaemonError } from "./local-daemon-owner.js";
 import path from "node:path";
 import { ConfigStore } from "./config-store.js";
-import { getOpenRigHome, readOpenRigEnv } from "./openrig-compat.js";
+import { getOpenRigHome, readOpenRigEnv, readOpenRigUrl } from "./openrig-compat.js";
 import { fetchWithTimeout, FetchTimeoutError } from "./fetch-with-timeout.js";
 import { FETCH_HEADERS_TIMEOUT_MS, nodeHttpFetch } from "./long-request-fetch.js";
 
@@ -153,6 +153,9 @@ interface DaemonClientOptions {
   timeoutMs?: number;
   /** The seat this client acts as, for a client built per authenticated caller; default: the process env. */
   sessionName?: string;
+  /** With sessionName: the caller whose grant the MCP adapter checked, sent as X-OpenRig-Principal (JSON of its source,
+   *  id and, for a grant-service grant, grant id and version; never a credential). */
+  principal?: { source: "file" | "grant-service"; id: string; grant?: string; version?: number | string };
 }
 
 /** Routing state published by daemon start, not a health check or sibling-home discovery. */
@@ -183,6 +186,7 @@ export class DaemonClient {
   private identity?: Promise<Record<string, string>>;
   private originUnknown = false;
   private readonly sessionName?: string;
+  private readonly principal?: DaemonClientOptions["principal"];
 
   /** Isolated terminal tools require this home's durable identity, even on loopback. */
   async isLocalInstance(): Promise<boolean> {
@@ -208,20 +212,59 @@ export class DaemonClient {
   }
 
   private async identityHeaders(): Promise<Record<string, string>> {
+    const { headers, local } = await this.senderHeaders();
+    // Only beside a seat this client was built for, and only to this host's own daemon: the endpoint itself must answer
+    // as this host's instance, whichever way it was chosen (OPENRIG_URL, or an explicit URL such as rig mcp serve --port,
+    // which can be a forwarded port). The daemon records it only on a direct, attributed request.
+    if (!this.principal || this.sessionName === undefined || !local || !(await this.endpointIsThisHost())) return headers;
+    // A header value can't carry characters beyond Latin-1 (fetch throws), and a grant name may hold any: everything past
+    // ASCII travels as JSON's own \u escapes, which the daemon's JSON.parse reads back.
+    const principal = JSON.stringify(this.principal).replace(/[\u0080-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    return { ...headers, "X-OpenRig-Principal": principal };
+  }
+
+  /** Whether this client's endpoint answers /healthz with the id this host's own daemon minted. */
+  private async endpointIsThisHost(): Promise<boolean> {
+    if (this.remoteTarget) return false;
+    // Imported here, not at the top: it loads better-sqlite3 and yaml.
+    const origin = this.originSelfHostId ?? (await import("./local-origin.js")).readLocalOrigin();
+    return !!origin && (await this.endpointSelfHostId()) === origin;
+  }
+
+  /** The endpoint's own instance id from /healthz, or undefined when it doesn't answer within a second. */
+  private async endpointSelfHostId(): Promise<unknown> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        (async () => {
+          const res = await this.fetchImpl(`${this.baseUrl.replace(/\/+$/, "")}/healthz`, { signal: controller.signal });
+          return res.ok ? (await res.json() as { selfHostId?: unknown }).selfHostId : undefined;
+        })(),
+        new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), Math.min(this.timeoutMs, 1000)); }),
+      ]);
+    } catch { return undefined; }
+    finally { clearTimeout(timer); controller.abort(); }
+  }
+
+  /** The sender headers, and whether the endpoint is this host's own daemon: no direct endpoint is configured, or the
+   *  endpoint answered with this host's own instance id. */
+  private async senderHeaders(): Promise<{ headers: Record<string, string>; local: boolean }> {
     const localHeaders = senderIdentityHeaders(undefined, this.sessionName);
     const session = localHeaders[SENDER_IDENTITY_HEADER];
-    if (!session || session.split("@").length >= 3) return localHeaders;
-    const directTarget = readOpenRigEnv("OPENRIG_URL", "RIGGED_URL");
-    if (!this.remoteTarget && !directTarget) return localHeaders;
+    if (!session || session.split("@").length >= 3) return { headers: localHeaders, local: false };
+    const directTarget = readOpenRigUrl();
+    if (!this.remoteTarget && !directTarget) return { headers: localHeaders, local: true };
     // Imported here, not at the top: it loads better-sqlite3 and yaml, which only a seat on a direct endpoint needs.
     const origin = this.originSelfHostId ?? (await import("./local-origin.js")).readLocalOrigin();
     if (!origin) {
       this.originUnknown = true;
-      return { ...localHeaders, "X-OpenRig-Origin-Unknown": "true" };
+      return { headers: { ...localHeaders, "X-OpenRig-Origin-Unknown": "true" }, local: false };
     }
-    // Loopback may be forwarded. Unproved locality carries the known origin.
-    if (!this.remoteTarget && await this.matchesInstanceIdentity(origin)) return localHeaders;
-    return senderIdentityHeaders(origin, this.sessionName);
+    // Loopback may be a forwarded endpoint. Only matching instance identity proves locality; unproved, the sender carries
+    // the known origin, never the endpoint's identity.
+    if (!this.remoteTarget && (await this.endpointSelfHostId()) === origin) return { headers: localHeaders, local: true };
+    return { headers: senderIdentityHeaders(origin, this.sessionName), local: false };
   }
 
   /** The sender this client stamps on its requests (the X-OpenRig-Session value, absent without a seat), and whether it marked
@@ -236,7 +279,7 @@ export class DaemonClient {
     if (baseUrl) {
       this.baseUrl = baseUrl;
     } else {
-      const envUrl = readOpenRigEnv("OPENRIG_URL", "RIGGED_URL");
+      const envUrl = readOpenRigUrl();
       if (envUrl) {
         this.baseUrl = envUrl;
       } else {
@@ -257,6 +300,7 @@ export class DaemonClient {
     this.ownerProbe = options?.ownerProbe ?? ((url, timeoutMs) => assessLocalDaemonOwner(url, { fetchImpl: this.fetchImpl, timeoutMs }));
     this.timeoutMs = options?.timeoutMs ?? 5_000;
     this.sessionName = options?.sessionName;
+    this.principal = options?.principal;
   }
 
   /** Shared with raw CLI data readers. Constructor URLs alone do not establish explicit intent. */

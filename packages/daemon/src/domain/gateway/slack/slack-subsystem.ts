@@ -41,10 +41,9 @@ import { startSocketInbound, type SocketInboundHandle, type WsLike } from "./soc
 import { HUMAN_ALERT_TAG, loadHumanRegistry, resolveSlackHandle } from "../human-registry.js";
 import { sharedChannelAddresses, sharedChannelFor } from "../participants.js";
 import { hasLiveHumanGate, isBlockerLive, type QueueRepository } from "../../queue-repository.js";
-import { formatReplyToChoice, REPLY_TO_CHOICE_ACTOR, REPLY_TO_CHAIN_LIMIT, type ReplyToChoice } from "../../reply-to-choice.js";
+import { formatReplyToChoice, formatReplyToThreadMissing, REPLY_TO_CHOICE_ACTOR, REPLY_TO_CHAIN_LIMIT, type ReplyToChoice } from "../../reply-to-choice.js";
 import { parseSessionName } from "../../session-name.js";
 import type { FetchImpl } from "./slack-api.js";
-import { isHumanSeatSession } from "../../human-route-enforcer.js";
 import { ownerNotificationLevelAtLeast } from "../../queue-transition-log.js";
 // OPR.0.5.6.1 — the delivery rules engine: ONE decision per message replaces
 // the two dial-reads (the S14 default-decision stub). The legacy dial path
@@ -59,7 +58,8 @@ import {
   type DeliveryDecision,
 } from "../delivery-rules-engine.js";
 import { armDeliveryDeferral } from "../../policies/delivery-deferral.js";
-import { confirmReleaseAtPost, holdForQuiet } from "../../policies/quiet-release.js";
+import { confirmReleaseAtPost, currentAskVerdict, holdForQuiet } from "../../policies/quiet-release.js";
+import { noteRePresentNotPosted, RE_PRESENT_DECISION_PREFIX } from "./open-asks.js";
 import { quietHoldFor } from "../human-quiet-windows.js";
 import { WatchdogJobsRepository } from "../../watchdog-jobs-repository.js";
 
@@ -109,12 +109,12 @@ export function makeHumanReplyResolver(
       return "resolved-uncertain";
     }
     let uncertain = false;
-    if (source?.state === "blocked" && isHumanSeatSession(source.blockedOn)) {
-      const episode = queueRepo.transitionLog.listForQitem(input.qitemId)
-        .filter((transition) => transition.ownerNotificationKind === "human-required").at(-1);
+    // A park on a person by any address (a registered person's own address, as their Slack rows carry it, or a
+    // legacy human seat) answers only from a reply written after its current question posted.
+    if (source?.state === "blocked" && source.blockedOn && queueRepo.isPersonAddress(source.blockedOn)) {
+      const episode = queueRepo.currentHumanRequiredEpisode(input.qitemId);
       if (!episode) return "not-applicable";
-      const key = `${input.qitemId}:${episode.transitionId}`;
-      const receipt = queueRepo.transitionLog.getOwnerNotificationReceipt(input.qitemId, key);
+      const { key, receipt } = episode;
       // A final receipt attests delivery even when reconciliation lost its timestamp.
       // Without one, ONLY a unique exact current-episode primary proves anything.
       const primary = !receipt && home ? pendingPrimaryReceipt(home, input.qitemId, key) : null;
@@ -609,6 +609,20 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
             log(`reply stamp failed for ${p.qitemId}: ${(e as Error).message}`);
           }
         },
+        // #2234: Slack posted a reply to this root as a new top-level message, so the root is gone. Its mapping is closed,
+        // so later posts don't reuse it. A closed root still routes a reply to its seat.
+        onThreadMissing: (p, threadTs, channel) => {
+          threadMap.close(threadTs, channel);
+          log(`thread ${threadTs} in ${channel} is gone: Slack posted the reply as a new message, so its mapping is closed`);
+          // A --reply-to update's receipt says where it actually went; the recorded choice stays, for retries.
+          if (threadReplyTo(p)) {
+            try {
+              opts.queueRepo.update({ qitemId: p.qitemId, actorSession: REPLY_TO_CHOICE_ACTOR, transitionNote: formatReplyToThreadMissing(threadTs) });
+            } catch (e) {
+              log(`reply-to placement for ${p.qitemId} not recorded: ${(e as Error).message}`);
+            }
+          }
+        },
         onTransportFailed: recordTransportFailed,
         onPosted: (p, messageTs, threadTs) => {
           // v3 digest branch: transport truth first — every member receipt is
@@ -806,6 +820,49 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       releaseRef(p.qitemId);
       return { ok: true as const };
     }
+    // An open ask shown again after enable (`rig slack post-open-asks`): checked here, at post time, against the row, the
+    // recipient and the posting threshold as they are now, then delivered like any fresh ask below (the delivery rules,
+    // quiet hours, digest, thread). One that's no longer current, or can't be checked, posts nothing and its row says why,
+    // unless an earlier attempt of it may already be in Slack (below).
+    if (decision.decisionId.startsWith(RE_PRESENT_DECISION_PREFIX) && p.qitemId) {
+      const key = p.notificationKey ?? p.qitemId;
+      if (opts.queueRepo.transitionLog.hasOwnerNotificationReceipt(p.qitemId, key)) {
+        releaseRef(key);
+        return { ok: true as const };
+      }
+      // Whether an earlier attempt can be in Slack is read from the attempt log, which the landing check below reads
+      // leniently. A log that exists but can't be read is unknown, not "never attempted": the decision stays in the buffer,
+      // with no post (delivery's reconcile reads the same log) and no not-posted record, until it reads.
+      try {
+        attempted.statuses();
+      } catch (error) {
+        log(`re-shown ${decision.decisionId} retained: the attempt log couldn't be read (${(error as Error).message})`);
+        return { ok: false as const, class: "re-present-attempt-log-unreadable", detail: (error as Error).message };
+      }
+      // An earlier attempt of this decision found in Slack goes to delivery, which records it.
+      const landing = "landing" in deliver ? await (deliver as { landing: (d: typeof decision) => Promise<string> }).landing(decision) : "unattempted";
+      if (landing === "found" || landing === "partial") return deliver(decision);
+      const verdict = await currentAskVerdict({
+        queueRepo: opts.queueRepo,
+        home: opts.home,
+        registry: { loadHumanRegistry: () => registrySurface.loadHumanRegistry(opts.home) },
+        entityId: (p.destinationSession ?? "").split("@")[0] ?? "",
+        qitemId: p.qitemId,
+        notificationKey: key,
+      });
+      if (verdict.kind !== "post") {
+        // One whose earlier attempt Slack couldn't rule out may already be posted: it's never recorded as not posted, and
+        // it stays in the buffer, so its replay decides again (and reconciles) instead of the uncertainty being dropped.
+        if (landing === "maybe") {
+          const why = verdict.kind === "unavailable" ? verdict.detail : verdict.reason;
+          log(`re-shown ${decision.decisionId} retained: an earlier attempt may be in Slack, and it can't go on now (${why})`);
+          return { ok: false as const, class: "re-present-earlier-attempt-unconfirmed", detail: why };
+        }
+        noteRePresentNotPosted(opts.queueRepo, p.qitemId, key, verdict);
+        releaseRef(key);
+        return { ok: true as const };
+      }
+    }
     if (p.deliveryDeferralFire) {
       const fireKey = p.notificationKey ?? p.qitemId;
       if (p.qitemId && opts.queueRepo.transitionLog.hasOwnerNotificationReceipt(p.qitemId, fireKey)) {
@@ -836,6 +893,11 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       // The decision couldn't be made (for example the person's quiet hours couldn't be read): post nothing and record
       // nothing. Releasing the in-flight guard lets the outbound sweep offer this still-unseen ask again and decide afresh.
       log(`delivery decision for ${p.qitemId} deferred: ${(error as Error).message}`);
+      // A re-shown ask is seen, so no sweep offers it again: its row says it wasn't posted, and the person who ran
+      // `rig slack post-open-asks` runs it again once the state reads (same decision id).
+      if (decision.decisionId.startsWith(RE_PRESENT_DECISION_PREFIX) && p.qitemId) {
+        noteRePresentNotPosted(opts.queueRepo, p.qitemId, p.notificationKey ?? p.qitemId, { kind: "unavailable", detail: (error as Error).message });
+      }
       // Released by notification key, the guard's own key: nothing marks this ask seen, so the next sweep must see it.
       releaseRef(p.notificationKey ?? p.qitemId!);
       return { ok: true as const };
@@ -971,6 +1033,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       seen: inboundSeen,
       deadLetter: dead,
       destination: cfg.inboundDestination,
+      reactions: cfg.reactions === "off" ? "off" : "route",
       resolveSender: makeInboundSenderResolver(registry, opts.home),
       // S10 — deterministic thread routing: mapped thread → exactly the mapped seat; unmapped
       // or human-initiated → the configured orchestrator slot as an unrouted-signal row.

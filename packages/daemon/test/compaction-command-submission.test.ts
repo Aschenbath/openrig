@@ -44,9 +44,10 @@ function fixture(compactInstruction = '') {
     sendKeys: vi.fn(async (_: string, keys: string[]) => { const receipt = onKeys?.(keys); events.push({kind: 'keys', keys}); return receipt ?? {ok: true}; }),
   };
   Object.assign(tmux, {deliveryGuard: new SeatDeliveryGuard(db, () => ({nodeId: 'node-one', session: seat, pane: '%1', occupant: generation}))});
-  // The transport's idle wait runs on real time (Date.now deadlines), so its sleep is a real timer and never moves
-  // the enforcer's clock: a fast machine must not spin the fake clock past the preparation deadline.
-  const transport = new SessionTransport({db, rigRepo: {} as any, sessionRegistry: {} as any, tmuxAdapter: tmux as any, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), now: () => new Date(clock), waitForIdlePollMs: 5});
+  // The enforcer and transport share one clock, including the transport's Date.now idle deadline.
+  // A scheduler pause must not consume the 20 ms idle budget while the fixture still models an idle seat.
+  vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  const transport = new SessionTransport({db, rigRepo: {} as any, sessionRegistry: {} as any, tmuxAdapter: tmux as any, sleep: async (ms) => { clock += ms; }, now: () => new Date(clock), waitForIdlePollMs: 5});
   (transport as any).getSessionMeta = () => { if (metaThrows) throw new Error('SQLITE_BUSY: database is locked'); return ({runtime: 'claude-code', attachmentType: 'tmux', nodeId: 'node-one', pane: '%1', occupant: generation, resumeToken: 'native-one'}); };
   (transport as any).claudeDeliveryObservation = async () => ({state: 'unknown', detail: 'injected process observation'});
   // A send that asks for pane-only readiness reads the pane; any other send may be decided by the hook.
@@ -499,14 +500,14 @@ it('a post-paste metadata failure (the binding read throws) reads written: 1 wri
   f.onText((text) => { if (text.startsWith('/compact')) f.metaThrows(true); });
   const real = f.transport.send.bind(f.transport);
   const results: any[] = [];
-  vi.spyOn(f.transport, 'send').mockImplementation(async (s: string, text: string, opts?: any) => { const r = await real(s, text, opts); if (text.startsWith('/compact')) results.push(r); return r; });
+  const sendSpy = vi.spyOn(f.transport, 'send').mockImplementation(async (s: string, text: string, opts?: any) => { const r = await real(s, text, opts); if (text.startsWith('/compact')) results.push(r); return r; });
   await f.e.maybeAutoCompact(input);
   expect(results[0]).toMatchObject({sent: true, inputPhase: 'written'});
   expect(results[0].error).toContain('Enter was not sent'); // the throw came before the Enter key reached the adapter
   expect(f.e.getPreparationState(seat)).toMatchObject({status: 'stopped', compact: 'uncertain'});
   expect(compactWrites(f)).toBe(1);
   expect(entersAfterCompact(f)).toBe(0);
-  vi.restoreAllMocks();
+  sendSpy.mockRestore();
   await noSecondWrite(f);
   expect(compactWrites(f)).toBe(1);
 });
@@ -519,13 +520,13 @@ it('Enter uncertainty (sendKeys itself throws): written, the submission outcome 
   f.onKeys(() => { if (pasted) throw new Error('send-keys: lost reply'); });
   const real = f.transport.send.bind(f.transport);
   const results: any[] = [];
-  vi.spyOn(f.transport, 'send').mockImplementation(async (s: string, text: string, opts?: any) => { const r = await real(s, text, opts); if (text.startsWith('/compact')) results.push(r); return r; });
+  const sendSpy = vi.spyOn(f.transport, 'send').mockImplementation(async (s: string, text: string, opts?: any) => { const r = await real(s, text, opts); if (text.startsWith('/compact')) results.push(r); return r; });
   await f.e.maybeAutoCompact(input);
   expect(results[0]).toMatchObject({sent: true, inputPhase: 'written'});
   expect(results[0].error).toContain('the submission (Enter) outcome is unconfirmed');
   expect(results[0].error).not.toContain('Enter was not sent');
   expect(f.e.getPreparationState(seat)).toMatchObject({status: 'stopped', compact: 'uncertain'});
-  vi.restoreAllMocks();
+  sendSpy.mockRestore();
   await noSecondWrite(f);
   expect(compactWrites(f)).toBe(1);
 });
@@ -533,9 +534,9 @@ it('Enter uncertainty (sendKeys itself throws): written, the submission outcome 
 async function compactResult(f: ReturnType<typeof fixture>) {
   const real = f.transport.send.bind(f.transport);
   const results: any[] = [];
-  vi.spyOn(f.transport, 'send').mockImplementation(async (s: string, text: string, opts?: any) => { const r = await real(s, text, opts); if (text.startsWith('/compact')) results.push(r); return r; });
+  const sendSpy = vi.spyOn(f.transport, 'send').mockImplementation(async (s: string, text: string, opts?: any) => { const r = await real(s, text, opts); if (text.startsWith('/compact')) results.push(r); return r; });
   await f.e.maybeAutoCompact(input);
-  vi.restoreAllMocks();
+  sendSpy.mockRestore();
   return results[0];
 }
 

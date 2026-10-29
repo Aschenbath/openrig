@@ -1,3 +1,10 @@
+import { tileAttachArgv } from "./tile-attach.js";
+import { shellQuote } from "../../adapters/shell-quote.js";
+import type { ViewerKey, ViewerResult } from "./herdr-viewer.js";
+import { TerminalFollowing, type FollowingSelector } from "./terminal-following.js";
+import type { FollowControls } from "./terminal-follow-policy.js";
+import type { EventBus } from "../event-bus.js";
+import { getDefaultOpenRigPath } from "../../openrig-compat.js";
 // OPR.0.4.6.02 C3 — the TerminalService orchestrator.
 //
 // ONE daemon-side composer for EVERY view kind (arch R1 / guard b1): the
@@ -30,6 +37,7 @@
 // not found), so the route JSON and the CLI JSON carry ONE contract for every
 // outcome.
 
+import type { TaskTerminalView, TaskMembership } from "./task-terminal-view.js";
 import { composeView, type ViewMemberInput } from "./view-composer.js";
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
@@ -51,6 +59,7 @@ import type {
   ProviderLiveness,
   ProviderStatus,
   TerminalProvider,
+  ViewDescriptor,
 } from "./terminal-provider.js";
 
 /** The provider name set (herdr = proof-gated primary; cmux = best-effort; rex = by name or from a Rex caller). */
@@ -64,7 +73,7 @@ export interface OpenViewRequest {
   provider?: string;
   /** An explicit provider session; omission retains the daemon's configured endpoint. */
   session?: string;
-  /** The view argument: a rig name | `mission:<id>` | `slice:<id>` | a saved-view id. */
+  /** A rig, mission:<id>, slice:<id>, qitem:<id> local episode, or saved view. */
   view: string;
   /** Preview fingerprint. A changed membership/layout must be previewed again. */
   expectedPlan?: string;
@@ -82,10 +91,13 @@ export interface TerminalPreview {
   /** The same pure grid roots consumed by the Herder adapter. */
   grids: ReturnType<typeof buildGridRoot>[];
   status: ProviderStatus;
+  task?: TaskMembership;
+  viewDescriptor?: ViewDescriptor;
 }
 
 /** The `rig terminal views` payload: saved views + the live rig names you can open. */
 export interface ListViewsResult {
+  following?: ReturnType<TerminalFollowing["list"]>;
   saved: SavedView[];
   /** Rig names openable as per-rig derived views (live from the inventory). */
   rigs: string[];
@@ -100,6 +112,7 @@ export interface ProviderStatusReport {
 }
 
 export interface TerminalStatusResult {
+  following?: ReturnType<TerminalFollowing["list"]>;
   providers: ProviderStatusReport[];
   tmux?: TmuxServerSelection;
   session?: string;
@@ -108,6 +121,8 @@ export interface TerminalStatusResult {
 }
 
 export interface TerminalServiceDeps {
+  eventBus?: Pick<EventBus, "subscribe">;
+  followingStatePath?: string;
   /** Resolve a provider name to its adapter, or null for an unknown name. */
   resolveProvider(name: string): TerminalProvider | null;
   /** Resolve an explicit session without altering the default provider instance. */
@@ -122,6 +137,8 @@ export interface TerminalServiceDeps {
   listPodSeats(rigArg: string, podNamespace: string): Promise<LiveSeatRow[] | null> | LiveSeatRow[] | null;
   /** Live seats for a derived scope (`mission:<id>` | `slice:<id>`); null when the scope is unknown/invalid. */
   listScopeSeats(scope: string): Promise<LiveSeatRow[] | null> | LiveSeatRow[] | null;
+  /** Exact local queue episode; unavailable owners must remain in task.members. */
+  resolveTaskView?(qitemId: string): Promise<TaskTerminalView | null> | TaskTerminalView | null;
   /** Known rig names (for the `views` listing). */
   listRigNames(): Promise<string[]> | string[];
   /** Read-only host resolution for the composer (registry unavailable → null for every id). */
@@ -160,13 +177,57 @@ function savedMemberToInput(m: SavedViewMember): ViewMemberInput {
 /** The default kernel view's space name in a terminal multiplexer such as Herdr. */
 export const KERNEL_SPACE_LABEL = "openrig kernel";
 
-type ResolvedView = { id: string; members: ViewMemberInput[]; kernelLayout?: string; columns?: number; panesPerPage?: number } | { code: string; error: string };
+type ResolvedView = { id: string; members: ViewMemberInput[]; kernelLayout?: string; columns?: number; panesPerPage?: number; task?: TaskMembership } | { code: string; error: string };
 type ComposedTerminalView = ComposedView & { kernelLayout?: string };
 
 export class TerminalService {
   private localTmux?: Promise<string | undefined>;
+  private following?: TerminalFollowing;
 
-  constructor(private readonly deps: TerminalServiceDeps) {}
+  constructor(private readonly deps: TerminalServiceDeps) {
+    if (deps.eventBus) this.following = new TerminalFollowing(
+      deps.followingStatePath ?? getDefaultOpenRigPath("private/terminal-following/selectors.json"), deps.eventBus,
+      (selector, controls) => this.renderFollowing(selector, controls));
+  }
+
+  async stop(): Promise<void> { await this.following?.stop(); }
+
+  async followView(req: OpenViewRequest & FollowControls): Promise<OpenViewResult> {
+    if (!this.following) return errorResult("herdr", "follow_unavailable", "This daemon has no event-driven terminal following service.");
+    if (!req.view.startsWith("qitem:")) return errorResult("herdr", "follow_view_required", "Follow requires qitem:<id>, whose membership has an authoritative completeness signal.");
+    const selected = this.selectProvider({ ...req, provider: req.provider ?? "herdr" });
+    if ("ok" in selected) return selected;
+    if (selected.name !== "herdr" || !selected.provider.followView) return errorResult(selected.name, "follow_unsupported", "Follow is supported by the qualified Herdr provider only.");
+    if (req.expectedPlan !== undefined) {
+      const composed = await this.resolveComposed(req.view, selected.provider.panesPerPage);
+      if ("code" in composed) return errorResult(selected.name, composed.code, composed.error);
+      if (req.expectedPlan !== this.planId(selected.name, composed, selected.session)) return errorResult(selected.name, "preview_changed", "Task membership changed since preview; refresh before enabling following.");
+    }
+    const { enabled, maxTiles, graceMs, focusRetentionMs, pin, unpin, suppress, unsuppress, suppressionMs } = req;
+    return this.following.open({ view: req.view, provider: "herdr", ...(selected.session !== undefined ? { session: selected.session } : {}) },
+      { enabled, maxTiles, graceMs, focusRetentionMs, pin, unpin, suppress, unsuppress, suppressionMs });
+  }
+
+  private async renderFollowing(selector: FollowingSelector, controls: FollowControls): Promise<OpenViewResult> {
+    const selected = this.selectProvider(selector);
+    if ("ok" in selected) return selected;
+    if (!selected.provider.followView) return errorResult(selected.name, "follow_unsupported", "This provider cannot follow a task.");
+    let composed: ComposedView | null = null;
+    try {
+      const current = await this.resolveComposed(selector.view, selected.provider.panesPerPage);
+      if (!("code" in current)) composed = { ...current, opened: current.opened.map(p => this.viewerPane(p)) };
+    } catch { /* Unreadable membership is supplied as unknown, never empty. */ }
+    const plan = composed && this.planId(selected.name, composed, selected.session);
+    const stillCurrent = async () => {
+      if (!composed?.task?.complete || !plan) return false;
+      const current = await this.resolveComposed(selector.view, selected.provider.panesPerPage);
+      return !("code" in current) && current.task?.complete === true && this.planId(selected.name,
+        { ...current, opened: current.opened.map(p => this.viewerPane(p)) }, selected.session) === plan;
+    };
+    const result = await selected.provider.followView(selector.view, composed, controls, stillCurrent);
+    return { ...result, ...(selected.session !== undefined ? { session: selected.session } : {}),
+      ...(composed?.task ? { task: composed.task } : {}), viewDescriptor: { kind: controls.enabled && result.following?.enabled !== false ? "following" : "fixed", name: composed?.task?.name ?? selector.view } };
+  }
 
   private selectProvider(req: Pick<OpenViewRequest, "provider" | "session">): {
     name: string; provider: TerminalProvider; session?: string;
@@ -224,11 +285,12 @@ export class TerminalService {
 
     const composed = await this.resolveComposed(req.view, provider.panesPerPage, req.viewportColumns);
     if ("code" in composed) return errorResult(providerName, composed.code, composed.error);
+    await this.viewerMappings(provider, composed);
     const planId = this.planId(providerName, composed, session);
     if (req.expectedPlan !== undefined && req.expectedPlan !== planId) {
       return errorResult(providerName, "preview_changed", "View membership, layout or provider session changed. Refresh the preview before Open; nothing was launched.");
     }
-    const notes = composed.kernelLayout ? [`Default kernel view: ${composed.kernelLayout}.`] : [];
+    const notes = composed.task ? [...composed.task.issues] : composed.kernelLayout ? [`Default kernel view: ${composed.kernelLayout}.`] : [];
     if (fellBack) notes.push(`Herdr isn't available here (not installed or not answering), so this view uses ${providerName}.`);
     if (composed.kernelLayout && composed.opened.length === 0) {
       return {
@@ -246,7 +308,7 @@ export class TerminalService {
     if (!composed.kernelLayout && composed.opened.some(pane => !pane.readOnly)) {
       notes.push("The shared dashboard is the overview; the team's lead pane is where you can talk about the work. Check the opened seats and any absent or degraded seats above. Can you see the team? A created workspace or a capture alone does not confirm what is visible on your screen.");
     }
-    return { ...result, ...(session !== undefined ? { session } : {}), ...(notes.length ? { notes: [...notes, ...(result.notes ?? [])] } : {}) };
+    return { ...result, viewDescriptor: composed.viewDescriptor, ...(composed.task ? { task: composed.task } : {}), ...(session !== undefined ? { session } : {}), ...(notes.length ? { notes: [...notes, ...(result.notes ?? [])] } : {}) };
   }
 
   private async resolveComposed(viewArg: string, panesPerPage?: number, viewportColumns?: number): Promise<ComposedTerminalView | { code: string; error: string }> {
@@ -255,6 +317,21 @@ export class TerminalService {
     const resolved = await this.resolveView(view);
     if ("code" in resolved) return resolved;
     const composed = composeView(resolved.id, await this.refineLiveness(resolved.members), { resolveHost: (id) => this.deps.resolveHost(id), panesPerPage: resolved.panesPerPage ?? panesPerPage, localTmux: await this.resolveLocalTmux(), localTmuxServer: daemonTmuxServerArgs(), localTmuxServerMode: daemonTmuxServerInfo()?.mode });
+    const saved = view.startsWith("saved:") ? this.deps.viewsStore.get(view.slice(6))
+      : !/^(qitem|mission|slice|pod|seat|rig):/.test(view) ? this.deps.viewsStore.get(view) : null;
+    composed.viewDescriptor = { kind: saved && saved.id === resolved.id ? "fixed" : "following",
+      name: resolved.task?.name ?? (saved?.id === resolved.id ? saved.name : resolved.id) };
+    if (resolved.task) {
+      for (const member of resolved.task.members) {
+        const missing = composed.absent.find(item => item.seat === member.seat);
+        if (missing && member.availability === "available") {
+          member.availability = "missing"; member.reason = missing.reason;
+        } else if (member.availability !== "available") {
+          composed.absent.push({ seat: member.seat, host: member.key.hostId, reason: member.reason ?? member.availability });
+        }
+      }
+      return { ...composed, task: resolved.task };
+    }
     if (resolved.kernelLayout && Number.isSafeInteger(viewportColumns) && viewportColumns! >= 120) {
       // The default's members are operator, dashboard, advisor. Keep the advisor separate
       // even when one of the other roles is unavailable; chunking two at a time would not.
@@ -266,7 +343,7 @@ export class TerminalService {
   }
 
   private planId(provider: string, composed: ComposedView, session?: string): string {
-    return createHash("sha256").update(JSON.stringify({ provider, ...(session !== undefined ? { session } : {}), composed, grids: composed.pages.map(page => buildGridRoot(page, composed.columns)) })).digest("hex");
+    return createHash("sha256").update(JSON.stringify({ provider, ...(session !== undefined ? { session } : {}), composed: { ...composed, ...(composed.task ? { task: { ...composed.task, members: composed.task.members.map(({ viewer, viewerStatus, ...member }) => member) } } : {}) }, grids: composed.pages.map(page => buildGridRoot(page, composed.columns)) })).digest("hex");
   }
 
   /** Passive: inventory, local has-session and provider probe only. Never openView. */
@@ -277,14 +354,55 @@ export class TerminalService {
     const { provider, session } = selected;
     const composed = await this.resolveComposed(req.view, provider.panesPerPage, req.viewportColumns);
     if ("code" in composed) return errorResult(providerName, composed.code, composed.error);
+    await this.viewerMappings(provider, composed);
     const tmux = daemonTmuxServerInfo();
-    return { provider: providerName, ...(session !== undefined ? { session } : {}), ...(tmux ? { tmux } : {}), view: req.view, composed,
+    return { provider: providerName, ...(session !== undefined ? { session } : {}), ...(tmux ? { tmux } : {}), view: req.view, composed, viewDescriptor: composed.viewDescriptor, ...(composed.task ? { task: composed.task } : {}),
       grids: composed.pages.map(page => buildGridRoot(page, composed.columns)), planId: this.planId(providerName, composed, session), status: await provider.status() };
+  }
+
+  private viewerPane(pane: import("./terminal-provider.js").ComposedPane) {
+    const original = pane.attachArgv;
+    if (!original) return pane;
+    const attachArgv = tileAttachArgv(original[5]!, original.slice(6), original[4]!, false);
+    return { ...pane, readOnly: false, attachArgv, paneCommand: attachArgv.map(shellQuote).join(" ") };
+  }
+
+  private async viewerMappings(provider: TerminalProvider, composed: ComposedView): Promise<void> {
+    if (!composed.task || !provider.lookupViewer) return;
+    for (const member of composed.task.members) {
+      const pane = composed.opened.find(p => p.seat === member.seat);
+      if (!pane || !member.key.hostId || !member.key.nodeId) continue;
+      const result = await provider.lookupViewer({ hostId: member.key.hostId, nodeId: member.key.nodeId }, this.viewerPane(pane));
+      if (result.ok) { member.viewerStatus = "verified"; member.viewer = result.viewer; }
+      else if (result.code !== "viewer_not_provisioned") member.viewerStatus = "unconfirmed";
+    }
+  }
+
+  /** Explicit owner operation: membership never grants input authority. The
+   * HTTP route supplies the existing owner bearer/browser boundary. */
+  async ensureViewer(req: OpenViewRequest & { member: ViewerKey; expectedPlan: string }): Promise<ViewerResult> {
+    if (!req.view.startsWith("qitem:")) return { ok: false, code: "view_required", error: "Ensure-viewer requires a qitem view." };
+    const selected = this.selectProvider({ ...req, provider: req.provider ?? "herdr" });
+    if ("ok" in selected) return { ok: false, code: selected.code ?? "unknown_provider", error: selected.error ?? "Provider unavailable." };
+    if (!selected.provider.ensureViewer) return { ok: false, code: "viewer_unsupported", error: "This provider has no qualified ensure-viewer operation." };
+    const composed = await this.resolveComposed(req.view, selected.provider.panesPerPage, req.viewportColumns);
+    if ("code" in composed) return { ok: false, code: composed.code, error: composed.error };
+    if (req.expectedPlan !== this.planId(selected.name, composed, selected.session)) return { ok: false, code: "preview_changed", error: "Task membership or attachment changed; refresh the preview before ensuring a viewer." };
+    if (!composed.task?.complete) return { ok: false, code: "viewer_unconfirmed", error: "Task membership is incomplete; no viewer was provisioned." };
+    const member = composed.task.members.find(m => m.key.hostId === req.member.hostId && m.key.nodeId === req.member.nodeId);
+    const pane = member?.availability === "available" && composed.opened.find(p => p.seat === member.seat);
+    if (!pane) return { ok: false, code: "viewer_unavailable", error: "This current task member has no verified local terminal attachment." };
+    return selected.provider.ensureViewer(req.member, this.viewerPane(pane), async () => {
+      const current = await this.resolveComposed(req.view, selected.provider.panesPerPage, req.viewportColumns);
+      return !("code" in current) && current.task?.complete === true
+        && this.planId(selected.name, current, selected.session) === req.expectedPlan;
+    });
   }
 
   /** List saved views + the rig names openable as derived views. */
   async listViews(detail = false): Promise<ListViewsResult> {
     const result: ListViewsResult = {
+      following: this.following?.list() ?? [],
       saved: this.deps.viewsStore.list(),
       rigs: await this.deps.listRigNames(),
     };
@@ -319,7 +437,7 @@ export class TerminalService {
     if (session !== undefined) {
       const selected = this.selectProvider({ provider: providerName, session });
       if ("ok" in selected) return { providers: [], error: selected.error, code: selected.code };
-      return { session: selected.session, ...(tmux ? { tmux } : {}), providers: [{ name: selected.name,
+      return { following: this.following?.list() ?? [], session: selected.session, ...(tmux ? { tmux } : {}), providers: [{ name: selected.name,
         status: await selected.provider.status(), liveness: await selected.provider.liveness() }] };
     }
     const names: string[] = providerName ? [providerName] : ["herdr", "cmux", "rex"];
@@ -335,11 +453,16 @@ export class TerminalService {
       }
       return { name, status: await p.status(), liveness: await p.liveness() };
     }));
-    return { providers, ...(tmux ? { tmux } : {}) };
+    return { providers, following: this.following?.list() ?? [], ...(tmux ? { tmux } : {}) };
   }
 
   /** Resolve a view argument into composer-ready members (precedence in the file header). */
   private async resolveView(view: string): Promise<ResolvedView> {
+    if (view.startsWith("qitem:")) {
+      const task = await this.deps.resolveTaskView?.(view.slice(6));
+      return task ? { id: view, members: task.members, task: task.task }
+        : { code: "view_not_found", error: `unknown local queue episode '${view.slice(6)}'` };
+    }
     if (view.startsWith("saved:")) {
       const saved = this.deps.viewsStore.get(view.slice(6));
       if (saved) return { id: saved.id, members: saved.members.map(savedMemberToInput) };
@@ -373,6 +496,23 @@ export class TerminalService {
       const rows = await this.deps.listPodSeats(rest.slice(0, slash), rest.slice(slash + 1));
       if (rows == null) {
         return { code: "view_not_found", error: `unknown pod '${rest.slice(slash + 1)}' in rig '${rest.slice(0, slash)}'` };
+      }
+      return { id: view, members: deriveViewMembers(rows, { readOnly: false }) };
+    }
+
+    // 2b. one seat within a rig — `seat:<rig-id-or-name>/<logicalId>` (the TUI's agent page opens just that agent).
+    //     Interactive, like its rig. A logical id has no `/`, so the last `/` splits it from the rig.
+    if (view.startsWith("seat:")) {
+      const rest = view.slice("seat:".length);
+      const slash = rest.lastIndexOf("/");
+      if (slash <= 0 || slash === rest.length - 1) {
+        return { code: "view_not_found", error: `malformed seat view '${view}' — expected seat:<rig>/<logical-id>` };
+      }
+      const rigArg = rest.slice(0, slash);
+      const logicalId = rest.slice(slash + 1);
+      const rows = ((await this.deps.listRigSeats(rigArg)) ?? []).filter((row) => row.logicalId === logicalId);
+      if (rows.length === 0) {
+        return { code: "view_not_found", error: `unknown seat '${logicalId}' in rig '${rigArg}'` };
       }
       return { id: view, members: deriveViewMembers(rows, { readOnly: false }) };
     }

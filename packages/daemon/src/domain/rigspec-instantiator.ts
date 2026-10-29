@@ -1,3 +1,4 @@
+import { isEscalationTargetRef } from "./escalation-target-ref.js";
 import nodePath from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { effortPrecedence, readSeatEffort } from "./seat-effort.js";
@@ -122,6 +123,7 @@ export class RigInstantiator {
             effort: specNode.effort,
             advisor: specNode.advisor,
             claudePermissions: specNode.claudePermissions,
+            claudeTokenRef: specNode.claudeTokenRef,
             codexPermissions: specNode.codexPermissions,
             cwd: specNode.cwd,
             surfaceHint: specNode.surfaceHint,
@@ -137,7 +139,7 @@ export class RigInstantiator {
           this.rigRepo.addEdge(
             rig.id,
             nodeIdMap[specEdge.from]!,
-            nodeIdMap[specEdge.to]!,
+            nodeIdMap[specEdge.to] ?? specEdge.to,
             specEdge.kind
           );
         }
@@ -314,7 +316,8 @@ import { RigSpecCodec as PodRigSpecCodec } from "./rigspec-codec.js";
 import { RigSpecSchema as PodRigSpecSchema, VALID_EDGE_KINDS } from "./rigspec-schema.js";
 import { rigPreflight, preflightValidatedSpec } from "./rigspec-preflight.js";
 import { resolveAgentRef, type AgentResolverFsOps } from "./agent-resolver.js";
-import { resolveAdvisorModel, resolveNodeConfig, selectedPluginPaths } from "./profile-resolver.js";
+import { resolveAdvisorModel, selectedPluginPaths, type ResolutionResult } from "./profile-resolver.js";
+import { resolveNodeConfigAsync, withNodeConfigResolver } from "./profile-resolution-worker.js";
 import { resolveStartup } from "./startup-resolver.js";
 import { isCommunityHarnessRuntime } from "./built-in-runtimes.js";
 import { planProjection, claudeConflictTargetPath, projectionConflictWarnings, filterProtectedProjections, type ProjectionPlan } from "./projection-planner.js";
@@ -492,6 +495,11 @@ class GenerationChanged extends Error {
   constructor(name: string) {
     super(`The rigs named "${name}" changed while this import was checking them. Nothing was created; retry the import.`);
   }
+}
+
+/** Worker failures must reach the existing member-failure cleanup and retry refusal paths. */
+function failedLaunchResolution(error: unknown): ResolutionResult {
+  return { ok: false, errors: [`Profile resolution failed: ${String(error)}`] };
 }
 
 export class PodRigInstantiator {
@@ -810,7 +818,7 @@ export class PodRigInstantiator {
         for (const pod of rigSpec.pods) {
           for (const edge of pod.edges) {
             const fromId = logicalIdToNodeId.get(`${pod.id}.${edge.from}`);
-            const toId = logicalIdToNodeId.get(`${pod.id}.${edge.to}`);
+            const toId = logicalIdToNodeId.get(`${pod.id}.${edge.to}`) ?? (edge.kind === "escalates_to" && isEscalationTargetRef(edge.to) ? edge.to : undefined);
             if (!fromId || !toId) {
               throw { code: "materialize_conflict", message: `Pod-local edge references missing node: ${pod.id}.${edge.from} -> ${pod.id}.${edge.to}` };
             }
@@ -820,7 +828,7 @@ export class PodRigInstantiator {
 
         for (const edge of rigSpec.edges) {
           const fromId = logicalIdToNodeId.get(edge.from);
-          const toId = logicalIdToNodeId.get(edge.to);
+          const toId = logicalIdToNodeId.get(edge.to) ?? (edge.kind === "escalates_to" && isEscalationTargetRef(edge.to) ? edge.to : undefined);
           if (!fromId || !toId) {
             throw { code: "materialize_conflict", message: `Cross-pod edge references missing node: ${edge.from} -> ${edge.to}` };
           }
@@ -1214,8 +1222,8 @@ export class PodRigInstantiator {
     const resolvedEdges: Array<{ from: string; to: string; kind: string }> = [];
     for (const edge of declaredEdges) {
       const from = `${podNamespace}.${edge.from}`;
-      const to = `${podNamespace}.${edge.to}`;
-      if (!knownLogicalIds.has(from) || !knownLogicalIds.has(to)) {
+      const to = edge.kind === "escalates_to" && isEscalationTargetRef(edge.to) ? edge.to : `${podNamespace}.${edge.to}`;
+      if (!knownLogicalIds.has(from) || (!knownLogicalIds.has(to) && !(edge.kind === "escalates_to" && isEscalationTargetRef(to)))) {
         const missing = !knownLogicalIds.has(from) ? from : to;
         return { ok: false, code: "edge_unresolved", message: `Pod-local edge references "${missing}", which is neither the new member "${qualifiedId}" nor an existing seat in rig "${rig.rig.name}". Use member ids within pod "${podNamespace}".` };
       }
@@ -1334,7 +1342,7 @@ export class PodRigInstantiator {
     const initialRefusal = eligible();
     if (initialRefusal) return refuse(initialRefusal);
 
-    const retainedFields = new Set(["id", "label", "agent_ref", "profile", "runtime", "model", "effort", "advisor", "cwd", "role", "codex_config_profile", "permission_policy", "claude_permissions", "codex_permissions", "restore_policy"]);
+    const retainedFields = new Set(["id", "label", "agent_ref", "profile", "runtime", "model", "effort", "advisor", "cwd", "role", "codex_config_profile", "permission_policy", "claude_permissions", "claude_token", "codex_permissions", "restore_policy"]);
     if (Object.keys(memberFragment).some(key => !retainedFields.has(key))) return refuse("Retry accepts only retained member fields; topology and startup overrides require a separate change.");
     const rawSpec = { version: "0.2", name: rig.rig.name, pods: [{ id: podRow.namespace, label: podRow.label, members: [memberFragment], edges: [] }], edges: [] };
     const validation = PodRigSpecSchema.validate(rawSpec);
@@ -1354,9 +1362,9 @@ export class PodRigInstantiator {
     const resolved = resolveAgentRef(member.agentRef, rigRoot, this.deps.fsOps);
     if (!resolved.ok) return refuse(resolved.code === "validation_failed" ? resolved.errors.join("; ") : resolved.error);
     if (!node.resolvedSpecHash || resolved.resolved.hash !== node.resolvedSpecHash) return refuse("Agent source hash differs from the failed first start.");
-    const config = resolveNodeConfig({ baseSpec: resolved.resolved, importedSpecs: resolved.imports, collisions: resolved.collisions,
+    const config = await resolveNodeConfigAsync({ baseSpec: resolved.resolved, importedSpecs: resolved.imports, collisions: resolved.collisions,
       profileName: member.profile, specRoot: rigRoot, member, pod, rig: this.withRigStartupLayers(rigSpec, this.rigStartupLayers(rigSpec, rigRoot, rigId)),
-      skillsRoot: this.resolveSkillsRoot(), ...this.systemWorldResolutionContext() });
+      skillsRoot: this.resolveSkillsRoot(), ...this.systemWorldResolutionContext() }).catch(failedLaunchResolution);
     if (!config.ok) return refuse(config.errors.join("; "));
     // A seat whose first start failed before Advisor support recorded no Advisor, though its unchanged agent spec (the
     // hash above) may name one. Its retry keeps the launch it recorded: no Advisor, stored and launched alike. Any
@@ -1611,8 +1619,10 @@ export class PodRigInstantiator {
       rollbackServices = hookResult.rollback;
     }
 
-    // Phase 2: Process members in launch order
-    for (const { pod, member, podId, qualifiedId } of memberEntries) {
+    // Phase 2: Process members in launch order. Reuse one worker, but no scanScope:
+    // an earlier member's startup can change the skills a later member resolves.
+    await withNodeConfigResolver(async resolveConfig => {
+      for (const { pod, member, podId, qualifiedId } of memberEntries) {
 
         // Terminal fast-path: skip agent resolution and profile resolution
         if (member.agentRef === "builtin:terminal") {
@@ -1634,7 +1644,7 @@ export class PodRigInstantiator {
         }
 
         // Resolve node config (profile + precedence)
-        const configResult = resolveNodeConfig({
+        const configResult = await resolveConfig({
           baseSpec: resolveResult.resolved,
           importedSpecs: resolveResult.imports,
           collisions: resolveResult.collisions,
@@ -1646,7 +1656,7 @@ export class PodRigInstantiator {
           rig: rigSpec,
           skillsRoot: this.resolveSkillsRoot(),
           ...this.systemWorldResolutionContext(),
-        });
+        }).catch(failedLaunchResolution);
         if (!configResult.ok) {
           nodeResults.push({ logicalId: qualifiedId, status: "failed", error: configResult.errors.join("; ") });
           continue;
@@ -1675,6 +1685,7 @@ export class PodRigInstantiator {
             // createMemberNode or `rig up <spec>` seats lose their policy ref.
             permissionPolicy: member.permissionPolicy,
             claudePermissions: member.claudePermissions,
+            claudeTokenRef: member.claudeTokenRef,
             codexPermissions: member.codexPermissions,
             env: member.env,
             sessionSource: member.sessionSource,
@@ -1739,12 +1750,13 @@ export class PodRigInstantiator {
           sessionName: launched.sessionName,
         });
       }
+    });
 
     // Create pod-local edges (after all members created)
     for (const pod of rigSpec.pods) {
       for (const edge of pod.edges) {
         const fromId = nodeIdMap[`${pod.id}.${edge.from}`];
-        const toId = nodeIdMap[`${pod.id}.${edge.to}`];
+        const toId = nodeIdMap[`${pod.id}.${edge.to}`] ?? (edge.kind === "escalates_to" && isEscalationTargetRef(edge.to) ? edge.to : undefined);
         if (fromId && toId) {
           try {
             this.deps.rigRepo.addEdge(rigId, fromId, toId, edge.kind);
@@ -1756,7 +1768,7 @@ export class PodRigInstantiator {
     // Create cross-pod edges
     for (const edge of rigSpec.edges) {
       const fromId = nodeIdMap[edge.from];
-      const toId = nodeIdMap[edge.to];
+      const toId = nodeIdMap[edge.to] ?? (edge.kind === "escalates_to" && isEscalationTargetRef(edge.to) ? edge.to : undefined);
       if (fromId && toId) {
         try {
           this.deps.rigRepo.addEdge(rigId, fromId, toId, edge.kind);
@@ -1869,7 +1881,7 @@ export class PodRigInstantiator {
     // Carry sessionName + evidence through to InstantiateResult.nodes
     // so BootstrapOrchestrator can build AttentionNode[] in the mixed
     // launched+attention_required path (guard verdict
-    // qitem-20260518082933 BLOCKER 1).
+    // BLOCKER 1).
     const resultNodes = nodeResults.map((n) => ({
       logicalId: n.logicalId,
       status: n.status,
@@ -2066,6 +2078,7 @@ export class PodRigInstantiator {
       // rig-level lives on the rig row; precedence applies at RESOLUTION, not storage.
       permissionPolicy: input.member.permissionPolicy,
       claudePermissions: input.member.claudePermissions,
+      claudeTokenRef: input.member.claudeTokenRef,
       codexPermissions: input.member.codexPermissions,
       env: input.member.env,
       sessionSource: input.member.sessionSource,
@@ -2331,7 +2344,7 @@ export class PodRigInstantiator {
      *  projection targets instead of protecting them. Absent = protect (safe default). */
     force?: boolean;
     resolveResult?: ReturnType<typeof resolveAgentRef> extends infer T ? T : never;
-    configResult?: ReturnType<typeof resolveNodeConfig> extends infer T ? T : never;
+    configResult?: ResolutionResult;
     /** The first-start retry's member carries only retained fields, not the launch additions: keep the ones the first
      *  start recorded rather than read an empty request as "none". */
     keepRecordedAdditions?: boolean;
@@ -2349,7 +2362,7 @@ export class PodRigInstantiator {
     }
 
     const rigLayers = this.rigStartupLayers(input.rigSpec, input.rigRoot, input.rigId);
-    const configResult = input.configResult ?? resolveNodeConfig({
+    const configResult = input.configResult ?? await resolveNodeConfigAsync({
       baseSpec: resolveResult.resolved,
       importedSpecs: resolveResult.imports,
       collisions: resolveResult.collisions,
@@ -2361,7 +2374,7 @@ export class PodRigInstantiator {
       rig: this.withRigStartupLayers(input.rigSpec, rigLayers),
       skillsRoot: this.resolveSkillsRoot(),
       ...this.systemWorldResolutionContext(),
-    });
+    }).catch(failedLaunchResolution);
     if (!configResult.ok) {
       return { status: "failed", error: configResult.errors.join("; ") };
     }

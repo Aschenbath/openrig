@@ -25,6 +25,9 @@ export interface QueueTransition {
   /** P21 §4 era-stamp: how actorSession was established. `transport:v1` = derived from the
    *  transport chokepoint; null/absent = claimed-era (pre-verification), never re-labeled. */
   identityProvenance: string | null;
+  /** With `principal:v1`: the caller the local MCP adapter checked a grant for (JSON: source, id, and for a
+   *  grant-service grant its id and version). Null on every other row. */
+  identityPrincipal: string | null;
   ownerNotificationKind: string | null;
   ownerNotificationLevel: OwnerNotificationLevel;
 }
@@ -39,6 +42,8 @@ export interface QueueTransitionInput {
   /** P21 §4 era-stamp: the route passes `transport:v1` when actorSession came from the transport
    *  header chokepoint; omit (null) for system/claimed-era transitions — absence is the marker. */
   identityProvenance?: string | null;
+  /** Recorded only with identityProvenance `principal:v1` (resolveRecordedIdentity). */
+  identityPrincipal?: string | null;
   ownerNotificationKind?: string | null;
   ownerNotificationLevel?: OwnerNotificationLevel | null;
 }
@@ -79,6 +84,7 @@ interface QueueTransitionRow {
   closure_reason: string | null;
   closure_target: string | null;
   identity_provenance?: string | null;
+  identity_principal?: string | null;
   owner_notification_kind?: string | null;
   owner_notification_level?: string | null;
 }
@@ -175,6 +181,7 @@ export class QueueTransitionLog {
    *  era-stamp column, so the writer degrades (omits it) instead of throwing. */
   private readonly hasIdentityProvenanceColumn: boolean;
   private readonly hasOwnerNotificationColumns: boolean;
+  private readonly hasIdentityPrincipalColumn: boolean;
   private readonly historySource: string;
   /** The history tables this schema has: the live table, and the archive where it exists. */
   private readonly historyTables: string[];
@@ -188,10 +195,11 @@ export class QueueTransitionLog {
       (this.db.prepare("PRAGMA table_info(queue_transitions)").all() as Array<{ name: string }>).map((c) => c.name),
     );
     this.hasOwnerNotificationColumns = columns.has("owner_notification_kind") && columns.has("owner_notification_level");
+    this.hasIdentityPrincipalColumn = columns.has("identity_principal");
     // One explicit projection for all history readers, including old nullable schemas.
     // SELECT * cannot union the archive's extra archived_at column with the live table.
     const fields = ["transition_id", "qitem_id", "ts", "state", "transition_note", "actor_session",
-      "closure_reason", "closure_target", "identity_provenance", "owner_notification_kind", "owner_notification_level"];
+      "closure_reason", "closure_target", "identity_provenance", "identity_principal", "owner_notification_kind", "owner_notification_level"];
     this.historyTables = [];
     const sources = ["queue_transitions", "queue_transitions_archive"].flatMap((table) => {
       const available = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name));
@@ -220,9 +228,15 @@ export class QueueTransitionLog {
       input.closureReason ?? null,
       input.closureTarget ?? null,
     ];
+    // A principal is kept only beside principal:v1; a schema without the column records today's stamp instead.
+    const principal = input.identityProvenance === "principal:v1" && this.hasIdentityPrincipalColumn ? input.identityPrincipal ?? null : null;
     if (this.hasIdentityProvenanceColumn) {
       columns.push("identity_provenance");
-      values.push(input.identityProvenance ?? null);
+      values.push(input.identityProvenance === "principal:v1" && !principal ? "transport:v1" : input.identityProvenance ?? null);
+    }
+    if (principal) {
+      columns.push("identity_principal");
+      values.push(principal);
     }
     if (this.hasOwnerNotificationColumns) {
       columns.push("owner_notification_kind", "owner_notification_level");
@@ -444,6 +458,62 @@ export class QueueTransitionLog {
     return this.getOwnerNotificationReceipt(qitemId, notificationKey) !== null;
   }
 
+/** The latest owner-notification episode per ACTIVE queue row, in queue order. One query
+ *  joins every eligibility rule into the selection — the row is active, it carries an owner
+ *  notification, and (when `includePosted` is false, the alert sweep's path) no posted
+ *  receipt exists for that notification's key — so rows that cannot matter never reach a
+ *  per-row lookup. There is no row cap: an eligible item older than any window still comes
+ *  back, and `posted` reports the receipt state for callers that list both.
+ *
+ *  The eligible set is restricted to active queue items before any ranking happens, so a
+ *  large notification archive never adds scan or ranking work to a sweep with no active item. */
+  activeOwnerNotificationEpisodes(includePosted: boolean): Array<{ qitemId: string; transition: QueueTransition; posted: boolean }> {
+    if (!this.hasOwnerNotificationColumns) return [];
+    // Exact token match with no wildcard risk: pad both ends so a key at the note's
+    // start or end still matches, and instr() compares literally (qitem ids may
+    // contain characters LIKE would treat as wildcards).
+    const receipt = (qitemIdExpr: string, transitionIdExpr: string) =>
+      `EXISTS (
+         SELECT 1 FROM ${this.historySource} r
+         WHERE r.qitem_id = ${qitemIdExpr}
+           AND r.transition_note LIKE 'slack-owner-notification-posted %'
+           AND instr(' ' || r.transition_note || ' ', ' notification_key=' || ${qitemIdExpr} || ':' || ${transitionIdExpr} || ' ') > 0
+       )`;
+    const postedFilter = includePosted ? "" : `AND NOT ${receipt("latest.qitem_id", "latest.transition_id")}`;
+    const rows = this.db
+      .prepare(
+        `WITH active_ids AS (
+           SELECT qitem_id FROM queue_items WHERE state IN ('pending', 'in-progress', 'blocked')
+         ),
+         active AS (
+           SELECT qitem_id, ts_created FROM queue_items WHERE state IN ('pending', 'in-progress', 'blocked')
+         ),
+         history_active AS (
+           SELECT h.* FROM ${this.historySource} h
+           WHERE h.qitem_id IN (SELECT qitem_id FROM active_ids)
+             AND h.owner_notification_level IS NOT NULL
+         ),
+         ranked AS (
+           SELECT h.*, ROW_NUMBER() OVER (PARTITION BY h.qitem_id ORDER BY h.transition_id DESC) AS rn
+           FROM history_active h
+         ),
+         latest AS (
+           SELECT * FROM ranked WHERE rn = 1
+         )
+         SELECT latest.*, ${receipt("latest.qitem_id", "latest.transition_id")} AS posted
+           FROM active
+           JOIN latest ON latest.qitem_id = active.qitem_id
+          ${postedFilter}
+           ORDER BY active.ts_created DESC`,
+      )
+      .all() as Array<QueueTransitionRow & { posted: 0 | 1 }>;
+    return rows.map((row) => ({
+      qitemId: row.qitem_id,
+      transition: this.rowToTransition(row),
+      posted: row.posted === 1,
+    }));
+  }
+
   getOwnerNotificationReceipt(qitemId: string, notificationKey: string): { messageTs: string | null; threadTs: string | null; digest: string | null } | null {
     const rows = this.db
       .prepare(
@@ -472,6 +542,7 @@ export class QueueTransitionLog {
       closureReason: row.closure_reason as ClosureReason | null,
       closureTarget: row.closure_target,
       identityProvenance: row.identity_provenance ?? null,
+      identityPrincipal: row.identity_principal ?? null,
       ownerNotificationKind: row.owner_notification_kind ?? null,
       ownerNotificationLevel: OWNER_NOTIFICATION_LEVELS.includes(row.owner_notification_level as OwnerNotificationLevel)
         ? row.owner_notification_level as OwnerNotificationLevel

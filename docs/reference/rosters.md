@@ -86,3 +86,9 @@ UNKNOWN is `{ "status": "unknown", "reason": "..." }`; older daemons may yield
 `null`. `--full` and `--fields modelObservation` retain the full object, including
 its status and occupant generation. Human output and roster reports use the full
 labelled observation.
+
+A member marked `"hosted": true` is a hosted member: a tool outside the terminal that reaches the team over MCP, with no node or pane.
+`rig_team` lists it with its capabilities and caveat, no pane and activity unknown, unless its seat is one of the rig's nodes.
+`show` and `find` say it's hosted rather than unmatched. See [Hosted members](hosted-members.md).
+Its entry can declare `wake.webhook`, the secret names for a trigger OpenRig rings when work lands for it
+(see [Ring it when work lands](hosted-members.md#ring-it-when-work-lands)).

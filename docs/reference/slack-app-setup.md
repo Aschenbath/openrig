@@ -58,6 +58,15 @@ not fill in; if so, follow the form.
    one, it is refused.
 10. Run `rig slack setup --channel <channel-id> --secrets-env-file <path>`, then
     `rig slack verify`, then `rig slack enable`.
+11. Enabling treats the asks already open as seen, so none of them post. To see them in Slack, run
+    `rig slack post-open-asks`. Each goes through ordinary delivery at the level it was asked at
+    (quiet hours, digest and the posting floor apply), and the command says what became of each:
+    posted, already posted, queued awaiting its receipt, held, below the posting floor, no longer
+    active, superseded, recipient changed, state unavailable, transport failed or uncertain. An ask
+    asked at RECORD stays on Steering and the Feed without a post. Running it again reuses each ask's
+    one decision rather than making another, so an ask whose post is confirmed isn't posted again. As
+    with any Slack post, one whose earlier attempt Slack couldn't confirm may post once more, marked as
+    a possible repeat. `--wait <seconds>` (default 10) is how long it waits for Slack receipts.
 
 ## What the app asks for
 
@@ -99,6 +108,14 @@ its first message, a long ask's numbered parts, and an ask posted as a reply in 
 reaction on any other message, including a person's reply in the thread, is ignored. An app created from an older manifest has neither the `reactions:read` scope nor the
 `reaction_added` event: add both under **OAuth & Permissions** and **Event Subscriptions**, then
 reinstall the app to the workspace.
+
+To have reactions ignored instead, run `rig slack setup --reactions off`. The agent that asked
+never hears of a reaction, including one still waiting to be retried, and a person answers an ask by
+typing a reply in its thread. Slack still sends the event and the manifest keeps it, so switching
+back with `--reactions route` needs no change to the app. Like any saved change, the setting reaches
+a running connector when it next rewires, which a daemon restart does (`rig daemon stop`, then
+`rig daemon start`). See [One channel per rig or seat](#one-channel-per-rig-or-seat-optional) for
+why disabling and re-enabling the connector isn't the same.
 
 The manifest also turns on **Interactivity**, so the human can answer a decision's structured
 questions by clicking a button (`rig queue create --human-questions-file`). In Socket Mode the
@@ -182,6 +199,14 @@ rig slack channel-map remove pr@my-rig
   - **Answers come back to where the person asked.** A person's new message is the root of its
     answer: when the seat it reached replies with `--reply-to` that message's row, the answer and
     later updates land in the person's thread, in the channel they used.
+  - **One conversation, whoever writes.** Messages routed to the same continuing agent
+    conversation can use that conversation's earlier context, whoever sent them. A queue row
+    records who sent a message and which seat owns it; it doesn't start a separate agent
+    conversation. If people need separate conversations, route them to separate seats
+    (`--inbound` names the seat a channel's new messages reach). Separate channels help only when
+    their routing also keeps the conversations separate: new messages in a seat's own channel
+    still go to the inbound destination unless its entry names `--inbound`. A conversation shared
+    on purpose is fine.
   - Missed-message recovery (below) covers the default channel only.
 
 Invite the app to every mapped channel (`/invite @OpenRig`). `rig slack verify` checks
@@ -190,7 +215,8 @@ app is in all of them. A saved change reaches a running connector when it next r
 daemon restart does (`rig daemon stop`, then `rig daemon start`). `rig slack disable --reason
 "<why>"` then `rig slack enable` rewires too, but alerts still waiting to be posted when it's
 re-enabled are treated as already seen and aren't posted. Only an earlier post that failed or
-didn't finish still posts: an alert whose row is still open, a decision-resolved notice, or a digest. The TUI's Connections page says whether the running
+didn't finish still posts: an alert whose row is still open, a decision-resolved notice, or a digest. `rig slack post-open-asks`
+then shows the asks still open. The TUI's Connections page says whether the running
 configuration matches the file.
 
 The map is stored as `channelMap` in `slack-connector.json`, as a list of `{ "match", "channel" }`
@@ -258,7 +284,7 @@ reaches a running connector when it next rewires, which a daemon restart does (`
 then `rig daemon start`). `rig slack disable --reason "<why>"` then `rig slack enable` rewires too,
 but alerts still waiting to be posted when it's re-enabled are treated as already seen and aren't
 posted. Only an earlier post that failed or didn't finish still posts: an alert whose row is still
-open, a decision-resolved notice, or a digest.
+open, a decision-resolved notice, or a digest. `rig slack post-open-asks` then shows the asks still open.
 
 ## One app across machines (optional)
 

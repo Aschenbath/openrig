@@ -220,7 +220,10 @@ export function startWakeLadderScheduler(deps: {
       readPromptState: makePromptStateReader({
         db,
         getSeatState: (nodeId) => deps.seatActivityService?.getSeatState(nodeId),
-        getLatestHook: (sessionName) => deps.agentActivityStore?.getLatestForNode({ sessionName }),
+        getLatestHook: (sessionName, runtime) => deps.agentActivityStore?.getLatestForNode({
+          sessionName,
+          order: runtime === "claude-code" ? "source" : "arrival",
+        }),
       }),
       ...(deps.providerService
         ? { getProviderReadModel: () => deps.providerService!.getReadModel() }
@@ -272,8 +275,8 @@ export async function startServer(port?: number) {
   // The overloaded routing env (OPENRIG_HOST/RIGGED_HOST) is observed for the
   // provenance line below and NEVER selects the bind branch: a managed environment's
   // injected endpoint is byte-indistinguishable from opt-in, and the parent daemon
-  // silently lost its Tailscale listener to exactly that (operator baton
-  // qitem-20260827070400). The auth-bearer-tailscale-trust ruling rides the new
+  // silently lost its Tailscale listener to exactly that (operator baton).
+  // The auth-bearer-tailscale-trust ruling rides the new
   // surface unchanged.
   const bindPlan = resolveBindPlan({
     bindHostEnv: process.env.OPENRIG_BIND_HOST,
@@ -392,6 +395,7 @@ export async function startServer(port?: number) {
     phases: [
       // First, while transport still works: let the delivery in flight finish; the rest wait for the next start.
       ["wake-recovery", () => wakeRecovery.stop()],
+      ["terminal-following", () => deps.terminalService?.stop()],
       ["timers", () => {
         deps.resumeMetadataRefresher?.stop();
         if (heartbeatTimer) clearInterval(heartbeatTimer);

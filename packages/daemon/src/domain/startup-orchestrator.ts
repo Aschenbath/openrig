@@ -19,7 +19,7 @@ import { AppliedLaunchObservationStore } from "./applied-launch-observation-stor
 import { NativePermissionStore } from "./native-permission-store.js";
 import { RigRepository } from "./rig-repository.js";
 import { SessionTransport, inspectStartupStagedText } from "./session-transport.js";
-import { settleOwnStartupPaste, startupSubmissionEvidence, STARTUP_SUBMIT_CAPTURE_LINES, STARTUP_SUBMIT_RETRIES, waitForClaudeInputBox, type StartupSubmissionDiagnostic } from "./startup-submission-evidence.js";
+import { settleOwnStartupPaste, startupSubmissionEvidence, STARTUP_SUBMIT_CAPTURE_LINES, STARTUP_SUBMIT_RETRIES, STARTUP_UNCONFIRMED_REASON, waitForClaudeInputBox, type StartupSubmissionDiagnostic } from "./startup-submission-evidence.js";
 import type { AppliedLaunchObservation } from "./permission-drift.js";
 import { resolveReadinessTimeoutMs } from "./readiness-timeout.js";
 import { SettingsStore } from "./user-settings/settings-store.js";
@@ -33,10 +33,10 @@ import { recordConversationPromptForNode, recordForkConversationPromptForNode, s
 
 // Why a startup prompt's submission could not be confirmed, as told to the operator when the
 // proof line is held back.
-const UNCONFIRMED_STAGED = "the prompt still looked staged in the input box";
-const UNCONFIRMED_UNOBSERVABLE = "the input box could not be observed";
-const UNCONFIRMED_UNCLEAR = "the input box did not clearly show the prompt as submitted";
-const UNCONFIRMED_RETRY_REFUSED = "the guarded Enter retry did not go through";
+const UNCONFIRMED_STAGED = STARTUP_UNCONFIRMED_REASON.staged;
+const UNCONFIRMED_UNOBSERVABLE = STARTUP_UNCONFIRMED_REASON.unobservable;
+const UNCONFIRMED_UNCLEAR = STARTUP_UNCONFIRMED_REASON.unclear;
+const UNCONFIRMED_RETRY_REFUSED = STARTUP_UNCONFIRMED_REASON.retryRefused;
 
 /**
  * The proof line is held back on purpose when the startup prompt isn't confirmed submitted. Say that
@@ -159,6 +159,8 @@ export function isSeatSkillsBootstrapLine(file: Pick<ResolvedStartupFile, "path"
 }
 
 export interface StartupInput {
+  /** Explicit history startup checks its exact source after awaited preparation. */
+  beforeNativeLaunch?: () => boolean;
   /** Internal attempt state: a launch input may already have reached the harness, so it cannot be replayed. */
   firstInputPassed?: boolean;
   rigId: string;
@@ -550,9 +552,12 @@ export class StartupOrchestrator {
 
     // 5. Launch harness (unless skipped for legacy nodes)
     // A community harness's seat: record the selection on this session before the app starts. It's provenance for
-    // later reads (identity, activity, labels, restore), not launch success or identity proof.
+    // later reads (identity, activity, labels, restore), not launch success or identity proof. Whether this launch's
+    // preset declares a runner is recorded with it, so activity follows the occupant as launched, not a later edit:
+    // only a harness launch samples it, and a continuation that launches nothing keeps what was recorded.
     if (input.adapter instanceof CommunityHarnessRuntimeAdapter) {
-      try { this.sessionRegistry.recordCommunityHarnessSelection(input.sessionId, input.adapter.runtime); }
+      try { this.sessionRegistry.recordCommunityHarnessSelection(input.sessionId, input.adapter.runtime,
+        input.skipHarnessLaunch ? undefined : input.adapter.runner()); }
       catch (err) { errors.push(`Couldn't record the community harness selection: ${(err as Error).message}`); return this.fail(input, "failed", errors); }
     }
 
@@ -576,11 +581,15 @@ export class StartupOrchestrator {
             launchPrompt = this.composeInitialSessionPrompt(deliveryInput, identityAction, postLaunchFiles,
               launchChallenge?.promptBlock ?? null, input.includeDurableObligations);
           }
+          if (input.beforeNativeLaunch && !input.beforeNativeLaunch()) {
+            return this.fail(input, "attention_required", ["The selected seat, settings or history changed after preparation; native resume was not dispatched."], undefined, false, undefined, false, "harness_launch", true);
+          }
           const launchResult = await input.adapter.launchHarness(input.binding, {
             name: input.sessionName ?? input.binding.tmuxSession ?? "",
             ...(launchPrompt ? { firstInputText: launchPrompt.prompt } : {}),
             resumeToken: launchResumeToken,
             ...(launchResumeToken && input.resumeType ? { resumeType: input.resumeType } : {}),
+            ...(input.beforeNativeLaunch ? { beforeNativeDispatch: input.beforeNativeLaunch } : {}),
             ...(input.forkSource && !launchResumeToken ? { forkSource: input.forkSource } : {}),
           });
           if (launchResult.firstInput) {
@@ -588,6 +597,13 @@ export class StartupOrchestrator {
             this.eventBus.emit({ type: "node.startup_first_input_passed", rigId: input.rigId, nodeId: input.nodeId,
               sessionId: input.sessionId, ...launchResult.firstInput });
             warnings.push("First startup input passed at launch; submission is not confirmed.");
+          }
+          if (launchResult.modelInput?.dispatch === "confirmed") {
+            this.eventBus.emit({ type: "node.startup_model_passed", rigId: input.rigId, nodeId: input.nodeId,
+              sessionId: input.sessionId, model: launchResult.modelInput.model, resume: !!launchResumeToken });
+            warnings.push(`Model "${launchResult.modelInput.model}" passed to the launcher at launch; which model runs is not confirmed.`);
+          } else if (launchResult.modelInput) {
+            warnings.push(`Model "${launchResult.modelInput.model}": the launch command's send is uncertain, so it isn't recorded as passed.`);
           }
           if (launchResult.ok) {
             appliedLaunch = launchResult.appliedLaunch;
@@ -803,7 +819,7 @@ export class StartupOrchestrator {
       challengeOnlyPrompt = challenge.promptBlock;
     }
 
-    // OPR.0.4.7.17 restore-order-correction (qitem-e99624f7). On a resumed
+    // OPR.0.4.7.17 restore-order-correction. On a resumed
     // restore the work-triggering guidance/role.md is delivered as a post-launch
     // send_text file (step 7 below) and starts the seat's first turn at once. An
     // after_ready send_text "BEFORE you do anything else, load skills" preload

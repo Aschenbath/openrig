@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type Database from "better-sqlite3";
 import { createFullTestDb } from "./helpers/test-app.js";
-import { SessionRegistry } from "../src/domain/session-registry.js";
+import { SessionRegistry, sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "../src/domain/session-registry.js";
+import { COMMUNITY_HARNESS_RUNG_INVENTORY, COMMUNITY_RUNNER_RUNG_INVENTORY, runtimeRungInventory } from "../src/domain/activity-taxonomy.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { StartupOrchestrator, isRecoverableStartupFailure, type StartupInput, type StartupResult } from "../src/domain/startup-orchestrator.js";
@@ -28,6 +29,7 @@ import * as nodeFs from "node:fs";
 import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
 import { Hono } from "hono";
+import { execFileSync } from "node:child_process";
 import { nodesRoutes } from "../src/routes/sessions.js";
 import { compactNodeProjection } from "../../cli/src/commands/ps.js";
 
@@ -152,6 +154,96 @@ describe("StartupOrchestrator", () => {
       ...overrides,
     };
   }
+
+  it("community contract: launch surfaces undelivered startup files without placing or pasting them", async () => {
+    const root = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "community-startup-files-"));
+    try {
+      nodeFs.writeFileSync(nodePath.join(root, "synth.yaml"), "format: 1\nname: synth\ncommand: synth-launch\nmaintainer: Example\nlimits: []\n");
+      const file = nodePath.join(root, "role.md");
+      nodeFs.writeFileSync(file, "private startup text must not be pasted");
+      const seed = seedSession();
+      const sendShellCommand = vi.fn(async () => ({ ok: true as const }));
+      const adapter = new CommunityHarnessRuntimeAdapter("synth", { presetsDir: () => root,
+        tmux: { hasSession: async () => true, getPaneCommand: async () => "node", sendShellCommand } });
+      const delivery = vi.spyOn(adapter, "deliverStartup");
+      const before = nodeFs.readdirSync(root);
+      const result = await createOrchestrator().startNode(makeInput(seed, { adapter,
+        binding: { ...makeBinding(), cwd: root },
+        resolvedStartupFiles: [{ path: "role.md", absolutePath: file, ownerRoot: root,
+          deliveryHint: "guidance_merge", required: true, appliesOn: ["fresh_start"] }] }));
+      expect(result).toMatchObject({ ok: true, warnings: [expect.stringContaining('takes no startup files; 1 not delivered: role.md')] });
+      expect(delivery.mock.results.length).toBeGreaterThan(0);
+      expect(await delivery.mock.results[0]!.value).toMatchObject({ delivered: 0, failed: [] });
+      expect(nodeFs.readdirSync(root)).toEqual(before);
+      expect(nodeFs.readFileSync(file, "utf8")).toBe("private startup text must not be pasted");
+      expect(tmux.sendText).not.toHaveBeenCalled();
+      expect(sendShellCommand).toHaveBeenCalledTimes(1);
+    } finally { nodeFs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.skipIf(process.platform === "win32")("community contract: a named resume whose launcher exits keeps its DB name and never starts fresh", async () => {
+    const root = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "community-named-missing-"));
+    try {
+      const trace = nodePath.join(root, "attempt.json");
+      const script = nodePath.join(root, "missing.mjs");
+      nodeFs.writeFileSync(script, `import {writeFileSync} from 'node:fs'; writeFileSync(${JSON.stringify(trace)}, JSON.stringify({resume:process.env.OPENRIG_RESUME_REF, fresh:process.env.OPENRIG_CONVERSATION ?? null})); process.exit(4);`);
+      nodeFs.writeFileSync(nodePath.join(root, "synth.yaml"), `format: 1\nname: synth\ncommand: ${process.execPath} ${script}\nmaintainer: Example\nlimits: []\nnames_conversation: true\nresume: true\n`);
+      const seed = seedSession();
+      db.prepare("UPDATE nodes SET runtime='synth' WHERE id=?").run(seed.nodeId);
+      sessionRegistry.recordCommunityHarnessSelection(seed.sessionId, "synth");
+      sessionRegistry.recordLauncherReportedToken(seed.sessionId, "community:synth", "saved-name", "passed");
+      let foreground = "node";
+      const sendShellCommand = vi.fn(async (_session: string, command: string) => {
+        let status: number | null = 0;
+        try { execFileSync("/bin/sh", ["-c", command], { cwd: root, timeout: 3000, stdio: "ignore" }); }
+        catch (error) { status = (error as { status: number | null }).status; }
+        expect(status).toBe(4);
+        foreground = "bash";
+        return { ok: true as const };
+      });
+      const adapter = new CommunityHarnessRuntimeAdapter("synth", { presetsDir: () => root,
+        tmux: { hasSession: async () => true, getPaneCommand: async () => foreground, sendShellCommand } });
+      const result = await createOrchestrator().startNode(makeInput(seed, { adapter, isRestore: true,
+        resumeToken: "saved-name", resumeType: "community:synth", readinessTimeoutMs: 1 }));
+      expect(result).toMatchObject({ ok: false, startupStatus: "failed" });
+      expect(JSON.parse(nodeFs.readFileSync(trace, "utf8"))).toEqual({ resume: "saved-name", fresh: null });
+      expect(sendShellCommand).toHaveBeenCalledTimes(1);
+      expect(db.prepare("SELECT resume_token, resume_type FROM sessions WHERE id=?").get(seed.sessionId))
+        .toEqual({ resume_token: "saved-name", resume_type: "community:synth" });
+      expect(tmux.sendText).not.toHaveBeenCalled();
+    } finally { nodeFs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("community contract: a continuation that launches nothing keeps the runner declaration its launch recorded", async () => {
+    const root = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "community-runner-continue-"));
+    try {
+      const preset = (runner: boolean) => nodeFs.writeFileSync(nodePath.join(root, "synth.yaml"),
+        `format: 1\nname: synth\ncommand: synth-launch\nmaintainer: Example\nlimits: []\n${runner ? "launch_result: true\nrunner: true\n" : ""}`);
+      const seed = seedSession();
+      db.prepare("UPDATE nodes SET runtime='synth' WHERE id=?").run(seed.nodeId);
+      sessionRegistry.recordCommunityHarnessSelection(seed.sessionId, "synth", true); // launched as a runner
+      preset(false); // then the person edits the preset to plain and continues the same process (`rig seat continue`)
+      const sendShellCommand = vi.fn(async () => ({ ok: true as const }));
+      const adapter = new CommunityHarnessRuntimeAdapter("synth", { presetsDir: () => root, launchResultRoot: () => root,
+        launchResultWait: { timeoutMs: 20, intervalMs: 10 },
+        tmux: { hasSession: async () => true, getPaneCommand: async () => "node", sendShellCommand } });
+      const recorded = () => db.prepare(`SELECT ${sessionCommunityHarnessSelect(db)} AS harness, ${sessionCommunityRunnerSelect(db)} AS runner
+        FROM sessions s WHERE s.id = ?`).get(seed.sessionId) as { harness: string | null; runner: number | null };
+      const inventory = () => runtimeRungInventory("synth", recorded().harness, recorded().runner === 1);
+
+      await createOrchestrator().startNode(makeInput(seed, { adapter, binding: { ...makeBinding(), cwd: root },
+        skipHarnessLaunch: true, continueFreshStartup: true }));
+      expect(sendShellCommand).not.toHaveBeenCalled();
+      expect(recorded()).toEqual({ harness: "synth", runner: 1 });
+      expect(inventory()).toBe(COMMUNITY_RUNNER_RUNG_INVENTORY);
+
+      // A real launch samples the preset as it is now.
+      await createOrchestrator().startNode(makeInput(seed, { adapter, binding: { ...makeBinding(), cwd: root } }));
+      expect(sendShellCommand).toHaveBeenCalledTimes(1);
+      expect(recorded()).toEqual({ harness: "synth", runner: 0 });
+      expect(inventory()).toBe(COMMUNITY_HARNESS_RUNG_INVENTORY);
+    } finally { nodeFs.rmSync(root, { recursive: true, force: true }); }
+  });
 
   it.each(["codex-first-login.txt", "codex-first-login-0.162.1.txt"])("persists %s as attention and withholds startup context", async (fixture) => {
     const seed = seedSession();
@@ -1350,6 +1442,27 @@ describe("StartupOrchestrator", () => {
       expect(exec).not.toHaveBeenCalled();
       expect(db.prepare("SELECT payload FROM events WHERE node_id=? AND type='node.startup_first_input_passed'").all(seed.nodeId)).toHaveLength(0);
       expect(JSON.stringify(result)).not.toContain("passed at launch");
+    } finally { nodeFs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([[true, "vendor/model", true, 1], [false, "vendor/model", true, 0], [true, undefined, true, 0], [true, "vendor/model", false, 0]])("records a model passed at launch only when the preset opts in (%s), the seat declares one (%s) and the send is confirmed (%s)", async (opted, model, sent, records) => {
+    const dir = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "model-input-"));
+    try {
+      nodeFs.writeFileSync(nodePath.join(dir, "synth.yaml"), `format: 1\nname: synth\ncommand: synth\nmaintainer: Example\n${opted ? "passes_model: true\n" : ""}`);
+      const seed = seedSession();
+      db.prepare("UPDATE nodes SET runtime='synth' WHERE id=?").run(seed.nodeId);
+      const adapter = new CommunityHarnessRuntimeAdapter("synth", { presetsDir: () => dir,
+        launchResultRoot: () => nodePath.join(dir, "state", "launch-results"),
+        tmux: { hasSession: async () => true, getPaneCommand: async () => "node",
+          sendShellCommand: vi.fn(async (_session: string, _command: string, beforeInput?: () => void) => {
+            beforeInput?.();
+            return sent ? { ok: true as const } : { ok: false as const, message: "typed, then the pane went away" };
+          }) } });
+      const result = await createOrchestrator().startNode(makeInput(seed, { adapter, binding: { ...makeBinding(), ...(model ? { model } : {}) } }));
+      expect(result.ok).toBe(sent);
+      const rows = db.prepare("SELECT payload FROM events WHERE node_id=? AND type='node.startup_model_passed'").all(seed.nodeId) as { payload: string }[];
+      expect(rows).toHaveLength(records);
+      if (records) expect(JSON.parse(rows[0]!.payload)).toMatchObject({ model, resume: false });
     } finally { nodeFs.rmSync(dir, { recursive: true, force: true }); }
   });
 

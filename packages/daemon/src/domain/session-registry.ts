@@ -104,6 +104,8 @@ export interface LatestLiveSession {
   resumeType: string | null;
   resumeToken: string | null;
   cwd: string | null;
+  /** The community harness this session was launched for, when it was. */
+  communityHarness?: string | null;
 }
 
 export interface WatchdogRegistrationObserver {
@@ -478,6 +480,12 @@ export class SessionRegistry {
     ).run(sessionId);
   }
 
+  /** Record a supported stop on a row that keeps its status: a rolled-back launch's superseded session is
+   * occupant history, and turning it into an exit would make it a restore candidate. */
+  recordStopIntent(sessionId: string): void {
+    this.db.prepare("UPDATE sessions SET intentionally_stopped = 1 WHERE id = ?").run(sessionId);
+  }
+
   updateStartupStatus(sessionId: string, status: "pending" | "ready" | "attention_required" | "failed", completedAt?: string): void {
     if (completedAt) {
       this.db
@@ -505,8 +513,14 @@ export class SessionRegistry {
   // empty-token skip or a lower-rank no-op. Callers that only set-and-forget can
   // ignore it; the adoption-capture path uses it so its audit event never
   // falsely claims a captured write when the provenance guard refused it.
-  /** Record that this session was launched for a community harness, selected through its preset. */
-  recordCommunityHarnessSelection(sessionId: string, app: string): void {
+  /** Record that this session was launched for a community harness, selected through its preset. With `runner`, also
+   *  record what that launch's preset declared (`runner: true` or not), so activity reads the launched occupant's
+   *  declaration, never a later preset edit. Without it (a restore carrying only the selection) the field is left as is. */
+  recordCommunityHarnessSelection(sessionId: string, app: string, runner?: boolean): void {
+    if (runner !== undefined && sessionCommunityRunnerSelect(this.db, "sessions") !== "NULL") {
+      this.db.prepare("UPDATE sessions SET agent_app = ?, agent_runner = ? WHERE id = ?").run(app, runner ? 1 : 0, sessionId);
+      return;
+    }
     this.db.prepare("UPDATE sessions SET agent_app = ? WHERE id = ?").run(app, sessionId);
   }
 
@@ -753,13 +767,14 @@ export class SessionRegistry {
    *  FR-4 periodic/manual snapshot refresh call ONE query (no duplication). */
   getLatestLiveSessions(rigId: string): LatestLiveSession[] {
     const rows = this.db.prepare(`
-      SELECT n.id as node_id, s.id as session_id, s.session_name, s.status, n.runtime, n.cwd, s.resume_type, s.resume_token
+      SELECT n.id as node_id, s.id as session_id, s.session_name, s.status, n.runtime, n.cwd, s.resume_type, s.resume_token,
+        ${sessionCommunityHarnessSelect(this.db)} as community_harness
       FROM nodes n
       JOIN sessions s ON s.node_id = n.id
       WHERE n.rig_id = ?
         AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
         AND s.status IN ('running', 'idle', 'unknown')
-    `).all(rigId) as Array<{ node_id: string; session_id: string; session_name: string; status: string; runtime: string | null; cwd: string | null; resume_type: string | null; resume_token: string | null }>;
+    `).all(rigId) as Array<{ node_id: string; session_id: string; session_name: string; status: string; runtime: string | null; cwd: string | null; resume_type: string | null; resume_token: string | null; community_harness: string | null }>;
 
     return rows.map((r) => ({
       nodeId: r.node_id,
@@ -770,6 +785,7 @@ export class SessionRegistry {
       resumeType: r.resume_type,
       resumeToken: r.resume_token,
       cwd: r.cwd,
+      communityHarness: r.community_harness,
     }));
   }
 
@@ -931,4 +947,17 @@ export function sessionCommunityHarnessSelect(db: Database.Database, alias = "s"
     sessionsHaveCommunityHarness.set(db, has);
   }
   return has ? `${alias}.agent_app` : "NULL";
+}
+
+const sessionsHaveCommunityRunner = new WeakMap<Database.Database, boolean>();
+
+/** The SQL that reads whether a session's community app was launched as a runner: 1, 0, or NULL. NULL also on a schema
+ *  without the column, so a legacy database reads every seat as before (never a runner opt-in). */
+export function sessionCommunityRunnerSelect(db: Database.Database, alias = "s"): string {
+  let has = sessionsHaveCommunityRunner.get(db);
+  if (has === undefined) {
+    has = (db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name?: string }>).some(row => row.name === "agent_runner");
+    sessionsHaveCommunityRunner.set(db, has);
+  }
+  return has ? `${alias}.agent_runner` : "NULL";
 }

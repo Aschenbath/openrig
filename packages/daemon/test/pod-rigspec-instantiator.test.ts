@@ -88,7 +88,7 @@ describe("PodRigInstantiator", () => {
     const eventBus = new EventBus(db);
     const tmux = mockTmux();
     const nodeLauncher = new NodeLauncher({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux });
-    const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux });
+    const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux, sleep: async () => {} });
     const adapter = mockAdapter();
     const codexAdapter = mockAdapter("codex");
     const files = fsFiles ?? { [`${RIG_ROOT}/agents/impl/agent.yaml`]: agentYaml("impl") };
@@ -119,6 +119,25 @@ describe("PodRigInstantiator", () => {
       expect(result.result.nodes).toHaveLength(1);
     }
     db.close();
+  });
+
+  it.each(["rig", "pod"])("imports and exports a %s-level deferred escalation before its destination rig exists", async level => {
+    const { db, rigRepo, sessionRegistry, inst } = setup();
+    try {
+      const expected = [{ from: "dev.impl", to: "review-advisor@coord", kind: "escalates_to" }];
+      const spec = makeRigSpec({ edges: level === "rig" ? expected : [] });
+      if (level === "pod") spec.pods[0]!.edges = [{ from: "impl", to: "review-advisor@coord", kind: "escalates_to" }];
+      const result = await inst.instantiate(RigSpecCodec.serialize(spec), RIG_ROOT);
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      if (!result.ok) return;
+      const rig = rigRepo.getRig(result.result.rigId)!;
+      expect(rig.edges).toHaveLength(1);
+      expect(rig.edges[0]).toMatchObject({ targetRef: "review-advisor@coord", kind: "escalates_to" });
+      const { RigSpecExporter } = await import("../src/domain/rigspec-exporter.js");
+      const exported = new RigSpecExporter({ rigRepo, sessionRegistry, podRepo: new PodRepository(db) }).exportRig(result.result.rigId) as RigSpec;
+      expect(exported.edges).toEqual(expected);
+      expect(RigSpecCodec.parse(RigSpecCodec.serialize(exported)).edges).toEqual(expected);
+    } finally { db.close(); }
   });
 
   // T2: resolved spec identity persisted
@@ -725,7 +744,7 @@ profiles:
     const eventBus = new EventBus(db);
     const tmux = mockTmux();
     const nodeLauncher = new NodeLauncher({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux });
-    const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux });
+    const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux, sleep: async () => {} });
     const adapter = mockAdapter();
     const fsOps = mockFs({
       [`${RIG_ROOT}/agents/impl/agent.yaml`]: `
@@ -980,7 +999,7 @@ profiles:
     const nodeLauncher = new NodeLauncher({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux });
 
     // Startup orchestrator that fails for qa
-    const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux });
+    const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux, sleep: async () => {} });
     const origStartNode = startupOrch.startNode.bind(startupOrch);
     let callCount = 0;
     startupOrch.startNode = async (input) => {
@@ -1821,7 +1840,7 @@ state: 2-named
       [`${RIG_ROOT}/agents/qa/agent.yaml`]: agentYaml("qa"),
     });
     const nodeLauncher = new NodeLauncher({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux });
-    const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux });
+    const startupOrch = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux, sleep: async () => {} });
     const origStartNode = startupOrch.startNode.bind(startupOrch);
     let callCount = 0;
     startupOrch.startNode = async (input) => {

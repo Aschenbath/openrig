@@ -82,6 +82,33 @@ describe("reopening a Herdr view in a desktop window", () => {
     expect(f.exec).toHaveBeenCalledWith("/fixture/bin/tmux", ["-S", socket, "list-clients", "-F", "#{client_pid}\t#{session_name}\t#{client_readonly}"]);
   });
 
+  it.each([[undefined, true], ["daemon-named", true], [undefined, false], ["daemon-named", false]] as const)("following binds the exact custom endpoint before tab selection (session=%s matches=%s)", async (session, matches) => {
+    const f = fixture([{ workspace_id: "follow-w", tab_id: "follow-t", label: "following" }], "kernel", session);
+    const namedSocket = "/run private/custom.sock";
+    f.get.mockImplementation(async (url: string) => ({ status: 200, data: url.includes("preview")
+      ? { ...(session ? { session } : {}), planId, composed: f.composed, status: { launch: { socketPath: namedSocket, session: "daemon-named" } } }
+      : { ...(session ? { session } : {}), providers: [{ liveness: { alive: true }, status: { launch: { socketPath: namedSocket, session: "daemon-named" } } }] } }) as never);
+    f.post.mockResolvedValue({ status: 200, data: { provider: "herdr", ok: true, workspaceId: "follow-w", opened: ["operator"], absent: [], degraded: [], pages: 1,
+      ...(session ? { session } : {}),
+      following: { id: "same", enabled: true, state: "following", maxTiles: 8, tiles: [], events: [], overflow: [] } } } as never);
+    const original = f.exec.getMockImplementation()!;
+    f.exec.mockImplementation(async (file, args) => args.includes("status") && args.includes("server")
+      ? JSON.stringify({ result: { running: true, socket: matches ? namedSocket : "/wrong/default.sock" } }) : original(file, args));
+    await f.run(["--follow", "--json", ...(session ? ["--session", session] : [])]);
+    const parsed = JSON.parse(logs[0]!);
+    if (matches) {
+      expect(parsed).toMatchObject({ ok: true, workspaceId: "follow-w" });
+      expect(f.focus).toHaveBeenCalledExactlyOnceWith("follow-t");
+      for (const [, args] of f.exec.mock.calls.filter(([, args]) => args.includes("status") || args.includes("tab"))) {
+        expect(args).toContain(`HERDR_SOCKET_PATH=${namedSocket}`);
+        expect(args).not.toContain("--session");
+      }
+    } else {
+      expect(parsed.ok).toBe(false); expect(f.focus).not.toHaveBeenCalled(); expect(f.list).not.toHaveBeenCalled();
+      expect(parsed.error).toContain("exact following endpoint");
+    }
+  });
+
   it("a named session scopes every reuse inventory and focus command to the selected socket", async () => {
     const f = fixture([{ workspace_id: "existing", tab_id: "existing-tab", label: label() }], "kernel", "prod");
     await f.run(["--session", "prod", "--json"]);
@@ -178,6 +205,16 @@ describe("reopening a Herdr view in a desktop window", () => {
       expect(f.focus).not.toHaveBeenCalled();
       expect(f.post).toHaveBeenCalledTimes(1);
     }
+  });
+
+  it("also reuses live viewers with the legacy writable attach spelling", async () => {
+    const f = fixture([{ workspace_id: "old", tab_id: "first", label: label() }]);
+    for (const pane of f.composed.opened) {
+      pane.recoveryCommand = pane.recoveryCommand!.replace("-f ignore-size ", "");
+    }
+    await f.run();
+    expect(f.focus).toHaveBeenCalledExactlyOnceWith("first");
+    expect(f.post).not.toHaveBeenCalled();
   });
 
   it("confirms an absolute tmux command, quoted session alias and read-only attachment", async () => {

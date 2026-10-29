@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const seat = 'dev-impl@dev-pair-stub';
 const destination = 'dev-qa@dev-pair-stub';
@@ -31,19 +32,24 @@ export function verifyMcpStdio(proof) {
     assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
   }
   assert.deepEqual(JSON.parse(proof.missing.content[0].text), proof.daemonError.body);
-  const lines = proof.instructions.split('\n');
-  assert.equal(lines.length, 4);
-  for (const [index, text] of ['OPENRIG_SESSION_NAME', 'rig_queue_create', 'not idle', 'reserved for a person'].entries()) {
+  verifyInstructions(proof.instructions);
+}
+
+/** The server's instructions, one marker per line, in order. */
+export const INSTRUCTION_MARKERS = ['OPENRIG_SESSION_NAME', 'rig_queue_create', 'not idle', 'reserved for a person', 'rig_queue_claim'];
+
+export function verifyInstructions(instructions) {
+  const lines = instructions.split('\n');
+  assert.equal(lines.length, INSTRUCTION_MARKERS.length);
+  for (const [index, text] of INSTRUCTION_MARKERS.entries()) {
     assert.ok(lines[index].includes(text), text);
   }
 }
 
-// Use the SDK shipped beside the installed CLI, not a source-only MCP server.
+// The installed CLI's own MCP server, not a source-only one, driven by a 2025-era client. The CLI no longer ships that
+// client's SDK (it serves through the 2.x server packages), so the client is bundled into the runner with this helper.
 export async function checkMcpStdio(rigBin, readEnv) {
   const started = performance.now();
-  const require = createRequire(rigBin);
-  const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
-  const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
   const proof = {};
   for (const configuredSeat of [seat, '']) {
     const client = new Client({ name: 'installed-scenario', version: '1' });

@@ -27,6 +27,7 @@ import {
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { writeRuntimeStubs } from "../../../../test/stub-runtimes.js";
+import { shellQuote } from "../../src/adapters/shell-quote.js";
 
 /**
  * Inherited environment variables that redirect the CLI/daemon client at a
@@ -341,20 +342,14 @@ export function prepareHermeticEnv(opts: PrepareHermeticEnvOptions = {}): Hermet
 
   // Test-only command seam: every child `tmux` call gets one explicit private
   // socket. TMUX_TMPDIR remains for compatibility, but is never the selector.
+  // Exec directly so each terminal operation does not start another Node process.
   const originalPath = baseEnv.PATH ?? process.env.PATH ?? "";
   writeFileSync(
     tmuxWrapperPath,
-    `#!/usr/bin/env node
-const { spawnSync } = require("node:child_process");
-const socketPath = ${JSON.stringify(tmuxSocketPath)};
-const originalPath = ${JSON.stringify(originalPath)};
-const env = { ...process.env, PATH: originalPath };
-const result = spawnSync("tmux", ["-S", socketPath, ...process.argv.slice(2)], { env, stdio: "inherit" });
-if (result.error) {
-  console.error(result.error.message);
-  process.exit(127);
-}
-process.exit(result.status ?? 1);
+    `#!/bin/sh
+PATH=${shellQuote(originalPath)}
+export PATH
+exec tmux -S ${shellQuote(tmuxSocketPath)} "$@"
 `,
     { mode: 0o755 },
   );
@@ -399,25 +394,57 @@ process.exit(result.status ?? 1);
     if (!existsSync(root)) return;
     if (existsSync(tmuxSocketPath)) {
       let privateServerRunning = true;
+      let privateProcesses = "";
       try {
-        execFileSync("tmux", ["-S", tmuxSocketPath, "list-sessions"], {
+        privateProcesses = execFileSync("tmux", ["-S", tmuxSocketPath, "list-panes", "-a", "-F", "#{pid} #{pane_pid}"], {
           env: { ...env, PATH: originalPath } as NodeJS.ProcessEnv,
-          stdio: "ignore",
+          stdio: ["ignore", "pipe", "ignore"],
+          encoding: "utf8",
+          timeout: 2_000,
         });
       } catch (error) {
         if (typeof (error as { status?: unknown }).status !== "number") throw error;
         privateServerRunning = false;
       }
       if (privateServerRunning) {
+        // kill-server acknowledges the signal before pane processes have exited.
+        // Capture only this private server's existing process tree before signalling.
+        const owned = new Set(privateProcesses.trim().split(/\s+/).map(Number));
+        if (![...owned].every(pid => Number.isInteger(pid) && pid > 1)) {
+          throw new Error("Private scenario process identity unavailable; scratch evidence retained");
+        }
+        const tree = execFileSync("ps", ["-axo", "pid=,ppid="], { encoding: "utf8", timeout: 2_000 })
+          .trim().split("\n").map(line => line.trim().split(/\s+/).map(Number) as [number, number]);
+        let added: boolean;
+        do {
+          added = false;
+          for (const [pid, parent] of tree) {
+            if (owned.has(parent) && !owned.has(pid)) { owned.add(pid); added = true; }
+          }
+        } while (added);
         execFileSync("tmux", ["-S", tmuxSocketPath, "kill-server"], {
           env: { ...env, PATH: originalPath } as NodeJS.ProcessEnv,
           stdio: "ignore",
+          timeout: 2_000,
         });
+        const deadline = Date.now() + 2_000;
+        const pause = new Int32Array(new SharedArrayBuffer(4));
+        while ([...owned].some(pid => {
+          try { process.kill(pid, 0); return true; }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+            throw error;
+          }
+        })) {
+          if (Date.now() >= deadline) throw new Error("Private scenario processes did not exit; scratch evidence retained");
+          Atomics.wait(pause, 0, 0, 10);
+        }
       }
     }
     rmSync(root, { recursive: true, force: true });
   };
 
+  let cleanupFailure: { cause: unknown } | undefined;
   return {
     root,
     home,
@@ -426,6 +453,11 @@ process.exit(result.status ?? 1);
     tmuxTmpDir,
     tmuxSocketPath,
     env,
-    cleanup,
+    cleanup() {
+      // A later call cannot bypass failed process settlement just because the socket is gone.
+      if (cleanupFailure) throw cleanupFailure.cause;
+      try { cleanup(); }
+      catch (cause) { cleanupFailure = { cause }; throw cause; }
+    },
   };
 }

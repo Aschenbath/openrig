@@ -315,6 +315,14 @@ function hasClaudeComposerPrompt(paneContent: string): boolean {
   return /(^|\n)\s*❯/.test(paneContent);
 }
 
+/** A fresh launch needs the last prompt inside Claude's complete input frame. Earlier
+ * headers or frames can belong to the predecessor above the shell's launch command. */
+export function hasClaudeDrawnInput(paneContent: string): boolean {
+  const rows = paneContent.split(/\r?\n/);
+  const prompt = rows.map(row => /^\s*❯/.test(row)).lastIndexOf(true);
+  return prompt > 0 && hasClaudeInputFrame(rows.slice(prompt - 1));
+}
+
 function looksLikeClaudeBypassConsentPrompt(paneContent: string): boolean {
   // Plain capture of Claude's current consent menu. Labels in prose or a menu
   // followed by a new composer are not evidence of an active dialog.

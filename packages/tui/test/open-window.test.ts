@@ -1,9 +1,9 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { inRex, openTerminalInWindow, terminalWindowNotice, viewerTerminalEnv, windowProvider } from "../src/terminals/open-window.js";
+import { inCmux, inRex, openTerminalInWindow, terminalWindowNotice, viewerTerminalEnv, windowProvider } from "../src/terminals/open-window.js";
 import { createViewState } from "../src/state.js";
 import { demoSnapshot } from "../src/demo-data.js";
 import { parseCommand } from "../src/grammar.js";
@@ -17,6 +17,9 @@ const openWithRecovery: (view: string, endpoint: string, entry?: string, plan?: 
 
 const roots: string[] = [];
 const spawned: ChildProcess[] = [];
+// A test run inside cmux would otherwise open through cmux.
+const cmuxKeys = ["CMUX_SOCKET_PATH", "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID"];
+beforeEach(() => { for (const key of cmuxKeys) vi.stubEnv(key, ""); });
 afterEach(() => {
   vi.unstubAllEnvs();
   for (const proc of spawned.splice(0)) proc.kill();
@@ -33,7 +36,7 @@ console.log(${JSON.stringify(JSON.stringify(result))});process.exitCode=${exit};
 const opened = { provider: "tmux", ok: true, opened: ["advisor", "operator"], absent: [], degraded: [], pages: 1 };
 
 describe("TUI desktop terminal action", () => {
-  it.each(["rig", "pod"])("direct %s action reaches exact attach guidance after definite window refusal, without relaunch", async kind => {
+  it.each(["rig", "seat"])("direct %s action reaches exact attach guidance after definite window refusal, without relaunch", async kind => {
     let snap = demoSnapshot();
     const view = createViewState({ instanceId: "fixture", getSnapshot: () => snap });
     view.dispatch(parseCommand("rig openrig-build"));
@@ -141,6 +144,25 @@ describe("TUI desktop terminal action", () => {
     expect(f.calls()).toHaveLength(1);
   });
 
+  it("retains accepted-but-unconfirmed panes on a nonzero result, without replay", async () => {
+    const onUnavailable = vi.fn();
+    const f = child({ ...opened, ok: false, opened: [], degraded: [{ seat: "operator", code: "pane_unconfirmed", reason: "Inspect the terminal before retrying." }] }, 1);
+    await expect(openWithRecovery("saved:kernel", "http://localhost:7433", f.entry, "plan", onUnavailable)).rejects.toThrow(/Unconfirmed: operator — Inspect/);
+    expect(f.calls()).toHaveLength(1);
+    expect(onUnavailable).not.toHaveBeenCalled();
+  });
+
+  it("separates confirmed tiles, unconfirmed panes and skipped members in a partial notice", () => {
+    const notice = terminalWindowNotice("saved:kernel", { ...opened, opened: ["operator"], degraded: [
+      { seat: "advisor", code: "pane_unconfirmed", reason: "pane listing unreadable" },
+      { seat: "remote", reason: "no SSH route" },
+    ] });
+    expect(notice).toContain("1 tiles prepared; 0 absent; 2 degraded.");
+    expect(notice).toContain("Unconfirmed: advisor — pane listing unreadable");
+    expect(notice).toContain("Skipped: remote — no SSH route");
+    expect(notice).not.toContain("Skipped: advisor");
+  });
+
   it("reports named partial results and visibility limits without claiming a visible window", () => {
     const notice = terminalWindowNotice("saved:kernel", { ...opened, ok: false,
       absent: [{ seat: "review", reason: "stopped" }],
@@ -158,6 +180,7 @@ describe("TUI desktop terminal action", () => {
 
 const viewerMarkers = { TERM_PROGRAM: "herdr", HERDR_ENV: "1", HERDR_PANE_ID: "p-viewer", HERDR_SOCKET_PATH: "/run/viewer/herdr.sock" };
 const rexMarkers = { TERM_PROGRAM: "rex", REX_SESSION: "session:viewer", REX_BLOCK: "block:viewer", REX_SERVER: "unix:///viewer/rex.sock", REX_BIN_DIR: "/viewer/rex" };
+const cmuxMarkers = { CMUX_SOCKET_PATH: "/tmp/cmux-fixture.sock", CMUX_SURFACE_ID: "surface-1", CMUX_WORKSPACE_ID: "workspace-1" };
 const herdrKeys = ["TERM_PROGRAM", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_SESSION", "REX_SESSION", "REX_BLOCK", "REX_SERVER", "REX_BIN_DIR"];
 
 describe("TUI terminal action, viewed from a Herdr pane", () => {
@@ -213,6 +236,10 @@ console.log(${JSON.stringify(JSON.stringify(opened))});`);
     ["viewed from Herdr", { TERM_PROGRAM: "tmux" }, viewerMarkers, "herdr"],
     ["inside Herdr, whatever views it", { TERM_PROGRAM: "herdr", REX_SESSION: "s", REX_BLOCK: "b", REX_SERVER: "x" }, rexMarkers, "herdr"],
     ["with no viewer", { TERM_PROGRAM: "tmux", REX_SERVER: "x" }, undefined, "herdr"],
+    ["inside cmux, whatever views it", { TERM_PROGRAM: "ghostty", ...cmuxMarkers }, viewerMarkers, "cmux"],
+    ["in a Herdr pane inside cmux", { ...cmuxMarkers, ...viewerMarkers }, undefined, "herdr"],
+    ["in Rex inside cmux", { ...cmuxMarkers, TERM_PROGRAM: "rex" }, undefined, "rex"],
+    ["with only cmux's workspace id, as the daemon's tmux keeps it", { TERM_PROGRAM: "tmux", CMUX_WORKSPACE_ID: "w" }, undefined, "herdr"],
   ] as const)("previews with the provider the window opener picks %s", async (_name, env, viewed, provider) => {
     ownEnv(env);
     expect(await windowProvider(async () => viewed)).toBe(provider);
@@ -236,6 +263,46 @@ console.log(${JSON.stringify(JSON.stringify(opened))});`);
     await openTerminalInWindow("saved:kernel", "http://localhost:7433", f.entry, undefined, undefined, viewer);
     expect(viewer).not.toHaveBeenCalled();
     expect(f.seen()).toMatchObject({ HERDR_PANE_ID: "p-own", HERDR_SOCKET_PATH: "/run/own/herdr.sock" });
+  });
+
+  it("inside cmux, opens in cmux as rig terminal open --provider cmux does, without --window or a viewer", async () => {
+    ownEnv({ TERM_PROGRAM: "ghostty", ...cmuxMarkers });
+    const inCmuxOpen = { ...opened, provider: "cmux" };
+    const f = child(inCmuxOpen);
+    const viewer = vi.fn(async () => viewerMarkers);
+    expect(await openTerminalInWindow("saved:kernel", "http://selected.example:7439", f.entry, "cmux-plan", undefined, viewer)).toEqual(inCmuxOpen);
+    expect(viewer).not.toHaveBeenCalled();
+    expect(f.calls()).toEqual([{ url: "http://selected.example:7439",
+      args: ["terminal", "open", "--provider", "cmux", "--json", "--expected-plan", "cmux-plan", "--", "saved:kernel"] }]);
+  });
+
+  it("keeps a failed cmux open's attach commands and names cmux's socket setting, without the window recovery or a retry", async () => {
+    ownEnv({ TERM_PROGRAM: "ghostty", ...cmuxMarkers });
+    const f = child({ provider: "cmux", ok: false, opened: [], absent: [], degraded: [], pages: 0, code: "cmux_unavailable",
+      error: "cmux is not connected — install cmux from https://cmux.io and run: cmux ping",
+      notes: ["In a new terminal on the daemon's host, attach directly using one of these commands:", "operator: env -u TMUX tmux attach -t '=operator@kernel'"] }, 1);
+    let recoveries = 0;
+    await expect(openTerminalInWindow("saved:kernel", "http://localhost:7433", f.entry, undefined, () => { recoveries++; }))
+      .rejects.toThrow(/cmux is not connected[\s\S]*"Automation mode" for Socket Control Mode[\s\S]*rig doctor[\s\S]*operator: env -u TMUX tmux attach/);
+    expect(recoveries).toBe(0);
+    expect(f.calls()).toHaveLength(1);
+    expect(f.calls()[0].args.slice(0, 4)).toEqual(["terminal", "open", "--provider", "cmux"]);
+  });
+
+  it("adds the socket setting only for cmux_unavailable", async () => {
+    ownEnv({ TERM_PROGRAM: "ghostty", ...cmuxMarkers });
+    const f = child({ provider: "cmux", ok: false, opened: [], absent: [], degraded: [], pages: 0, code: "preview_changed",
+      error: "View membership, layout or provider session changed. Refresh the preview before Open; nothing was launched." }, 1);
+    const failure = await openTerminalInWindow("saved:kernel", "http://localhost:7433", f.entry, "stale-plan").catch((error: Error) => error);
+    expect(String(failure)).toContain("Refresh the preview");
+    expect(String(failure)).not.toContain("Socket Control Mode");
+  });
+
+  it("reads cmux's markers only with its socket and surface, and not inside Herdr or Rex", () => {
+    expect(inCmux(cmuxMarkers)).toBe(true);
+    expect(inCmux({ CMUX_SURFACE_ID: "s", CMUX_WORKSPACE_ID: "w" })).toBe(false);
+    expect(inCmux({ ...cmuxMarkers, TERM_PROGRAM: "herdr" })).toBe(false);
+    expect(inCmux({ ...cmuxMarkers, REX_SESSION: "s", REX_BLOCK: "b", REX_SERVER: "x" })).toBe(false);
   });
 });
 

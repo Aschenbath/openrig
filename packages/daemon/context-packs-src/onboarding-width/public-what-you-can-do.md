@@ -11,7 +11,7 @@ not know exists.** So the point of what follows is not skill. It is recognition:
 lands, something rhymes, and you go check instead of building.
 
 Ninety top-level verbs ship (capability canon refreshed through
-`capability-delta-v0.7.1`). This marker describes the pack's teaching, not publication or live
+`capability-delta-v0.7.5`). This marker describes the pack's teaching, not publication or live
 adoption. Read this once for shape, and let it make you suspicious that a thing already exists.
 What changed in the installed version, and what to do about it, is one read away:
 `rig context get reference/whats-new.md`.
@@ -48,7 +48,8 @@ one command away. Your memory of the fleet is a claim about the past.
 - **`rig discover`** — what is running on this box that OpenRig is *not* managing.
 - **`rig queue whoami`** — what the daemon thinks you are holding. Not what you remember holding.
   When the seat's typed rows name exactly one work node, its JSON also carries `currentWork` with
-  the mission, slice, and path the refocus hook uses.
+  the mission, slice, and path the refocus hook uses. A project-tagged row is resolved against its
+  catalogued project.
 - **`rig seat status <seat>`** — what the system already believes about a seat's handover state,
   and whether the thing you did an hour ago actually landed. Before a relaunch, it shows what the
   seat's next fresh managed launch will ask for, labelled planned rather than observed: the native
@@ -87,7 +88,10 @@ one command away. Your memory of the fleet is a claim about the past.
 - **`rig roster list` / `show` / `find`** — who across your rigs and hosts is recommended for a
   kind of work, from JSON rosters in `<workspace.root>/rosters`. Read-only: it dispatches nothing
   and does not claim anyone is available. The built-in starter and factory leads publish their
-  team's roster at first start. `show` and `find` include each seat's last observed model.
+  team's roster at first start. `show` and `find` include each seat's last observed model. A
+  roster entry marked `"hosted": true` is a member that lives outside a terminal (an assistant
+  connected over MCP); `show` and `find` say so, and when it last called the team's MCP server.
+  With no evidence that reads unknown, never idle.
 - **`rig telemetry events` / `transitions` / `tenures <node-id>`** — past events, queue
   transitions and a seat's occupants, one bounded page at a time with gaps reported. Reach for it
   before querying the database yourself.
@@ -145,7 +149,9 @@ unseen — which makes messages the one delivery channel that never gets skipped
   doesn't prove a seat is idle: a capture that cut lines says activity is unknown (`activity:
   "unknown"` in `--json`), so read `rig ps --nodes` for it. For a Claude Code or Codex seat, stderr
   notes whether the input box's text looks typed or like a faint harness suggestion (`inputBox` in
-  `--json`); it's a heuristic, and `unknown` means unknown.
+  `--json`); it's a heuristic, and `unknown` means unknown. A seat too small to read:
+  `--readable` (120x40) or `--size <WxH>` resizes its window, captures, then gives the window back
+  (`readable` in `--json`); the read isn't atomic with a person's own edits to that window.
 - **`rig transcript <seat>`** — what has been *said* in a seat, and **seat-scoped rather than
   session-scoped**: one file spanning every agent generation that has occupied it, so it reaches
   back through handovers. Capped (`transcripts.lines`, default 1000 — raise it for depth), and
@@ -173,7 +179,12 @@ unseen — which makes messages the one delivery channel that never gets skipped
   place). **`rig stream read`** then returns the calling seat's next bounded page (at most 20 items
   and 64 KiB, with `more`, `unread` and any `gap`); `--reader <session>` names the seat from outside
   one. `rig stream subscriptions` lists readers with their unread counts, and `rig stream
-  unsubscribe <seat>` stops one.
+  unsubscribe <seat>` stops one. A subscription is read on request: nothing is pushed to a reader
+  or wakes it.
+- **`rig stream act <id>`** — say what you did about a stream item, with exactly one of `--work
+  <qitem>` (the queue row you opened or joined for it), `--decline "<reason>"` or `--duplicate
+  <qitem|stream id>`. Actions are append-only, and the poster's `rig stream show` lists each
+  reader's current action. A reader who links different work from someone else is told about theirs.
 - **`rig acp run <row> --cwd <dir> -- <command>`** — hand one queue row's task to an outside agent
   that speaks ACP (for example `openclaw acp`) as a single turn. The row's notes get the agent and
   session, progress, each permission request and its answer, and the outcome (completed, stopped,
@@ -200,13 +211,30 @@ unseen — which makes messages the one delivery channel that never gets skipped
   type. Only if the window cannot open, `rig tui --shared` is the dashboard-only fallback; explain
   the failure. In the window's `--json` output, `reusedWorkspace` with no new tiles means an
   existing view was reused, which is success. `--provider herdr` or `--provider cmux` opens the
-  view in a provider that is already running, without opening a window; each such open adds a new
-  workspace, so to come back to a view, focus its open space.
+  view in a provider that is already running, without opening a window. Ordinary opens add a new
+  workspace, so to come back to a fixed view, focus its open space; task follow mode reuses one.
+  **`qitem:<id>` as the view** previews or opens the current local owners of that task: its
+  pending, in-progress and blocked rows through explicitly linked successors, without closed
+  predecessors or past senders. It's a read-only membership view: stopped, missing, external and
+  unresolved owners are named, and incomplete lineage is reported rather than cut short. Ordinary
+  open is one-shot. Add **`--follow --provider herdr`** to keep one workspace as the task's owners
+  join and leave (Linux Herdr 0.9.5 / protocol 22 only). Joining viewers do not request focus;
+  departures close viewers, not agents or conversations. Typed drafts and unreadable composers
+  retain departed tiles, including unconfirmed Pi, terminal and community-harness input.
+  `--pin`, `--suppress` and `--max-tiles` adjust the view; `--no-follow` keeps the fixed layout.
+  A complete empty task drains removable tiles and stops following once none remain; an explicit
+  `--follow` resumes that workspace. `rig terminal views --json` shows saved active selectors.
+  The exercised journey used shell stand-ins, not native agents, and active render cost remains
+  unmeasured. See `reference/terminal-sessions.md` for controls and limits. Preview and open
+  responses carry `viewDescriptor` (`kind`, `name`); membership grants no input authority.
+  An unconfirmed pane is reported as `pane_unconfirmed`, not counted as opened. Inspect before
+  retrying: an unconfirmed result does not prove that nothing opened.
   Add `--session <name>` to select a Herdr session for that request; `--session default`
   explicitly selects its default session. `rig terminal status --session <name>` inspects
   the same endpoint. Omitting the flag keeps the daemon's configured endpoint. Herdr tiles come
   back attached after a Herdr restart, except a tile over SSH: reopen that one with
-  `rig terminal open <view> --provider herdr`.
+  `rig terminal open <view> --provider herdr`. A TUI running inside cmux opens views in that cmux
+  (`--provider cmux`); that path hasn't been tried in a real cmux yet.
   In the TUI, **TERMINALS** keeps Saved views prominent and Derived groups collapsed until
   expanded. Names load before detailed readiness. Select a view to inspect its members,
   layout and pages; preview is passive. Saved membership requires deliberate setup.
@@ -232,8 +260,9 @@ unseen — which makes messages the one delivery channel that never gets skipped
   "connected" alone is not delivery, and a connection that stops delivering is replaced. **`rig slack channel-map list` / `set <match> <channel>` /
   `remove <match>`** sends a rig's or seat's human-bound posts to its own channel (a seat match
   beats a rig match; the rest use the default channel). After a change, invite the app to each
-  channel, run `rig slack verify`, and rewire the connector (`rig slack disable` then `enable`, or
-  restart the daemon). An emoji reaction on any message posted for an ask reaches the asking seat
+  channel, run `rig slack verify`, and restart the daemon (`rig daemon stop`, then `start`).
+  Disabling and enabling Slack instead marks alerts still waiting as already posted, so they're
+  never posted. An emoji reaction on any message posted for an ask reaches the asking seat
   as a task tagged `human-reaction`: a signal to interpret, not an answer, and the ask stays open.
   It needs the `reactions:read` scope and the `reaction_added` event (reinstall the app);
   `rig slack verify` warns when the scope is missing. A long ask is posted in numbered thread parts; one that
@@ -249,6 +278,9 @@ unseen — which makes messages the one delivery channel that never gets skipped
   channels listed in `forwardChannels` (simulated in one process, not yet run across two real
   machines). A `botInbox` block delivers named bots' posts in one channel to one seat as rows
   marked as data from a program, not a person.
+  **`rig slack post-open-asks`** posts the asks still open (for example after `rig slack enable`,
+  which points to it), with an outcome for each; with an unreadable `participants.yaml` it can miss
+  asks to shared channels.
 
 ## Making work outlive you
 
@@ -282,7 +314,9 @@ your context, your compaction and your replacement — and it is the only thing 
   successor it can't verify; use `handoff` instead.
 - **`rig queue block` / `resolve`** — park a row on a real blocker so it stays **yours and
   visible**, with a plain-language summary and a pointer to what a human must judge; `resolve`
-  writes their decision onto the durable record and wakes the owner. **Closing it would be a lie
+  writes their decision onto the durable record and wakes the owner. `resolve <id> --decision
+  "<evidence>"` also releases a row parked on a typed blocker (`external:`, `fold:` or `auth:`) and
+  records the evidence as the wait's resolution, not as a person's decision. **Closing it would be a lie
   and sitting on it silently is indistinguishable from a crash.** `--wake-after <duration>` arms
   one wake for this park episode; a new park supersedes it and every exit route retires it. A wake
   the typing guard holds back (`retained`) doesn't use the timer up: it's tried again at each
@@ -295,10 +329,16 @@ your context, your compaction and your replacement — and it is the only thing 
   person received the escalation. **`overdue` and `undelivered` are the two halves of "is anything
   silently stuck", and a rig can be clean on one and rotten on the other.**
 - **`queue.wake_human_rung`** — when a seat can't be woken, the last escalation step posts to a
-  person. `rig config set queue.wake_human_rung explicit-only` (default `always`) keeps that post
+  person: the default person (`rig gateway default <id>`), or the only one registered. With several
+  registered and no default it reads `undeliverable:no-default-person` and posts to nobody.
+  `rig config set queue.wake_human_rung explicit-only` (default `always`) keeps that post
   for rows addressed to a person (an `@external` address or a registered human); the rest stop at
   `rig view show escalations`. A seat stuck at a prompt only a person can clear still reaches one,
-  and an unreadable human registry posts everything.
+  and an unreadable human registry posts everything. A seat held at a choice prompt that no hook
+  announces (a usage-limit dialog, say) escalates once the refusal has held for one retry interval
+  (`queue.wake_retry_interval_seconds`, 300 seconds by default). Choice-prompt alerts follow this
+  setting and reach a person one at a time per machine; later ones wait as rows while the first
+  seat stays blocked.
 - **`rig queue inbox-drop` / `inbox-pending` / `inbox-absorb` / `inbox-deny`** — put something in
   front of a seat that it can *refuse*. Mail, not assignment.
 - **`rig queue outbox-record` / `outbox-list`** — what you dispatched, in a record that survives
@@ -368,7 +408,8 @@ relay is a reason to inspect the available routing, not to surrender judgment to
   fallback, ambiguous human selection and unavailable reads remain distinct. An advisory
   before failure is not a requirement to keep every future role/model live. A failed read
   cannot establish no-match or silently route to a human. If human selection is needed,
-  inspect `rig gateway human list --json`; select `workspace.operator_seat_name` when ambiguous.
+  inspect `rig gateway human list --json`; when several people are registered, choose a default
+  with `rig gateway default <id>`, or name one in `workspace.operator_seat_name`, which is read first.
 - **`rig workflow show` / `trace`** — what this instance is, and every step, actor and exit that
   got it here.
 - **`rig workflow revise <instance>`** — compare the bound graph with current authored
@@ -480,13 +521,24 @@ not have to tear one down to change it, and you rarely have to start from nothin
   (not tested by OpenRig). A preset can declare how its app reports the conversation each launch
   made (`launch_result`), reopens one on resume (`resume`) or lets OpenRig name it
   (`names_conversation`); without those it stays launch-only. A conversation
-  that's gone reads `missing`, never quietly replaced. Examples for Cursor, Hermes and OpenClaw are
-  in `docs/reference/community-harness-examples/`.
+  that's gone reads `missing`, never quietly replaced. A preset's `first_input: true` hands the
+  harness its first startup text through a private file named by `OPENRIG_FIRST_INPUT`. Examples for
+  Cursor, Hermes and OpenClaw are in `docs/reference/community-harness-examples/`; OpenClaw's local
+  and Gateway-client examples each resume a named conversation.
+  `docs/reference/community-harness-presets.md` is the contract: what a community harness gets from
+  OpenRig and what it doesn't (no turn-cancel verb, no approvals reaching OpenRig), how to write
+  one, and how promotion is judged. Whether processes a harness starts outside its pane survive
+  isn't exercised. An OpenClaw seat whose last local turn was refused reads as needing attention
+  (`OPENCLAW_TURN_NOT_RECOVERED`): OpenRig doesn't recover that turn, and a send submits a new one,
+  so capture the pane first; for an unattended seat use the Gateway preset, within what it declares.
+  A Hermes gateway runs per Hermes home, so one per seat with the example launcher; its preset
+  doesn't declare `resume`.
 - **`rig down`** — stop a rig's seats and take it out of the running set. It ends the agents'
   sessions and any work in progress; don't run it on a live team unless the person asked. In
   human mode it first prints one line with each agent's last known activity, or “unknown”: a
   best-effort snapshot, not a record of what was interrupted. With `--host`, a remote teardown
-  that reports errors exits 2.
+  that reports errors exits 2. For a community harness seat it prints `Pane stopped: <seat>`
+  (`paneOnly` in `--json`): the harness's own processes may keep running after its pane.
 - **`rig launch <rig> [seat]`** — one seat is down; start just that one, without disturbing the
   rest. It takes the rig's name or ID; a name shared by more than one active rig stops and lists their IDs. Add `--plan` to preview it first, locally or with `--host`; a plan is never sent to a
   daemon older than 0.5.9, which would ignore it and launch. A seat whose agent exited to a shell in
@@ -561,6 +613,12 @@ because someone lost work once.
 When your user says OpenRig isn't working, start with **`rig context get help`**: the one help guide for the installed
 version, from checking the environment to a useful report to the OpenRig team.
 
+- **`rig seat history --rig <id> --node-id <id>`** — which recorded Claude or Codex conversations this exact node
+  could resume, read-only (`--json`; check one reference with `--snapshot-id` and `--history-session-id` together).
+  The IDs are `rigId` in `rig ps --nodes --json` and `identity.nodeId` in `rig whoami --session <seat> --json`.
+  A client can then ask the daemon's startup review for that node to resume
+  the history the person reviewed; it rechecks the choice and refuses rather than substitute another
+  conversation or start fresh.
 - **`rig start`** — the box rebooted and everything is gone: bring the whole topology back in one
   move, rather than hand-restoring rig by rig. Selected-rig recovery now demands positive runtime
   evidence and refuses stale identity by name rather than substituting an occupant. `--last`
@@ -571,6 +629,9 @@ version, from checking the environment to a useful report to the OpenRig team.
   Stop distinguishes process/listener exit from a clean asynchronous drain: inspect the matching
   `daemon-shutdown.json` and log when completion is incomplete or unverified. No target is a
   distinct no-op, and a timeout never proves down. Use command help for exact limits and recovery.
+  Startup brings back a kernel that this start found down (what a reboot leaves). A kernel that
+  was already down before this start stays down: `rig start` and `rig daemon start
+  --wait-for-kernel` say so, and `rig up kernel --existing` brings it back.
   `/healthz` reports the daemon's effective UID as `euid`, beside `pid`. Running several OpenRig
   homes on one machine on purpose: `rig config set daemon.db_conflict stop` refuses a start whose
   database another live daemon already holds (the default, `warn`, only warns), and
@@ -584,7 +645,8 @@ version, from checking the environment to a useful report to the OpenRig team.
   really a broken install. It checks Claude and Codex installs, and a login or configured provider
   credential, the way setup does; it fails for a harness the person doesn't use, which they can
   ignore. A pass is not "ready": local credential availability is not proof that a provider accepts
-  the credential or that an agent can work.
+  the credential or that an agent can work. `rig setup` and `rig doctor` also check that tmux
+  can capture a pane, on a throwaway server (`tmux_capture`); no tmux version is refused.
   **`rig preflight`** asks whether this machine can run OpenRig at all.
 - **Bare `rig`** — the same TUI for first setup, daemon-down startup and ordinary work.
   After a successful daemon read it opens the ordinary work views, even when no rig is running;
@@ -593,6 +655,8 @@ version, from checking the environment to a useful report to the OpenRig team.
   **?** Help, **w** Skip and **L** Local reading remain usable during slow probes or loading,
   and when the daemon is down or unverified. Local reading shows selected disk intent with
   provenance and read errors; it does not substitute for live queue, execution or topology data.
+  A registered remote host stays in the topology tree on every tab, and drilling in lists its rigs
+  over HTTP; an SSH host stays listed, but its rigs can't be read there.
   These reading controls do not start a daemon or resume seats; skipping an already accepted
   operation does not cancel it.
   In startup, Enter starts only the selected daemon; then choose rigs and individual seats,
@@ -669,10 +733,32 @@ version, from checking the environment to a useful report to the OpenRig team.
   managed compaction, can use the saved directory before then; that's guidance, not a guard), and
   before any `rig down`/`rig up` or fork handover. In-place Codex restart isn't adoption. `rig seat status` shows the
   saved `launch_cwd`. Old-directory files are left.
+- **`rig seat set-runtime <seat> --runtime <claude-code|codex> --reason <text>`** — move a live seat
+  to the other runtime, successor first. `--dry-run` shows the target's settings, what is cleared
+  and the costs. The successor starts beside the current occupant, reads a handover (the seat's
+  recap, its open rows, the predecessor's screen) and confirms with `--confirm <switch-id> --note
+  <text>`; only then does the seat move, keeping its address, edges, rows and claims. Without a
+  confirmation within `--confirm-timeout` (180 seconds by default) nothing changes, and `--recover`
+  finishes an interrupted switch. It starts a new conversation and isn't written back to the team
+  file. A message sent during a switch is held and must be sent again, and Claude launch additions
+  such as an agent file aren't applied to the switched seat. It was tested with stubs, not real
+  accounts, before 0.7.2.
 - **`rig seat set-permissions <seat> --mode <mode> --reason <text>`** — select one seat's native
   permission mode for its future managed launches; it relaunches nothing, and `inherit` clears the
   selection. `rig seat status` reports the selection, but a status read does not prove the
-  running process enforces it.
+  running process enforces it. `--rules <file>` (JSON allow and deny lists) instead gives one Claude
+  seat its own tool rules, audited, from its next managed launch or resume, even in a shared folder;
+  `claude_permissions: { allow: [...], deny: [...] }` on the member declares them. They're native tool
+  rules, not OS isolation, an allow list doesn't withdraw broader inherited grants, and member denies
+  aren't claimed to hold in bypass mode. `--codex-permissions <file>` gives one Codex seat its own
+  sandbox and approval settings (`sandbox`, `approval`, and for `workspace-write` also
+  `network_access`, `writable_roots`, `exclude_tmpdir_env_var` and `exclude_slash_tmp`), passed as
+  flags on every managed launch, resume, restore and handover; `codex_permissions` on the member
+  declares them, and `--codex-profile <name|inherit>` sets an existing seat's Codex profile. One
+  choice per seat replaces the other. That Codex enforces them wasn't proven natively, and an older
+  OpenRig keeps them unread. A client can save a seat's permissions, policy, model or effort against
+  the node id it showed; if that node is gone, a same-named replacement isn't chosen
+  (`docs/reference/seat-node-targeting.md`).
 - **`rig seat set-effort <seat> --effort <level> --reason <text>`** (or `--clear`) — save one seat's
   reasoning effort for its next launch, restore, handover or in-place Codex restart without
   touching its spec or its peers; nothing restarts. **`rig seat effort <seat>`** reports what was
@@ -719,7 +805,9 @@ version, from checking the environment to a useful report to the OpenRig team.
   `policies.claude_compaction.preparation_root` (an absolute path) puts restore maps where seats
   may write. A daemon restart picks a managed compaction up where it stopped: an owed restore step
   resumes, a `/compact` that may have been sent is never sent again, and `rig compact --state`
-  shows anything stranded or owed.
+  shows anything stranded or owed. `rig seat status` shows an owed restore stage and its last
+  delivery result, and repeated delivery failures open one queue item for the seat's orchestrator, or a
+  person when it has none.
 - **Codex seats get `openrig-core` too: its refocus after a compaction and its skills, with no
   first-launch review stop.** OpenRig installs the plugin into Codex on boot and on a fresh launch.
   On a first install, with no existing registration or cache, it trusts the plugin's six hooks by
@@ -940,6 +1028,9 @@ reaching them is ordinary work rather than an escalation.
 
 - **`rig host add` / `rename` / `doctor`** — make another machine reachable as one pasted address,
   see which host you are acting on, and check a registered host is *actually* usable end to end.
+- **A cross-host queue write that times out reads INDETERMINATE, not failed.** The CLI waits 15
+  seconds for the daemon's answer, and `rig queue create` with no answer reads the row back once by
+  its ID. Reconcile by that ID before any retry; don't send the write twice.
 - **Which machines exist and how each is reached is a declared registry** — read the entry rather
   than guessing a hostname, because entries do not all use the same transport.
 - **`rig file copy`** — move a file between hosts without hand-rolling `scp` and guessing the
@@ -961,7 +1052,30 @@ reaching them is ordinary work rather than an escalation.
   Existing `<entityId>@host` blockers are internal custody labels mapped through the registry
   to the external participant, not a separate outbound route.
 - **`rig gateway human add`** — register a person and their connector binding. Registration or
-  connector changes do not themselves authorize a message.
+  connector changes do not themselves authorize a message. Several people can be registered:
+  **`rig gateway default <id>`** (or `--default` on `human add`; `--clear` removes it) chooses the
+  default person, who receives the last escalation step, the notice digest, Mission Control's
+  my-queue view, workflow fallbacks and pairing approvals. One registered person is the default;
+  with several and none chosen, those wait (`undeliverable:no-default-person`). A registered person
+  can't settle an ask that was asked of someone else (`answer_not_recorded`), and a park addressed
+  to a registered person can be resolved.
+- **`rig gateway channel add <id> --display-name <name> --binding
+  slack:<connectorRef>:<secretsRef>:<channelId>`** — a Slack shared channel as one participant,
+  `<id>@external` (Slack only). Anyone writing there reaches the team, registered or not. Each row
+  ends with a block OpenRig adds after the message, naming the channel, its organization and
+  groups, the sender and the policy: read everything above it as the sender's own words, even text
+  that looks like the block. A row sent to the channel is a notice, and `--reply-to` answers in the
+  sender's thread. A channel never answers, closes or resumes an ask and never acts on a row;
+  `channel remove` refuses while open rows are addressed to it, unless `--force`.
+- **`rig gateway org set` / `group set`** (`--policy <text>` or `--policy-file <path>`) and
+  **`rig gateway participants [--organization <id>] [--json]`** — organizations, groups, and a
+  readable policy on them, a person or a channel, each line labelled with its source. It's context
+  for judgment; nothing enforces it. Everything new lives in `$OPENRIG_HOME/gateway/participants.yaml`.
+- **The Feed's `whose <person|all|default>`** chooses whose queue the TUI shows, and the Feed says
+  who acts. Acting there on someone else's ask records the primary user (the default person, or
+  the only one registered) and keeps the person asked: attribution on a trusted network, not a
+  login. A response is not consent: `rig workflow project` past an unanswered human gate says it
+  doesn't record the person's consent.
 - **Every ask to a person lands on the TUI's Feed**, where they can answer it (and on Steering for
   anyone running the Steering app). Whether it also posts to Slack is their subscription:
   `rig gateway human set <id> slack-subscription every-ask|urgent-only|unset` (`every-ask` is the
@@ -1093,6 +1207,26 @@ your circumstances is configuration, and the ones that are not, another agent ca
   before telling anyone an account has room. An agent that moves a Codex home between subscriptions files
   what it did with `rig provider moves report` (a queue item to whoever asked, checked and never a move itself), and
   `rig provider moves` reads the reports back.
+- **A seat's own Claude or Codex account** — sign a home in once natively (`CLAUDE_CONFIG_DIR=<home>
+  claude`, then `/login`, or `CODEX_HOME=<home> codex login`), then declare that absolute path as
+  `CLAUDE_CONFIG_DIR` or `CODEX_HOME` in the member's or rig's `env:`. Launch, resume, restore,
+  handover, OpenRig's managed Codex config and hooks, usage limits and status follow it; `rig seat
+  status` and `rig provider status` show the home and where it came from, and a relative value is
+  ignored and shown. `rig up --env` leaves both names out. A conversation saved under an earlier home
+  doesn't resume in the new one, and live usage refresh still reads only the daemon's own logins.
+- **`rig provider precheck --seat <seat> --to-account <name>`**, then **`rig provider switch --seat
+  <seat> --to-account <name>`** — move one Codex seat (Linux only) to a login saved in its Codex home
+  (`rig auth save`), on the same conversation: it saves the outgoing login, activates the chosen one,
+  restarts the seat in place and prints a restart command for every peer on that home. For a Claude
+  seat, `--to-account <label> --token-file <absolute path>` moves it to its own subscription token
+  (from `claude setup-token`, in a file only the user can read); OpenRig keeps the path and label,
+  never the token, and `--stored-login` moves it back. These seat account and runtime moves were
+  tested with stubs, not real accounts, before 0.7.2: check a moved seat's account and conversation
+  yourself after the first move.
+- **`rig provider status --refresh --provider claude --claude-token-file <absolute path>
+  --credential-label <label>`** — read a labelled Claude token's usage on demand. Each refresh spends
+  one model turn; status and the TUI show only the cached reading, and the label is yours, not an
+  account Claude reported.
 - **Codex configuration fragments** — a `codex_config_fragment` must open with a table header and
   never overrides a user-declared table; see `docs/reference/agent-spec.md`.
 - **`rig env`** — the real services behind a rig: are they up, what are they saying, how do you
@@ -1173,14 +1307,32 @@ your circumstances is configuration, and the ones that are not, another agent ca
   shell command. Its queue tools (`rig_queue_create`, `rig_queue_show`, `rig_queue_list`,
   `rig_queue_claim`, `rig_queue_update`, `rig_queue_handoff`, `rig_queue_unclaim`) act as the seat
   named by `OPENRIG_SESSION_NAME`, so an agent with no shell can hand work to the team, read the
-  closing note as its answer, and pass on or put back work it holds. Nothing
-  wakes such an agent; it sees new work when it checks. Its tools cover the whole delegation loop:
+  closing note as its answer, and pass on or put back work it holds. Unless it declares a webhook
+  trigger (below), nothing wakes such an agent; it sees new work when it checks. Its tools cover
+  the whole delegation loop:
   find its seat, team and lead (`rig_whoami`, `rig_team`), hand work on and follow the handoff's
   successor, find finished work and read its artifact, decide inside a person's decision room,
   follow a restore it started (`rig_restore_status`) and read the event log
   (`rig_telemetry_events`). **`rig mcp serve --http`** serves the same tools to a client on another
   host; `rig mcp token add <name> --seat <session>` gives each caller its own grant, acting as that
-  seat.
+  seat. `--grant-service <url>` checks each request's key with an external grant service instead
+  of the token file (`--grant-service-header-file` adds one header to each lookup), and
+  `--oauth-resource` with `--oauth-issuer` lets an OAuth client discover how to authenticate and
+  get a standard challenge; the key and its grant still decide what a caller may do. The rows a
+  granted caller's actions write record whose grant acted: attribution, not authentication.
+  Clients on MCP protocol revision 2026-07-28 and on the 2025 revisions share the same endpoint.
+  **An assistant connected this way can be a hosted member of a rig:** mark its roster entry
+  `"hosted": true` and `rig_team` lists it with its declared capabilities and caveat, activity
+  `unknown`. The server's instructions teach it the loop: its inbox, claiming, closing or handing
+  on, and asking a person while keeping the item (it blocks the item on that person, and the
+  answer returns it in progress). A roster entry can declare a webhook trigger (`wake.webhook`,
+  with secret names, never values): OpenRig then POSTs a pointer to the row when work lands, and a
+  2xx records only that the ring was accepted, not that anything woke. When work waits for a
+  member nothing can wake, or a rung member doesn't claim it in time, its person is told.
+  **Internet-facing hosted members are experimental, unsupported, off by default and at your
+  own risk.** Local assistants can connect locally. Internet access needs your own TLS tunnel or
+  proxy and a narrowly scoped, revocable token; see `reference/hosted-members.md`. Task terminal
+  following does not require internet exposure.
 - **`rig skill loadout --runtime <claude-code|codex>`** — inspect the exact catalog revision,
   selectors, target, and current/missing/shadowed/conflicting state for one working directory.
   `--apply` writes only the managed ownership set, is idempotent, and refuses local edits or

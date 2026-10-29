@@ -42,6 +42,7 @@ import {
   type GateCompileResult,
   type ProjectStepInput,
   type ProjectStepResult,
+  workflowHumanGateGuidance,
 } from "./workflow-projector.js";
 import { loadHostRegistry } from "./hosts/hosts-registry-reader.js";
 import type { HostRegistryLookupFn } from "./workflow-validator.js";
@@ -865,7 +866,7 @@ export class WorkflowRuntime {
       );
     });
     if (entryQitemId && entryQitemDestinationSession) {
-      await this.queueRepo.maybeNudge(entryQitemId, entryQitemDestinationSession, entryQitemNudge);
+      await this.queueRepo.maybeNudge(entryQitemId, entryQitemDestinationSession, entryQitemNudge, input.createdBySession);
     }
 
     const finalInstance = this.instanceStore.getByIdOrThrow(instanceId!);
@@ -1287,7 +1288,7 @@ export class WorkflowRuntime {
 
       // P34 (site :791) — NO SEAM ASSERT HERE, deliberately.
       //
-      // Canonical correction, transition 5764 on qitem-20260809175537-8e25384f:
+      // Canonical correction:
       // "Intent goes on :791; the assert runs only where a real source->successor
       // pair exists." This transaction has no such pair. The N exception closes
       // above are terminal closes with NO successor of their own (`no-follow-on`),
@@ -1804,8 +1805,8 @@ export class WorkflowRuntime {
   }
 
   /**
-   * OPR.0.4.6.WF1 FR-2 COMPLETION FIXBACK (build-vs-ratified-AC debt,
-   * qitem-20260706211220-279039f5): the ratified FR-2 AC requires the
+   * OPR.0.4.6.WF1 FR-2 COMPLETION FIXBACK (build-vs-ratified-AC debt):
+   * the ratified FR-2 AC requires the
    * stuck classification to be "queryable via list/show/trace … with
    * the evidence (step, owner, deadline, age)". The merged WF-1 build
    * surfaced it only through the boot sweep + keepalive nudges; this
@@ -1886,6 +1887,7 @@ function workflowInstantiateBody(input: {
       "",
       `Gate: ${input.gate.kind === "human" ? "human sign-off" : "handler-role check"} — the workflow is PARKED (waiting) until this item is resolved/closed; the flow then continues from this step.`,
     );
+    if (input.gate.kind === "human") lines.push(...workflowHumanGateGuidance(input.gate.parkOn!));
     if (input.gate.summary) lines.push(`Ask: ${input.gate.summary}`);
     if (input.gate.evidenceRef) lines.push(`Evidence: ${input.gate.evidenceRef}`);
   }

@@ -16,13 +16,28 @@ type: `openrig-urgent`, `urgent-only` and `sends-only`. Sibling seats keep their
 
 Lifecycle work is refused at `openrig-urgent` and `urgent-only`, as at `hold`.
 
+A terminal member (`runtime: terminal`) defaults to `sends-only`, which holds OpenRig's own notices. Set one
+to `off` and those notices, such as park reminders and other watchdog messages, type into whatever the pane
+is running, and a shell prompt runs each line as a command, From and To lines included: OpenRig doesn't check
+a terminal pane's foreground process. `openrig-urgent` and `draft-aware` type only into a recognized empty agent composer, so
+a shell prompt holds them. Keep the default for a seat that may fall back to a shell.
+
 Runtime permissions are separate. Recipient and interactive-prompt checks still
 apply. `--raw` and `--force` do not bypass the typing guard. A deliberate
 `--dangerously-interact --reason` remains available at every interruption level
 and uses the existing-input check below. Direct human input remains available.
 
 A message sent to a busy Codex seat joins its running turn and may redirect it.
-For separate work, use `rig send <seat> "<message>" --wait-for-idle <seconds>`.
+For separate work, create a queue row instead:
+`rig queue create --destination <seat> --summary "<one line>" --body-file <file>`.
+A row that's saved keeps the work apart from its wake, the short pointer typed
+into the seat. The wake is still typed input, and it isn't proof that the seat
+claimed or finished the work: the row's state says that.
+
+`rig send <seat> "<message>" --wait-for-idle <seconds>` suits a sender who
+watches the result. If the seat is still busy, or its activity is unknown, when
+the wait ends, nothing is sent (exit 1, "No text was sent.") and OpenRig keeps
+nothing to send later.
 
 ## Configure and inspect
 

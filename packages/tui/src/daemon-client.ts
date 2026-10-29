@@ -41,7 +41,7 @@ export interface TerminalOpenResult {
   ok: boolean;
   opened: string[];
   absent: Array<{ seat: string; reason: string }>;
-  degraded: Array<{ seat: string; reason: string }>;
+  degraded: Array<{ seat: string; reason: string; code?: "pane_unconfirmed" }>;
   pages: number;
   error?: string;
   code?: string;
@@ -291,10 +291,11 @@ export class DaemonClient {
   rigNodes(rigId: string) {
     return this.get(`/api/rigs/${encodeURIComponent(rigId)}/nodes`);
   }
-  /** The existing per-seat effort report: requested, saved, emitted and observed. */
+  /** The existing per-seat effort report: requested, saved, emitted and observed.
+   * A refusal is an answer, so the page reader doesn't count it as a failed read. */
   async seatEffort(seatRef: string): Promise<unknown> {
     const route = `/api/seat/effort/${encodeURIComponent(seatRef)}`;
-    const res = await this.fetchImpl(`${this.baseUrl}${route}`, {
+    const res = await this.optionalFetchImpl(`${this.baseUrl}${route}`, {
       headers: this.headers,
       signal: AbortSignal.timeout(5_000),
     });
@@ -436,19 +437,20 @@ export class DaemonClient {
     return await this.get("/api/terminal/views") as { saved: Array<{ id: string; name: string; members: Array<{ seat: string }> }>; rigs: string[] };
   }
   /** The preview behind "Open terminals". That action opens through `rig terminal open --window`, which composes with
-   *  Rex's layout from inside Rex and otherwise Herdr's (falling back to plain tmux), so preview with the provider it
-   *  will use: its planId is the window opener's expected plan. A provider-less preview may pick cmux, whose plan the
-   *  window opener never matches. */
-  async previewTerminal(view: string, provider: "herdr" | "rex" = "herdr"): Promise<import("./terminals/terminal-model.js").TerminalPreview> {
-    // The interactive TUI has a TTY; measure each preview again after a resize. Unknown stays narrow.
-    const columns = process.stdout.isTTY ? process.stdout.columns : undefined;
+   *  Rex's layout from inside Rex and otherwise Herdr's (falling back to plain tmux), or, from inside cmux, through
+   *  `rig terminal open --provider cmux`. Preview with the provider it will use: its planId is the open's expected plan.
+   *  A provider-less preview may pick cmux, whose plan the window opener never matches. */
+  async previewTerminal(view: string, provider: "herdr" | "rex" | "cmux" = "herdr"): Promise<import("./terminals/terminal-model.js").TerminalPreview> {
+    // The interactive TUI has a TTY; measure each preview again after a resize. Unknown stays narrow. The cmux open sends
+    // no width, and a wide one changes the kernel view's layout and so its plan, so a cmux preview sends none either.
+    const columns = provider !== "cmux" && process.stdout.isTTY ? process.stdout.columns : undefined;
     const viewport = Number.isSafeInteger(columns) && columns! > 0 ? `&viewportColumns=${columns}` : "";
     return await this.get(`/api/terminal/preview?view=${encodeURIComponent(view)}&provider=${provider}${viewport}`) as import("./terminals/terminal-model.js").TerminalPreview;
   }
   async openTerminal(view: string, expectedPlan?: string): Promise<TerminalOpenResult> {
     const result = (await this.post(`/api/terminal/open`, { view, ...(expectedPlan !== undefined ? { expectedPlan } : {}) })) as TerminalOpenResult;
     if (!Array.isArray(result.opened) || result.opened.length === 0) {
-      throw new Error(`terminal open failed: ${result.error ?? result.code ?? ([...new Set(result.degraded?.map(m => m.reason))].join("; ") || "no tiles opened")}`);
+      throw new Error(`terminal open failed: ${result.error ?? result.code ?? ([...new Set(result.degraded?.map(m => `${m.code === "pane_unconfirmed" ? "Unconfirmed" : "Skipped"}: ${m.seat} — ${m.reason}`))].join("; ") || "no tiles opened")}`);
     }
     return result;
   }

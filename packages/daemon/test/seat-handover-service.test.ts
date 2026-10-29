@@ -1362,6 +1362,7 @@ describe("SeatHandoverService", () => {
 
   it("carries the current rules, primary model and Advisor through handover to the successor", async () => {
     const { node } = seedSeat({ runtime: "claude-code", model: "claude-sonnet-5-5", advisor: "opus" });
+    capturePaneScreen.mockResolvedValue("Claude Code v2.1.303\n❯ \n────────────────────\n  ⏵⏵ accept edits on (shift+tab to cycle)");
     const rules = { allow: [], deny: ["Read(./private/**)"] };
     const writer = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux() });
     expect(await writer.setPermissions({ seatRef: "dev-impl@seat-rig", rules, actor: "operator@seat-rig", reason: "Set successor rules" })).toMatchObject({ ok: true });
@@ -1393,6 +1394,7 @@ describe("SeatHandoverService", () => {
 
   it("OPR.0.7.0.9 (K2): a Claude seat's launch additions reach its fresh handover successor's launch, and the new conversation's start is recorded", async () => {
     const { rig } = seedSeat({ runtime: "claude-code" });
+    capturePaneScreen.mockResolvedValue("Claude Code v2.1.303\n❯ \n────────────────────\n  ⏵⏵ accept edits on (shift+tab to cycle)");
     const src = fs.mkdtempSync(path.join(os.tmpdir(), "handover-additions-"));
     try {
       fs.writeFileSync(path.join(src, "prompt.md"), "Short answers.\n");

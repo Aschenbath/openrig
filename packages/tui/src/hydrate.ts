@@ -22,6 +22,7 @@ import { DaemonClient } from "./daemon-client.js";
 import { parse as parseYaml } from "yaml";
 import type { AgentRow, FleetSnapshot, HealthCoverage, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, SeatActivitySummary, SeatEffortRead, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
 import { isHumanSeatSession } from "./pulse/pulse-model.js";
+import { sanitizeHostDisplayName } from "./topology/host-label.js";
 
 // Narrow read-shapes: just the served fields this module consumes (names match
 // the daemon's serialized output — see the Phase-2 endpoint-shape survey).
@@ -176,6 +177,7 @@ interface AttentionAggregateRead {
 }
 /** The host registry (`rig host list`): each registered host with a quick reachability probe. */
 interface HostsRead {
+  ownName?: unknown;
   hosts?: Array<{ id?: unknown; status?: unknown }>;
 }
 interface StreamItemRead {
@@ -311,6 +313,12 @@ function groupPods(nodes: NodeInventoryRead[]): PodNode[] {
     pods.set(pod, list);
   }
   return [...pods.entries()].map(([name, agents]) => ({ name, agents }));
+}
+
+// Rigs are listed as `rig ps` lists them: by name, compared as SQLite's `ORDER BY r.name` does (so uppercase before
+// lowercase). The summary arrives in creation order and the sort is stable, so equal names keep that order, as in `rig ps`.
+function byRigName(a: { name: string }, b: { name: string }): number {
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
 }
 
 function toNeedsItem(item: NeedsYouItemRead): NeedsItem {
@@ -654,11 +662,13 @@ export async function hydrateSnapshot(
     }
   }
   const aggHosts = agg?.hosts ?? [];
+  const ownName = typeof hostsRead?.ownName === "string" ? sanitizeHostDisplayName(hostsRead.ownName) : undefined;
   const localHost: HostNode = {
     id: "local",
     name: instanceHealth?.selfHostId?.trim() || "local",
+    displayName: ownName && ownName !== "localhost" ? ownName : undefined,
     reachable: true,
-    rigs,
+    rigs: rigs.sort(byRigName),
   };
   // A remote host is any registered host, or one the attention aggregate answered for. Its reachability is the aggregate's
   // answer where there is one, else the registry's probe. Only a drilled-into remote host's rigs are read, through this
@@ -676,7 +686,7 @@ export async function hydrateSnapshot(
     name: id,
     reachable: aggStatus.has(id) ? aggStatus.get(id) === "ok" : registered.some((h) => h.id === id && h.reachable),
     rigs: id === drilledRemote
-      ? (remoteRigs ?? []).map((rig) => ({ id: rig.id, name: rig.name, lifecycleState: rig.lifecycleState, hasLiveAgents: rig.hasLiveAgents ?? null, pods: [], remoteHost: id }))
+      ? (remoteRigs ?? []).map((rig) => ({ id: rig.id, name: rig.name, lifecycleState: rig.lifecycleState, hasLiveAgents: rig.hasLiveAgents ?? null, pods: [], remoteHost: id })).sort(byRigName)
       : [],
   }));
 

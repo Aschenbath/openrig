@@ -517,6 +517,25 @@ describe("RestoreOrchestrator.launchNodeSubset", () => {
     expect(listProcesses).not.toHaveBeenCalled();
   });
 
+  it("#1822 automatic carry idle-shell advice does not pin an explicit snapshot", async () => {
+    const { rigId, session } = seedPreservedShell();
+    sessionRegistry.updateResumeToken(session.id, "claude_id", "idle-conversation");
+    const capture = new SnapshotCapture({ db, rigRepo, sessionRegistry, eventBus, snapshotRepo, checkpointStore: new CheckpointStore(db) });
+    capture.captureSnapshot(rigId, "auto-pre-down");
+    sessionRegistry.updateStatus(session.id, "exited");
+    const periodic = capture.captureSnapshot(rigId, "auto-periodic");
+    sessionRegistry.updateStatus(session.id, "running"); // preserved shell, not a live agent
+    const automatic = await orchestrator.launchSingleNode(rigId, "dev.driver");
+    const advice = automatic.launched?.[0]?.error;
+    expect(advice).toContain("To retry automatic resume:");
+    expect(advice).toContain(`then rig launch ${rigId} dev.driver (`);
+    expect(advice).toContain("reselects the latest usable snapshot");
+    expect(advice).not.toContain("--snapshot-id");
+    const explicit = await orchestrator.launchSingleNode(rigId, "dev.driver", { snapshotId: periodic.id });
+    expect(explicit.launched?.[0]?.error).toContain("start nothing and ask for a decision");
+    expect(tmux.createSession).not.toHaveBeenCalled();
+  });
+
   it("single-seat launch also reports the stopped agent", async () => {
     const { rigId } = seedPreservedShell();
     const result = await orchestrator.launchSingleNode(rigId, "dev.driver");
@@ -731,6 +750,24 @@ describe("RestoreOrchestrator.launchNodeSubset", () => {
       expect(db.prepare("SELECT status FROM sessions WHERE id = ?").get(live.id)).toEqual({ status: "running" });
     });
 
+    it("carries the running Claude executable through takeover to the continuation", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "continuation-executable-"));
+      try {
+        const executable = path.join(root, "claude");
+        fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        const { rigId, nodeIds } = seedPodAwareRig();
+        seedSnapshot(rigId, nodeIds, { [nodeIds[0]!]: emptyStartupContext("claude-code") });
+        liveDriver(rigId, nodeIds[0]!);
+        tmux.getPanePid.mockResolvedValue(10 as never);
+        processes = [{ pid: 10, ppid: 1, pgid: 10, tpgid: 10, command: `${executable} --session-id original`,
+          executableName: "claude", startedAt: "Fri Oct 9 07:00:00 2026" }];
+        const adapter = readyAdapter("claude-code");
+        (tmux as any).signalPaneProcess.mockImplementation(async () => { processes = []; return { ok: true }; });
+        await orchestrator.launchSingleNode(rigId, "dev.driver", { adapters: { "claude-code": adapter }, keepPane: true });
+        expect(adapter.launchHarness).toHaveBeenCalledWith(expect.objectContaining({ claudeExecutable: fs.realpathSync(executable) }), expect.anything());
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
+
     it("a process that won't end isn't replaced: no shell is started over it", async () => {
       const { rigId, nodeIds } = seedPodAwareRig();
       seedSnapshot(rigId, nodeIds, { [nodeIds[0]!]: emptyStartupContext("claude-code") });
@@ -745,7 +782,7 @@ describe("RestoreOrchestrator.launchNodeSubset", () => {
       expect((tmux as any).respawnPane).not.toHaveBeenCalled();
     });
 
-    it("the takeover goes through the daemon's delivery guard: the seat's pane stays its target while it's ended and restarted", async () => {
+    it("the takeover keeps its guarded seat target when another binding retains the same pane id", async () => {
       // The guard's own tables, as a daemon's database has them.
       db.close();
       const full = createDb();
@@ -754,6 +791,10 @@ describe("RestoreOrchestrator.launchNodeSubset", () => {
       const { rigId, nodeIds } = seedPodAwareRig();
       seedSnapshot(rigId, nodeIds, { [nodeIds[0]!]: emptyStartupContext("claude-code") });
       liveDriver(rigId, nodeIds[0]!);
+      const peer = sessionRegistry.registerSession(nodeIds[1]!, "dev-guard@test-rig");
+      sessionRegistry.updateStatus(peer.id, "running");
+      sessionRegistry.updateBinding(nodeIds[1]!, { tmuxSession: "dev-guard@test-rig", tmuxPane: "%7" });
+      expect(resolveGuardTarget(db, "%7")).toBeNull();
       // The real adapter's signal and respawn, behind the real guard, as a daemon wires them. Only the shell is a fake.
       const guard = new SeatDeliveryGuard(db, (name) => resolveGuardTarget(db, name));
       const commands: string[] = [];
@@ -780,6 +821,7 @@ describe("RestoreOrchestrator.launchNodeSubset", () => {
       expect(configs).toEqual([expect.stringMatching(/^respawn-pane -t \S*%7/)]);
       expect(result.launched).toEqual([expect.objectContaining({ logicalId: "dev.driver", status: "fresh-primed" })]);
       expect(sessionRegistry.getBindingForNode(nodeIds[0]!)).toMatchObject({ tmuxSession: "dev-driver@test-rig", tmuxPane: "%7" });
+      expect(sessionRegistry.getBindingForNode(nodeIds[1]!)).toMatchObject({ tmuxSession: "dev-guard@test-rig", tmuxPane: "%7" });
     });
 
     it("a failed registration after the pane was restarted leaves the person's session alone", async () => {

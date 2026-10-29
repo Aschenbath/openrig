@@ -22,6 +22,7 @@ import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js"
 import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_guard.js";
 import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 import { EventBus } from "../src/domain/event-bus.js";
+import { QueueRepository } from "../src/domain/queue-repository.js";
 import { getNodeInventory } from "../src/domain/node-inventory.js";
 import type { TmuxAdapter, TmuxResult } from "../src/adapters/tmux.js";
 import { createFullTestDb } from "./helpers/test-app.js";
@@ -576,6 +577,41 @@ describe("SessionTransport", () => {
     sessionRegistry.updateBinding(node.id, { tmuxSession: "r00-legacy-worker-a" });
     return { rig, node, session };
   }
+
+  it("community contract: a successful queue wake passes through the transport once", async () => {
+    const { session } = seedCanonicalRig("synth");
+    sessionRegistry.recordCommunityHarnessSelection(session.id, "synth");
+    let screen = "custom harness screen";
+    const sendText = vi.fn(async (_target: string, text: string) => { screen = text; return { ok: true as const }; });
+    const sendKeys = vi.fn(async () => ({ ok: true as const }));
+    const transport = createTransport(mockTmux({ getPaneCommand: async () => "node", capturePaneContent: async () => screen, sendText, sendKeys }),
+      { sleep: async () => {} });
+    const queue = new QueueRepository(db, new EventBus(db), { transport, validateRig: () => true });
+    const item = await queue.create({ sourceSession: "sender@my-rig", destinationSession: "dev-impl@my-rig", body: "assigned task", nudge: false });
+    await queue.maybeNudge(item.qitemId, item.destinationSession, true, item.sourceSession);
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(sendText.mock.calls[0]![1]).toContain(item.qitemId);
+    expect(sendKeys).toHaveBeenCalledTimes(1);
+    expect(sendKeys.mock.calls[0]).toEqual(["dev-impl@my-rig", ["Enter"]]);
+    expect(queue.getById(item.qitemId)?.lastNudgeResult).toBe("verified");
+  });
+
+  it.each([
+    ["a shell", "bash", "shell prompt", "target_runtime_unverified"],
+    ["a numbered choice", "node", "› 1. Yes, continue\n  2. No, cancel\n\nPress enter to continue", "target_needs_input"],
+  ])("community contract: refuses %s without pasting text or pressing Enter", async (_label, command, screen, reason) => {
+    const { session } = seedCanonicalRig("synth");
+    sessionRegistry.recordCommunityHarnessSelection(session.id, "synth");
+    const sendText = vi.fn(async () => ({ ok: true as const }));
+    const sendKeys = vi.fn(async () => ({ ok: true as const }));
+    const transport = createTransport(mockTmux({ getPaneCommand: async () => command,
+      capturePaneContent: async () => screen, sendText, sendKeys }));
+    const result = await transport.send("dev-impl@my-rig", "ordinary work");
+    expect(result).toMatchObject({ ok: false, reason });
+    expect(result.sent).not.toBe(true);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendKeys).not.toHaveBeenCalled();
+  });
 
   function seedExternalCliRig() {
     const rig = rigRepo.createRig("rigged-buildout");
@@ -1723,6 +1759,43 @@ describe("SessionTransport", () => {
     expect(result.activity).toMatchObject({ state: "needs_input", reason: "selection_prompt" });
     expect(capture).toHaveBeenCalledTimes(1);
     expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { newer: "StopFailure", older: "Stop", state: "unknown", ok: false },
+    { newer: "Stop", older: "StopFailure", state: "idle", ok: true },
+  ])("send readiness keeps the newer Claude $newer when $older arrives later", async ({ newer, older, state, ok }) => {
+    seedCanonicalRig();
+    const now = new Date();
+    const eventBus = new EventBus(db);
+    const agentActivityStore = new AgentActivityStore({ db, eventBus, now: () => now });
+    for (const [index, hookEvent] of [newer, older].entries()) {
+      expect(agentActivityStore.recordHookEvent({ runtime: "claude-code", sessionName: "dev-impl@my-rig", hookEvent,
+        subtype: hookEvent === "StopFailure" ? "rate_limit" : null,
+        occurredAt: new Date(now.getTime() - (index + 1) * 1000).toISOString() }).ok).toBe(true);
+    }
+    const sendText = vi.fn(async () => ({ ok: true as const }));
+    const transport = createTransport(mockTmux({ sendText }), { agentActivityStore, now: () => now, sleep: async () => undefined });
+    const result = await transport.send("dev-impl@my-rig", "follow-on work", { waitForIdleMs: 50 });
+    expect(result).toMatchObject({ ok, activity: { state, rawEvent: newer } });
+    expect(sendText).toHaveBeenCalledTimes(ok ? 1 : 0);
+  });
+
+  it("producer-link diagnostics keep the newer Claude hook when an expired Stop arrives later", async () => {
+    seedCanonicalRig();
+    const now = new Date();
+    const eventBus = new EventBus(db);
+    const agentActivityStore = new AgentActivityStore({ db, eventBus, now: () => now });
+    expect(agentActivityStore.recordHookEvent({ runtime: "claude-code", sessionName: "dev-impl@my-rig",
+      hookEvent: "StopFailure", subtype: "rate_limit", occurredAt: new Date(now.getTime() - 1000).toISOString() }).ok).toBe(true);
+    expect(agentActivityStore.recordHookEvent({ runtime: "claude-code", sessionName: "dev-impl@my-rig",
+      hookEvent: "Stop", occurredAt: new Date(now.getTime() - agentActivityStore.freshnessMs - 1000).toISOString() }).ok).toBe(true);
+    const sendText = vi.fn(async () => ({ ok: true as const }));
+    const transport = createTransport(mockTmux({ sendText }), { agentActivityStore, now: () => now });
+    const result = await transport.send("dev-impl@my-rig", "follow-on work");
+    expect(result.ok).toBe(true);
+    expect(result.warning).toContain("producer-link: a recent activity hook exists");
+    expect(sendText).toHaveBeenCalledOnce();
   });
 
   it("uses the recorded pane when a fresh Claude hook checks a split session", async () => {
