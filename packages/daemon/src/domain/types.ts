@@ -565,6 +565,8 @@ export type ContinuityOutcome = "resumed" | "rebuilt" | "forked" | "fresh" | "fa
 export type HandoverResult = "complete" | "unchanged" | "partial" | "failed" | null;
 export type AgentActivityState = "running" | "needs_input" | "idle" | "unknown";
 export type AgentActivityEvidenceSource =
+  /** Explicit pane liveness (including tmux pane_dead), not inferred input or activity. */
+  | "pane_process"
   | "runtime_hook"
   | "pane_heuristic"
   /** ACTIVITY D1+D2 — tmux `#{window_activity}` motion (SeatActivityService). A fact about BYTES on
@@ -654,6 +656,7 @@ export interface SeatIdentityVerdict {
     | "pane_pid_gone"
     | "binding_pane_missing"
     | "session_missing"
+    | "pane_exited"
     | "tmux_unavailable"
     | null;
   evidence: {
@@ -673,6 +676,12 @@ export interface SeatIdentityVerdict {
  * Callers must first gate the verdict to the current session and binding. */
 export function identityVerdictConfirmsSessionMissing(verdict: SeatIdentityVerdict | null | undefined): boolean {
   return verdict?.reason === "session_missing";
+}
+
+/** Positive executor absence only. Unknown identity or an unreadable pane never proves an exit.
+ * Callers must first gate the verdict to the current session, binding and occupant. */
+export function identityVerdictConfirmsExecutorStopped(verdict: SeatIdentityVerdict | null | undefined): boolean {
+  return identityVerdictConfirmsSessionMissing(verdict) || verdict?.reason === "pane_exited";
 }
 
 /**
