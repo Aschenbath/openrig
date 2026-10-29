@@ -80,11 +80,7 @@ function makeDeps(overrides: Partial<TerminalServiceDeps> = {}): {
     },
     listRigSeats: (rigArg) => (rigArg === "acme-build" || rigArg === "rig-id-1" ? rigRows : null),
     listPodSeats: (rigArg, pod) => (rigArg === "acme-build" && pod === "dev" ? [rigRows[0]!] : null),
-    listScopeSeats: (scope) =>
-      scope === "mission:4.6" || scope === "slice:02"
-        ? [{ canonicalSessionName: "dev-driver@acme-build", attachmentType: "tmux", tmuxSession: "dev-driver@acme-build", rigName: "acme-build", logicalId: "dev.driver" }]
-        : null,
-    resolveScopeView: view => view === "slice:02" ? { task: { kind: "slice", id: "02", name: "Slice 02", complete: true, issues: [], members: [] },
+    resolveScopeView: view => view === "slice:02" || view === "mission:4.6" ? { task: { kind: view.startsWith("slice:") ? "slice" : "mission", id: view.split(":")[1]!, name: view, complete: true, issues: [], members: [] },
       members: [{ seat: "dev-driver@acme-build", tmuxSession: "dev-driver@acme-build", host: null, readOnly: true, alive: true }] }
       : { code: "scope_not_found", error: "Unknown fixture slice" },
     listRigNames: () => ["acme-build"],
@@ -794,4 +790,14 @@ it("keeps unsupported ensure as a client error and maps unknown/ambiguous scope 
   expect((await app.request("/terminal/preview?view=slice:absent")).status).toBe(404);
   Object.assign(deps, { resolveScopeView: () => ({ code: "scope_ambiguous", error: "Ambiguous scope" }) });
   expect((await app.request("/terminal/preview?view=slice:duplicate")).status).toBe(409);
+});
+
+
+it("previews mission owners and ensure capability through the same scoped resolver", async () => {
+  const { deps, herdr } = makeDeps();
+  Object.assign(herdr, { ensureViewer: async () => { throw new Error("Preview is passive"); } });
+  Object.assign(deps, { resolveScopeView: () => ({ task: { kind: "mission", id: "work", name: "work", complete: true, issues: [], members: [] }, members: [] }) });
+  const preview = await new TerminalService(deps).previewView({ view: "mission:work" });
+  expect(preview).toMatchObject({ task: { kind: "mission", id: "work", complete: true, members: [] }, capabilities: { ensureViewer: true } });
+  expect("task" in preview && preview.task).not.toHaveProperty("qitemId");
 });

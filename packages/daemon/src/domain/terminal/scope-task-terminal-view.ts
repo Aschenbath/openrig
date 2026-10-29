@@ -10,6 +10,8 @@ import { projectTaskOwners, type TaskSeat, type TaskTerminalView } from "./task-
 export interface ScopeViewError { code: "scope_unsupported" | "scope_not_found" | "scope_ambiguous" | "scope_unavailable"; error: string }
 type IndexContext = Pick<SliceIndexer, "slicesRoot" | "additionalSliceRoots" | "projectId">;
 interface Scope { name: string; id?: string; title: string; source: string; mission?: string; missionSource?: string }
+interface Mission { name: string; source: string; manifest?: string }
+interface ScopeIndex { slices: Scope[]; missions: Mission[]; claims: Map<string, Set<string>>; missionIssues: string[] }
 const MAX_ENTRIES = 4096, MAX_HEADER_BYTES = 16384, MAX_SOURCE_BYTES = 8 * 1024 * 1024;
 const MAX_ROWS = 50000, MAX_TAG_BYTES = 16384, MAX_TOTAL_TAG_BYTES = 8 * 1024 * 1024;
 class ScopeLimit extends Error {}
@@ -18,9 +20,10 @@ const unavailable = (error: string): ScopeViewError => ({ code: "scope_unavailab
 /** Strict bounded identity read over the configured index roots. The review
  * listing's first-match and unreadable-as-empty fallbacks are not authority
  * for retiring viewers. No inferred project, substring match or remote I/O. */
-function readScopeIndex(index: IndexContext): Scope[] | ScopeViewError {
+function readScopeIndex(index: IndexContext): ScopeIndex | ScopeViewError {
   let entries = 0, bytes = 0;
-  const scopes: Scope[] = [], seenRoots = new Set<string>(), seenScopes = new Map<string, Scope>();
+  const scopes: Scope[] = [], missions: Mission[] = [], missionIssues: string[] = [];
+  const seenRoots = new Set<string>(), scopeBySource = new Map<string, Scope>(), missionBySource = new Map<string, Mission>();
   const list = (dir: string, visit: (name: string) => void) => {
     const handle = fs.opendirSync(dir);
     try {
@@ -30,12 +33,15 @@ function readScopeIndex(index: IndexContext): Scope[] | ScopeViewError {
       }
     } finally { handle.closeSync(); }
   };
+  const addMission = (dir: string, name: string, manifest?: string): Mission => {
+    const source = fs.realpathSync(dir), existing = missionBySource.get(source);
+    if (existing) return existing;
+    const mission = { name, source, ...(manifest ? { manifest } : {}) };
+    missionBySource.set(source, mission); missions.push(mission); return mission;
+  };
   const add = (dir: string, name: string, mission?: string, missionSource?: string) => {
-    const source = fs.realpathSync(dir), existing = seenScopes.get(source);
-    if (existing) {
-      if (missionSource && !existing.missionSource) { existing.mission = mission; existing.missionSource = missionSource; }
-      return;
-    }
+    const source = fs.realpathSync(dir), existing = scopeBySource.get(source);
+    if (existing) { if (missionSource && !existing.missionSource) { existing.mission = mission; existing.missionSource = missionSource; } return; }
     let raw = "";
     for (const file of NODE_FILE_PRECEDENCE) {
       let fd: number;
@@ -58,8 +64,8 @@ function readScopeIndex(index: IndexContext): Scope[] | ScopeViewError {
     const id = typeof fields.id === "string" && fields.id ? fields.id : undefined;
     const title = typeof fields.title === "string" && fields.title ? fields.title
       : typeof fields.slice === "string" && fields.slice ? fields.slice : raw.match(/^# (.+)$/m)?.[1]?.trim() || name;
-    const scope = { name, id, title, source, mission, missionSource };
-    seenScopes.set(source, scope); scopes.push(scope);
+    const scope = { name, id, title, source, ...(missionSource ? { mission, missionSource } : {}) };
+    scopeBySource.set(source, scope); scopes.push(scope);
   };
   try {
     for (const [position, root] of [index.slicesRoot, ...index.additionalSliceRoots].entries()) {
@@ -79,17 +85,26 @@ function readScopeIndex(index: IndexContext): Scope[] | ScopeViewError {
         try { isMission = fs.statSync(nested).isDirectory(); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
         if (isMission) {
-          const missionSource = fs.realpathSync(dir);
-          list(nested, child => add(path.join(nested, child), child, name, missionSource));
+          const mission = addMission(dir, name);
+          list(nested, child => add(path.join(nested, child), child, name, mission.source));
+        } else {
+          add(dir, name); // Preserve existing flat-slice lookup and header accounting.
+          const manifest = path.join(dir, "mission.yaml");
+          try { if (fs.statSync(manifest).isFile()) addMission(dir, name, manifest); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") missionIssues.push("Mission declarations could not be enumerated completely."); }
         }
-        else add(dir, name);
       });
     }
   } catch (error) {
     return unavailable(error instanceof ScopeLimit ? `${error.message} This index is too large for this bounded read; use a smaller configured index or a qitem view.`
       : "Scope index sources are unavailable or malformed; inspect the configured sources and refresh the view.");
   }
-  return scopes;
+  const claims = new Map<string, Set<string>>();
+  for (const scope of scopes) for (const key of new Set([scope.name, scope.id])) {
+    if (!key) continue;
+    const owners = claims.get(key) ?? new Set<string>(); owners.add(scope.source); claims.set(key, owners);
+  }
+  return { slices: scopes, missions, claims, missionIssues };
 }
 function selectSlice(scopes: Scope[], key: string): Scope | ScopeViewError {
   if (!key || key.trim() !== key || /[\\/\x00-\x1f\x7f]/.test(key)) return { code: "scope_not_found", error: "Invalid slice name or id." };
@@ -105,18 +120,55 @@ function selectSlice(scopes: Scope[], key: string): Scope | ScopeViewError {
   return selected;
 }
 
+function selectMission(index: ScopeIndex, key: string): { mission: Mission; sliceKeys: Set<string>; collidingKeys: Map<string, Set<string>> } | ScopeViewError {
+  if (!key || key.trim() !== key || /[\\/\x00-\x1f\x7f]/.test(key)) return { code: "scope_not_found", error: "Invalid mission directory id." };
+  if (index.missionIssues.length) return unavailable(index.missionIssues.join(" "));
+  const matches = index.missions.filter(mission => mission.name === key);
+  if (!matches.length) return { code: "scope_not_found", error: `No indexed mission exactly matches '${key}'.` };
+  if (matches.length !== 1) return { code: "scope_ambiguous", error: `Multiple indexed missions match '${key}'.` };
+  const mission = matches[0]!, sliceKeys = new Set<string>(), collidingKeys = new Map<string, Set<string>>();
+  if (mission.manifest) {
+    try { fs.accessSync(mission.manifest, fs.constants.R_OK); }
+    catch { return unavailable("The selected mission declaration is unavailable; refresh after inspecting its configured source."); }
+  }
+  for (const slice of index.slices) {
+    if (slice.missionSource !== mission.source) continue;
+    for (const tag of [slice.name, slice.id]) {
+      if (!tag) continue;
+      if ((index.claims.get(tag)?.size ?? 0) > 1) { collidingKeys.set(tag, new Set()); continue; }
+      sliceKeys.add(tag);
+    }
+  }
+  // One bounded index pass establishes which missions can place shared keys.
+  for (const slice of index.slices) for (const tag of new Set([slice.name, slice.id])) {
+    if (tag && slice.mission) collidingKeys.get(tag)?.add(slice.mission);
+  }
+  return { mission, sliceKeys, collidingKeys };
+}
+
 /** Active typed-tag owners only, with one bounded local queue projection.
  * A cap or malformed record is incomplete, never authoritative empty. */
 export function readScopedTaskTerminalView(db: Database.Database, view: string, index: IndexContext,
   resolveSeat: (address: string) => TaskSeat | null, readIndex = () => readScopeIndex(index)): TaskTerminalView | ScopeViewError {
-  if (!view.startsWith("slice:")) return { code: "scope_unsupported", error: "Authoritative following for this scope kind is not implemented." };
+  if (!/^(slice|mission):/.test(view)) return { code: "scope_unsupported", error: "Authoritative following for this scope kind is not implemented." };
   const identities = readIndex();
   if ("code" in identities) return identities;
-  const scope = selectSlice(identities, view.slice(6));
-  if ("code" in scope) return scope;
+  const kind = view.startsWith("mission:") ? "mission" : "slice";
+  let id: string, name: string, sliceKeys: Set<string>, missionKey: string | undefined, scope: Scope | undefined;
+  let collidingKeys = new Map<string, Set<string>>();
+  if (kind === "slice") {
+    const selected = selectSlice(identities.slices, view.slice(6));
+    if ("code" in selected) return selected;
+    scope = selected;
+    id = scope.id ?? scope.name; name = scope.title; sliceKeys = new Set([scope.name, ...(scope.id ? [scope.id] : [])]);
+  } else {
+    const selected = selectMission(identities, view.slice(8));
+    if ("code" in selected) return selected;
+    id = name = missionKey = selected.mission.name; sliceKeys = selected.sliceKeys; collidingKeys = selected.collidingKeys;
+  }
   // At most two linear index passes per resolve, never a scan per queue row.
-  const claims = new Map([...new Set([scope.name, scope.id].filter((key): key is string => !!key))].map(key => {
-    const candidates = identities.filter(candidate => candidate.name === key || candidate.id === key);
+  const claims = new Map(scope ? [...new Set([scope.name, scope.id].filter((key): key is string => !!key))].map(key => {
+    const candidates = identities.slices.filter(candidate => candidate.name === key || candidate.id === key);
     const byMission = new Map<string, Scope[]>();
     for (const candidate of candidates) {
       if (!candidate.mission) continue;
@@ -124,7 +176,7 @@ export function readScopedTaskTerminalView(db: Database.Database, view: string, 
       sameMission.push(candidate); byMission.set(candidate.mission, sameMission);
     }
     return [key, { count: candidates.length, byMission }] as const;
-  }));
+  }) : []);
   return db.transaction(() => {
     const issues = new Set<string>();
     const selected: Array<{ qitem_id: string; destination_session: string; state: string }> = [];
@@ -146,6 +198,18 @@ export function readScopedTaskTerminalView(db: Database.Database, view: string, 
       }
       if (index.projectId && !belongsToProject(row.tags, index.projectId)) continue;
       const parsed = parseScopeTags(row.tags);
+      if (kind === "mission") {
+        if (missionKey && parsed.missions.has(missionKey)) { selected.push(row); continue; }
+        const mission = parsed.missions.size === 1 ? parsed.missions.values().next().value : undefined;
+        const unplaced = [...parsed.slices].some(key => collidingKeys.has(key)
+          && (mission === undefined || !collidingKeys.get(key)!.has(mission)));
+        if (unplaced) {
+          issues.add(`Queue row '${row.qitem_id}' has unplaceable or contradictory colliding slice tags; membership is incomplete.`);
+          continue;
+        }
+        if ([...parsed.slices].some(tag => sliceKeys.has(tag))) selected.push(row);
+        continue;
+      }
       let here = false, elsewhere = false, unplaced = false;
       const mission = parsed.missions.size === 1 ? parsed.missions.values().next().value : undefined;
       for (const [key, claim] of claims) {
@@ -155,14 +219,14 @@ export function readScopedTaskTerminalView(db: Database.Database, view: string, 
         // claimant in that mission. Never assign it by first-match or absence.
         const placed = mission === undefined ? [] : claim.byMission.get(mission) ?? [];
         if (placed.length !== 1) { unplaced = true; continue; }
-        if (placed[0]!.source === scope.source) here = true; else elsewhere = true;
+        if (placed[0]!.source === scope!.source) here = true; else elsewhere = true;
       }
       if (unplaced || (here && elsewhere)) {
         issues.add(`Queue row '${row.qitem_id}' has unplaceable or contradictory colliding slice tags; membership is incomplete.`);
       } else if (here) selected.push(row);
     }
     selected.sort((a, b) => a.qitem_id.localeCompare(b.qitem_id));
-    return projectTaskOwners({ kind: "slice", id: scope.id ?? scope.name, name: scope.title,
+    return projectTaskOwners({ kind, id, name,
       complete: issues.size === 0, issues: [...issues] }, selected, resolveSeat);
   })();
 }
@@ -173,7 +237,7 @@ export function readScopedTaskTerminalView(db: Database.Database, view: string, 
  * every call; an appearing/unwatched root disables generation reuse. */
 export function createScopedTaskResolver(db: Database.Database, index: IndexContext,
   resolveSeat: (address: string) => TaskSeat | null, observed: () => boolean) {
-  let cached: Scope[] | undefined;
+  let cached: ScopeIndex | undefined;
   return {
     invalidate() { cached = undefined; },
     resolve(view: string): TaskTerminalView | ScopeViewError {
@@ -190,7 +254,7 @@ export function createScopedTaskResolver(db: Database.Database, index: IndexCont
         const result = readScopedTaskTerminalView(db, view, index, resolveSeat, () => {
           if (cached) return cached;
           const next = readScopeIndex(index);
-          if (reusable && Array.isArray(next)) cached = next;
+          if (reusable && !("code" in next)) cached = next;
           return next;
         });
         if ("code" in result) cached = undefined;

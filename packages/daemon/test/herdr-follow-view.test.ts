@@ -254,7 +254,7 @@ describe("slice follower policy", () => {
 });
 
 
-function scopeCoreFixture(kind: "qitem" | "slice") {
+function scopeCoreFixture(kind: "qitem" | "slice" | "mission") {
   const f = fixture(), component = f.create();
   let failed = false;
   const callbacks = new Set<Parameters<EventBus["subscribe"]>[0]>();
@@ -266,7 +266,7 @@ function scopeCoreFixture(kind: "qitem" | "slice") {
       liveness: async () => ({ alive: true }), openView: async () => { throw new Error("No whole-view relayout"); },
       followView: component.follow.bind(component) }),
     viewsStore: { list: () => [], get: () => null }, listRigSeats: () => null, listPodSeats: () => null,
-    listScopeSeats: () => null, listRigNames: () => [], resolveHost: () => null, hasSession: () => true,
+    listRigNames: () => [], resolveHost: () => null, hasSession: () => true,
     resolveTaskView: snapshot, resolveScopeView: () => failed ? { code: "scope_not_found", error: "Slice was renamed; reopen the view under its current key." } : snapshot() });
   return { ...f, service, selector: `${kind}:empty`, fail: () => {
     failed = true; for (const callback of callbacks) callback({ type: "queue.updated" } as Parameters<typeof callback>[0]);
@@ -289,5 +289,16 @@ it("preserves the resolver's renamed-slice explanation in the real provider noti
     await expect.poll(async () => (await f.service.status()).following?.[0]?.status?.events.join(" ")).toContain("reopen the view under its current key");
     expect((await f.service.status()).following?.[0]?.enabled).toBe(true);
     expect(f.calls.some(call => call[1] === "close")).toBe(false);
+  } finally { await f.service.stop(); }
+});
+
+
+it("keeps a real empty mission workspace enabled through Core with a mission waiting notice", async () => {
+  const f = scopeCoreFixture("mission");
+  try {
+    const result = await f.service.followView({ view: f.selector, provider: "herdr", enabled: true });
+    expect(result).toMatchObject({ ok: true, following: { state: "empty", enabled: true, maxTiles: 4 }, viewDescriptor: { kind: "following" } });
+    expect(result.following?.events.join(" ")).toContain("following this mission");
+    expect((await f.service.status()).following).toHaveLength(1);
   } finally { await f.service.stop(); }
 });
