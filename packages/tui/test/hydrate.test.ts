@@ -269,6 +269,7 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     ["rig Overview", { resource: "rig", name: "myrig", target: { host: "mm2-openrig1" } }, "overview"],
     ["pod Table", { resource: "pod", name: "dev", target: { host: "mm2-openrig1", rig: "myrig" } }, "table"],
     ["pod Overview", { resource: "pod", name: "dev", target: { host: "mm2-openrig1", rig: "myrig" } }, "overview"],
+    ["agent detail", { resource: "agent", name: "dev.impl", target: { host: "mm2-openrig1", rig: "myrig", pod: "dev" } }, "table"],
   ] as const;
   it.each(focusedHealthViews)("loads health for the focused %s so its summary reports the served findings", async (_label, drill, tab) => {
     const calls: string[] = [];
@@ -280,13 +281,21 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     view.dispatch({ type: "drill", ...drill } as never);
     view.dispatch({ type: "tab", tab });
     const { section, viewTab, drill: segments } = view.get();
-    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/health?limit=200": health }, calls), undefined, undefined, undefined, segments.find((part) => part.kind === "rig")?.name, { section, viewTab, drill: segments });
+    const snap = await hydrateSnapshot(fixtureClient({}, {
+      "/api/health?limit=200": health,
+      "/api/seat/effort/dev.impl%40myrig": { ok: true, saved: { effective: "high", source: "seat_choice" } },
+    }, calls), undefined, undefined, undefined, segments.find((part) => part.kind === "rig")?.name, { section, viewTab, drill: segments });
     expect(calls.filter(route => route === "/api/health?limit=200")).toEqual(["/api/health?limit=200"]);
     expect(calls.filter(route => route === "/healthz")).toEqual(["/healthz"]);
     expect(snap.health).toMatchObject({ availability: "loaded", total: 1, truncated: false, coverage,
       records: [{ id: "health-context-dev-impl", scope: { rigId: "01JRIG", seatId: "01JNODEIMPL" }, severity: "warning" }] });
     const text = renderScreen(view.get(), snap, { cols: 220, rows: 60 }).lines.join("\n");
-    expect(text).toMatch(/HEALTH\s+ACTIVE.*WARN 1.*PARTIAL.*context 1/);
+    if (_label === "agent detail") {
+      expect(text).toContain("── HEALTH");
+      expect(text).toContain("WARNING       Seat context utilization reached 96%.");
+    } else {
+      expect(text).toMatch(/HEALTH\s+ACTIVE.*WARN 1.*PARTIAL.*context 1/);
+    }
     expect(text).toContain("Seat context utilization reached 96%.");
     expect(text).not.toContain("Not assessed");
   });
@@ -297,7 +306,9 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     view.dispatch({ type: "drill", ...drill } as never);
     view.dispatch({ type: "tab", tab });
     const { section, viewTab, drill: segments } = view.get();
-    const snap = await hydrateSnapshot(fixtureClient({ "/api/health?limit=200": { status: 503 } }, {}, calls), undefined, undefined, undefined, segments.find((part) => part.kind === "rig")?.name, { section, viewTab, drill: segments });
+    const snap = await hydrateSnapshot(fixtureClient({ "/api/health?limit=200": { status: 503 } }, {
+      "/api/seat/effort/dev.impl%40myrig": { ok: true, saved: { effective: "high", source: "seat_choice" } },
+    }, calls), undefined, undefined, undefined, segments.find((part) => part.kind === "rig")?.name, { section, viewTab, drill: segments });
     expect(calls.filter(route => route === "/api/health?limit=200")).toEqual(["/api/health?limit=200"]);
     expect(snap.controlPlane).toMatchObject({ ok: true, selfHostId: "mm2-openrig1" });
     expect(snap.health).toMatchObject({ availability: "unavailable", records: [] });

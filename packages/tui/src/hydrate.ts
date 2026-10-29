@@ -510,7 +510,8 @@ export async function hydrateSnapshot(
   // Seat rows (Q / WORK / NOW) join these four lists: only a seat's page and the drilled table tab show them.
   const seatQueueReads = broadReads || (focusedTopology && (topologyLeaf?.kind === "agent" || (!!topologyLeaf && viewContext?.viewTab === "table")));
   // render.ts draws healthSummaryLine on the instance Table and on the rig/pod Table and Overview; those focused pages must load health too.
-  const rendersHealthSummary = (topologyLeaf?.kind === "host" && viewContext?.viewTab === "table")
+  const rendersHealthSummary = topologyLeaf?.kind === "agent"
+    || (topologyLeaf?.kind === "host" && viewContext?.viewTab === "table")
     || ((topologyLeaf?.kind === "rig" || topologyLeaf?.kind === "pod") && (viewContext?.viewTab === "table" || viewContext?.viewTab === "overview"));
   const healthRequested = broadReads || viewContext?.viewTab === "health" || rendersHealthSummary;
   const wantsGraph = wantsTopologyScope && (!viewContext || viewContext.viewTab === "graph");
