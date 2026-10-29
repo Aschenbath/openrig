@@ -1100,6 +1100,8 @@ export interface LegacyRigSpecNode {
   effort?: string;
   advisor?: string;
   claudePermissions?: import("./claude-permission-rules.js").ClaudePermissionRules;
+  /** A Claude seat's own subscription token file, by reference (spec `claude_token`); read as Claude starts. */
+  claudeTokenRef?: import("./claude-seat-token.js").ClaudeSeatTokenRef;
   claudeMcp?: import("./claude-mcp.js").ClaudeMcp;
   codexPermissions?: import("./codex-member-permissions.js").CodexMemberPermissions;
   cwd?: string;
@@ -1222,6 +1224,8 @@ export interface RigSpecPodMember {
    *  custom path). Absent = the floor. Overrides the rig-level ref. */
   permissionPolicy?: string;
   claudePermissions?: import("./claude-permission-rules.js").ClaudePermissionRules;
+  /** A Claude seat's own subscription token file, by reference (spec `claude_token`); read as Claude starts. */
+  claudeTokenRef?: import("./claude-seat-token.js").ClaudeSeatTokenRef;
   claudeMcp?: import("./claude-mcp.js").ClaudeMcp;
   /** A Codex member's own permission envelope; the seat's live record afterwards. */
   codexPermissions?: import("./codex-member-permissions.js").CodexMemberPermissions;
@@ -1513,6 +1517,7 @@ export interface ExpansionPodFragment {
     effort?: unknown;
     codexConfigProfile?: string;
     claudePermissions?: unknown;
+    claudeToken?: unknown;
     claudeMcp?: unknown;
     codexPermissions?: unknown;
     /** OPR.0.4.8.3 Seam B: per-seat permission_policy REF — threaded through the

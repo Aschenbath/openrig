@@ -167,6 +167,8 @@ function normalizeExpansionPodFragment(raw: Record<string, unknown>): ExpansionP
               : undefined,
         ...("claudePermissions" in m ? { claudePermissions: m["claudePermissions"] }
           : "claude_permissions" in m ? { claudePermissions: m["claude_permissions"] } : {}),
+        ...("claudeToken" in m ? { claudeToken: m["claudeToken"] }
+          : "claude_token" in m ? { claudeToken: m["claude_token"] } : {}),
         ...("claudeMcp" in m ? { claudeMcp: m["claudeMcp"] }
           : "claude_mcp" in m ? { claudeMcp: m["claude_mcp"] } : {}),
         ...("codexPermissions" in m ? { codexPermissions: m["codexPermissions"] }

@@ -123,6 +123,7 @@ export class RigInstantiator {
             effort: specNode.effort,
             advisor: specNode.advisor,
             claudePermissions: specNode.claudePermissions,
+            claudeTokenRef: specNode.claudeTokenRef,
             claudeMcp: specNode.claudeMcp,
             codexPermissions: specNode.codexPermissions,
             cwd: specNode.cwd,
@@ -1343,7 +1344,7 @@ export class PodRigInstantiator {
     const initialRefusal = eligible();
     if (initialRefusal) return refuse(initialRefusal);
 
-    const retainedFields = new Set(["id", "label", "agent_ref", "profile", "runtime", "model", "effort", "advisor", "cwd", "role", "codex_config_profile", "permission_policy", "claude_permissions", "claude_mcp", "codex_permissions", "restore_policy"]);
+    const retainedFields = new Set(["id", "label", "agent_ref", "profile", "runtime", "model", "effort", "advisor", "cwd", "role", "codex_config_profile", "permission_policy", "claude_permissions", "claude_token", "claude_mcp", "codex_permissions", "restore_policy"]);
     if (Object.keys(memberFragment).some(key => !retainedFields.has(key))) return refuse("Retry accepts only retained member fields; topology and startup overrides require a separate change.");
     const rawSpec = { version: "0.2", name: rig.rig.name, pods: [{ id: podRow.namespace, label: podRow.label, members: [memberFragment], edges: [] }], edges: [] };
     const validation = PodRigSpecSchema.validate(rawSpec);
@@ -1686,6 +1687,7 @@ export class PodRigInstantiator {
             // createMemberNode or `rig up <spec>` seats lose their policy ref.
             permissionPolicy: member.permissionPolicy,
             claudePermissions: member.claudePermissions,
+            claudeTokenRef: member.claudeTokenRef,
             claudeMcp: member.claudeMcp,
             codexPermissions: member.codexPermissions,
             env: member.env,
@@ -2079,6 +2081,7 @@ export class PodRigInstantiator {
       // rig-level lives on the rig row; precedence applies at RESOLUTION, not storage.
       permissionPolicy: input.member.permissionPolicy,
       claudePermissions: input.member.claudePermissions,
+      claudeTokenRef: input.member.claudeTokenRef,
       claudeMcp: input.member.claudeMcp,
       codexPermissions: input.member.codexPermissions,
       env: input.member.env,
