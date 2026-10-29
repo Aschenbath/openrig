@@ -8,6 +8,8 @@
 //  - the composed view handed to the provider carries the composer's partition.
 
 import { describe, it, expect } from "vitest";
+import { Hono } from "hono";
+import { terminalRoutes } from "../src/routes/terminal.js";
 import { createHash } from "node:crypto";
 import { planHerdrLayout } from "../src/domain/terminal/herdr-adapter.js";
 import { TerminalService, type TerminalServiceDeps } from "../src/domain/terminal/terminal-service.js";
@@ -82,6 +84,9 @@ function makeDeps(overrides: Partial<TerminalServiceDeps> = {}): {
       scope === "mission:4.6" || scope === "slice:02"
         ? [{ canonicalSessionName: "dev-driver@acme-build", attachmentType: "tmux", tmuxSession: "dev-driver@acme-build", rigName: "acme-build", logicalId: "dev.driver" }]
         : null,
+    resolveScopeView: view => view === "slice:02" ? { task: { kind: "slice", id: "02", name: "Slice 02", complete: true, issues: [], members: [] },
+      members: [{ seat: "dev-driver@acme-build", tmuxSession: "dev-driver@acme-build", host: null, readOnly: true, alive: true }] }
+      : { code: "scope_not_found", error: "Unknown fixture slice" },
     listRigNames: () => ["acme-build"],
     resolveHost: () => null,
     hasSession: () => true,
@@ -738,4 +743,55 @@ describe("TerminalService — an omitted provider falls back from herdr to cmux 
     expect(herdr.lastView).not.toBeNull();
     expect(cmux.lastView).toBeNull();
   });
+});
+
+
+describe("slice task preview and explicit viewer capability", () => {
+  function sliceService(complete = true) {
+    const { deps, herdr } = makeDeps();
+    const snapshot = () => ({ task: { kind: "slice", id: "build", name: "Build it", complete,
+      issues: complete ? [] : ["Scope read unavailable"], members: [{ key: { hostId: "local", nodeId: "a" }, seat: "a@team",
+        obligations: [{ qitemId: "work", state: "pending" }], availability: "available", viewerStatus: "not-provisioned" }] },
+      members: [{ seat: "a@team", tmuxSession: "a", alive: true, readOnly: true }] });
+    Object.assign(deps, { resolveScopeView: () => snapshot() });
+    let effects = 0;
+    Object.assign(herdr, { ensureViewer: async () => { effects++; return { ok: false, code: "viewer_unconfirmed", error: "Fixture viewer not started" }; } });
+    return { service: new TerminalService(deps), effects: () => effects };
+  }
+  it("uses authoritative scoped membership instead of the live review band", async () => {
+    const { service } = sliceService();
+    const preview = await service.previewView({ view: "slice:build" });
+    expect(preview).toMatchObject({ task: { kind: "slice", id: "build", name: "Build it", complete: true,
+      members: [{ seat: "a@team", obligations: [{ qitemId: "work", state: "pending" }] }] }, capabilities: { ensureViewer: true } });
+    expect("task" in preview && preview.task).not.toHaveProperty("qitemId");
+  });
+  it("rejects changed scope plans before any owner ensure effect", async () => {
+    const { service, effects } = sliceService();
+    expect(await service.ensureViewer({ view: "slice:build", expectedPlan: "stale", member: { hostId: "local", nodeId: "a" } }))
+      .toMatchObject({ ok: false, code: "preview_changed" });
+    expect(effects()).toBe(0);
+  });
+  it("distinguishes an incomplete scope from an empty scope and never ensures it", async () => {
+    const { service, effects } = sliceService(false);
+    const preview = await service.previewView({ view: "slice:build" });
+    if (!("planId" in preview)) throw new Error("Expected scoped preview");
+    expect(preview.task?.complete).toBe(false);
+    expect(await service.ensureViewer({ view: "slice:build", expectedPlan: preview.planId, member: { hostId: "local", nodeId: "a" } }))
+      .toMatchObject({ ok: false, code: "viewer_unconfirmed" });
+    expect(effects()).toBe(0);
+  });
+});
+
+
+it("keeps unsupported ensure as a client error and maps unknown/ambiguous scope errors explicitly", async () => {
+  const { deps, herdr } = makeDeps(); Object.assign(herdr, { ensureViewer: async () => { throw new Error("No effect"); } });
+  const service = new TerminalService(deps), app = new Hono();
+  app.use("*", async (c, next) => { c.set("terminalService" as never, service as never); await next(); });
+  app.route("/terminal", terminalRoutes({ bearerToken: "fixture-owner-token" }));
+  const unsupported = await app.request("/terminal/viewer/ensure", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer fixture-owner-token" },
+    body: JSON.stringify({ view: "saved:fixed", member: { hostId: "local", nodeId: "a" }, expectedPlan: "p" }) });
+  expect(unsupported.status).toBe(400); expect(await unsupported.json()).toMatchObject({ code: "view_required" });
+  expect((await app.request("/terminal/preview?view=slice:absent")).status).toBe(404);
+  Object.assign(deps, { resolveScopeView: () => ({ code: "scope_ambiguous", error: "Ambiguous scope" }) });
+  expect((await app.request("/terminal/preview?view=slice:duplicate")).status).toBe(409);
 });

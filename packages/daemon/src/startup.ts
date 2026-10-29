@@ -2005,7 +2005,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     deps.sliceIndexer = sliceIndexer;
     if (sliceIndexer.isReady()) {
       const { watchProofSources } = await import("./domain/proof/source-watch.js");
-      deps.proofSourceWatch = watchProofSources(sliceIndexer.slicesRoot, () => sliceIndexer.invalidate(), eventBus);
+      deps.proofSourceWatch = watchProofSources(sliceIndexer.slicesRoot, () => sliceIndexer.invalidate(), eventBus, () => {
+        sliceIndexer.invalidate();
+        eventBus.emit({ type: "scope.sources_changed", scope: sliceIndexer.slicesRoot });
+      });
     }
     deps.sliceDetailProjector = sliceDetailProjector;
     // Living Notes Packet 2 (OPR.0.4.4.20): the composed-review gatherer.
@@ -2039,6 +2042,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     const { createRexCliTransport } = await import("./domain/terminal/rex-transport.js");
     const { CmuxLayoutService } = await import("./domain/cmux-layout-service.js");
     const { TerminalViewsStore } = await import("./domain/terminal/terminal-views-store.js");
+    const { createScopedTaskResolver } = await import("./domain/terminal/scope-task-terminal-view.js");
     const { readTaskTerminalView, resolveLocalTaskSeat } = await import("./domain/terminal/task-terminal-view.js");
     const { getSelfHostId } = await import("./domain/hosts/fanout-contract.js");
     const { getNodeInventory, getNodeInventoryForRigs } = await import("./domain/node-inventory.js");
@@ -2081,6 +2085,9 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       rex: new RexAdapter({ transport: createRexCliTransport(opts?.rexRun ? { run: opts.rexRun, binary: () => "rex" } : {}) }),
     };
 
+    const scopeTasks = deps.sliceIndexer ? createScopedTaskResolver(db, deps.sliceIndexer, address =>
+      resolveLocalTaskSeat(db, address, getSelfHostId(), sessionRegistry.resolveAddress(address)?.nodeId),
+      () => deps.proofSourceWatch?.observation().state === "watching") : null;
     deps.terminalService = new TerminalService({
       eventBus,
       resolveProvider: (name) => providerMap[name] ?? null,
@@ -2130,6 +2137,9 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       },
       resolveTaskView: (qitemId) => readTaskTerminalView(db, qitemId, (address) =>
         resolveLocalTaskSeat(db, address, getSelfHostId(), sessionRegistry.resolveAddress(address)?.nodeId)),
+      resolveScopeView: view => scopeTasks?.resolve(view)
+        ?? { code: "scope_unavailable", error: "The configured scope index is unavailable." },
+      invalidateScopeView: () => scopeTasks?.invalidate(),
       listRigNames: () => rigRepo.listRigs().map((r) => r.name),
       resolveHost: (id) => {
         const res = loadHostRegistry();
