@@ -231,6 +231,29 @@ describe("per-agent Claude MCP selection (#1478)", () => {
     expect(command).toContain('{"mcpServers":{}}');
   });
 
+  // A Claude member may also name its own subscription token (#2246): each setting is stored, launched and exported
+  // beside the other, on pod members and on legacy flat nodes.
+  it("keeps the opt-out beside the member's own subscription token through creation, launch and export", async () => {
+    const f = setup(), ref = { label: "owner-sub", tokenFile: path.join(f.root, "owner.token") };
+    Object.assign(f.raw.pods[0]!.members[0]!, { claude_token: { label: ref.label, file: ref.tokenFile } });
+    expect(RigSpecSchema.validate(f.raw).errors).toEqual([]);
+    const start = await f.inst.instantiate(JSON.stringify(f.raw), f.root);
+    expect(start, JSON.stringify(start)).toMatchObject({ ok: true });
+    if (!start.ok) throw Error("fixture did not start");
+    const owner = f.rigRepo.getRig(start.result.rigId)!.nodes.find(n => n.logicalId === "dev.owner")!;
+    expect(owner).toMatchObject({ claudeMcp: "none", claudeTokenRef: ref });
+    expect(f.commands.find(c => c.session.startsWith("dev-owner") && c.command.includes("--session-id"))!.command).toContain("--strict-mcp-config");
+    const member = RigSpecSchema.normalize(RigSpecCodec.parse(RigSpecCodec.serialize(f.exporter.exportRig(start.result.rigId))) as Record<string, unknown>)
+      .pods[0]!.members.find(m => m.id === "owner");
+    expect(member).toMatchObject({ claudeMcp: "none", claudeTokenRef: ref });
+
+    const flat = f.rigRepo.createRig("flat");
+    f.rigRepo.addNode(flat.id, "owner", { runtime: "claude-code", cwd: f.root, claudeMcp: "none", claudeTokenRef: ref });
+    const exported = LegacyRigSpecCodec.parse(LegacyRigSpecCodec.serialize(f.exporter.exportRig(flat.id) as LegacyRigSpec));
+    expect(LegacyRigSpecSchema.validate(exported).errors).toEqual([]);
+    expect(LegacyRigSpecSchema.normalize(exported as Record<string, unknown>).nodes[0]).toMatchObject({ claudeMcp: "none", claudeTokenRef: ref });
+  });
+
   it.each([
     ["already bound", "none"], ["already bound", undefined],
     ["tmux failure", "none"], ["tmux failure", undefined],

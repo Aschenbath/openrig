@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ClaudeManagedLaunch } from "../src/domain/claude-managed-launch.js";
@@ -54,7 +54,7 @@ function fixture(managed: boolean) {
   const resume = new ClaudeResumeAdapter(tmux, { claudeManagedLaunch: launcher, listProcesses, sleep: async () => {} });
   const binding: NodeBinding = { id: "binding", nodeId: "node", cwd, tmuxSession: "seat", tmuxPane: "%1", tmuxWindow: null,
     cmuxWorkspace: null, cmuxSurface: null, updatedAt: "", ...(managed ? { permissionMode: "auto" } : {}) };
-  return { adapter, resume, binding, args: () => args, tmux };
+  return { adapter, resume, binding, args: () => args, tmux, db };
 }
 
 describe("Claude MCP launch and identity", () => {
@@ -90,6 +90,27 @@ describe("Claude MCP launch and identity", () => {
     expect(args.filter(arg => arg === "--strict-mcp-config")).toHaveLength(1);
     expect(args[args.indexOf("--mcp-config") + 1]).toBe(EMPTY);
     expect(claudeCommandSessionToken(`claude ${args.join(" ")}`)).toBe("history-id");
+  });
+
+  // A Claude member may name its own subscription token (#2246). The managed launch reads it in the same command that
+  // carries the opt-out, so the process gets both.
+  it.skipIf(process.platform === "win32").each(["fresh", "legacy"])("a seat's own subscription token reaches the same %s launch as the opt-out", async mode => {
+    const f = fixture(true), root = path.dirname(f.binding.cwd), tokenFile = path.join(root, "seat.token");
+    const synthetic = "synthetic-fixture-value-not-a-credential", executable = path.join(root, "bin", "claude");
+    writeFileSync(tokenFile, `${synthetic}\n`, { mode: 0o600 });
+    f.db.exec("ALTER TABLE nodes ADD COLUMN claude_token_ref TEXT");
+    f.db.prepare("UPDATE nodes SET claude_token_ref = ? WHERE id = 'node'").run(JSON.stringify({ label: "seat-sub", tokenFile }));
+    writeFileSync(executable, `#!${process.execPath}\nif (process.argv.includes('--help')) console.log('--permission-mode <mode> (choices: "auto", "acceptEdits", "default")'); else import('node:fs').then(fs => { fs.writeFileSync(process.argv[1] + '.token', process.env.CLAUDE_CODE_OAUTH_TOKEN === ${JSON.stringify(synthetic)} ? 'applied' : 'missing'); console.log(JSON.stringify(process.argv.slice(2))); });\n`);
+    const result = mode === "legacy"
+      ? await f.resume.resume("seat", "claude_id", "history-id", f.binding.cwd, undefined, undefined, f.binding.permissionMode, "node",
+        undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "none")
+      : await f.adapter.launchHarness({ ...f.binding, claudeMcp: "none" }, { name: "seat" });
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+    expect(readFileSync(`${executable}.token`, "utf8")).toBe("applied");
+    const args = f.args();
+    expect(args.filter(arg => arg === "--strict-mcp-config")).toHaveLength(1);
+    expect(args[args.indexOf("--mcp-config") + 1]).toBe(EMPTY);
+    expect(claudeCommandSessionToken(`claude ${args.join(" ")}`)).toBe(mode === "legacy" ? "history-id" : "fresh-id");
   });
 
   it.each([`--strict-mcp-config --mcp-config ${EMPTY}`, `--mcp-config=${EMPTY} --strict-mcp-config`])("keeps strict and delivery identity for the emitted configuration: %s", async flags => {
