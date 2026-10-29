@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ClaudeManagedLaunch } from "../src/domain/claude-managed-launch.js";
@@ -75,6 +75,22 @@ describe("Claude MCP launch and identity", () => {
       expect(claudeCommandSessionToken(`claude ${args.join(" ")}`)).toBe(expectedToken);
     });
   }
+
+  // A same-conversation relaunch may carry the executable the seat was running (#2196); the opt-out travels beside it.
+  it.skipIf(process.platform === "win32").each([false, true])("legacy resume keeps the opt-out with a retained executable outside PATH (managed=%s)", async managed => {
+    const f = fixture(managed), retained = path.join(path.dirname(f.binding.cwd), "retained", "claude");
+    mkdirSync(path.dirname(retained));
+    writeFileSync(retained, `#!${process.execPath}\nif (process.argv.includes('--help')) console.log('--permission-mode <mode> (choices: "auto", "acceptEdits", "default")'); else import('node:fs').then(fs => { fs.writeFileSync(process.argv[1] + '.ran', ''); console.log(JSON.stringify(process.argv.slice(2))); });\n`);
+    chmodSync(retained, 0o700);
+    const result = await f.resume.resume("seat", "claude_id", "history-id", f.binding.cwd, undefined, undefined, f.binding.permissionMode, "node",
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, retained, "none");
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+    expect(existsSync(`${retained}.ran`)).toBe(true);
+    const args = f.args();
+    expect(args.filter(arg => arg === "--strict-mcp-config")).toHaveLength(1);
+    expect(args[args.indexOf("--mcp-config") + 1]).toBe(EMPTY);
+    expect(claudeCommandSessionToken(`claude ${args.join(" ")}`)).toBe("history-id");
+  });
 
   it.each([`--strict-mcp-config --mcp-config ${EMPTY}`, `--mcp-config=${EMPTY} --strict-mcp-config`])("keeps strict and delivery identity for the emitted configuration: %s", async flags => {
     const processes = rows(`${flags} --resume history-id`.split(" "));
