@@ -286,7 +286,7 @@ export class CodexInPlaceRestart {
 
     let launch: HarnessLaunchResult;
     if (report.paneShape === "shell_backed") {
-      const stopped = await this.stopUnderShell(pane, panePid, codexPid, codexStartedAt);
+      const stopped = await this.stopUnderShell(pane, panePid, codexPid, codexStartedAt, report.oldProcess);
       if (stopped === "running") {
         return { ...report, outcome: "not_started", recoveryCommand, message: "Codex did not exit after TERM and KILL; nothing was restarted and the original process is still running." };
       }
@@ -443,8 +443,23 @@ export class CodexInPlaceRestart {
         : `not established: ${evidence.reason ?? "no_log_row"}`;
     }
 
+    // Resolve ambiguous launcher names before classifying the observed process chain.
+    const byPid = new Map(rows.map(row => [row.pid, row]));
+    const launcherFacts = new Map<number, ProcessFacts | null>();
+    const visited = new Set<number>([process.pid]);
+    let ancestor = process;
+    while (ancestor.pid !== panePid) {
+      const parent = byPid.get(ancestor.ppid);
+      if (!parent || visited.has(parent.pid)) break;
+      visited.add(parent.pid);
+      if (executableBase(parent) === "MainThread") {
+        launcherFacts.set(parent.pid, await this.io.readProcess(parent.pid));
+      }
+      ancestor = parent;
+    }
+
     // Pane shape: the pane's root is Codex itself, or a shell whose child chain is Codex.
-    const chain = codexChain(rows, process, panePid);
+    const chain = codexChain(rows, process, panePid, launcherFacts);
     const top = chain.at(-1)!;
     const root = rows.find((row) => row.pid === panePid);
     let paneShape: PaneShape;
@@ -574,12 +589,14 @@ export class CodexInPlaceRestart {
   }
 
   /** Shell-backed: TERM the Codex chain's top process (not the pane's shell), KILL after the timeout, then
-   *  require the original process gone AND the shell back in the foreground. */
-  private async stopUnderShell(pane: string, panePid: number, pid: number, startedAt: string | null): Promise<"stopped" | "running" | "unknown"> {
+   *  require both launcher and native process gone AND the shell back in the foreground. */
+  private async stopUnderShell(pane: string, panePid: number, pid: number, startedAt: string | null,
+    native: InPlaceRestartReport["oldProcess"]): Promise<"stopped" | "running" | "unknown"> {
     const gone = async (): Promise<boolean | null> => {
       const rows = await this.listProcesses();
       if (rows.length === 0) return null;
-      if (rows.some((row) => row.pid === pid && (row.startedAt ?? null) === startedAt)) return false;
+      if (rows.some((row) => (row.pid === pid && (row.startedAt ?? null) === startedAt)
+        || (row.pid === native.pid && (row.startedAt ?? null) === native.startedAt))) return false;
       const command = await this.deps.tmux.getPaneCommand(pane);
       const root = rows.find((row) => row.pid === panePid);
       return command !== null && isShellForeground(command) && !!root;
@@ -596,7 +613,8 @@ export class CodexInPlaceRestart {
     };
     await this.deps.tmux.signalPid(pid, "TERM");
     if (await wait()) return "stopped";
-    await this.deps.tmux.signalPid(pid, "KILL");
+    const launcherLive = (await this.listProcesses()).some((row) => row.pid === pid && (row.startedAt ?? null) === startedAt);
+    if (launcherLive) await this.deps.tmux.signalPid(pid, "KILL");
     const last = await wait();
     return last ? "stopped" : last === null ? "unknown" : "running";
   }
@@ -850,8 +868,31 @@ function isStagedLaunchScript(row: NativeProcessRow): boolean {
   return SH_RUNS_AS.has(executableBase(row)) && argv.length === 2 && /^(?:\/bin\/)?sh$/.test(argv[0]!) && isStagedSendScriptPath(argv[1]!);
 }
 
+const NODE_LAUNCH_FLAGS = new Set(["--no-warnings", "--trace-warnings", "--enable-source-maps",
+  "--preserve-symlinks", "--preserve-symlinks-main", "--no-deprecation", "--trace-deprecation",
+  "--throw-deprecation", "--inspect", "--inspect-brk"]);
+const NODE_LAUNCH_VALUE_FLAGS = new Set(["-r", "--require", "--import", "--loader", "--experimental-loader",
+  "-C", "--conditions", "--title"]);
+
+/** Identify the entry script, never an option's value or a script argument. Unknown option arity refuses the restart. */
+function nodeLaunchScript(argv: string[]): string | undefined {
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--") return argv[i + 1];
+    if (!arg.startsWith("-")) return arg;
+    if (NODE_LAUNCH_VALUE_FLAGS.has(arg)) {
+      if (!argv[++i]) return undefined;
+    } else if (!NODE_LAUNCH_FLAGS.has(arg)
+      && !(arg.includes("=") && process.allowedNodeEnvironmentFlags.has(arg))) {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 /** The Codex process and its Codex launcher ancestors, deepest first, up to the pane root. */
-function codexChain(rows: NativeProcessRow[], deepest: NativeProcessRow, panePid: number): NativeProcessRow[] {
+function codexChain(rows: NativeProcessRow[], deepest: NativeProcessRow, panePid: number,
+  launcherFacts: ReadonlyMap<number, ProcessFacts | null>): NativeProcessRow[] {
   const byPid = new Map(rows.map((row) => [row.pid, row]));
   const chain = [deepest];
   let current = deepest;
@@ -860,7 +901,16 @@ function codexChain(rows: NativeProcessRow[], deepest: NativeProcessRow, panePid
     if (!parent) break;
     const name = executableBase(parent);
     // A Codex launcher above the native binary: codex itself, or node running Codex's launcher script.
-    const launcher = /^codex/i.test(name) || (name === "node" && processArgv(parent.command).some((arg) => /codex/i.test(arg)));
+    // Node can name its Linux main thread MainThread; require the OS executable before accepting it.
+    const facts = launcherFacts.get(parent.pid);
+    const mainThreadNode = name === "MainThread" && nodePath.basename(facts?.exe ?? "") === "node";
+    // ps flattens argument boundaries; only exact argv can distinguish an option value from the entry script.
+    const script = mainThreadNode ? nodeLaunchScript(facts?.argv ?? []) : undefined;
+    const codexScript = !!script && nodePath.isAbsolute(script)
+      && (nodePath.basename(script) === "codex" || script.endsWith("/bin/codex.js"));
+    const launcher = /^codex/i.test(name)
+      || (name === "node" && processArgv(parent.command).some((arg) => /codex/i.test(arg)))
+      || (mainThreadNode && codexScript);
     if (!launcher) break;
     chain.push(parent);
     current = parent;

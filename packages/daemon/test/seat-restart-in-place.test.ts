@@ -398,6 +398,96 @@ describe("rig seat restart --keep-conversation: gates before any signal", () => 
     }
   });
 
+  it.each([
+    "node --pending-deprecation /absolute/bin/codex.js",
+    "node --max-http-header-size 16384 /absolute/bin/codex.js",
+    "node relative/bin/codex.js",
+    "node /opt/codex/renamed-entry.js",
+  ])("preserves the existing node launcher acceptance for %s without exact argv", async between => {
+    const w = world({ between, facts: { 150: null } });
+    expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "regression" })).toMatchObject({ ok: true });
+    expect(w.calls).toContain("signalPid 150 TERM");
+  });
+
+  it("refuses a MainThread supervisor mentioning Codex outside its launcher script", async () => {
+    const betweenName = "MainThread";
+    for (const between of ["node /opt/supervisor.js --project=codex", "node /opt/codex-supervisor.js", "node -e codex", "node /opt/tools.js /usr/local/bin/codex", "node --require /absolute/bin/codex.js /opt/supervisor.js", "node --eval=0 /absolute/bin/codex.js", "node --title /absolute/bin/codex.js /opt/supervisor.js"]) {
+      const w = world({ between, betweenName, facts: { 150: facts({ exe: "/usr/bin/node", argv: between.split(" ") }) } });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "regression" }), between).toMatchObject({ ok: false, code: "pane_shape_unknown" });
+      expect(w.calls, between).toEqual([]);
+    }
+  });
+
+  it("recognizes a MainThread Codex launcher after Node options", async () => {
+    const betweenName = "MainThread";
+    for (const options of ["--no-warnings", "--enable-source-maps --no-warnings", "--require /opt/preload.js", "--import=/opt/preload.mjs", "--inspect=127.0.0.1:9229", "--"]) {
+      const w = world({ between: `node ${options} /absolute/bin/codex.js`, betweenName, facts: { 150: facts({ exe: "/usr/bin/node", argv: ["node", ...options.split(" "), "/absolute/bin/codex.js"] }) } });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, plan: true }), options).toMatchObject({ ok: true, paneShape: "shell_backed" });
+      expect(w.calls).toEqual([]);
+    }
+  });
+
+  it("uses exact argv to distinguish a MainThread supervisor from a spaced launcher path", async () => {
+    const betweenName = "MainThread";
+    const cases = [
+      { argv: ["node", "--require", "/tmp/preload /absolute/bin/codex.js", "/opt/supervisor.js"], accepted: false },
+      { argv: ["node", "--require", "/tmp/preload with spaces.js", "/opt/tools/bin/codex.js"], accepted: true },
+      { argv: ["node", "--no-warnings", "/opt/my tools/bin/codex.js"], accepted: true },
+    ];
+    for (const { argv, accepted } of cases) {
+      const w = world({ between: argv.join(" "), betweenName, facts: { 150: facts({ exe: "/usr/bin/node", argv }) } });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "regression" })).toMatchObject(accepted
+        ? { ok: true, paneShape: "shell_backed" } : { ok: false, code: "pane_shape_unknown" });
+      if (accepted) expect(w.calls).toContain("signalPid 150 TERM");
+      else expect(w.calls).toEqual([]);
+    }
+  });
+
+  it("refuses a MainThread launcher with unreadable exact argv", async () => {
+    const betweenName = "MainThread";
+    for (const observed of [null, facts({ exe: "/usr/bin/node" }), facts({ exe: "/usr/bin/node", argv: null }), facts({ exe: "/usr/bin/node", argv: [] })]) {
+      const w = world({ between: "node /usr/local/bin/codex", betweenName, facts: { 150: observed } });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, plan: true })).toMatchObject({ ok: false, code: "pane_shape_unknown" });
+      expect(w.calls).toEqual([]);
+    }
+  });
+
+  it.each(["survives", "launcher PID reused", "exits after KILL", "PID reused"])("checks launcher and native identities before KILL and resume: %s", async nativeState => {
+    const w = world({ between: "node /usr/local/bin/codex", betweenName: "MainThread",
+      facts: { 150: facts({ exe: "/usr/bin/node", argv: ["node", "/usr/local/bin/codex"] }) } });
+    const signalPid = w.tmux.signalPid;
+    w.tmux.signalPid = async (pid, signal) => {
+      const result = await signalPid(pid, signal);
+      if (nativeState !== "exits after KILL" || signal !== "KILL") {
+        const launcherRows: NativeProcessRow[] = nativeState === "exits after KILL" || nativeState === "launcher PID reused"
+          ? [{ pid: 150, ppid: 100, pgid: 150, tpgid: 150, executableName: "MainThread", command: "node /usr/local/bin/codex",
+            startedAt: nativeState === "launcher PID reused" ? LATER : LSTART }] : [];
+        w.setRows([shellRow(100, 100), ...launcherRows, codexRow(200, launcherRows.length ? 150 : 1, `-m gpt-5.5 -s workspace-write resume ${TOKEN}`,
+          nativeState === "PID reused" ? LATER : LSTART)]);
+      }
+      return result;
+    };
+    const result = await w.service.restartInPlace({ seatRef: SEAT, reason: "regression" });
+    const survives = nativeState === "survives" || nativeState === "launcher PID reused";
+    expect(result).toMatchObject({ ok: true, outcome: survives ? "not_started" : "restarted_account_unverified" });
+    if (survives) expect(w.launches).toEqual([]);
+    else expect(w.launches).toHaveLength(1);
+    if (nativeState === "exits after KILL") expect(w.calls).toContain("signalPid 150 KILL");
+    else expect(w.calls).not.toContain("signalPid 150 KILL");
+  });
+
+  it("recognizes a MainThread-named npm launcher only when its OS executable is Node", async () => {
+    for (const exe of ["/usr/local/bin/node", "/usr/bin/python3", "", null]) {
+      const w = world({ between: "node /usr/local/bin/codex", betweenName: "MainThread",
+        facts: { 150: exe === null ? null : facts({ exe, argv: ["node", "/usr/local/bin/codex"] }) } });
+      const result = await w.service.restartInPlace({ seatRef: SEAT, plan: true });
+      expect(result).toMatchObject(exe?.endsWith("/node")
+        ? { ok: true, paneShape: "shell_backed" }
+        : { ok: false, code: "pane_shape_unknown" });
+      expect(w.calls).toEqual([]);
+    }
+  });
+
   it("refuses when the running Codex is on another conversation, or none can be proven", async () => {
     const other = world({ runningArgs: "-m gpt-5.5 -s workspace-write resume 019a-other" });
     expect(await other.service.restartInPlace({ seatRef: SEAT, plan: true })).toMatchObject({ ok: false, code: "resume_binding_unverified" });
