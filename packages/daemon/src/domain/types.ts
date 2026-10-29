@@ -40,9 +40,11 @@ export interface Node {
   claudeMcp?: import("./claude-mcp.js").ClaudeMcp | null;
   /** OPR.0.7.0.7: the seat's explicit effort choice (rig seat set-effort); null = none. */
   effortChoice?: string | null;
+  /** Explicit native account-home selection; a path only, not credential data. */
+  accountHome?: string | null;
   codexConfigProfile?: string | null;
   /** A Claude seat's own subscription credential, as a reference (operator label and token-file path); null = none. */
-  claudeTokenRef?: { label: string; tokenFile: string } | null;
+  claudeTokenRef?: { label: string; tokenFile: string; kind?: "api-key" } | null;
   /** OPR.0.4.8.3 Seam B: attached permission_policy REF (builtin:<name> or spec-relative custom
    *  path), or null when none is attached (= the floor). */
   permissionPolicy?: string | null;
@@ -252,6 +254,7 @@ export type RigEvent =
   | { type: "pod.deleted"; rigId: string; podId: string }
   | { type: "node.startup_pending"; rigId: string; nodeId: string; startupProof?: StartupProofSelection }
   | { type: "node.startup_first_input_passed"; rigId: string; nodeId: string; sessionId: string; path: string; submission: "unconfirmed" }
+  | { type: "node.startup_model_passed"; rigId: string; nodeId: string; sessionId: string; model: string; resume: boolean }
   | { type: "node.startup_ready"; rigId: string; nodeId: string; previousStatus?: "failed" | "attention_required"; submission?: { status: "unverified" | "staged"; reasons: string[]; warning?: string; diagnostics?: StartupSubmissionDiagnostic[] } }
   | { type: "node.startup_failed"; rigId: string; nodeId: string; error: string; sessionId?: string; freshContextPending?: boolean; forkContextPending?: { parentToken: string; isRestore: boolean }; submissionDiagnostics?: StartupSubmissionDiagnostic[]; stage?: StartupFailureStage; hasPendingWork?: boolean; requestedResumeToken?: string | null; requestedResumeType?: string | null; probe?: import("./native-resume-probe-evidence.js").NativeResumeProbeEvidence }
   // OPR.0.4.3.06 — startup proof (challenge-verified orientation). Append-only.
@@ -497,6 +500,8 @@ export interface RestoreValidationBlocker {
 }
 
 export interface RestoreNodeResult {
+  /** An in-place restore started a replacement shell; a later refusal cannot leave the predecessor untouched. */
+  launchStarted?: true;
   nodeId: string;
   logicalId: string;
   /** Set only by an explicit selected-history startup; these are runtime row IDs, not native tokens. */
@@ -562,6 +567,8 @@ export type ContinuityOutcome = "resumed" | "rebuilt" | "forked" | "fresh" | "fa
 export type HandoverResult = "complete" | "unchanged" | "partial" | "failed" | null;
 export type AgentActivityState = "running" | "needs_input" | "idle" | "unknown";
 export type AgentActivityEvidenceSource =
+  /** Explicit pane liveness (including tmux pane_dead), not inferred input or activity. */
+  | "pane_process"
   | "runtime_hook"
   | "pane_heuristic"
   /** ACTIVITY D1+D2 — tmux `#{window_activity}` motion (SeatActivityService). A fact about BYTES on
@@ -576,6 +583,10 @@ export type AgentActivityEvidenceSource =
 
 export interface AgentActivity {
   turnId?: string | null;
+  /** Native Claude hook actor: null is the main session; absent means an older or unrecognized relay. */
+  hookAgentId?: string | null;
+  /** Recorded on a hook for a session launched for a community runner (its launch fact, not the hook's claim). */
+  communityRunner?: boolean;
 
   state: AgentActivityState;
   reason: string;
@@ -647,6 +658,7 @@ export interface SeatIdentityVerdict {
     | "pane_pid_gone"
     | "binding_pane_missing"
     | "session_missing"
+    | "pane_exited"
     | "tmux_unavailable"
     | null;
   evidence: {
@@ -666,6 +678,12 @@ export interface SeatIdentityVerdict {
  * Callers must first gate the verdict to the current session and binding. */
 export function identityVerdictConfirmsSessionMissing(verdict: SeatIdentityVerdict | null | undefined): boolean {
   return verdict?.reason === "session_missing";
+}
+
+/** Positive executor absence only. Unknown identity or an unreadable pane never proves an exit.
+ * Callers must first gate the verdict to the current session, binding and occupant. */
+export function identityVerdictConfirmsExecutorStopped(verdict: SeatIdentityVerdict | null | undefined): boolean {
+  return identityVerdictConfirmsSessionMissing(verdict) || verdict?.reason === "pane_exited";
 }
 
 /**
@@ -1491,6 +1509,8 @@ export interface ExpansionPodFragment {
     profile?: string;
     cwd?: string;
     model?: string;
+    /** As written: the canonical RigSpec schema trims a text effort and ignores any other value with an advisory. */
+    effort?: unknown;
     codexConfigProfile?: string;
     claudePermissions?: unknown;
     claudeMcp?: unknown;

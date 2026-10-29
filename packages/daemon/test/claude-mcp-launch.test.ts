@@ -63,7 +63,7 @@ describe("Claude MCP launch and identity", () => {
       const f = fixture(managed), binding = { ...f.binding, claudeMcp: selection };
       const result = mode === "legacy"
         ? await f.resume.resume("seat", "claude_id", "history-id", binding.cwd, undefined, undefined, binding.permissionMode, "node",
-          undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, selection)
+          undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, selection)
         : await f.adapter.launchHarness(binding, { name: "seat", ...(mode === "resume" ? { resumeToken: "history-id" } : {}),
           ...(mode === "fork" ? { forkSource: { kind: "native_id" as const, value: "parent-id" } } : {}) });
       expect(result, JSON.stringify(result)).toMatchObject({ ok: true });

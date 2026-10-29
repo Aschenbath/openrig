@@ -1,4 +1,6 @@
+import type { ViewerKey, ViewerResult } from "./herdr-viewer.js";
 import type { TaskMembership } from "./task-terminal-view.js";
+import type { FollowControls, FollowingStatus } from "./terminal-follow-policy.js";
 // OPR.0.4.6.02 C2 — the TerminalProvider abstraction (the CORE seam of the
 // terminal-provider ride).
 //
@@ -49,6 +51,8 @@ export interface AbsentSeat {
 /** A seat that is honestly degraded (e.g. an http-registered host that tiles cannot reach over ssh). */
 export interface DegradedSeat {
   seat: string;
+  /** The provider accepted the layout but could not confirm this seat's pane. */
+  code?: "pane_unconfirmed";
   /** Structured host id (degrade is always host-driven). */
   host: string;
   reason: string;
@@ -105,6 +109,9 @@ export interface ProviderLiveness {
  * pane that failed to render). `pages` is the number of grid pages painted.
  */
 export interface OpenViewResult {
+  /** Stable provider workspace of an explicitly following task. */
+  workspaceId?: string;
+  following?: FollowingStatus;
   provider: string;
   task?: TaskMembership;
   viewDescriptor?: ViewDescriptor;
@@ -140,4 +147,7 @@ export interface TerminalProvider {
   status(): Promise<ProviderStatus>;
   liveness(): Promise<ProviderLiveness>;
   openView(view: ComposedView): Promise<OpenViewResult>;
+  ensureViewer?(key: ViewerKey, pane: ComposedPane, stillCurrent?: () => Promise<boolean>): Promise<ViewerResult>;
+  lookupViewer?(key: ViewerKey, pane: ComposedPane): Promise<ViewerResult>;
+  followView?(viewId: string, view: ComposedView | null, controls: FollowControls, stillCurrent: () => Promise<boolean>): Promise<OpenViewResult>;
 }

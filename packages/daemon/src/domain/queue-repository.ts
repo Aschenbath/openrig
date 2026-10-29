@@ -18,11 +18,11 @@ import { isBoundTerminalSeat } from "./terminal-seat.js";
 import { renderQueueHandoffNudge } from "./queue-nudge-text.js";
 import { getSelfHostId } from "./hosts/fanout-contract.js";
 import { parseSessionName, isHumanSeatSessionRef } from "./session-name.js";
-import { parseReplyToChoice, formatReplyToChoice, describeReplyToFallback, REPLY_TO_CHOICE_ACTOR, type ReplyToChoice } from "./reply-to-choice.js";
+import { parseReplyToChoice, parseReplyToThreadMissing, formatReplyToChoice, describeReplyToFallback, REPLY_TO_CHOICE_ACTOR, type ReplyToChoice } from "./reply-to-choice.js";
 import { classifyDestination, type DestinationClass } from "./gateway/destination-resolver.js";
 import { join } from "node:path";
 import { SettingsStore } from "./user-settings/settings-store.js";
-import { hostedWakeFor, type RosterWake } from "./rosters.js";
+import { hostedWakeFor, isHostedMemberAt, type RosterWake } from "./rosters.js";
 import { ringHostedWake } from "./hosted-wake.js";
 import { effectiveGateRoles } from "./gate-predicate.js";
 import {
@@ -39,6 +39,7 @@ import {
 import { WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
 import { armQueueWait, backOffQueueWait, refreshQueueWaits, evaluateQueueWait, retargetQueueWait, isQueueWait } from "./queue-wait-backoff.js";
 import { parseHumanQuestions, unansweredQuestions, describeTypedReplyPlacement, type HumanQuestion, type HumanAnswers, type TypedHumanReply, type RecordHumanAnswerResult } from "./human-questions.js";
+import { slackMicros } from "./gateway/slack/state-store.js";
 
 export const QUEUE_STATES = [
   "pending",
@@ -566,6 +567,17 @@ function defaultHostedWake(destination: string): RosterWake | null {
   }
 }
 
+/** Whether the authored rosters on this host list this address as a hosted member, trigger or not. False when they
+ *  can't be read: the address then gets the general unroutable teaching. */
+function defaultIsHostedMember(destination: string): boolean {
+  try {
+    const root = new SettingsStore().resolveOne("workspace.root").value;
+    return typeof root === "string" && !!root && isHostedMemberAt(destination, join(root, "rosters"), getSelfHostId());
+  } catch {
+    return false;
+  }
+}
+
 export class QueueRepositoryError extends Error {
   readonly code: string;
   readonly meta: Record<string, unknown> | undefined;
@@ -911,7 +923,10 @@ export class QueueRepository {
    *     best-effort {@link maybeNudge} when no store is attached (P34 made that
    *     fallback real code rather than a promise in a comment). */
   private outbox: OutboxHandler | undefined;
-  private readonly promptBlockedSessions = new Set<string>();
+  // A first clear may recover durable refusals observed before startup. Later clears need
+  // a new positive refusal/attention episode, so a returning prompt cannot spin retries.
+  private readonly promptRecoveryState = new Map<string, boolean>();
+  private readonly promptClearRetries = new Map<string, number>();
   private resolveOccupantGeneration?: (sessionName: string) => string | null;
   private readonly resolveSessionAddresses: (name: string) => string[];
   private readonly wakeRepo: QueueWakeRepository;
@@ -938,6 +953,8 @@ export class QueueRepository {
   private readonly sharedChannelsFn: () => ReadonlyArray<{ address: string }>;
   /** A hosted member's trigger, from the authored rosters on this host. */
   private readonly hostedWakeFn: (destination: string) => RosterWake | null;
+  /** Whether the rosters list an address as a hosted member, trigger or not. */
+  private readonly hostedMemberFn: (destination: string) => boolean;
   private readonly hostedWakeFetch: typeof fetch | undefined;
   /** OPR.0.4.6.WF3 FR-6 — injected by startup (never imported): the
    *  workflow domain's is-live-frontier-packet predicate. */
@@ -981,6 +998,7 @@ export class QueueRepository {
       loadHumanRegistry?: () => LoadResult;
       sharedChannels?: () => ReadonlyArray<{ address: string }>;
       hostedWake?: (destination: string) => RosterWake | null;
+      isHostedMember?: (destination: string) => boolean;
       hostedWakeFetch?: typeof fetch;
     }
   ) {
@@ -997,6 +1015,7 @@ export class QueueRepository {
     this.loadHumanRegistryFn = opts?.loadHumanRegistry ?? (() => loadHumanRegistry());
     this.sharedChannelsFn = opts?.sharedChannels ?? (() => sharedChannelAddresses());
     this.hostedWakeFn = opts?.hostedWake ?? defaultHostedWake;
+    this.hostedMemberFn = opts?.isHostedMember ?? defaultIsHostedMember;
     this.hostedWakeFetch = opts?.hostedWakeFetch;
     this.hasTargetRepoColumn = detectQueueColumn(db, "target_repo");
     this.hasSummaryColumn = detectQueueColumn(db, "summary");
@@ -1623,11 +1642,18 @@ export class QueueRepository {
   }
 
   /** One recovery pass on a positive attention-clear transition; the existing sweep remains the backstop. */
-  async retryPromptWakesOnClear(sessionName: string, state: AgentActivity["state"] | undefined): Promise<void> {
-    if (state === "needs_input") { this.promptBlockedSessions.add(sessionName); return; }
-    if ((state !== "running" && state !== "idle") || !this.promptBlockedSessions.delete(sessionName)) return;
+  async retryPromptWakesOnClear(sessionName: string, state: AgentActivity["state"] | undefined, paneNeedsInput = false): Promise<void> {
     const addresses = this.resolveSessionAddresses(sessionName);
     if (!addresses.length) return;
+    // A fresh idle hook must not hide the pane's positive attention observation here.
+    // Inventory keeps its own precedence; this only arms recovery, never admits a send.
+    if (paneNeedsInput || state === "needs_input") {
+      for (const address of addresses) this.promptRecoveryState.set(address, true);
+      return;
+    }
+    if (state !== "running" && state !== "idle") return;
+    if (addresses.every(address => this.promptRecoveryState.get(address) === false)) return;
+    for (const address of addresses) this.promptRecoveryState.set(address, false);
     // Correlation may expand the group or release members for separate sends. Each claim must
     // independently qualify for this clear-triggered pass; general recovery keeps its broader policy.
     const eligible = (entry: OutboxEntry): boolean => {
@@ -1641,15 +1667,26 @@ export class QueueRepository {
         AND (last_nudge_result LIKE 'failed:Refused:%interactive prompt%' OR last_nudge_result = 'failed:target_needs_input')`)
       .all(...addresses) as Array<{ qitem_id: string; destination_session: string; source_session: string }>;
     const attempted = new Set<string>();
-    for (const row of rows) {
-      const intents = this.outbox ? this.db.prepare(`SELECT outbox_id, delivery_state FROM outbox_entries
-        WHERE audit_pointer = ? AND substr(outbox_id, 1, ?) = ?`).all(row.qitem_id, WAKE_INTENT_PREFIX.length, WAKE_INTENT_PREFIX) as Array<{ outbox_id: string; delivery_state: string }> : [];
-      if (intents.length) {
-        // Claims, known delivery, uncertainty and deliberate holds are not a prompt-refused wake.
-        for (const intent of intents) if (intent.delivery_state === "failed") await this.deliverWakeIntent(intent.outbox_id, attempted, eligible);
-      } else if (this.getById(row.qitem_id)?.state === "pending") {
-        // Older/non-precommitted nudges retain the existing best-effort path.
-        await this.maybeNudge(row.qitem_id, row.destination_session, undefined, row.source_session);
+    // Reserve the whole selection before awaiting: a correlated send can include several rows.
+    // Its refusal stays durable, but must not re-arm this same clear-triggered pass.
+    for (const row of rows) this.promptClearRetries.set(row.qitem_id, (this.promptClearRetries.get(row.qitem_id) ?? 0) + 1);
+    try {
+      for (const row of rows) {
+        const intents = this.outbox ? this.db.prepare(`SELECT outbox_id, delivery_state FROM outbox_entries
+          WHERE audit_pointer = ? AND substr(outbox_id, 1, ?) = ?`).all(row.qitem_id, WAKE_INTENT_PREFIX.length, WAKE_INTENT_PREFIX) as Array<{ outbox_id: string; delivery_state: string }> : [];
+        if (intents.length) {
+          // Claims, known delivery, uncertainty and deliberate holds are not a prompt-refused wake.
+          for (const intent of intents) if (intent.delivery_state === "failed") await this.deliverWakeIntent(intent.outbox_id, attempted, eligible);
+        } else if (this.getById(row.qitem_id)?.state === "pending") {
+          // Older/non-precommitted nudges retain the existing best-effort path.
+          await this.maybeNudge(row.qitem_id, row.destination_session, undefined, row.source_session);
+        }
+      }
+    } finally {
+      for (const row of rows) {
+        const remaining = this.promptClearRetries.get(row.qitem_id)! - 1;
+        if (remaining) this.promptClearRetries.set(row.qitem_id, remaining);
+        else this.promptClearRetries.delete(row.qitem_id);
       }
     }
   }
@@ -3740,12 +3777,14 @@ export class QueueRepository {
    * resolve) with exactly what the seat will read. Anything else is not-applicable (a forged
    * id, a stranger, a decision already resolved), never an error the socket must retry.
    */
-  recordHumanAnswer(input: { qitemId: string; actorSession: string; questionId: string; optionId: string; primaryUser?: boolean }): RecordHumanAnswerResult {
+  recordHumanAnswer(input: { qitemId: string; actorSession: string; questionId: string; optionId: string; primaryUser?: boolean;
+    /** The click's Slack action_ts: a decision parked on the person it asked takes the click only from after its current question posted. */
+    clickedTs?: string }): RecordHumanAnswerResult {
     if (!this.hasHumanQuestionsColumn) return { status: "not-applicable", reason: "schema" };
     return this.db.transaction(() => {
       const item = this.getById(input.qitemId);
       if (!item?.humanQuestions?.length) return { status: "not-applicable" as const, reason: "no-questions" };
-      if (item.state !== "pending") {
+      if (item.state !== "pending" && !this.clickAnswersPark(item, input.actorSession, input.clickedTs)) {
         // Slack can redeliver the click that closed it. Only to the asked human, say whether this answer is on record.
         const onRecord = item.destinationSession === input.actorSession && item.humanAnswers?.[input.questionId] === input.optionId;
         const delegated = item.destinationSession === input.actorSession ? item.delegatedDecision : null;
@@ -3766,6 +3805,24 @@ export class QueueRepository {
       const complete = unansweredQuestions(item.humanQuestions, answers).length === 0;
       return { status: "recorded" as const, answers, complete, questions: item.humanQuestions };
     })();
+  }
+
+  /** A decision parked on the person it asked takes that person's click, as their typed reply does (makeHumanReplyResolver):
+   *  the park is on them by any of their addresses, and the click came after its current question posted. */
+  private clickAnswersPark(item: QueueItem, actorSession: string, clickedTs: string | undefined): boolean {
+    if (item.state !== "blocked" || !item.blockedOn || !this.isPersonAddress(item.blockedOn)) return false;
+    if (item.destinationSession !== actorSession || this.askedSomeoneElse(actorSession, item.blockedOn)) return false;
+    const posted = slackMicros(this.currentHumanRequiredEpisode(item.qitemId)?.receipt?.messageTs);
+    const clicked = slackMicros(clickedTs);
+    return posted !== null && clicked !== null && clicked > posted;
+  }
+
+  /** A park's current question: its latest human-required transition, and that notification's final post receipt, if any. */
+  currentHumanRequiredEpisode(qitemId: string): { key: string; receipt: ReturnType<QueueTransitionLog["getOwnerNotificationReceipt"]> } | null {
+    const episode = this.transitionLog.listForQitem(qitemId).filter((transition) => transition.ownerNotificationKind === "human-required").at(-1);
+    if (!episode) return null;
+    const key = `${qitemId}:${episode.transitionId}`;
+    return { key, receipt: this.transitionLog.getOwnerNotificationReceipt(qitemId, key) };
   }
 
   /**
@@ -3931,7 +3988,14 @@ export class QueueRepository {
 
   private replyToFallbackFor(qitemId: string): string | null {
     const choice = this.replyToChoiceFor(qitemId);
-    return choice?.kind === "fallback" ? describeReplyToFallback(choice) : null;
+    if (choice?.kind === "fallback") return describeReplyToFallback(choice);
+    // #2234: the choice threaded it, but Slack found the root gone and posted it top-level. Same trust rule as the choice.
+    for (const t of this.transitionLog.listForQitem(qitemId).reverse()) {
+      if (t.actorSession !== REPLY_TO_CHOICE_ACTOR || t.identityProvenance !== null) continue;
+      const missing = parseReplyToThreadMissing(t.transitionNote ?? "");
+      if (missing) return `thread-missing (thread ${missing})`;
+    }
+    return null;
   }
 
   /** The parked query's obligation face: open rows to one destination, newest first, without the per-row
@@ -4356,6 +4420,7 @@ export class QueueRepository {
       })(),
       hasTerminalTransport: (dest) => this.hasTerminalTransport(dest),
       hostedWake: (dest) => this.hostedWakeFn(dest),
+      isHostedMember: (dest) => this.hostedMemberFn(dest),
     });
   }
 
@@ -4585,6 +4650,13 @@ export class QueueRepository {
          WHERE qitem_id = ?`
       )
       .run(ts, result, qitemId);
+    // The transport's definite no-write refusal establishes the episode even when a
+    // fresh hook hid needs_input. Uncertain delivery never arms clear-triggered replay.
+    if (!this.promptClearRetries.has(qitemId) && (result === "failed:target_needs_input"
+      || (result.startsWith("failed:Refused:") && result.includes("interactive prompt")))) {
+      const row = this.getById(qitemId);
+      if (row?.state === "pending") this.promptRecoveryState.set(row.destinationSession, true);
+    }
   }
 
   /**

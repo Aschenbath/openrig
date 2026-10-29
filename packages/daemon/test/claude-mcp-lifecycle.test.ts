@@ -331,7 +331,7 @@ describe("per-agent Claude MCP selection (#1478)", () => {
 
   it("upgrades existing nodes without changing their default and persists a new opt-out atomically", () => {
     const db = new Database(":memory:"); cleanups.push(() => db.close());
-    migrate(db, ALL_MIGRATIONS.filter(m => m.name !== "141_node_claude_mcp.sql"));
+    migrate(db, ALL_MIGRATIONS.filter(m => m.name !== "142_node_claude_mcp.sql"));
     const repo = new RigRepository(db), rig = repo.createRig("upgrade");
     const old = repo.addNode(rig.id, "old", { runtime: "claude-code" });
     expect(() => repo.addNode(rig.id, "unmigrated", { runtime: "claude-code", claudeMcp: "none" })).toThrow();

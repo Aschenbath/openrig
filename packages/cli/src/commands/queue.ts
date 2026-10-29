@@ -515,13 +515,10 @@ function notThisCreate(row: Record<string, unknown>, sent: SentCreate, storedSou
   return null;
 }
 
-/** A create whose answer didn't arrive, or arrived unreadable, may still have committed. Read the row back once by the ID it
- *  was sent with, from the daemon that holds it: this one for a local row, the destination's registered daemon for a
- *  cross-host one. Only a row that is this create counts as committed; anything else leaves the outcome unknown. It never
- *  sends the create again. */
-async function readBackCreate(deps: QueueDeps, client: DaemonClient, hostId: string | undefined, qitemId: string, sent: SentCreate): Promise<{ row: Record<string, unknown> | null; note: string }> {
-  const remote = remoteHostOf(hostId);
-  const where = remote ? ` on host '${remote}'` : "";
+/** Both reconciliation and --verify read the daemon that holds the row, with its own bearer. */
+async function queueReadTarget(deps: QueueDeps, client: DaemonClient, hostId: string | undefined) {
+  let remote = remoteHostOf(hostId);
+  if (remote && await daemonSelfHostId(client) === remote) remote = undefined;
   let reader = client;
   let options: { timeoutMs: number; headers?: Record<string, string> } = { timeoutMs: CREATE_READ_BACK_TIMEOUT_MS };
   if (remote) {
@@ -529,15 +526,45 @@ async function readBackCreate(deps: QueueDeps, client: DaemonClient, hostId: str
     const match = registry.ok ? resolveHost(registry.registry, remote, loadHostBindings().bindings) : undefined;
     if (!match?.ok || match.host.transport !== "http") {
       const why = match?.ok ? "its entry in this CLI's host registry is SSH, not a daemon URL" : "it isn't in this CLI's host registry";
-      return { row: null, note: `This CLI couldn't read the row back from host '${remote}' (${why}).` };
+      return { error: `from host '${remote}' (${why})` };
     }
     const bearer = resolveRemoteBearer(match.host);
-    if (!bearer.ok) return { row: null, note: `This CLI couldn't read the row back from host '${remote}' (${bearer.error}).` };
+    if (!bearer.ok) return { error: `from host '${remote}' (${bearer.error})` };
     reader = deps.clientFactory(match.host.url);
     if (bearer.token) options = { ...options, headers: { Authorization: `Bearer ${bearer.token}` } };
   }
+  return { reader, options };
+}
+
+/** A successful forward isn't a delivery receipt. Never accept a different remote row as this create's receipt. */
+function createReceiptReader(deps: QueueDeps, client: DaemonClient, hostId: string | undefined, qitemId: string, sent: SentCreate): Pick<DaemonClient, "get"> {
+  if (!remoteHostOf(hostId)) return client;
+  let target: ReturnType<typeof queueReadTarget> | undefined;
+  let source: ReturnType<typeof storedSourceOf> | undefined;
+  return {
+    get: async <T>(path: string) => {
+      const selected = await (target ??= queueReadTarget(deps, client, hostId));
+      if ("error" in selected) throw new Error(`receipt could not be read ${selected.error}`);
+      const response = await selected.reader.get<T>(path, selected.options);
+      const row = response.data as Record<string, unknown> | undefined;
+      if (response.status === 200 && (!row || row.qitemId !== qitemId
+        || notThisCreate(row, sent, await (source ??= storedSourceOf(client, sent))) !== null)) {
+        throw new Error("receipt row does not match the created qitem");
+      }
+      return response;
+    },
+  };
+}
+
+/** A create whose answer didn't arrive, or arrived unreadable, may still have committed. Read the row back once by the ID it
+ *  was sent with, from the daemon that holds it. Only this create's row counts; it never sends the create again. */
+async function readBackCreate(deps: QueueDeps, client: DaemonClient, hostId: string | undefined, qitemId: string, sent: SentCreate): Promise<{ row: Record<string, unknown> | null; note: string }> {
+  const remote = remoteHostOf(hostId);
+  const where = remote ? ` on host '${remote}'` : "";
+  const target = await queueReadTarget(deps, client, hostId);
+  if ("error" in target) return { row: null, note: `This CLI couldn't read the row back ${target.error}.` };
   try {
-    const res = await reader.get<Record<string, unknown>>(`/api/queue/${encodeURIComponent(qitemId)}`, options);
+    const res = await target.reader.get<Record<string, unknown>>(`/api/queue/${encodeURIComponent(qitemId)}`, target.options);
     if (res.status === 200 && res.data?.qitemId === qitemId) {
       const differs = notThisCreate(res.data, sent, await storedSourceOf(client, sent));
       if (differs === "unread") {
@@ -1079,7 +1106,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           if (opts.verify && status < 400) {
             const createdId = typeof created.qitemId === "string" ? created.qitemId : null;
             const delivery = createdId
-              ? await waitForDeliveryOutcome(client, createdId, deps.deliveryVerify, { destinationSession: hostResolved.destination, nudge: opts.nudge })
+              ? await waitForDeliveryOutcome(createReceiptReader(deps, client, hostResolved.hostId, qitemId, sent), createdId, deps.deliveryVerify, { destinationSession: hostResolved.destination, nudge: opts.nudge })
               : unreadableDeliveryResult(null, hostResolved.destination, {}, "create response did not include a qitem id; delivery cannot be correlated");
             await printWriteResult(client, opts.json ?? false, { ...created, qitemId: createdId, persisted: true, delivery }, status, receipt);
             return;

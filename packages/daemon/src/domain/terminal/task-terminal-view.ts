@@ -10,7 +10,8 @@ export interface TaskTerminalMember {
   availability: "available" | "missing" | "stopped" | "hosted" | "unresolved";
   reason?: string;
   /** Membership does not provision or authorize terminal input. */
-  viewerStatus: "not-provisioned";
+  viewerStatus: "not-provisioned" | "verified" | "unconfirmed";
+  viewer?: import("./herdr-viewer.js").ViewerMapping;
 }
 export interface TaskMembership {
   qitemId: string;

@@ -1,5 +1,5 @@
 import { runtimeSwitchActivityRole } from "./runtime-switch-custody.js";
-import { physicalSessionName } from "../domain/session-registry.js";
+import { physicalSessionName, sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "../domain/session-registry.js";
 import { existsSync } from "node:fs";
 import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
@@ -11,6 +11,7 @@ import { verifyStartupProof } from "../domain/startup-proof.js";
 import type { ActivityEvidence, EvidenceRoute } from "../domain/activity-taxonomy.js";
 import type { AgentActivity } from "../domain/types.js";
 import * as parkedQuery from "../domain/parked-query.js";
+import { nodeExecutorConfirmedStopped } from "../domain/node-inventory.js";
 import { runtimeRungInventory } from "../domain/activity-taxonomy.js";
 import { validateResumeToken } from "../domain/resume-token-validation.js";
 import { claudeHookFromLaunchedProcess, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
@@ -52,10 +53,14 @@ export function evidenceFromHookActivity(input: {
   }
   if (input.runtime === "claude-code" && input.activity.rawEvent === "Notification"
       && input.activity.reason === "permission_prompt") {
-    return { ...base, permissionRequest: { id: "claude-permission-prompt" }, needsInput: { count: 1, reason: "permission_prompt" } };
+    const hookAgentId = input.activity.hookAgentId;
+    return { ...base, permissionRequest: {
+      id: hookAgentId ? `claude-permission-prompt:${hookAgentId}` : "claude-permission-prompt",
+      ...(hookAgentId !== undefined ? { hookAgentId } : {}),
+    }, needsInput: { count: 1, reason: "permission_prompt" } };
   }
   // A runner's exit report clears what its last turn said: the seat is no longer at a prompt or mid-turn.
-  if (input.activity.rawEvent === "Stop" && isRunnerExit(input.activity.rawSubtype, input.runtime)) {
+  if (input.activity.rawEvent === "Stop" && isRunnerExit(input.activity.rawSubtype, input.runtime, input.activity.communityRunner === true)) {
     return { ...base, activity: "unknown", needsInput: { count: 0, reason: null } };
   }
   switch (input.activity.state) {
@@ -82,7 +87,8 @@ export function restoredRunnerHookEvidence(
   const latest = store.getLatestForNode({ nodeId: seat.seatNodeId, sessionName: seat.sessionName, order: "source" });
   if (!latest || latest.evidenceSource !== "runtime_hook" || latest.generationProvenance !== "resolved") return null;
   const state = !latest.stale ? latest.state
-    : latest.reason === "stale_runtime_hook" ? hookEventState(latest.rawEvent, latest.rawSubtype, runtime) : "unknown";
+    : latest.reason === "stale_runtime_hook"
+      ? hookEventState(latest.rawEvent, latest.rawSubtype, runtime, latest.communityRunner === true) : "unknown";
   return evidenceFromHookActivity({ seatNodeId: seat.seatNodeId, sessionName: seat.sessionName, runtime,
     activity: { ...latest, state }, seq: 0 });
 }
@@ -448,6 +454,46 @@ activityRoutes.post("/hooks", async (c) => {
     return c.json({ ok: true, oriented: "verified", nodeId: result.nodeId, challengeId: result.challengeId });
   }
 
+  // All tools in this actor's batch have resolved. An individual PostToolUse can belong to a parallel tool,
+  // and a subagent's batch says nothing about the main session's permission. Only the current occupant can
+  // settle a matching, older episode. Do not record an unrelated batch as an unknown hook that hides attention.
+  const claudePermission = body.runtime === "claude-code" && body.hookEvent === "Notification" && body.subtype === "permission_prompt";
+  if (body.hookEvent === "PostToolBatch" || claudePermission) {
+    const oracle = c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined;
+    const registry = c.get("sessionRegistry" as never) as SessionRegistry | undefined;
+    const sessionName = stringOrNull(body.sessionName);
+    const seat = store.resolveSession({ sessionName, nodeId: stringOrNull(body.nodeId) });
+    const hookAgentId = body.hookAgentId;
+    const generation = stringOrNull(body.generation);
+    const occurredAt = stringOrNull(body.occurredAt);
+    let current: ReturnType<SessionRegistry["currentOccupantTenure"]> | undefined;
+    try {
+      current = seat ? registry?.currentOccupantTenure(seat.nodeId) : null;
+    } catch {
+      return c.json({ ok: false, code: "generation_resolver_error", error: "Occupant generation is unavailable." }, 503);
+    }
+    const session = seat && store.db.prepare("SELECT status FROM sessions WHERE id = ?")
+      .get(seat.sessionId) as { status: string } | undefined;
+    const attributable = body.runtime === "claude-code" && seat?.runtime === "claude-code"
+      && (!sessionName || sessionName === seat.sessionName) && session?.status === "running"
+      && generation !== null && current?.generationUuid === generation
+      && (hookAgentId === null || (typeof hookAgentId === "string" && hookAgentId.trim().length > 0))
+      && occurredAt !== null && Number.isFinite(Date.parse(occurredAt));
+    if (body.hookEvent === "PostToolBatch") {
+      if (attributable && oracle && !oracle.hasRungInventory(seat!.nodeId, seat!.sessionName)) {
+        // The completion may be this occupant's first hook to reach the daemon.
+        oracle.declareRungInventory({ seatNodeId: seat!.nodeId, sessionName: seat!.sessionName }, runtimeRungInventory("claude-code"));
+      }
+      const settled = attributable && oracle
+        ? oracle.completeClaudeToolBatch(seat!.sessionName, hookAgentId as string | null, occurredAt!) : false;
+      return c.json({ ok: true, permissionResolved: settled });
+    }
+    // Do not publish an already-completed request as fresh attention to the store's event consumers.
+    if (attributable && oracle?.hasLaterClaudeToolBatch(seat!.sessionName, hookAgentId as string | null, occurredAt!)) {
+      return c.json({ ok: true, permissionResolved: true });
+    }
+  }
+
   const result = store.recordHookEvent({
     runtime: stringOrNull(body.runtime),
     sessionName: stringOrNull(body.sessionName),
@@ -460,6 +506,8 @@ activityRoutes.post("/hooks", async (c) => {
     // (sound per-path absence; never false-fresh).
     generation: stringOrNull(body.generation),
     turnId: stringOrNull(body.turnId),
+    ...(body.hookAgentId === null || (typeof body.hookAgentId === "string" && body.hookAgentId.trim().length > 0)
+      ? { hookAgentId: body.hookAgentId } : {}),
     sourceSequence: typeof body.sequence === "number" && Number.isSafeInteger(body.sequence) && body.sequence > 0 ? body.sequence : null,
     livenessSeconds: typeof body.livenessSeconds === "number" && Number.isSafeInteger(body.livenessSeconds)
       && body.livenessSeconds > 0 && body.livenessSeconds <= 3600 ? body.livenessSeconds : null,
@@ -483,8 +531,9 @@ activityRoutes.post("/hooks", async (c) => {
   // the emitter supplied an old sessionName, so check both identities before
   // declaring an inventory (which would reactivate a retired seat).
   const currentSession = oracle && emitted?.nodeId
-    ? store.db.prepare("SELECT session_name, status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1")
-      .get(emitted.nodeId) as { session_name: string; status: string } | undefined
+    ? store.db.prepare(`SELECT s.session_name, s.status, ${sessionCommunityHarnessSelect(store.db)} AS community_harness,
+        ${sessionCommunityRunnerSelect(store.db)} AS community_runner FROM sessions s WHERE s.node_id = ? ORDER BY s.id DESC LIMIT 1`)
+      .get(emitted.nodeId) as { session_name: string; status: string; community_harness: string | null; community_runner: number | null } | undefined
     : undefined;
   const suppliedSessionName = stringOrNull(body.sessionName);
   if (oracle && emitted?.nodeId && emitted.sessionName
@@ -504,7 +553,8 @@ activityRoutes.post("/hooks", async (c) => {
     if (!oracle.hasRungInventory(emitted.nodeId, emitted.sessionName)) {
       oracle.declareRungInventory(
         { seatNodeId: emitted.nodeId, sessionName: emitted.sessionName },
-        runtimeRungInventory(runtime),
+        // The same recorded launch facts the reconcile pass reads, so a community seat's first hook gets its own inventory.
+        runtimeRungInventory(runtime, currentSession?.community_harness ?? null, currentSession?.community_runner === 1),
       );
     }
     const evidence = evidenceFromHookActivity({
@@ -580,7 +630,7 @@ activityRoutes.get("/parked", (c) => {
 
   const { diagnoseSeatParked, diagnoseRigParked, PARKED_OBLIGATION_LIMIT } = parkedQuery;
   const deps = {
-    getSeatState: (id: string) => oracle.getSeatState(id),
+    getSeatState: (id: string) => nodeExecutorConfirmedStopped(rigRepo.db, id) ? null : oracle.getSeatState(id),
     listOpenObligations: (destination: string, limit: number) => ({
       rows: queueRepo
         .list({ destinationSession: destination, state: ["pending", "in-progress", "blocked"], limit })

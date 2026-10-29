@@ -92,7 +92,8 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
       { pid: 1135, ppid: 1, pgid: 1135, tpgid: 1196, executableName: "zsh", command: "-zsh", startedAt },
       { pid: 1196, ppid: 1135, pgid: 1196, tpgid: 1196, executableName: "bash", command: "/bin/sh /tmp/launch.txt", startedAt },
       { pid: 1199, ppid: 1196, pgid: 1196, tpgid: 1196, executableName: "node", command: `node /opt/bin/codex resume ${nativeToken}`, startedAt },
-      { pid: 1205, ppid: 1199, pgid: 1196, tpgid: 1196, executableName: "codex", command: `/opt/native/codex resume ${nativeToken}`, startedAt },
+      { pid: 1205, ppid: 1199, pgid: 1196, tpgid: 1196, executableName: "codex", command: `/opt/native/codex resume ${nativeToken}`,
+        argv: ["/opt/native/codex", "resume", nativeToken], startedAt },
     ];
   }
 
@@ -119,6 +120,29 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     expect(listProcesses).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["ordinary verified send", "queue nudge", "watchdog wake"])("wrapped Codex with unreadable argv still receives %s", async kind => {
+    const opaque = vi.fn(async () => wrapperProcesses().map(row => row.pid === 1205 ? { ...row, argv: null } : row));
+    const { transport, sendText, sendKeys } = wrappedSeat(opaque);
+    const result = kind === "watchdog wake"
+      ? await watchdogSend(transport, "dev-check@my-rig")
+      : await transport.send("dev-check@my-rig", "existing review", {
+        verify: true, ...(kind === "queue nudge" ? { actorSession: "dev-owner@my-rig", auditPointer: "existing-review", deliveryId: "nudge-opaque" } : {}),
+      });
+    expect(result.ok).toBe(true);
+    expect(sendText).toHaveBeenCalledOnce();
+    expect(sendKeys).toHaveBeenCalledOnce();
+    expect(opaque).toHaveBeenCalledTimes(2);
+  });
+
+  it("wrapped Codex with unreadable argv still refuses an approval prompt", async () => {
+    const opaque = vi.fn(async () => wrapperProcesses().map(row => row.pid === 1205 ? { ...row, argv: null } : row));
+    const { transport, tmux, sendText, sendKeys } = wrappedSeat(opaque);
+    tmux.capturePaneContent = async () => "Would you like to run the following command?\n› 1. Yes, proceed (y)\n2. No\nPress enter to confirm or esc to cancel";
+    expect(await transport.send("dev-check@my-rig", "existing review")).toMatchObject({ ok: false, reason: "target_needs_input" });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendKeys).not.toHaveBeenCalled();
+  });
+
   it("proven native wrapper still refuses an approval prompt", async () => {
     const { transport, tmux, sendText, sendKeys } = wrappedSeat();
     tmux.capturePaneContent = async () => "Would you like to run the following command?\n› 1. Yes, proceed (y)\n2. No\nPress enter to confirm or esc to cancel";
@@ -131,7 +155,7 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     const { transport, session, listProcesses, sendText } = wrappedSeat();
     sessionRegistry.clearResumeToken(session.id);
     listProcesses.mockResolvedValue(wrapperProcesses().map(r => r.pid === 1205
-      ? { ...r, command: "/opt/native/codex -m model" } : r));
+      ? { ...r, command: "/opt/native/codex -m model", argv: ["/opt/native/codex", "-m", "model"] } : r));
     expect((await watchdogSend(transport, "dev-check@my-rig")).ok).toBe(true);
     expect(sendText).toHaveBeenCalledOnce();
   });
@@ -139,12 +163,13 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
   // #1079: a `codex` launcher that spawns Codex, which spawns its native child.
   function launcherProcesses(): NativeProcessRow[] {
     const [shell, sh] = wrapperProcesses();
-    const link = (pid: number, ppid: number, command: string): NativeProcessRow =>
-      ({ ...sh!, pid, ppid, executableName: "codex", command });
+    const link = (pid: number, ppid: number, command: string, argv: string[]): NativeProcessRow =>
+      ({ ...sh!, pid, ppid, executableName: "codex", command, argv });
     return [shell!, sh!,
-      link(1199, 1196, "codex --no-daemon -s workspace-write -c check_for_update_on_startup=false"),
-      link(1203, 1199, "codex --no-daemon -s workspace-write"),
-      link(1205, 1203, "codex -c model_provider=local")];
+      link(1199, 1196, "codex --no-daemon -s workspace-write -c check_for_update_on_startup=false",
+        ["codex", "--no-daemon", "-s", "workspace-write", "-c", "check_for_update_on_startup=false"]),
+      link(1203, 1199, "codex --no-daemon -s workspace-write", ["codex", "--no-daemon", "-s", "workspace-write"]),
+      link(1205, 1203, "codex -c model_provider=local", ["codex", "-c", "model_provider=local"])];
   }
 
   it.each(["ordinary verified send", "watchdog wake"])("#1079 Codex behind a spawning launcher receives %s", async kind => {
@@ -169,7 +194,8 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     ["exited native with stale UI", rows => rows.slice(0, -1)],
     ["background native", rows => rows.map(r => r.pid === 1205 ? { ...r, pgid: 999 } : r)],
     ["another pane's native", rows => rows.map(r => r.pid === 1205 ? { ...r, ppid: 999 } : r)],
-    ["wrong resume identity", rows => rows.map(r => r.pid === 1205 ? { ...r, command: "/opt/native/codex resume different" } : r)],
+    ["wrong resume identity", rows => rows.map(r => r.pid === 1205
+      ? { ...r, command: "/opt/native/codex resume different", argv: ["/opt/native/codex", "resume", "different"] } : r)],
     ["incomplete process identity", rows => rows.map(r => ({ ...r, startedAt: undefined }))],
   ];
   it.each(unproved)("shell label still refuses %s without input", async (_name, mutate) => {
@@ -292,7 +318,7 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     const { transport, sendText, sendKeys } = wrappedClaude(vi.fn(async () =>
       claudeProcesses(`--resume ${identity === "matching" ? nativeToken : "other"}`).map(row =>
         identity === "different-runtime" && row.pid === 1205
-          ? { ...row, executableName: "codex", command: "codex resume other" } : row)));
+          ? { ...row, executableName: "codex", command: "codex resume other", argv: ["codex", "resume", "other"] } : row)));
     const repo = new QueueRepository(db, new EventBus(db), {
       transport, loadHumanRegistry: () => ({ ok: true, entities: [] }),
     });

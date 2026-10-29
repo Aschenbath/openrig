@@ -115,8 +115,8 @@ describe("TerminalService — view resolution + one-shape result", () => {
     expect(notes).toContain("Can you see the team?");
     expect(notes).toContain("does not confirm");
     if (unavailable) {
-      expect(result.notes).toContain("dev.driver: env -u TMUX '/opt/tools/tmux' attach -t 'dev-driver@acme-build'");
-      expect(result.notes).toContain("rev.r1: env -u TMUX '/opt/tools/tmux' attach -t 'rev-r1@acme-build'");
+      expect(result.notes).toContain("dev.driver: env -u TMUX '/opt/tools/tmux' attach -f ignore-size -t 'dev-driver@acme-build'");
+      expect(result.notes).toContain("rev.r1: env -u TMUX '/opt/tools/tmux' attach -f ignore-size -t 'rev-r1@acme-build'");
       expect(notes).toContain("include every command in full, unchanged");
     } else {
       expect(notes).not.toContain("attach -t");
@@ -160,6 +160,27 @@ describe("TerminalService — view resolution + one-shape result", () => {
     const svc = new TerminalService(deps);
     expect((await svc.openView({ view: "pod:acme-build" })).code).toBe("view_not_found"); // no /pod
     expect((await svc.openView({ view: "pod:acme-build/ghost" })).code).toBe("view_not_found"); // unknown pod
+  });
+
+  it("opens a seat:<rig>/<logical-id> as just that seat, interactive (the TUI agent page)", async () => {
+    const { deps, herdr } = makeDeps();
+    const svc = new TerminalService(deps);
+    const res = await svc.openView({ view: "seat:acme-build/rev.r1" });
+    expect(res.ok).toBe(true);
+    expect(res.opened).toEqual(["rev-r1@acme-build"]);
+    expect(herdr.lastView?.opened.every((p) => p.readOnly === false)).toBe(true);
+    expect(herdr.lastView?.id).toBe("seat:acme-build/rev.r1");
+    expect((await svc.openView({ view: "seat:rig-id-1/dev.driver" })).opened).toEqual(["dev-driver@acme-build"]); // rig id form
+  });
+
+  it("a malformed or unknown seat view → view_not_found, naming the expected form", async () => {
+    const { deps } = makeDeps();
+    const svc = new TerminalService(deps);
+    const malformed = await svc.openView({ view: "seat:acme-build" });
+    expect(malformed.code).toBe("view_not_found");
+    expect(malformed.error).toContain("seat:<rig>/<logical-id>");
+    expect((await svc.openView({ view: "seat:acme-build/ghost" })).code).toBe("view_not_found"); // unknown seat
+    expect((await svc.openView({ view: "seat:no-such-rig/dev.driver" })).code).toBe("view_not_found"); // unknown rig
   });
 
   it.each(["mission:4.6", "slice:02"])("opens %s as a watch view without a team-conversation handoff", async view => {
@@ -397,7 +418,7 @@ describe("default saved kernel conversations", () => {
     expect(result.opened).toEqual(unavailable ? [] : ["operator-bound", "tui-bound", "advisor-bound"]);
     expect(result.notes?.join("\n")).toContain("Default kernel view:");
     expect(result.notes?.join("\n")).not.toMatch(/lead pane|Can you see the team/);
-    if (unavailable) expect(result.notes).toContain("operator: env -u TMUX tmux attach -t 'operator-bound'");
+    if (unavailable) expect(result.notes).toContain("operator: env -u TMUX tmux attach -f ignore-size -t 'operator-bound'");
   });
 
   it.each(["herdr", "cmux"])("offers existing conversation attachments when %s is unavailable", async providerName => {
@@ -412,8 +433,8 @@ describe("default saved kernel conversations", () => {
     const result = await new TerminalService(deps).openView({ view: "saved:kernel", provider: providerName });
     expect(result).toMatchObject({ ok: false, opened: [], code: `${providerName}_unavailable` });
     expect(result.absent.map(member => member.seat)).toContain("advisor-bound");
-    expect(result.notes).toContain("operator: env -u TMUX tmux attach -t 'operator-bound'");
-    expect(result.notes).toContain("dashboard: env -u TMUX tmux attach -t 'actual-tui'");
+    expect(result.notes).toContain("operator: env -u TMUX tmux attach -f ignore-size -t 'operator-bound'");
+    expect(result.notes).toContain("dashboard: env -u TMUX tmux attach -f ignore-size -t 'actual-tui'");
     expect(result.notes).toContain("Original provider detail");
     expect(result.notes!.join("\n")).not.toContain("attach -t 'advisor-bound'");
     expect(result.notes!.join("\n")).not.toContain("queue-bound");

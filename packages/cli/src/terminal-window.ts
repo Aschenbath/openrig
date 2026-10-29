@@ -4,11 +4,11 @@ import { homedir, hostname, networkInterfaces } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import type { DaemonClient } from "./client.js";
+import { terminalAuthHeaders, type DaemonClient } from "./client.js";
 import { shellQuote } from "./cross-host-executor.js";
 import { prepareHerdrLaunchConfig } from "./herdr-launch-config.js";
 import { openRexView } from "./terminal-window-rex.js";
-import type { OpenViewResult } from "./commands/terminal.js";
+import type { FollowControls, OpenViewResult } from "./commands/terminal.js";
 
 interface Pane { seat: string; label: string; paneCommand: string; recoveryCommand?: string }
 interface HerdrTab { workspace_id: string; tab_id: string; label: string }
@@ -226,7 +226,8 @@ async function hasLiveAttachments(existing: HerdrTab, tabs: HerdrTab[], pages: P
       if (!pid || !/^\d+$/.test(pid) || !session || !["0", "1"].includes(readOnly ?? "")) continue;
       // Compare the composer's exact command, including session aliases and read-only mode.
       // SSH/custom commands cannot be confirmed from this local client inventory.
-      clients.set(pid, ["tmux", quote(tmux)].map(binary => `${binary} attach ${readOnly === "1" ? "-r " : ""}-t ${quote(session)}`));
+      const flags = readOnly === "1" ? ["-r "] : ["", "-f ignore-size "];
+      clients.set(pid, ["tmux", quote(tmux)].flatMap(binary => flags.map(flag => `${binary} attach ${flag}-t ${quote(session)}`)));
     }
     const used = new Set<string>();
     for (const [index, page] of pages.entries()) {
@@ -259,12 +260,12 @@ async function hasLiveAttachments(existing: HerdrTab, tabs: HerdrTab[], pages: P
 }
 
 /** Render the daemon's existing composition; never rediscover/relaunch kernel seats here. */
-export async function openTerminalWindow(client: DaemonClient, view: string, requestedProvider?: string, deps = defaultWindowDeps(), expectedPlan?: string, requestedSession?: string): Promise<OpenViewResult> {
+export async function openTerminalWindow(client: DaemonClient, view: string, requestedProvider?: string, deps = defaultWindowDeps(), expectedPlan?: string, requestedSession?: string, following?: FollowControls): Promise<OpenViewResult> {
   const session = requestedSession?.trim();
-  if (session === undefined && (requestedProvider === "rex" || (requestedProvider === undefined && inRex(deps.env)))) {
+  if (!following && session === undefined && (requestedProvider === "rex" || (requestedProvider === undefined && inRex(deps.env)))) {
     return openRexView(client, view, deps, expectedPlan);
   }
-  const selectedProvider = requestedProvider ?? (session !== undefined ? "herdr" : undefined);
+  const selectedProvider = requestedProvider ?? (session !== undefined || following ? "herdr" : undefined);
   const sessionFlag = session === undefined ? "" : ` --session ${shellQuote(session)}`;
   const sessionQuery = session === undefined ? "" : `&session=${encodeURIComponent(session)}`;
   let provider = selectedProvider ?? "herdr";
@@ -282,6 +283,7 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
   const windowNotes: string[] = [];
   try {
     if (!localDaemon(client.baseUrl)) throw new Error("The window launcher must run on the daemon's own desktop; the configured daemon is remote.");
+    if (following && selectedProvider !== "herdr") throw new Error("Following requires the qualified Herdr provider.");
     if (session !== undefined && selectedProvider !== "herdr") throw new Error("--session selects a Herdr session; use --provider herdr.");
     if (selectedProvider && !["herdr", "tmux"].includes(selectedProvider)) throw new Error("--window supports herdr, rex or tmux. Use cmux without --window.");
     const launchWindow = await windowLauncher(deps, windowNotes);
@@ -306,7 +308,7 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
     if (expectedPlan !== undefined && expectedPlan !== planId) {
       return failure(provider, "The terminal view changed since preview. Refresh the preview before opening.");
     }
-    if (!composed.opened.length) return { ...failed("No conversations are attachable."), absent: composed.absent, degraded: composed.degraded };
+    if (!composed.opened.length && !following) return { ...failed("No conversations are attachable."), absent: composed.absent, degraded: composed.degraded };
     const measureWindow = async () => {
       if (window && "columns" in window && window.columns !== viewportColumns && composed.kernelLayout) {
         viewportColumns = window.columns;
@@ -392,6 +394,26 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
       // Inventory is read-only: a failed read must not prevent the first open.
       // Scope each tab list to its workspace, on the daemon's exact endpoint.
       const herdrArgs = ["-u", "TMUX", "-u", "HERDR_SESSION", "-u", "HERDR_SOCKET_PATH", `HERDR_SOCKET_PATH=${endpoint.socketPath}`, herdr];
+      if (following) {
+        // Follow has a stable journaled workspace. A changed membership plan
+        // must never enter the one-shot plan-label/new-workspace path below.
+        const answer = await client.post<OpenViewResult>("/api/terminal/follow", { view, provider: "herdr", ...following,
+          ...(session !== undefined ? { session } : {}), ...(expectedPlan !== undefined ? { expectedPlan } : {}) },
+          { timeoutMs: 45_000, headers: terminalAuthHeaders() });
+        if (!answer.data.ok || !answer.data.workspaceId) return { ...answer.data, window, notes: [...(answer.data.notes ?? []), ...windowNotes] };
+        const selectedArgs = herdrArgs;
+        const selectedStatus = JSON.parse(await deps.exec("/usr/bin/env", [...selectedArgs, "status", "server", "--json"]));
+        const selectedBody = selectedStatus?.result ?? selectedStatus;
+        if (selectedStatus.error || selectedBody?.running !== true || selectedBody.socket !== endpoint.socketPath) {
+          throw new Error("The Herdr CLI did not confirm the daemon's exact following endpoint; no tab lookup or focus was requested.");
+        }
+        const listed = JSON.parse(await deps.exec("/usr/bin/env", [...selectedArgs, "tab", "list", "--workspace", answer.data.workspaceId]));
+        const tab = (listed?.result?.tabs as HerdrTab[] | undefined)?.find(t => t.workspace_id === answer.data.workspaceId);
+        if (!tab) throw new Error("The stable following workspace has no confirmed tab. Inspect it before retrying.");
+        const focused = JSON.parse(await deps.exec("/usr/bin/env", [...selectedArgs, "tab", "focus", tab.tab_id]));
+        if (focused?.result?.tab?.tab_id !== tab.tab_id || focused.result.tab.workspace_id !== tab.workspace_id) throw new Error("Following tab selection was not confirmed.");
+        return { ...answer.data, window, notes: [...(answer.data.notes ?? []), ...windowNotes] };
+      }
       const closeCommand = (id: string) => `${session === undefined ? "herdr" : `env -u HERDR_SESSION HERDR_SOCKET_PATH=${shellQuote(endpoint.socketPath)} ${shellQuote(herdr)}`} workspace close ${shellQuote(id)}`;
       let tabs: HerdrTab[] = [];
       const spaceLabels = new Map<string, string>();

@@ -1,3 +1,4 @@
+import { nodeAccountHomeSchema } from "./migrations/141_node_account_home.js";
 import { escalationTargetRefsSchema } from "./migrations/126_escalation_target_refs.js";
 import { claudeTokenReadingsSchema } from "./migrations/134_claude_token_readings.js";
 // The canonical ordered migration list. SINGLE SOURCE: the daemon boot path
@@ -7,7 +8,8 @@ import { claudeTokenReadingsSchema } from "./migrations/134_claude_token_reading
 
 import { nodeClaudePermissionsSchema } from "./migrations/139_node_claude_permissions.js";
 import { identityPrincipalSchema } from "./migrations/140_identity_principal.js";
-import { nodeClaudeMcpSchema } from "./migrations/141_node_claude_mcp.js";
+import { sessionAgentRunnerSchema } from "./migrations/141_session_agent_runner.js";
+import { nodeClaudeMcpSchema } from "./migrations/142_node_claude_mcp.js";
 import { nodeCodexPermissionsSchema } from "./migrations/137_node_codex_permissions.js";
 import { coreSchema } from "./migrations/001_core_schema.js";
 import { terminalPolicySchema } from "./migrations/128_terminal_policy.js";
@@ -282,5 +284,7 @@ export const ALL_MIGRATIONS: Migration[] = [
   nodeClaudePermissionsSchema,
   nodeCodexPermissionsSchema,
   identityPrincipalSchema,
+  sessionAgentRunnerSchema,
+  nodeAccountHomeSchema,
   nodeClaudeMcpSchema,
 ];
