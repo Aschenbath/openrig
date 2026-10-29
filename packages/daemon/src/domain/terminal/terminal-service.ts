@@ -1,3 +1,4 @@
+import type { ScopeViewError } from "./scope-task-terminal-view.js";
 import { tileAttachArgv } from "./tile-attach.js";
 import { shellQuote } from "../../adapters/shell-quote.js";
 import type { ViewerKey, ViewerResult } from "./herdr-viewer.js";
@@ -92,6 +93,7 @@ export interface TerminalPreview {
   grids: ReturnType<typeof buildGridRoot>[];
   status: ProviderStatus;
   task?: TaskMembership;
+  capabilities: { ensureViewer: boolean };
   viewDescriptor?: ViewDescriptor;
 }
 
@@ -139,6 +141,10 @@ export interface TerminalServiceDeps {
   listScopeSeats(scope: string): Promise<LiveSeatRow[] | null> | LiveSeatRow[] | null;
   /** Exact local queue episode; unavailable owners must remain in task.members. */
   resolveTaskView?(qitemId: string): Promise<TaskTerminalView | null> | TaskTerminalView | null;
+  /** Authoritative scoped work in this daemon's configured index context. */
+  resolveScopeView?(view: string): Promise<TaskTerminalView | ScopeViewError> | TaskTerminalView | ScopeViewError;
+  /** Drop generation-cached scope identities on the same source event as following. */
+  invalidateScopeView?(): void;
   /** Known rig names (for the `views` listing). */
   listRigNames(): Promise<string[]> | string[];
   /** Read-only host resolution for the composer (registry unavailable → null for every id). */
@@ -184,24 +190,29 @@ export class TerminalService {
   private localTmux?: Promise<string | undefined>;
   private following?: TerminalFollowing;
 
+  private unsubscribeScope?: () => void;
   constructor(private readonly deps: TerminalServiceDeps) {
+    if (deps.invalidateScopeView) this.unsubscribeScope = deps.eventBus?.subscribe(event => {
+      if (event.type === "scope.sources_changed") deps.invalidateScopeView?.();
+    });
     if (deps.eventBus) this.following = new TerminalFollowing(
       deps.followingStatePath ?? getDefaultOpenRigPath("private/terminal-following/selectors.json"), deps.eventBus,
       (selector, controls) => this.renderFollowing(selector, controls));
   }
 
-  async stop(): Promise<void> { await this.following?.stop(); }
+  async stop(): Promise<void> { this.unsubscribeScope?.(); await this.following?.stop(); }
 
   async followView(req: OpenViewRequest & FollowControls): Promise<OpenViewResult> {
     if (!this.following) return errorResult("herdr", "follow_unavailable", "This daemon has no event-driven terminal following service.");
-    if (!req.view.startsWith("qitem:")) return errorResult("herdr", "follow_view_required", "Follow requires qitem:<id>, whose membership has an authoritative completeness signal.");
+    if (!/^(qitem|slice):.+/.test(req.view)) return errorResult("herdr", "follow_view_required", "Follow requires an authoritative qitem:<id> or slice:<id-or-name> view.");
+    if (req.view.startsWith("slice:") && !this.deps.resolveScopeView) return errorResult("herdr", "scope_unsupported", "This daemon has no authoritative slice membership resolver.");
     const selected = this.selectProvider({ ...req, provider: req.provider ?? "herdr" });
     if ("ok" in selected) return selected;
     if (selected.name !== "herdr" || !selected.provider.followView) return errorResult(selected.name, "follow_unsupported", "Follow is supported by the qualified Herdr provider only.");
-    if (req.expectedPlan !== undefined) {
+    if (req.view.startsWith("slice:") || req.expectedPlan !== undefined) {
       const composed = await this.resolveComposed(req.view, selected.provider.panesPerPage);
       if ("code" in composed) return errorResult(selected.name, composed.code, composed.error);
-      if (req.expectedPlan !== this.planId(selected.name, composed, selected.session)) return errorResult(selected.name, "preview_changed", "Task membership changed since preview; refresh before enabling following.");
+      if (req.expectedPlan !== undefined && req.expectedPlan !== this.planId(selected.name, composed, selected.session)) return errorResult(selected.name, "preview_changed", "Task membership changed since preview; refresh before enabling following.");
     }
     const { enabled, maxTiles, graceMs, focusRetentionMs, pin, unpin, suppress, unsuppress, suppressionMs } = req;
     return this.following.open({ view: req.view, provider: "herdr", ...(selected.session !== undefined ? { session: selected.session } : {}) },
@@ -213,9 +224,11 @@ export class TerminalService {
     if ("ok" in selected) return selected;
     if (!selected.provider.followView) return errorResult(selected.name, "follow_unsupported", "This provider cannot follow a task.");
     let composed: ComposedView | null = null;
+    let membershipError: string | undefined;
     try {
       const current = await this.resolveComposed(selector.view, selected.provider.panesPerPage);
       if (!("code" in current)) composed = { ...current, opened: current.opened.map(p => this.viewerPane(p)) };
+      else membershipError = `${current.code}: ${current.error}${selector.view.startsWith("slice:") ? " Refresh or reopen the slice under its current unambiguous key." : ""}`;
     } catch { /* Unreadable membership is supplied as unknown, never empty. */ }
     const plan = composed && this.planId(selected.name, composed, selected.session);
     const stillCurrent = async () => {
@@ -224,7 +237,7 @@ export class TerminalService {
       return !("code" in current) && current.task?.complete === true && this.planId(selected.name,
         { ...current, opened: current.opened.map(p => this.viewerPane(p)) }, selected.session) === plan;
     };
-    const result = await selected.provider.followView(selector.view, composed, controls, stillCurrent);
+    const result = await selected.provider.followView(selector.view, composed, controls, stillCurrent, membershipError);
     return { ...result, ...(selected.session !== undefined ? { session: selected.session } : {}),
       ...(composed?.task ? { task: composed.task } : {}), viewDescriptor: { kind: controls.enabled && result.following?.enabled !== false ? "following" : "fixed", name: composed?.task?.name ?? selector.view } };
   }
@@ -357,6 +370,7 @@ export class TerminalService {
     await this.viewerMappings(provider, composed);
     const tmux = daemonTmuxServerInfo();
     return { provider: providerName, ...(session !== undefined ? { session } : {}), ...(tmux ? { tmux } : {}), view: req.view, composed, viewDescriptor: composed.viewDescriptor, ...(composed.task ? { task: composed.task } : {}),
+      capabilities: { ensureViewer: !!composed.task && !!provider.ensureViewer },
       grids: composed.pages.map(page => buildGridRoot(page, composed.columns)), planId: this.planId(providerName, composed, session), status: await provider.status() };
   }
 
@@ -381,7 +395,7 @@ export class TerminalService {
   /** Explicit owner operation: membership never grants input authority. The
    * HTTP route supplies the existing owner bearer/browser boundary. */
   async ensureViewer(req: OpenViewRequest & { member: ViewerKey; expectedPlan: string }): Promise<ViewerResult> {
-    if (!req.view.startsWith("qitem:")) return { ok: false, code: "view_required", error: "Ensure-viewer requires a qitem view." };
+    if (!/^(qitem|slice):.+/.test(req.view)) return { ok: false, code: "view_required", error: "Ensure-viewer requires an authoritative qitem or slice view." };
     const selected = this.selectProvider({ ...req, provider: req.provider ?? "herdr" });
     if ("ok" in selected) return { ok: false, code: selected.code ?? "unknown_provider", error: selected.error ?? "Provider unavailable." };
     if (!selected.provider.ensureViewer) return { ok: false, code: "viewer_unsupported", error: "This provider has no qualified ensure-viewer operation." };
@@ -462,6 +476,11 @@ export class TerminalService {
       const task = await this.deps.resolveTaskView?.(view.slice(6));
       return task ? { id: view, members: task.members, task: task.task }
         : { code: "view_not_found", error: `unknown local queue episode '${view.slice(6)}'` };
+    }
+    if (view.startsWith("slice:")) {
+      if (!this.deps.resolveScopeView) return { code: "scope_unsupported", error: "This daemon has no authoritative slice membership resolver." };
+      const scope = await this.deps.resolveScopeView(view);
+      return "code" in scope ? scope : { id: view, members: scope.members, task: scope.task };
     }
     if (view.startsWith("saved:")) {
       const saved = this.deps.viewsStore.get(view.slice(6));

@@ -35,7 +35,7 @@ import { barCells, flashActive, reducedMotion, spinnerFrame } from "./motion.js"
 import { explorerWidth, MOTION_FRAME_MS } from "./visual-layout.js";
 import type { ColorMode, Token } from "./theme.js";
 import { terminalLines } from "./terminals/terminal-model.js";
-import { detailPage, fieldLine, sectionRule, listItem, alignedRow, LABEL_W, wrapDetailLines } from "./detail.js";
+import { detailPage, fieldLine, sectionRule, listItem, alignedRow, LABEL_W, sliceWhole, wrapDetailLines } from "./detail.js";
 import { healthAgentLines, healthDetailLines, healthListLines, healthSummaryLine } from "./health/health-model.js";
 import type { Action, FleetSnapshot, LoadState, NeedsItem, RecentTransitionSnap, RowFlash, Screen, SeatEffortRead, ViewState } from "./types.js";
 
@@ -54,13 +54,13 @@ function pad(text: string | number | null | undefined, width: number): string {
   const t = String(text ?? "");
   if (t.length <= width) return t + " ".repeat(width - t.length);
   // never hard-clip mid-word: any truncation reads as an ellipsis (glance honesty)
-  return t.slice(0, Math.max(width - 1, 0)) + "…";
+  return (sliceWhole(t, Math.max(width - 1, 0)) + "…").padEnd(width);
 }
 
 function padLeft(text: string | number | null | undefined, width: number): string {
   const t = String(text ?? "");
   if (t.length <= width) return " ".repeat(width - t.length) + t;
-  return t.slice(0, Math.max(width - 1, 0)) + "…";
+  return (sliceWhole(t, Math.max(width - 1, 0)) + "…").padStart(width);
 }
 
 type Align = "left" | "right";
@@ -1271,7 +1271,8 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
                     }))),
                 {
                   label: "seats now",
-                  value: seats.join(", ") || "(none)",
+                  // Consumers are undefined when this page didn't read the seat inventory: unknown, not none.
+                  value: spec.consumers === undefined ? "not loaded in this view" : seats.join(", ") || "(none)",
                   link: { type: "cross", kind: "running", name: spec.name },
                 },
               ],
