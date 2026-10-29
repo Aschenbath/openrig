@@ -41,6 +41,8 @@ import { buildRestorePlanPreview } from "../src/domain/restore-plan-preview.js";
 import { AppliedLaunchObservationStore } from "../src/domain/applied-launch-observation-store.js";
 import { observeClaudePermission, observeCodexSandbox, observePiResourceTrust, observeOmpApprovalMode, type AppliedLaunchObservation } from "../src/domain/permission-drift.js";
 import { SeatIdentityReconciler } from "../src/domain/seat-identity-reconciler.js";
+import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
+import type { StartupOrchestrator } from "../src/domain/startup-orchestrator.js";
 import { createHash } from "node:crypto";
 import { SeatAttentionReconciler } from "../src/domain/seat-attention-reconciler.js";
 import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
@@ -2947,13 +2949,17 @@ describe("RestoreOrchestrator", () => {
     }
   });
 
-  it.each([false, true])("pod-aware missing conversation preserves a reused pane: %s", async keepPane => {
+  // A Claude seat stopped before its first message saved its launch's pre-assigned token for a
+  // conversation Claude never wrote, and never reached its prompt. The records can't tell that from a used conversation that
+  // lives elsewhere, so when Claude reports it missing the blank attempt is rolled back and the seat waits, with the one step
+  // that starts only this seat fresh for the person who knows it was never used.
+  it.each([false, true])("pod-aware missing conversation pauses with the steps that start it fresh, preserving a reused pane: %s", async keepPane => {
     const rig = rigRepo.createRig("test-rig");
     db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-claude-retry", rig.id, "Dev");
     const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code", podId: "pod-claude-retry" });
     const session = sessionRegistry.registerSession(node.id, "dev-impl@test-rig");
     sessionRegistry.updateStatus(session.id, "running");
-    sessionRegistry.updateResumeToken(session.id, "claude_id", "stale-claude-token");
+    sessionRegistry.updateResumeToken(session.id, "claude_id", "stale-claude-token", "scrape");
     db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)").run(node.id, "[]", "[]", "[]", "claude-code");
     const snap = snapshotCapture.captureSnapshot(rig.id, "test");
     if (!keepPane) sessionRegistry.updateStatus(session.id, "exited");
@@ -2989,9 +2995,16 @@ describe("RestoreOrchestrator", () => {
       expect(nodeResult!.status).toBe("awaiting-decision");
       expect(nodeResult!.error).toContain("Original session unresumable");
       expect(nodeResult!.error).toContain("The blank session was rolled back; no session is running");
-      // The one-seat command, not a whole-rig re-run, which is refused while sibling seats run.
-      expect(nodeResult!.error).toContain(`deliberately start only this seat fresh: rig seat launch '${node.logicalId}@test-rig' --fresh --reason "<why>".`);
+      expect(nodeResult!.error).toContain("OpenRig's records can't tell whether this conversation was ever used.");
+      // The one-seat commands, not a whole-rig re-run, which is refused while sibling seats run. A new pane is gone after the
+      // rollback, so the fresh launch is one step; a reused pane is left at a shell under the seat's own session name, which
+      // the fresh launch won't replace until the seat is stopped.
+      const fresh = `rig seat launch '${node.logicalId}@test-rig' --fresh --reason "<why>"`;
+      expect(nodeResult!.error).toContain(keepPane
+        ? `If you know this seat was never used, nothing is lost by starting only this seat fresh, in two steps: rig seat stop '${node.logicalId}@test-rig' --reason "<why>", then ${fresh}.`
+        : `If you know this seat was never used, nothing is lost by starting only this seat fresh, in one step: ${fresh}.`);
       expect(nodeResult!.error).not.toContain("Re-run with --fresh");
+      expect(result.warnings ?? []).not.toEqual(expect.arrayContaining([expect.stringContaining("started fresh")]));
       expect(launchHarness).toHaveBeenCalledTimes(1);
       expect(launchHarness.mock.calls[0]![1].resumeToken).toBe("stale-claude-token");
 
@@ -3006,9 +3019,120 @@ describe("RestoreOrchestrator", () => {
       if (keepPane) {
         expect(tmux.killSession).not.toHaveBeenCalled();
         expect(launchedSessions.find(row => row.id === session.id)?.status).toBe("superseded");
+
+        // The two steps, by effect, through the seat lifecycle service the commands reach: on the kept pane the fresh launch
+        // alone is refused, and once the seat is stopped it can go ahead.
+        let present = true;
+        Object.assign(tmux, {
+          probeSession: vi.fn(async () => ({ state: present ? "present" : "absent" })),
+          hasSession: vi.fn(async () => present),
+          killSession: vi.fn(async () => { present = false; return { ok: true as const }; }),
+        });
+        const seats = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux,
+          nodeLauncher: {} as NodeLauncher, startupOrchestrator: {} as StartupOrchestrator,
+          runtimeAdapters: { "claude-code": mockAdapter as unknown as RuntimeAdapter } });
+        const seatRef = `${node.logicalId}@test-rig`;
+        expect(await seats.planFresh({ seatRef, fresh: true }))
+          .toMatchObject({ launchable: false, blockers: [expect.objectContaining({ code: "unmanaged_session_collision" })] });
+        expect(await seats.stopSeat({ seatRef, reason: "never used" })).toMatchObject({ ok: true, sessionName: "dev-impl@test-rig" });
+        expect(await seats.planFresh({ seatRef, fresh: true })).toMatchObject({ launchable: true, currentOccupant: "absent" });
       }
       else expect(tmux.killSession).toHaveBeenCalled();
     }
+  });
+
+  // The pause is the same whatever the records say about use: a seat that reached its prompt, had an output observed or has a
+  // token Claude's hook reported, and one whose startup failed after typing a turn with no hook or telemetry to show it.
+  async function missingConversationRestore(setup: (node: { id: string }, sessionId: string) => void) {
+    const rig = rigRepo.createRig("test-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-claude-retry", rig.id, "Dev");
+    const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code", podId: "pod-claude-retry" });
+    const session = sessionRegistry.registerSession(node.id, "dev-impl@test-rig");
+    sessionRegistry.updateStatus(session.id, "running");
+    sessionRegistry.updateResumeToken(session.id, "claude_id", "stale-claude-token", "scrape");
+    setup(node, session.id);
+    db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)").run(node.id, "[]", "[]", "[]", "claude-code");
+    const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+    sessionRegistry.updateStatus(session.id, "exited");
+    db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
+    const launchHarness = vi.fn()
+      .mockResolvedValueOnce({ ok: false as const, error: "Claude resume failed: no conversation found for the requested session", recovery: "retry_fresh", missingConversation: true as const })
+      .mockResolvedValueOnce({ ok: true as const, resumeToken: "fresh-claude-token", resumeType: "claude_id" });
+    const mockAdapter = {
+      runtime: "claude-code",
+      listInstalled: vi.fn(async () => []),
+      project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
+      deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+      checkReady: vi.fn(async () => ({ ready: true })),
+      launchHarness,
+    };
+    const result = await createOrchestrator().launchSingleNode(rig.id, node.logicalId, { snapshotId: snap.id, adapters: { "claude-code": mockAdapter } });
+    expect(result.ok).toBe(true);
+    return { result, launchHarness, node };
+  }
+
+  it.each([
+    ["reached its prompt", (_node: { id: string }, id: string) => { sessionRegistry.updateStartupStatus(id, "ready"); }],
+    ["had an output observed", (node: { id: string }) => {
+      db.prepare("INSERT INTO context_usage (node_id, session_id, session_name, total_output_tokens) VALUES (?, ?, ?, 120)")
+        .run(node.id, "stale-claude-token", "dev-impl@test-rig");
+    }],
+    ["has a token Claude's hook reported", (_node: { id: string }, id: string) => { sessionRegistry.updateResumeToken(id, "claude_id", "stale-claude-token", "hook"); }],
+    ["failed its startup after typing a turn, with no hook or telemetry", (_node: { id: string }, id: string) => { sessionRegistry.updateStartupStatus(id, "failed"); }],
+  ])("a Claude seat that %s keeps awaiting-decision when Claude reports its conversation missing", async (_label, setup) => {
+    const { result, launchHarness, node } = await missingConversationRestore(setup);
+    const nodeResult = result.launched!.find((n) => n.nodeId === node.id);
+    expect(nodeResult!.status).toBe("awaiting-decision");
+    expect(nodeResult!.error).toContain("Original session unresumable");
+    expect(nodeResult!.error).toContain(`starting only this seat fresh, in one step: rig seat launch '${node.logicalId}@test-rig' --fresh --reason "<why>".`);
+    expect(launchHarness).toHaveBeenCalledTimes(1);
+    expect(result.warnings ?? []).not.toEqual(expect.arrayContaining([expect.stringContaining("started fresh")]));
+  });
+
+  // An operator's corrected token (rig seat set-resume-token) on the automatic replacement path is an explicit choice: when
+  // Claude reports it missing, the seat keeps awaiting-decision, and the replacement's stop isn't tried a second time.
+  it("an operator's corrected token that Claude reports missing keeps awaiting-decision on the automatic replacement path", async () => {
+    const rig = rigRepo.createRig("test-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-claude-corrected", rig.id, "Dev");
+    const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "claude-code", podId: "pod-claude-corrected" });
+    const name = "dev-impl@test-rig";
+    const live = sessionRegistry.registerSession(node.id, name);
+    sessionRegistry.updateStatus(live.id, "running");
+    sessionRegistry.updateResumeToken(live.id, "claude_id", "snapshot-token", "scrape");
+    db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)").run(node.id, "[]", "[]", "[]", "claude-code");
+    const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+    sessionRegistry.updateResumeToken(live.id, "claude_id", "corrected-token", "operator");
+    sessionRegistry.updateBinding(node.id, { tmuxSession: name, tmuxPane: "%1" });
+    let up = true;
+    const tmux = mockTmux();
+    Object.assign(tmux, {
+      hasSession: vi.fn(async () => up),
+      probeSession: vi.fn(async () => ({ state: up ? "present" : "absent" })),
+      killSession: vi.fn(async () => { up = false; return { ok: true as const }; }),
+      createSession: vi.fn(async () => { up = true; return { ok: true as const }; }),
+      startServer: vi.fn(async () => ({ ok: true as const })),
+      listSessions: vi.fn(async () => up ? [{ name }] : []),
+    });
+    const launchHarness = vi.fn()
+      .mockResolvedValueOnce({ ok: false as const, error: "Claude resume failed: no conversation found for the requested session", recovery: "retry_fresh", missingConversation: true as const })
+      .mockResolvedValueOnce({ ok: true as const, resumeToken: "fresh-claude-token", resumeType: "claude_id" });
+    const mockAdapter = {
+      runtime: "claude-code",
+      listInstalled: vi.fn(async () => []),
+      project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
+      deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+      checkReady: vi.fn(async () => ({ ready: true })),
+      launchHarness,
+    };
+    const result = await createOrchestrator({ tmux }).restore(snap.id, { adapters: { "claude-code": mockAdapter },
+      automaticReplacements: [{ nodeId: node.id, sessionId: live.id, resumeType: "claude_id", resumeToken: "corrected-token", corrected: true }] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const outcome = result.result.nodes.find((n) => n.nodeId === node.id)!;
+    expect(outcome.status).toBe("awaiting-decision");
+    expect(outcome.error).toContain("Original session unresumable");
+    expect(launchHarness).toHaveBeenCalledTimes(1);
+    expect(result.result.warnings).not.toEqual(expect.arrayContaining([expect.stringContaining("started fresh")]));
   });
 
   it("pod-aware Codex restore with resume type but missing token fails instead of launching fresh", async () => {

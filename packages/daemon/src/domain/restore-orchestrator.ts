@@ -91,7 +91,7 @@ const LAUNCH_DEPENDENCY_KINDS = new Set(["delegates_to", "spawned_by"]);
 // in the pure leaf module active-occupant.ts, shared with preview, snapshot
 // usability, and lifecycle projection. Imported and re-exported here so the
 // existing export surface and the execution call sites below are unchanged.
-import { resolveActiveSnapshotSession, activeOccupantAmbiguityError, absentSeatResumeHistory, absentSeatResumeHistoryError, freshSeatLaunchCommand } from "./active-occupant.js";
+import { resolveActiveSnapshotSession, activeOccupantAmbiguityError, absentSeatResumeHistory, absentSeatResumeHistoryError, freshSeatLaunchCommand, seatStopCommand } from "./active-occupant.js";
 import { effectiveRestorePolicy, isOrdinaryTerminalSeat, type RestoreSeatFacts, communityLaunchOnlyRestoreReason } from "./restore-policy.js";
 import { communityHarnessOf } from "./built-in-runtimes.js";
 import { communityHarnessStopsRestore } from "./community-harness-presets.js";
@@ -1473,6 +1473,11 @@ export class RestoreOrchestrator {
     return freshSeatLaunchCommand(logicalId, this.rigRepo.getRig(rigId)?.rig.name ?? data.rig.name);
   }
 
+  /** The stop a restore reason names first when the rollback kept the seat's pane, so its session is still there. */
+  private stopSeatCommand(rigId: string, data: SnapshotData, logicalId: string): string {
+    return seatStopCommand(logicalId, this.rigRepo.getRig(rigId)?.rig.name ?? data.rig.name);
+  }
+
   /** Replay the preflight-selected source after launch, keeping native identity and startup checks. */
   private async postLaunchRestore(
     entry: PlanEntry,
@@ -1961,11 +1966,16 @@ export class RestoreOrchestrator {
               // with its pane and binding kept, so its output can still be read.
               if (startupResult.missingConversation) {
                 if (!await rollbackOwnBlank()) return changedDuringRollback();
+                // The records can't tell a seat that was never used from one whose conversation is elsewhere (a moved
+                // account or folder), so the seat waits for the person who knows, with the steps that start it fresh. A kept
+                // pane leaves the seat's own tmux session at a shell, which the fresh launch won't replace until it's stopped.
+                const fresh = this.freshSeatCommand(rigId, data, node.logicalId);
+                const steps = opts?.keepPane ? `in two steps: ${this.stopSeatCommand(rigId, data, node.logicalId)}, then ${fresh}` : `in one step: ${fresh}`;
                 return {
                   nodeId: node.id,
                   logicalId: node.logicalId,
                   status: "awaiting-decision",
-                  error: `Original session unresumable: ${startupResult.errors.join("; ")}. The blank session was rolled back; no session is running. Restore the original session manually, or deliberately start only this seat fresh: ${this.freshSeatCommand(rigId, data, node.logicalId)}.`,
+                  error: `Original session unresumable: ${startupResult.errors.join("; ")}. The blank session was rolled back; no session is running. OpenRig's records can't tell whether this conversation was ever used. If you know this seat was never used, nothing is lost by starting only this seat fresh, ${steps}. Otherwise restore the original session manually.`,
                 };
               }
               return {
