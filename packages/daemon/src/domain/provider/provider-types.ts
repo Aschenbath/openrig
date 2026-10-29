@@ -134,7 +134,7 @@ export type PrecheckReason =
   | "invalid_token_reference" // the label or the token file's path can't be a seat's reference
   | "token_file_unusable" // the token file wouldn't give Claude a token: missing, empty, not a file or unreadable
   | "credential_outranks_token" // a cloud provider, API key, auth token or apiKeyHelper would win over the seat's token
-  | "seat_not_running"; // nothing to relaunch: launch the seat first
+  | "conversation_not_resumable"; // a stopped seat's next launch wouldn't resume its conversation
 
 /** A seat on the same Codex home, as the in-place restart reports it (its `PeerReport`). Declared here rather than
  *  imported, so the provider types don't import the restart module and its tmux dependencies. */
