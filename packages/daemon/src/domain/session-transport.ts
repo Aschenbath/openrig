@@ -2613,7 +2613,7 @@ export class SessionTransport {
           sessionName,
           sent: false,
           reason: "target_runtime_unverified",
-          error: `Refused: '${sessionName}' reports ${unverified} as the foreground command, but OpenRig could not verify its expected ${runtime} agent in the bound pane. The agent may still be running behind a wrapper. No text was sent.`,
+          error: `Refused: '${sessionName}' reports ${unverified} as the foreground command, but OpenRig could not verify its expected ${runtime} agent in the bound pane. The agent may still be running behind a wrapper. No text was sent. Delivery depends on verifying the bound pane and its input-owning agent; a live process alone is insufficient. Check what is running in the pane with rig capture <session>; if the agent has exited to its shell, start it again before resending.`,
         } };
       }
     }
@@ -2785,7 +2785,7 @@ export class SessionTransport {
         sessionName,
         sent: false,
         reason: "target_runtime_unverified",
-        error: `Refused: '${sessionName}' reports ${unverifiedShell} as the foreground command, but OpenRig could not verify its expected ${runtime} agent in the bound pane. The agent may still be running behind a wrapper. No text was sent.`,
+        error: `Refused: '${sessionName}' reports ${unverifiedShell} as the foreground command, but OpenRig could not verify its expected ${runtime} agent in the bound pane. The agent may still be running behind a wrapper. No text was sent. Delivery depends on verifying the bound pane and its input-owning agent; a live process alone is insufficient. Check what is running in the pane with rig capture <session>; if the agent has exited to its shell, start it again before resending.`,
       });
     }
 
