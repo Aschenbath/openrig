@@ -1507,6 +1507,8 @@ export interface ExpansionPodFragment {
   label: string;
   summary?: string;
   members: Array<{
+    /** Canonical RigSpec member fields pass through unchanged; the schema validates them. */
+    [field: string]: unknown;
     id: string;
     runtime: string;
     agentRef?: string;
