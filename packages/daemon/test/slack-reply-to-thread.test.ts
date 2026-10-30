@@ -399,6 +399,132 @@ describe("update --reply-to an earlier item's thread (#96)", () => {
         expect(repo.getById(ask.qitemId)?.state).toBe("blocked");
         expect(Object.keys(repo.getById(ask.qitemId)?.humanAnswers ?? {})).toEqual([]);
       });
+
+      // A typed reply in the ask's thread, from the person it asked.
+      const typed = (text: string, ts: string) => inboundSocket.onmessage?.({ data: JSON.stringify({
+        envelope_id: `e-${ts}`, type: "events_api", payload: { event: {
+          type: "message", user: registry.entities[0]!.connectorBindings[0]!.handle, text, ts, thread_ts: "1.1", channel: "C-TEST" } },
+      }) });
+      const answerRows = (qitemId: string) => db.prepare("SELECT qitem_id FROM queue_items WHERE reply_to = ? AND destination_session = 'author@rig'").all(qitemId);
+      // The rows the asking seat receives as an answer (tagged human-answer), with their words.
+      const humanAnswerRows = (qitemId: string) => db.prepare(`SELECT qitem_id, body FROM queue_items WHERE reply_to = ?
+        AND destination_session = 'author@rig' AND EXISTS (SELECT 1 FROM json_each(queue_items.tags) WHERE value = 'human-answer')`)
+        .all(qitemId) as Array<{ qitem_id: string; body: string }>;
+      const typedAnswer = (text: string, unansweredCount: number) => ({ kind: "typed-reply", text, placement: "first-unanswered", unansweredCount });
+
+      it("records a typed reply as the answer, resumes the ask once and hands it back once as the answer, even when Slack redelivers", async () => {
+        const ask = await parkedAsk();
+        typed("large", "990.1");
+        await vi.waitFor(() => expect(repo.getById(ask.qitemId)?.state).toBe("in-progress"));
+        expect(repo.getById(ask.qitemId)?.humanAnswers).toEqual({ q1: typedAnswer("large", 1) });
+        expect(humanAnswerRows(ask.qitemId)).toHaveLength(1);
+        expect(resolvedCount(ask.qitemId)).toBe(1);
+
+        typed("large", "990.1"); // Slack redelivers the same event
+        typed("small", "992.1"); // a later reply once the question is answered stays a message
+        await vi.waitFor(() => expect(answerRows(ask.qitemId)).toHaveLength(2));
+        expect(resolvedCount(ask.qitemId)).toBe(1);
+        expect(repo.getById(ask.qitemId)?.humanAnswers).toEqual({ q1: typedAnswer("large", 1) });
+        expect(humanAnswerRows(ask.qitemId)).toHaveLength(1);
+      });
+
+      it("keeps a typed reply from before its current question posted as a message: the ask stays parked, with no answer", async () => {
+        const ask = await parkedAsk();
+        typed("large", "1.5");
+        await vi.waitFor(() => expect(answerRows(ask.qitemId)).toHaveLength(1));
+        expect(repo.getById(ask.qitemId)?.state).toBe("blocked");
+        expect(Object.keys(repo.getById(ask.qitemId)?.humanAnswers ?? {})).toEqual([]);
+        expect(humanAnswerRows(ask.qitemId)).toHaveLength(0);
+      });
+
+      it("takes the current reply, not an earlier message, as the answer to the current question", async () => {
+        const ask = await parkedAsk();
+        typed("small", "1.5"); // before the current question: a message
+        await vi.waitFor(() => expect(answerRows(ask.qitemId)).toHaveLength(1));
+        typed("large", "990.1");
+        await vi.waitFor(() => expect(repo.getById(ask.qitemId)?.state).toBe("in-progress"));
+        expect(repo.getById(ask.qitemId)?.humanAnswers).toEqual({ q1: typedAnswer("large", 1) });
+        expect(humanAnswerRows(ask.qitemId).map((row) => row.body.includes("large"))).toEqual([true]);
+        expect(resolvedCount(ask.qitemId)).toBe(1);
+      });
+
+      it("answers a re-park with the person's new reply, not their answer to the earlier question", async () => {
+        const ask = await parkedAsk();
+        typed("large", "990.1");
+        await vi.waitFor(() => expect(repo.getById(ask.qitemId)?.state).toBe("in-progress"));
+        repo.update({ qitemId: ask.qitemId, actorSession: "author@rig", state: "blocked", blockedOn: human, summary: "And the users?",
+          evidenceRef: "/private/proof.md", transitionNote: "parked again for the second question" });
+        await postPendingNotice(ask.qitemId);
+        typed("yes", "995.1");
+        await vi.waitFor(() => expect(repo.getById(ask.qitemId)?.state).toBe("in-progress"));
+        expect(repo.getById(ask.qitemId)?.humanAnswers).toEqual({ q1: typedAnswer("large", 1), q2: typedAnswer("yes", 0) });
+        expect(humanAnswerRows(ask.qitemId)).toHaveLength(2);
+        expect(humanAnswerRows(ask.qitemId).filter((row) => row.body.includes("yes"))).toHaveLength(1);
+        expect(resolvedCount(ask.qitemId)).toBe(2);
+        expect(posts.some((post) => String(post.text ?? "").startsWith("Already answered"))).toBe(false);
+      });
+
+      it("stores the answer once when the resume is interrupted after it commits, and a redelivery finishes without a second return", async () => {
+        const act = MissionControlWriteContract.prototype.act;
+        let interrupt = true;
+        const spy = vi.spyOn(MissionControlWriteContract.prototype, "act").mockImplementation(async function (this: MissionControlWriteContract, input) {
+          const result = await act.call(this, input);
+          if (input.verb === "resolve" && interrupt) { interrupt = false; throw new Error("stopped after the resolve committed"); }
+          return result;
+        });
+        try {
+          const ask = await parkedAsk();
+          typed("large", "990.1");
+          await vi.waitFor(() => expect(repo.getById(ask.qitemId)?.state).toBe("in-progress"));
+          expect(interrupt).toBe(false);
+          typed("large", "990.1"); // the same event again, after the interrupted attempt
+          await new Promise((r) => setTimeout(r, 100));
+          expect(repo.getById(ask.qitemId)?.humanAnswers).toEqual({ q1: typedAnswer("large", 1) });
+          expect(resolvedCount(ask.qitemId)).toBe(1);
+          expect(answerRows(ask.qitemId)).toHaveLength(1);
+        } finally { spy.mockRestore(); }
+      });
+
+      // The click path keeps its own rules until its follow-up: only a typed reply stores its words as the answer.
+      it("stores no earlier typed answer under a re-park's question when the person clicks", async () => {
+        const ask = await parkedAsk();
+        typed("large", "990.1");
+        await vi.waitFor(() => expect(repo.getById(ask.qitemId)?.state).toBe("in-progress"));
+        repo.update({ qitemId: ask.qitemId, actorSession: "author@rig", state: "blocked", blockedOn: human, summary: "And the users?",
+          evidenceRef: "/private/proof.md", transitionNote: "parked again for the second question" });
+        await postPendingNotice(ask.qitemId);
+        click("q2", "yes", "996.1");
+        await vi.waitFor(() => expect(resolvedCount(ask.qitemId)).toBe(2));
+        expect(repo.getById(ask.qitemId)?.humanAnswers?.q2).toBeUndefined();
+      });
+
+      it("returns nothing again when a re-park's interrupted answer is replayed after the ask closes", async () => {
+        const ask = await parkedAsk();
+        typed("large", "990.1");
+        await vi.waitFor(() => expect(repo.getById(ask.qitemId)?.state).toBe("in-progress"));
+        repo.update({ qitemId: ask.qitemId, actorSession: "author@rig", state: "blocked", blockedOn: human, summary: "And the users?",
+          evidenceRef: "/private/proof.md", transitionNote: "parked again for the second question" });
+        await postPendingNotice(ask.qitemId);
+        const act = MissionControlWriteContract.prototype.act;
+        let interrupt = true;
+        const spy = vi.spyOn(MissionControlWriteContract.prototype, "act").mockImplementation(async function (this: MissionControlWriteContract, input) {
+          const result = await act.call(this, input);
+          if (input.verb === "resolve" && interrupt) { interrupt = false; throw new Error("stopped after the resolve committed"); }
+          return result;
+        });
+        try {
+          typed("yes", "995.1");
+          await vi.waitFor(() => expect(repo.getById(ask.qitemId)?.state).toBe("in-progress"));
+          expect(interrupt).toBe(false);
+          repo.update({ qitemId: ask.qitemId, actorSession: human, state: "done", closureReason: "no-follow-on", transitionNote: "decided" });
+          typed("yes", "995.1"); // the interrupted event again, after the ask closed
+          await new Promise((r) => setTimeout(r, 100));
+          expect(answerRows(ask.qitemId)).toHaveLength(2);
+          expect(humanAnswerRows(ask.qitemId)).toHaveLength(2);
+          expect(resolvedCount(ask.qitemId)).toBe(2);
+          expect(repo.getById(ask.qitemId)?.humanAnswers).toEqual({ q1: typedAnswer("large", 1), q2: typedAnswer("yes", 0) });
+        } finally { spy.mockRestore(); }
+      });
     });
 
     /** With `routed` false, the reaction must make no row: a routed one lands well within the wait (#2233). */
