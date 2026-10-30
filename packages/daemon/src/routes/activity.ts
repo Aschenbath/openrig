@@ -1,13 +1,13 @@
 import { runtimeSwitchActivityRole } from "./runtime-switch-custody.js";
-import { physicalSessionName, sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "../domain/session-registry.js";
+import { SessionRegistry, physicalSessionName, sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "../domain/session-registry.js";
 import { existsSync } from "node:fs";
 import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { AgentActivityStore } from "../domain/agent-activity-store.js";
 import { hookEventState, isRunnerExit } from "../domain/agent-activity-store.js";
-import type { SessionRegistry } from "../domain/session-registry.js";
 import type { EventBus } from "../domain/event-bus.js";
 import { verifyStartupProof } from "../domain/startup-proof.js";
+import { ActivityGrantStore, grantGeneration, type ActivityGrant } from "../domain/activity-grants.js";
 import type { ActivityEvidence, EvidenceRoute } from "../domain/activity-taxonomy.js";
 import type { AgentActivity } from "../domain/types.js";
 import * as parkedQuery from "../domain/parked-query.js";
@@ -110,6 +110,47 @@ function nextHookSeq(key: string): number {
 
 export const activityRoutes = new Hono();
 
+/** A seat activity grant's post, bound to the grant. A post that names another seat, or claims a generation the grant
+ *  wasn't issued for, is refused; so is a grant whose occupant was replaced (stale) or hasn't registered yet (pending).
+ *  A refusal records nothing, so a missing event stays unknown. Otherwise the seat and generation come from the grant. */
+function bindToGrant(c: Context, store: AgentActivityStore, grant: ActivityGrant, body: Record<string, unknown>):
+  { body: Record<string, unknown> } | { refused: Response } {
+  const refuse = (status: 401 | 403 | 409 | 503, code: string, error: string) => ({ refused: c.json({ ok: false, code, error }, status) });
+  // Read the grant again: it may have been revoked or reissued while the body arrived. Nothing is awaited from here to the
+  // write, so this is the grant's state when the post takes effect.
+  if (new ActivityGrantStore(store.db).get(grant.grantId)?.revokedAt !== null) {
+    return refuse(401, "activity_grant_revoked", "This activity grant was revoked; nothing was recorded.");
+  }
+  const claimedNode = stringOrNull(body.nodeId);
+  const claimedSession = stringOrNull(body.sessionName);
+  if ((claimedNode && claimedNode !== grant.nodeId)
+    || (claimedSession && store.resolveSession({ sessionName: claimedSession })?.nodeId !== grant.nodeId)) {
+    return refuse(403, "activity_grant_wrong_seat", "This activity grant speaks only for its own seat; nothing was recorded.");
+  }
+  const claimedGeneration = stringOrNull(body.generation);
+  if (claimedGeneration && claimedGeneration !== grant.generation) {
+    return refuse(409, "activity_grant_stale", "This post claims a launch generation its grant wasn't issued for; nothing was recorded.");
+  }
+  const registry = (c.get("sessionRegistry" as never) as SessionRegistry | undefined) ?? new SessionRegistry(store.db);
+  let standing: ReturnType<typeof grantGeneration>;
+  try {
+    standing = grantGeneration(grant, {
+      current: (nodeId) => registry.currentOccupantTenure(nodeId)?.generationUuid ?? null,
+      registered: (nodeId, generation) => registry.isOccupantGenerationRegistered(nodeId, generation),
+    });
+  } catch {
+    return refuse(503, "generation_resolver_error", "Occupant generation is unavailable.");
+  }
+  if (standing === "stale") {
+    return refuse(409, "activity_grant_stale", "This activity grant's launch generation no longer occupies the seat; nothing was recorded.");
+  }
+  if (standing === "pending") {
+    return refuse(409, "activity_grant_pending", "This activity grant's launch hasn't registered its occupant yet; nothing was recorded.");
+  }
+  const sessionName = claimedSession ?? store.resolveSession({ nodeId: grant.nodeId })?.sessionName ?? null;
+  return { body: { ...body, nodeId: grant.nodeId, generation: grant.generation, ...(sessionName ? { sessionName } : {}) } };
+}
+
 /** The shared front of the Pi usage routes: configuration, the local hook token, a JSON object body, and the
  *  managed Pi seat it names. Returns the response to send on any failure. */
 async function piUsageRequest(c: Context, what: string, needs: (db: SessionRegistry["db"]) => boolean):
@@ -184,11 +225,13 @@ activityRoutes.post("/pi-usage-charges", async (c) => {
   return c.json({ ok: true, ...result, rejected: charges.length - valid.length });
 });
 
-activityRoutes.post("/hooks", async (c) => {
+/** The hook ingress. The main routes accept the install-wide token or a seat activity grant; the guest router accepts a
+ *  grant only (`installTokenAccepted` false), so a guest-only listener never takes the token that speaks for every seat. */
+async function postHook(c: Context, installTokenAccepted: boolean): Promise<Response> {
   const store = c.get("agentActivityStore" as never) as AgentActivityStore | undefined;
-  const expectedToken = c.get("activityHookToken" as never) as string | undefined;
+  const expectedToken = installTokenAccepted ? c.get("activityHookToken" as never) as string | undefined : undefined;
 
-  if (!store || !expectedToken) {
+  if (!store || (installTokenAccepted && !expectedToken)) {
     return c.json({
       ok: false,
       code: "activity_hook_unconfigured",
@@ -199,12 +242,22 @@ activityRoutes.post("/hooks", async (c) => {
   const authHeader = c.req.header("authorization");
   const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : null;
   const headerToken = c.req.header("x-openrig-activity-token") ?? null;
-  if (bearerToken !== expectedToken && headerToken !== expectedToken) {
-    return c.json({
-      ok: false,
-      code: "activity_hook_unauthorized",
-      error: "Agent activity hook ingestion requires the configured local hook token.",
-    }, 401);
+  // The principal comes first. The install-wide token speaks for every seat, as before. A seat activity grant speaks
+  // only for its own seat and launch generation, which bindToGrant checks before anything the post claims is accepted.
+  let grant: ActivityGrant | null = null;
+  if (!expectedToken || (bearerToken !== expectedToken && headerToken !== expectedToken)) {
+    const grants = new ActivityGrantStore(store.db);
+    grant = grants.authenticate(bearerToken) ?? grants.authenticate(headerToken);
+    if (!grant) {
+      return c.json({
+        ok: false,
+        code: "activity_hook_unauthorized",
+        error: "Agent activity hook ingestion requires the configured local hook token.",
+      }, 401);
+    }
+    if (grant.revokedAt) {
+      return c.json({ ok: false, code: "activity_grant_revoked", error: "This activity grant was revoked; nothing was recorded." }, 401);
+    }
   }
 
   let body: Record<string, unknown>;
@@ -213,8 +266,16 @@ activityRoutes.post("/hooks", async (c) => {
   } catch {
     return c.json({ ok: false, code: "invalid_json", error: "Request body must be JSON." }, 400);
   }
+  if (grant && (body === null || typeof body !== "object" || Array.isArray(body))) {
+    return c.json({ ok: false, code: "invalid_json", error: "Request body must be a JSON object." }, 400);
+  }
 
   if (typeof body.sessionName === "string") body = { ...body, sessionName: physicalSessionName(store.db, body.sessionName) };
+  if (grant) {
+    const bound = bindToGrant(c, store, grant, body);
+    if ("refused" in bound) return bound.refused;
+    body = bound.body;
+  }
 
   // Slice 16: a runtime switch's staged successor (before commit) and retired predecessor (after) don't speak for the
   // seat. The staged successor's native identity is kept on the switch record, which the commit applies.
@@ -379,6 +440,11 @@ activityRoutes.post("/hooks", async (c) => {
         launchedProcess = await claudeHookFromLaunchedProcess({ target, tmux, launchToken: armed, hookPid,
           listProcesses: c.get("listProcesses" as never) as NativeProcessLister | undefined });
       }
+    }
+    // A grant's post is decided again after that wait, as it was after the body arrived.
+    if (grant) {
+      const still = bindToGrant(c, store, grant, body);
+      if ("refused" in still) return still.refused;
     }
     // #1524 (a), Codex only, synchronous with the write below (no await between them):
     // - a known earlier occupant's hook (its generation is registered for this node and isn't the current one)
@@ -569,7 +635,15 @@ activityRoutes.post("/hooks", async (c) => {
   }
 
   return c.json({ ok: true, activity: result.activity });
-});
+}
+
+activityRoutes.post("/hooks", (c) => postHook(c, true));
+
+/** The guest-facing activity ingress: the hook post alone, for a seat activity grant alone. A guest-only listener mounts
+ *  this, never activityRoutes, whose other routes (events, parked, Pi usage) don't check a grant, and never the daemon's
+ *  main listener, whose other routes trust any caller. */
+export const guestActivityRoutes = new Hono();
+guestActivityRoutes.post("/hooks", (c) => postHook(c, false));
 
 // ── S19 AM-R18 — the push substrate: GET /api/activity/events (SSE) ──
 // Desk-accepted shape (ruling row): CHANGE NOTIFICATIONS ONLY —
