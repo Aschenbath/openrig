@@ -1542,6 +1542,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     transcriptStore,
     sessionTransport: (() => {
       const t = new SessionTransport({
+        contextUsageStore,
         db,
         rigRepo,
         sessionRegistry,
