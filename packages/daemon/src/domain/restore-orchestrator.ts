@@ -91,7 +91,7 @@ const LAUNCH_DEPENDENCY_KINDS = new Set(["delegates_to", "spawned_by"]);
 // in the pure leaf module active-occupant.ts, shared with preview, snapshot
 // usability, and lifecycle projection. Imported and re-exported here so the
 // existing export surface and the execution call sites below are unchanged.
-import { resolveActiveSnapshotSession, activeOccupantAmbiguityError, absentSeatResumeHistory, absentSeatResumeHistoryError, freshSeatLaunchCommand } from "./active-occupant.js";
+import { resolveActiveSnapshotSession, activeOccupantAmbiguityError, absentSeatResumeHistory, absentSeatResumeHistoryError, freshSeatLaunchCommand, seatStopCommand } from "./active-occupant.js";
 import { effectiveRestorePolicy, isOrdinaryTerminalSeat, type RestoreSeatFacts, communityLaunchOnlyRestoreReason } from "./restore-policy.js";
 import { communityHarnessOf } from "./built-in-runtimes.js";
 import { communityHarnessStopsRestore } from "./community-harness-presets.js";
@@ -151,6 +151,20 @@ export function launchStatusIsRunning(status: string): boolean {
 /** The facts effectiveRestorePolicy reads for one saved seat: its saved runtime, the runtime it has now, and its recorded sessions. */
 function seatFacts(data: SnapshotData, nodeId: string, savedRuntime: string | null, currentRuntime: string | null): RestoreSeatFacts {
   return { savedRuntime, currentRuntime, recordedSessions: data.sessions.filter((session) => session.nodeId === nodeId) };
+}
+
+/** Whether an automatic periodic carry is still the seat's current resumable session when `rig launch` uses it: capture-time
+ *  eligibility can have expired without another tick, and a conversation a fresh launch retired is never resumed. */
+export function periodicCarryIsCurrent(db: Database.Database, rigSessions: readonly Session[], rigId: string, nodeId: string,
+  carried: Session, liveRuntime: string | null | undefined, savedRuntime: string | null | undefined): boolean {
+  const newest = rigSessions.filter(row => row.nodeId === nodeId)
+    .reduce<Session | null>((latest, row) => !latest || row.id > latest.id ? row : latest, null);
+  const fresh = readFreshOccupantRelations(db, rigId);
+  return !(!absentSeatResumeHistory([carried], nodeId) || !newest || newest.id !== carried.id
+    || newest.restorePolicy !== "resume_if_possible" || newest.status === "superseded"
+    || liveRuntime !== savedRuntime
+    || (!!newest.resumeToken?.trim() && (newest.resumeToken !== carried.resumeToken || newest.resumeType !== carried.resumeType))
+    || (Object.hasOwn(fresh, nodeId) && fresh[nodeId] !== carried.id));
 }
 
 /** What `rig launch` does for this node from this snapshot without --fresh, read as the restore path reads it: the
@@ -1098,14 +1112,7 @@ export class RestoreOrchestrator {
       // The launch lifecycle lease is held here, before any stale-state cleanup
       // or destination registration. Capture-time eligibility can have expired
       // without another tick; never resume a conversation a fresh launch retired.
-      const newest = this.sessionRegistry.getSessionsForRig(rigId).filter(row => row.nodeId === nodeId)
-        .reduce<Session | null>((latest, row) => !latest || row.id > latest.id ? row : latest, null);
-      const fresh = readFreshOccupantRelations(this.db, rigId);
-      if (!absentSeatResumeHistory([carried], nodeId) || !newest || newest.id !== carried.id
-        || newest.restorePolicy !== "resume_if_possible" || newest.status === "superseded"
-        || liveNode?.runtime !== node.runtime
-        || (!!newest.resumeToken?.trim() && (newest.resumeToken !== carried.resumeToken || newest.resumeType !== carried.resumeType))
-        || (Object.hasOwn(fresh, nodeId) && fresh[nodeId] !== carried.id)) {
+      if (!periodicCarryIsCurrent(this.db, this.sessionRegistry.getSessionsForRig(rigId), rigId, nodeId, carried, liveNode?.runtime, node.runtime)) {
         return { nodeId, logicalId: node.logicalId, status: "awaiting-decision",
           error: "The periodic resume source is no longer this seat's current resumable session. No session was started. Review its history or deliberately start this seat fresh." };
       }
@@ -1464,6 +1471,11 @@ export class RestoreOrchestrator {
   /** The one-seat command a restore reason names for a seat left awaiting a decision. */
   private freshSeatCommand(rigId: string, data: SnapshotData, logicalId: string): string {
     return freshSeatLaunchCommand(logicalId, this.rigRepo.getRig(rigId)?.rig.name ?? data.rig.name);
+  }
+
+  /** The stop a restore reason names first when the rollback kept the seat's pane, so its session is still there. */
+  private stopSeatCommand(rigId: string, data: SnapshotData, logicalId: string): string {
+    return seatStopCommand(logicalId, this.rigRepo.getRig(rigId)?.rig.name ?? data.rig.name);
   }
 
   /** Replay the preflight-selected source after launch, keeping native identity and startup checks. */
@@ -1954,11 +1966,16 @@ export class RestoreOrchestrator {
               // with its pane and binding kept, so its output can still be read.
               if (startupResult.missingConversation) {
                 if (!await rollbackOwnBlank()) return changedDuringRollback();
+                // The records can't tell a seat that was never used from one whose conversation is elsewhere (a moved
+                // account or folder), so the seat waits for the person who knows, with the steps that start it fresh. A kept
+                // pane leaves the seat's own tmux session at a shell, which the fresh launch won't replace until it's stopped.
+                const fresh = this.freshSeatCommand(rigId, data, node.logicalId);
+                const steps = opts?.keepPane ? `in two steps: ${this.stopSeatCommand(rigId, data, node.logicalId)}, then ${fresh}` : `in one step: ${fresh}`;
                 return {
                   nodeId: node.id,
                   logicalId: node.logicalId,
                   status: "awaiting-decision",
-                  error: `Original session unresumable: ${startupResult.errors.join("; ")}. The blank session was rolled back; no session is running. Restore the original session manually, or deliberately start only this seat fresh: ${this.freshSeatCommand(rigId, data, node.logicalId)}.`,
+                  error: `Original session unresumable: ${startupResult.errors.join("; ")}. The blank session was rolled back; no session is running. OpenRig's records can't tell whether this conversation was ever used. If you know this seat was never used, nothing is lost by starting only this seat fresh, ${steps}. Otherwise restore the original session manually.`,
                 };
               }
               return {

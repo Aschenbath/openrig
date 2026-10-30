@@ -1,3 +1,7 @@
+import { EnvironmentStartup } from "./domain/environment-startup.js";
+import { EnvironmentPlatform } from "./domain/environment-platform.js";
+import { OpenShellDriver } from "./adapters/openshell-driver.js";
+import { isBoundTerminalSeat } from "./domain/terminal-seat.js";
 import { seatAccountHome, effectiveRuntimeHome, type HomeRuntime } from "./domain/seat-runtime-home.js";
 import { reportRestoreDeliveryFailure } from "./domain/compaction-restore-notice.js";
 import { ClaudeTokenUsage, claudeTokenUsageReader } from "./domain/provider/claude-token-usage.js";
@@ -206,6 +210,8 @@ import {
 } from "./openrig-compat.js";
 
 interface DaemonOptions {
+  /** Explicit confined listener; absent means guest activity is unavailable. */
+  guestActivityPort?: number;
   dbPath?: string;
   /** S20 — the effective bind plan (mode/hosts/tailscaleDetected/ignoredRoutingHost),
    *  computed once in index.ts and exposed on /healthz so adoption gates verify
@@ -1156,11 +1162,26 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     },
   );
 
+  const environmentDriver = new OpenShellDriver();
+  const environmentPlatform = new EnvironmentPlatform(db, environmentDriver);
+  const checkGuestActivityEndpoint = (origin: string) => {
+    const url = new URL(origin);
+    if (!opts?.guestActivityPort || Number(url.port || (url.protocol === "https:" ? 443 : 80)) !== opts.guestActivityPort)
+      throw new Error("The guest activity origin must name the configured guest-only listener; the host API is not a guest endpoint");
+  };
+  const environmentStartup = new EnvironmentStartup(environmentPlatform, nodePath.join(OPENRIG_HOME, "state", "environment-staging"), async input => {
+    // The one shared P6 implementation owns token issuance and ingress validation.
+    const { ActivityGrantStore, guestActivityEnv } = await import("./domain/activity-grants.js");
+    checkGuestActivityEndpoint(input.guestBaseUrl);
+    const grant = new ActivityGrantStore(db).issue({ nodeId: input.nodeId, generation: input.generation, issuedBy: input.seat });
+    return { grantId: grant.grantId, env: guestActivityEnv(grant, input.seat, input.guestBaseUrl) };
+  }, checkGuestActivityEndpoint);
+
   const podInstantiator = new PodRigInstantiator({
     db, rigRepo, podRepo,
     sessionRegistry, eventBus, nodeLauncher, startupOrchestrator,
     fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), exists: (p: string) => fs.existsSync(p) },
-    adapters: withCommunityHarnesses({ "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() }, { tmux: tmuxAdapter, seatLaunchEnvironment }),
+    adapters: withCommunityHarnesses({ "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() }, { tmux: tmuxAdapter, seatLaunchEnvironment, environmentStartup }),
     tmuxAdapter,
     agentImageLibrary,
     continuityPolicyMaterializer,
@@ -1224,7 +1245,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     "omp": ompAdapter,
     "stub": stubAdapter,
     "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter(),
-  }, { tmux: tmuxAdapter, seatLaunchEnvironment });
+  }, { tmux: tmuxAdapter, seatLaunchEnvironment, environmentStartup });
   let kernelBootTracker: import("./domain/kernel-boot-tracker.js").KernelBootTracker | undefined;
   try {
     const { bootKernelIfNeeded } = await import("./domain/kernel-boot.js");
@@ -1429,6 +1450,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
 
 
   const deps: AppDeps = {
+    environmentDriver,
+    environmentArtifactRoot: nodePath.join(runtimeSettings.workspaceRoot, "artifacts", "environments"),
     databaseWarnings,
     rigRepo,
     sessionRegistry,
@@ -2137,22 +2160,6 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         // No node carries that pod namespace → an unknown pod (not an empty view).
         return rows.length > 0 ? rows : null;
       },
-      listScopeSeats: (scope) => {
-        const gatherer = deps.reviewGatherer;
-        if (!gatherer) return null;
-        // N1 (dev44-driver2 pre-guard): cast to the real AgentsScope union (not
-        // `never`) so the compile guard on the scope grammar is restored.
-        const band = gatherer.composeAgents(scope as import("./domain/review/types.js").AgentsScope);
-        if (!band) return null;
-        const wanted = new Set(band.rows.map((r) => r.sessionName));
-        const rows: ReturnType<typeof toLiveSeatRow>[] = [];
-        for (const rig of rigRepo.listRigs()) {
-          for (const e of getNodeInventory(db, rig.id)) {
-            if (e.canonicalSessionName && wanted.has(e.canonicalSessionName)) rows.push(toLiveSeatRow(e));
-          }
-        }
-        return rows;
-      },
       resolveTaskView: (qitemId) => readTaskTerminalView(db, qitemId, (address) =>
         resolveLocalTaskSeat(db, address, getSelfHostId(), sessionRegistry.resolveAddress(address)?.nodeId)),
       resolveScopeView: view => scopeTasks?.resolve(view)
@@ -2272,6 +2279,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       eventBus,
       deliver: makeWatchdogDeliver({
         sessionTransport,
+        isTerminalSeat: (sessionName) => isBoundTerminalSeat(db, sessionName),
         hasPendingPostCompactStage: (sessionName) => deps.compactionEnforcer?.hasPendingPostCompactStage(sessionName) ?? false,
         createContinuityAction: (action) => createContinuityCutoverBaton(action, queueRepoInstance).then(() => {}),
       }),
@@ -2366,6 +2374,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
               queueRepoInstance.recordNudgeAttempt(qitemId, result),
             listOpenIds: (destinationSession: string) =>
               queueRepoInstance.listOpenObligations(destinationSession, 500).map((r) => r.qitemId),
+          },
+          isTerminalSeat: (sessionName) => isBoundTerminalSeat(db, sessionName),
+          retentionState: (sessionName) => {
+            const target = resolveGuardTarget(db, sessionName);
+            if (!target) return null;
+            const guard = deliveryGuard.configuration(target.nodeId);
+            return JSON.stringify([target.nodeId, guard.desired.revision, guard.effective.revision, outboxHandlerInstance.retentionUsage(target.nodeId)]);
           },
           occupantGeneration: (sessionName) => sessionRegistry.currentOccupantGenerationForSession(sessionName),
           // The enforcer is constructed below; read its shared instance at evaluation time.

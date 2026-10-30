@@ -418,10 +418,12 @@ describe("SeatHandoverService", () => {
     ["default source", undefined],
     ["fresh source", "fresh"],
     ["rebuild source", "rebuild"],
-    ["fork source", "fork:abc123"],
+    ["fork source", "fork:dev-impl@seat-rig"],
     ["discovered source", "discovered:some-id"],
   ])("keeps dry-run mutation-free across %s (AC-1)", async (_label, source) => {
-    seedSeat();
+    const { sessionId } = seedSeat();
+    // A fork source is resolved in the dry run too, so it names a seat with a native conversation id.
+    if (source?.startsWith("fork:")) db.prepare("UPDATE sessions SET resume_token = ? WHERE id = ?").run("codex-thread-1", sessionId);
     const before = durableRows();
 
     const result = await service.handover({
@@ -891,14 +893,27 @@ describe("SeatHandoverService", () => {
     expect(durableRows()).toBe(before);
   });
 
-  it("B3: still returns a dry-run PLAN for fork/rebuild (planning is not blocked)", async () => {
-    seedSeat({ runtime: "codex" });
+  it("B3: still returns a dry-run PLAN for a fork source the real run can resolve (planning is not blocked)", async () => {
+    const { sessionId } = seedSeat({ runtime: "codex" });
+    db.prepare("UPDATE sessions SET resume_token = ? WHERE id = ?").run("codex-thread-1", sessionId);
     const before = durableRows();
 
-    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fork:abc", dryRun: true });
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fork:dev-impl@seat-rig", dryRun: true });
 
     expect(result.ok).toBe(true);
     expect(result.ok && "plan" in result && result.plan.willMutate).toBe(false);
+    expect(durableRows()).toBe(before);
+  });
+
+  it("a dry run refuses a fork source the real run refuses, with the same refusal, and writes nothing", async () => {
+    seedSeat({ runtime: "codex" });
+    const before = durableRows();
+
+    const dryRun = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fork:0b0165d7", dryRun: true });
+    const run = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fork:0b0165d7" });
+
+    expect(dryRun).toMatchObject({ ok: false, code: "fork_source_not_found" });
+    expect(dryRun).toEqual(run);
     expect(durableRows()).toBe(before);
   });
 

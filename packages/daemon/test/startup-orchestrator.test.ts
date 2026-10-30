@@ -875,6 +875,18 @@ describe("StartupOrchestrator", () => {
     expect(tmux.sendText).not.toHaveBeenCalled();
   });
 
+  it("does not mark pending or project when saved environment execution refuses the prelude", async () => {
+    const seed=seedSession();
+    sessionRegistry.updateStartupStatus(seed.sessionId,"ready");
+    const preflight=vi.fn(async () => { throw new Error("saved execution preserved"); });
+    const adapter=mockAdapter({runtime:"openshell-claude",environment:{} as RuntimeAdapter["environment"],preflightEnvironmentStartup:preflight});
+    const input=makeInput(seed,{adapter});
+    const result=await createOrchestrator().startNode(input);
+    expect(result).toMatchObject({ok:false,startupStatus:"attention_required",errors:["saved execution preserved"]});
+    expect(preflight).toHaveBeenCalledTimes(1); expect(adapter.project).not.toHaveBeenCalled(); expect(adapter.launchHarness).not.toHaveBeenCalled();
+    expect(db.prepare("SELECT startup_status FROM sessions WHERE id=?").get(seed.sessionId)).toEqual({startup_status:"ready"});
+  });
+
   // T1: fresh launch enters pending before startup delivery
   it("marks pending before delivery", async () => {
     const seed = seedSession();
@@ -2463,6 +2475,42 @@ describe("StartupOrchestrator", () => {
     const result = await orch.startNode(makeInput(seed, { adapter, readinessTimeoutMs: 10_000 }));
     expect(result.ok).toBe(true);
     expect(callCount).toBeGreaterThanOrEqual(3);
+  });
+
+  // #2277: a fresh retry in the same pane can be dispatched while the previous launch's not-found line is still on screen.
+  const notFound = "claude wasn't found when the launch ran (the pane shows: bash: claude: command not found).";
+
+  it("an earlier launch's not-found line doesn't end a new launch that then becomes ready (#2277)", async () => {
+    const seed = seedSession();
+    let calls = 0;
+    const adapter = mockAdapter({
+      checkReady: vi.fn(async () => (++calls >= 2 ? { ready: true } : { ready: false, reason: notFound, code: "returned_to_shell" })),
+    });
+    const orch = createOrchestrator();
+    const result = await orch.startNode(makeInput(seed, { adapter, readinessTimeoutMs: 10_000 }));
+    expect(result.ok).toBe(true);
+    expect(calls).toBe(2);
+  });
+
+  it("a launch that stays not-found reports it when the readiness wait ends (#2277)", async () => {
+    const seed = seedSession();
+    const adapter = mockAdapter({ checkReady: vi.fn(async () => ({ ready: false, reason: notFound, code: "returned_to_shell" })) });
+    const orch = createOrchestrator();
+    const result = await orch.startNode(makeInput(seed, { adapter, readinessTimeoutMs: 100 }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errors).toEqual([`Readiness timeout after 0.1s — harness did not become interactive: ${notFound}`]);
+  });
+
+  it("a pane back at its shell for another reason still waits for the readiness timeout", async () => {
+    const seed = seedSession();
+    const adapter = mockAdapter({
+      checkReady: vi.fn(async () => ({ ready: false, reason: "The probe pane returned to a shell instead of staying inside the runtime.", code: "returned_to_shell" })),
+    });
+    const orch = createOrchestrator();
+    const result = await orch.startNode(makeInput(seed, { adapter, readinessTimeoutMs: 100 }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errors).toEqual([expect.stringContaining("Readiness timeout after 0.1s")]);
+    expect((adapter.checkReady as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(1);
   });
 
   it("readiness timeout → startup_failed with timeout message", async () => {

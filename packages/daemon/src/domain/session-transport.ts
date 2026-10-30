@@ -25,7 +25,7 @@ import {
   type ComposerSnapshot,
 } from "./composer-prompts.js";
 export { inspectStartupStagedText } from "./startup-submission-evidence.js";
-import { OutboxHandler } from "./outbox-handler.js";
+import { OutboxHandler, OutboxHandlerError } from "./outbox-handler.js";
 import { DraftAwareDelivery, type GuardedDeliverySummary, type QueueWakeFacts } from "./draft-aware-delivery.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
@@ -1904,6 +1904,8 @@ export interface SendResult {
    *  `attempted` — the text write was issued and reported a failure (it may still have landed);
    *  `written` — the text was written and the send stopped before or at Enter (it may sit in the input box). */
   inputPhase?: "not_reached" | "attempted" | "written";
+  /** Typed refusal caught before any attempted/written input; never inferred from error text. */
+  noInputCode?: "retained_quota_full" | "terminal_seat";
 }
 
 /** One reading of a Claude Code or Codex input box: `exact` (the sent text, word boundaries kept), `ambiguous`
@@ -2548,7 +2550,10 @@ export class SessionTransport {
         return { ok: false, sessionName, outcome: "failed", inputPhase: "attempted", reason: (error as { code?: string }).code ?? "delivery_indeterminate",
           error: `A text write to '${sessionName}' was issued, but its result was lost: ${(error as Error).message}` };
       }
-      return { ok: false, sessionName, sent: false, reason: (error as { code?: string }).code ?? "guard_unavailable", error: (error as Error).message };
+      const noInputCode = error instanceof OutboxHandlerError && error.code === "retained_quota_full" ? "retained_quota_full" as const
+        : error instanceof DeliveryGuardError && error.code === "terminal_seat" ? "terminal_seat" as const : undefined;
+      return { ok: false, sessionName, sent: false, reason: (error as { code?: string }).code ?? "guard_unavailable", error: (error as Error).message,
+        ...(noInputCode ? { noInputCode, inputPhase: "not_reached" as const } : {}) };
     }
   }
 
@@ -2613,7 +2618,7 @@ export class SessionTransport {
           sessionName,
           sent: false,
           reason: "target_runtime_unverified",
-          error: `Refused: '${sessionName}' reports ${unverified} as the foreground command, but OpenRig could not verify its expected ${runtime} agent in the bound pane. The agent may still be running behind a wrapper. No text was sent.`,
+          error: `Refused: '${sessionName}' reports ${unverified} as the foreground command, but OpenRig could not verify its expected ${runtime} agent in the bound pane. The agent may still be running behind a wrapper. No text was sent. Delivery depends on verifying the bound pane and its input-owning agent; a live process alone is insufficient. Check what is running in the pane with rig capture <session>; if the agent has exited to its shell, start it again before resending.`,
         } };
       }
     }
@@ -2785,7 +2790,7 @@ export class SessionTransport {
         sessionName,
         sent: false,
         reason: "target_runtime_unverified",
-        error: `Refused: '${sessionName}' reports ${unverifiedShell} as the foreground command, but OpenRig could not verify its expected ${runtime} agent in the bound pane. The agent may still be running behind a wrapper. No text was sent.`,
+        error: `Refused: '${sessionName}' reports ${unverifiedShell} as the foreground command, but OpenRig could not verify its expected ${runtime} agent in the bound pane. The agent may still be running behind a wrapper. No text was sent. Delivery depends on verifying the bound pane and its input-owning agent; a live process alone is insufficient. Check what is running in the pane with rig capture <session>; if the agent has exited to its shell, start it again before resending.`,
       });
     }
 
