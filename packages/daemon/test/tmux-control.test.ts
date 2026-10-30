@@ -410,7 +410,9 @@ describe("tmuxControlExec", () => {
     await vi.waitFor(() => expect(args).toHaveLength(1));
     expect(args[0]).toEqual(["-C", "new-session", "-s", "openrig-control-d4e5", "-x", "80", "-y", "24", "-f", "no-output,ignore-size",
       "--", "sh", "-c", "while :; do sleep 86400; done",
-      ";", "set-option", "@openrig-control", "d4e5", ";", "set-option", "destroy-unattached", "on", ";", "set-option", "detach-on-destroy", "on"]);
+      ";", "set-option", "@openrig-control", "d4e5", ";", "set-option", "destroy-unattached", "off",
+      ";", "set-hook", "client-detached", "if-shell -F '#{==:#{session_attached},0}' kill-session",
+      ";", "set-option", "detach-on-destroy", "on"]);
     // Its name is taken (a session of someone else's, or one left by a daemon with the same id): tmux makes nothing,
     // and nothing is adopted. The command is spawned, and a client tried again only later.
     clients[0]!.child.stdout.write("%begin 1 1 0\nduplicate session: openrig-control-d4e5\n%error 1 1 0\n");
