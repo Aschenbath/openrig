@@ -1434,6 +1434,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const deps: AppDeps = {
     environmentDriver,
     environmentArtifactRoot: nodePath.join(runtimeSettings.workspaceRoot, "artifacts", "environments"),
+    environmentStateRoot: nodePath.join(OPENRIG_HOME, "state", "environment-checkpoints"),
     databaseWarnings,
     rigRepo,
     sessionRegistry,
